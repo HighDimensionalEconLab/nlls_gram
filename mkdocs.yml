@@ -1,0 +1,40 @@
+site_name: nlls_gram
+site_description: Gram/dual-form Levenberg-Marquardt nonlinear least-squares for JAX/Flax NNX models
+site_url: https://highdimensionaleconlab.github.io/nlls_gram/
+repo_url: https://github.com/HighDimensionalEconLab/nlls_gram
+repo_name: HighDimensionalEconLab/nlls_gram
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.top
+  palette:
+    - scheme: default
+      primary: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            show_root_heading: true
+            show_source: true
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - admonition
+
+nav:
+  - Home: index.md
