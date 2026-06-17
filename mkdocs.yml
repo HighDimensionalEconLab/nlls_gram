@@ -1,5 +1,5 @@
 site_name: nlls_gram
-site_description: Gram/dual-form Levenberg-Marquardt nonlinear least-squares for JAX/Flax NNX models
+site_description: Gram/dual-form Levenberg-Marquardt nonlinear least-squares for JAX
 site_url: https://highdimensionaleconlab.github.io/nlls_gram/
 repo_url: https://github.com/HighDimensionalEconLab/nlls_gram
 repo_name: HighDimensionalEconLab/nlls_gram

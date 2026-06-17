@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nlls-gram"
-version = "0.1.0"
-description = "Gram/dual-form Levenberg-Marquardt nonlinear least-squares solvers for JAX/Flax NNX models"
+version = "0.2.0"
+description = "Gram/dual-form Levenberg-Marquardt nonlinear least-squares solvers for JAX"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -15,8 +15,6 @@ keywords = [
     "levenberg-marquardt",
     "nonlinear-least-squares",
     "jax",
-    "flax",
-    "nnx",
     "optimization",
 ]
 classifiers = [
@@ -28,9 +26,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 dependencies = [
-    "flax>=0.10.7",
     "jax>=0.7.0",
-    "optax>=0.2.4",
 ]
 
 [project.urls]
