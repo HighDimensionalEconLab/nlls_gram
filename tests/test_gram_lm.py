@@ -172,6 +172,25 @@ def test_init_damping_must_be_positive():
         GramLevenbergMarquardt(residual_fn, init_damping=0.0)
 
 
+def test_fletcher_diagonal_clip_bounds_must_be_valid():
+    with pytest.raises(ValueError, match="fletcher_min_diagonal must be positive"):
+        GramLevenbergMarquardt(
+            residual_fn,
+            regularization="fletcher",
+            fletcher_min_diagonal=0.0,
+        )
+    with pytest.raises(
+        ValueError,
+        match="fletcher_max_diagonal must be greater than or equal",
+    ):
+        GramLevenbergMarquardt(
+            residual_fn,
+            regularization="fletcher",
+            fletcher_min_diagonal=1.0,
+            fletcher_max_diagonal=0.5,
+        )
+
+
 def test_default_float32_params_keep_float32_outputs():
     x = jnp.linspace(0.0, 2.0, 20)
     y = 2.0 * jnp.exp(-1.0 * x)
@@ -364,6 +383,61 @@ def test_fletcher_step_matches_regression_values():
     assert float(state.damping) == pytest.approx(0.004999999888241291)
     assert float(info.damping_factor) == pytest.approx(0.5)
     assert float(info.acceleration_ratio) == pytest.approx(0.0)
+
+
+def test_fletcher_clips_tiny_diagonal_from_below():
+    def residual(theta, target):
+        return jnp.array([theta[0] + 1e-4 * theta[1] - target])
+
+    theta0 = jnp.array([0.0, 0.0])
+    solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1.0,
+        regularization="fletcher",
+        fletcher_min_diagonal=1e-6,
+        fletcher_max_diagonal=1e6,
+    )
+    raw_solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1.0,
+        regularization="fletcher",
+        fletcher_min_diagonal=1e-12,
+        fletcher_max_diagonal=1e6,
+    )
+
+    theta, _, info = solver.update(theta0, solver.init(), 1.0)
+    raw_theta, _, _ = raw_solver.update(theta0, raw_solver.init(), 1.0)
+
+    clipped_diagonal = 1e-6
+    denominator = 1.0 + (1e-8 / clipped_diagonal) + 1.0
+    expected_theta = jnp.array([1.0, 1e-4 / clipped_diagonal]) / denominator
+
+    assert bool(info.accepted)
+    assert jnp.allclose(theta, expected_theta, rtol=1e-5, atol=1e-5)
+    assert jnp.abs(theta[1]) < 0.02 * jnp.abs(raw_theta[1])
+
+
+def test_fletcher_clips_large_diagonal_from_above():
+    def residual(theta, target):
+        return jnp.array([1e4 * theta[0] - target])
+
+    theta0 = jnp.array([0.0])
+    solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1.0,
+        regularization="fletcher",
+        fletcher_min_diagonal=1e-6,
+        fletcher_max_diagonal=1e6,
+    )
+
+    theta, _, info = solver.update(theta0, solver.init(), 1.0)
+
+    clipped_diagonal = 1e6
+    denominator = (1e8 / clipped_diagonal) + 1.0
+    expected_theta = jnp.array([1e4 / clipped_diagonal / denominator])
+
+    assert bool(info.accepted)
+    assert jnp.allclose(theta, expected_theta, rtol=1e-6, atol=1e-8)
 
 
 def test_geodesic_step_matches_regression_values():

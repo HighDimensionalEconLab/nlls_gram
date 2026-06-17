@@ -136,6 +136,9 @@ print(params["a"].dtype, info.loss.dtype, info.damping.dtype)
 The default `regularization="identity"` uses the classic LM damping matrix
 `lambda * I`. If parameters are badly scaled, `regularization="fletcher"` can
 help by damping each parameter direction in proportion to `diag(J.T @ J)`.
+The diagonal is clipped before use, with defaults
+`fletcher_min_diagonal=1e-6` and `fletcher_max_diagonal=1e6`, so nearly unused
+or extremely sensitive parameter directions do not dominate the Gram solve.
 
 ```python
 import jax.numpy as jnp
@@ -159,6 +162,8 @@ def iterations_to_threshold(regularization):
         residual_fn,
         init_damping=1e-2,
         regularization=regularization,
+        fletcher_min_diagonal=1e-6,
+        fletcher_max_diagonal=1e6,
     )
     lm_state = solver.init()
     for iteration in range(1, 51):

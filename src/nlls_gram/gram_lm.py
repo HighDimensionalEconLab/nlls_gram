@@ -38,7 +38,7 @@ class LMInfo(NamedTuple):
 #   step = -J' (J J' + damping I_n)^{-1} r
 # regularization controls the damping metric:
 #   "identity": add damping * I
-#   "fletcher": add damping * diag(J'J), using the equivalent dual formula
+#   "fletcher": add damping * clipped_diag(J'J), using the equivalent dual formula
 class GramLevenbergMarquardt:
     def __init__(
         self,
@@ -48,6 +48,8 @@ class GramLevenbergMarquardt:
         damping_decrease=0.5,
         damping_increase=4.0,
         regularization="identity",
+        fletcher_min_diagonal=1e-6,
+        fletcher_max_diagonal=1e6,
         geodesic_acceleration=False,
         geodesic_acceptance_ratio=0.75,
     ):
@@ -55,11 +57,20 @@ class GramLevenbergMarquardt:
             raise ValueError(f"unknown regularization: {regularization}")
         if init_damping <= 0:
             raise ValueError("init_damping must be positive")
+        if fletcher_min_diagonal <= 0:
+            raise ValueError("fletcher_min_diagonal must be positive")
+        if fletcher_max_diagonal < fletcher_min_diagonal:
+            raise ValueError(
+                "fletcher_max_diagonal must be greater than or equal to "
+                "fletcher_min_diagonal"
+            )
         self.residual_fn = residual_fn
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
         self.regularization = regularization
+        self.fletcher_min_diagonal = fletcher_min_diagonal
+        self.fletcher_max_diagonal = fletcher_max_diagonal
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
 
@@ -79,8 +90,10 @@ class GramLevenbergMarquardt:
         damping_decrease = jnp.asarray(self.damping_decrease, dtype=resid.dtype)
         damping_increase = jnp.asarray(self.damping_increase, dtype=resid.dtype)
         if self.regularization == "fletcher":
-            fletcher_diagonal = jnp.maximum(
-                jnp.sum(J**2, axis=0), jnp.finfo(resid.dtype).eps
+            fletcher_diagonal = jnp.clip(
+                jnp.sum(J**2, axis=0),
+                jnp.asarray(self.fletcher_min_diagonal, dtype=resid.dtype),
+                jnp.asarray(self.fletcher_max_diagonal, dtype=resid.dtype),
             )
 
         if self.regularization == "identity":
