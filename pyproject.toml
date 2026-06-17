@@ -49,7 +49,11 @@ select = ["E", "F", "I", "UP", "B"]
 testpaths = ["tests"]
 
 [dependency-groups]
+benchmark = [
+    "pytest-benchmark>=5.2.3",
+]
 dev = [
+    "flax>=0.12.7",
     "pytest>=8",
     "ruff>=0.15.17",
 ]

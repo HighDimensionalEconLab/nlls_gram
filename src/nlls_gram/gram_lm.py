@@ -11,9 +11,8 @@ from jax.flatten_util import ravel_pytree
 # residual_fn(params, batch). It knows nothing about flax/nnx/optax. The class does
 # not jit internally -- wrap the caller's train step in jax.jit. All hyperparameters
 # are static Python scalars; all data-dependent control flow is traced (jnp.where),
-# so a rejected step returns the unchanged params rather than branching. No floats
-# are cast anywhere on the step: dtypes flow from params/residual and jax decides
-# float32 vs float64 via jax_enable_x64.
+# so a rejected step returns the unchanged params rather than branching. Dtypes
+# flow from params/residual; damping scalars are converted to the residual dtype.
 
 
 class LMState(NamedTuple):
@@ -32,6 +31,10 @@ class LMInfo(NamedTuple):
 # system is factored for the identical step:
 #   "gram":   step = -J' (J J' + damping I_n)^{-1} r   (n x n dual; right for n << p)
 #   "normal": step = -(J'J + damping I_p)^{-1} J' r    (p x p; right for p <~ n)
+# regularization controls the damping metric:
+#   "identity": add damping * I
+#   "fletcher": add damping * diag(J'J), using the equivalent dual formula
+#               in gram mode
 class GramLevenbergMarquardt:
     def __init__(
         self,
@@ -41,14 +44,18 @@ class GramLevenbergMarquardt:
         damping_decrease=0.5,
         damping_increase=4.0,
         solve_method="gram",
+        regularization="identity",
     ):
         if solve_method not in ("gram", "normal"):
             raise ValueError(f"unknown solve_method: {solve_method}")
+        if regularization not in ("identity", "fletcher"):
+            raise ValueError(f"unknown regularization: {regularization}")
         self.residual_fn = residual_fn
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
         self.solve_method = solve_method
+        self.regularization = regularization
 
     def init(self):
         return LMState(jnp.asarray(self.init_damping))
@@ -60,23 +67,46 @@ class GramLevenbergMarquardt:
             return jnp.ravel(self.residual_fn(unravel(th), batch))
 
         resid = residual_flat(theta)
+        damping = jnp.asarray(state.damping, dtype=resid.dtype)
+        damping_decrease = jnp.asarray(self.damping_decrease, dtype=resid.dtype)
+        damping_increase = jnp.asarray(self.damping_increase, dtype=resid.dtype)
         J = jax.jacrev(residual_flat)(theta)
+        if self.regularization == "fletcher":
+            fletcher_diagonal = jnp.maximum(
+                jnp.sum(J**2, axis=0), jnp.finfo(resid.dtype).eps
+            )
         if self.solve_method == "gram":
-            step = -J.T @ jnp.linalg.solve(
-                J @ J.T + state.damping * jnp.eye(J.shape[0], dtype=resid.dtype), resid
-            )
+            if self.regularization == "identity":
+                step = -J.T @ jnp.linalg.solve(
+                    J @ J.T + damping * jnp.eye(J.shape[0], dtype=resid.dtype),
+                    resid,
+                )
+            else:
+                weighted_JT = J.T / fletcher_diagonal[:, None]
+                step = -weighted_JT @ jnp.linalg.solve(
+                    J @ weighted_JT + damping * jnp.eye(J.shape[0], dtype=resid.dtype),
+                    resid,
+                )
         else:
-            step = -jnp.linalg.solve(
-                J.T @ J + state.damping * jnp.eye(J.shape[1], dtype=resid.dtype),
-                J.T @ resid,
-            )
+            normal_matrix = J.T @ J
+            if self.regularization == "identity":
+                regularizer = jnp.eye(J.shape[1], dtype=resid.dtype)
+            else:
+                regularizer = jnp.diag(fletcher_diagonal)
+            step = -jnp.linalg.solve(normal_matrix + damping * regularizer, J.T @ resid)
         resid_new = residual_flat(theta + step)
-        improved = jnp.sum(resid_new**2) < jnp.sum(resid**2)
+        loss_old = jnp.sum(resid**2)
+        loss_new = jnp.sum(resid_new**2)
+        improved = loss_new < loss_old
         theta_new = jnp.where(improved, theta + step, theta)
-        damping = jnp.where(
+        new_damping = jnp.where(
             improved,
-            state.damping * self.damping_decrease,
-            state.damping * self.damping_increase,
+            damping * damping_decrease,
+            damping * damping_increase,
         )
-        loss = jnp.minimum(jnp.sum(resid_new**2), jnp.sum(resid**2))
-        return unravel(theta_new), LMState(damping), LMInfo(loss, improved, damping)
+        loss = jnp.minimum(loss_new, loss_old)
+        return (
+            unravel(theta_new),
+            LMState(new_damping),
+            LMInfo(loss, improved, new_damping),
+        )
