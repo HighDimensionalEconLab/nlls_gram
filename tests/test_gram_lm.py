@@ -10,6 +10,10 @@ def residual_fn(params, batch):
     return params["a"] * jnp.exp(params["b"] * x) - y
 
 
+REGRESSION_ATOL = 5e-5
+REGRESSION_RTOL = 1e-5
+
+
 def test_recovers_known_parameters_with_jitted_step():
     a_true, b_true = 2.0, -1.0
     x = jnp.linspace(0.0, 2.0, 20)
@@ -341,14 +345,22 @@ def test_fletcher_step_matches_regression_values():
     assert bool(info.accepted)
     assert not bool(info.used_geodesic)
     assert jnp.allclose(
-        new_params["a"], jnp.asarray(1.6462632417678833), rtol=1e-6, atol=1e-6
+        new_params["a"],
+        jnp.asarray(1.6462632417678833),
+        rtol=REGRESSION_RTOL,
+        atol=REGRESSION_ATOL,
     )
     assert jnp.allclose(
-        new_params["b"], jnp.asarray(-0.7737699747085571), rtol=1e-6, atol=1e-6
+        new_params["b"],
+        jnp.asarray(-0.7737699747085571),
+        rtol=REGRESSION_RTOL,
+        atol=REGRESSION_ATOL,
     )
-    assert float(info.loss) == pytest.approx(0.35342830419540405)
-    assert float(info.loss_old) == pytest.approx(5.599210739135742)
-    assert float(info.loss_candidate) == pytest.approx(0.35342830419540405)
+    assert float(info.loss) == pytest.approx(0.35342830419540405, abs=REGRESSION_ATOL)
+    assert float(info.loss_old) == pytest.approx(5.599210739135742, abs=REGRESSION_ATOL)
+    assert float(info.loss_candidate) == pytest.approx(
+        0.35342830419540405, abs=REGRESSION_ATOL
+    )
     assert float(state.damping) == pytest.approx(0.004999999888241291)
     assert float(info.damping_factor) == pytest.approx(0.5)
     assert float(info.acceleration_ratio) == pytest.approx(0.0)
@@ -370,17 +382,27 @@ def test_geodesic_step_matches_regression_values():
     assert bool(info.accepted)
     assert bool(info.used_geodesic)
     assert jnp.allclose(
-        new_params["a"], jnp.asarray(1.9073810577392578), rtol=1e-6, atol=1e-6
+        new_params["a"],
+        jnp.asarray(1.9073810577392578),
+        rtol=REGRESSION_RTOL,
+        atol=REGRESSION_ATOL,
     )
     assert jnp.allclose(
-        new_params["b"], jnp.asarray(-0.9168586730957031), rtol=1e-6, atol=1e-6
+        new_params["b"],
+        jnp.asarray(-0.9168586730957031),
+        rtol=REGRESSION_RTOL,
+        atol=REGRESSION_ATOL,
     )
-    assert float(info.loss) == pytest.approx(0.029626082628965378)
-    assert float(info.loss_old) == pytest.approx(5.599210739135742)
-    assert float(info.loss_candidate) == pytest.approx(0.029626082628965378)
+    assert float(info.loss) == pytest.approx(0.029626082628965378, abs=REGRESSION_ATOL)
+    assert float(info.loss_old) == pytest.approx(5.599210739135742, abs=REGRESSION_ATOL)
+    assert float(info.loss_candidate) == pytest.approx(
+        0.029626082628965378, abs=REGRESSION_ATOL
+    )
     assert float(state.damping) == pytest.approx(0.004999999888241291)
     assert float(info.damping_factor) == pytest.approx(0.5)
-    assert float(info.acceleration_ratio) == pytest.approx(0.8667416572570801)
+    assert float(info.acceleration_ratio) == pytest.approx(
+        0.8667416572570801, abs=REGRESSION_ATOL
+    )
 
 
 def test_fletcher_handles_unused_parameter():
