@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nlls-gram"
-version = "0.2.0"
+version = "0.3.0"
 description = "Gram/dual-form Levenberg-Marquardt nonlinear least-squares solvers for JAX"
 readme = "README.md"
 license = "MIT"
@@ -60,4 +60,7 @@ dev = [
 docs = [
     "mkdocs-material>=9.5",
     "mkdocstrings[python]>=0.26",
+]
+gpu = [
+    "jax[cuda13]>=0.7.0 ; sys_platform == 'linux'",
 ]

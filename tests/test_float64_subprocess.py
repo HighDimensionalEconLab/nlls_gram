@@ -39,8 +39,39 @@ for _ in range(5):
 assert_float64_tree(params)
 assert state.damping.dtype == jnp.float64
 assert info.loss.dtype == jnp.float64
+assert info.loss_old.dtype == jnp.float64
+assert info.loss_candidate.dtype == jnp.float64
 assert info.damping.dtype == jnp.float64
+assert info.damping_factor.dtype == jnp.float64
+assert info.acceleration_ratio.dtype == jnp.float64
 jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, (x, y)))(params, state))
+assert "f32" not in jaxpr, jaxpr
+
+
+def quadratic_residual(theta, target):
+    return jnp.array([theta[0] ** 2 - target])
+
+
+theta = jnp.asarray([1.9], dtype=jnp.float64)
+target = jnp.asarray(4.0, dtype=jnp.float64)
+solver = GramLevenbergMarquardt(
+    quadratic_residual,
+    init_damping=1e-12,
+    geodesic_acceleration=True,
+    geodesic_acceptance_ratio=1.0,
+)
+state = solver.init()
+theta, state, info = solver.update(theta, state, target)
+
+assert theta.dtype == jnp.float64
+assert state.damping.dtype == jnp.float64
+assert info.loss.dtype == jnp.float64
+assert info.loss_old.dtype == jnp.float64
+assert info.loss_candidate.dtype == jnp.float64
+assert info.damping.dtype == jnp.float64
+assert info.damping_factor.dtype == jnp.float64
+assert info.acceleration_ratio.dtype == jnp.float64
+jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, target))(theta, state))
 assert "f32" not in jaxpr, jaxpr
 
 
@@ -73,9 +104,7 @@ def nnx_residual_fn(params, batch):
     return model(x) - y
 
 
-solver = GramLevenbergMarquardt(
-    nnx_residual_fn, init_damping=0.0, solve_method="normal"
-)
+solver = GramLevenbergMarquardt(nnx_residual_fn, init_damping=1e-12)
 state = solver.init()
 nnx_params, state, info = solver.update(nnx_params, state, (x_nnx, y_nnx))
 trained = nnx.merge(graphdef, nnx_params)
@@ -85,6 +114,11 @@ assert trained.linear.kernel[...].dtype == jnp.float64
 assert jnp.allclose(trained.linear.kernel[...], jnp.asarray([[2.0]], dtype=jnp.float64))
 assert state.damping.dtype == jnp.float64
 assert info.loss.dtype == jnp.float64
+assert info.loss_old.dtype == jnp.float64
+assert info.loss_candidate.dtype == jnp.float64
+assert info.damping.dtype == jnp.float64
+assert info.damping_factor.dtype == jnp.float64
+assert info.acceleration_ratio.dtype == jnp.float64
 jaxpr = str(
     jax.make_jaxpr(lambda p, s: solver.update(p, s, (x_nnx, y_nnx)))(
         nnx_params, state

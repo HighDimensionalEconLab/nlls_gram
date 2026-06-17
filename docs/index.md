@@ -13,12 +13,36 @@ system instead of the `p x p` normal equations.
 The solver depends only on `jax` — it knows nothing about `flax`/`nnx`/`optax`.
 Dtypes flow from your `params`/residual, and the damping state follows the
 residual dtype; JAX decides `float32` vs `float64` via `jax_enable_x64`.
+`init_damping` must be positive; use a small positive value for near
+Gauss-Newton behavior. There is intentionally no normal-equation mode; use a
+different LM implementation when the Gram system is not the right shape for your
+problem.
 
 ## Install
 
 ```bash
 uv add nlls-gram
 ```
+
+For local development on an NVIDIA CUDA 13 machine, use the optional `gpu`
+dependency group:
+
+```bash
+uv sync --group gpu
+```
+
+That group is for this repository's development and GPU tests; it is not a
+published `nlls-gram[gpu]` extra. Users who want to run the optimizer on a GPU
+should install the JAX accelerator build that matches their hardware alongside
+`nlls-gram`, for example:
+
+```bash
+uv add nlls-gram "jax[cuda13]"
+```
+
+See the
+[JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for
+the current CUDA, ROCm, TPU, and CPU installation choices.
 
 ## Minimal example
 
@@ -127,7 +151,6 @@ def iterations_to_threshold(regularization):
     solver = GramLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
-        solve_method="normal",
         regularization=regularization,
     )
     lm_state = solver.init()
@@ -141,6 +164,27 @@ def iterations_to_threshold(regularization):
 print(iterations_to_threshold("identity"))  # ~16
 print(iterations_to_threshold("fletcher"))  # ~4
 ```
+
+## Geodesic acceleration
+
+Geodesic acceleration is off by default. When enabled, the solver uses analytic
+JAX forward-mode JVPs to build an accelerated candidate; it does not use finite
+differences.
+
+```python
+solver = GramLevenbergMarquardt(
+    residual_fn,
+    init_damping=1e-2,
+    geodesic_acceleration=True,
+)
+```
+
+The accelerated candidate is used only when its acceleration ratio,
+`2 * ||a|| / ||v||`, is at or below a positive `geodesic_acceptance_ratio` and
+its loss is no worse than the plain LM velocity candidate. Otherwise the update
+automatically falls back to the velocity step. Use `LMInfo.used_geodesic`,
+`LMInfo.acceleration_ratio`, `LMInfo.loss_old`, `LMInfo.loss_candidate`, and
+`LMInfo.damping_factor` to tune damping and geodesic behavior.
 
 `params` can be any pytree. With Flax NNX, pass `nnx.state(model, nnx.Param)` as
 `params` and write `residual_fn(state, batch)` using `nnx.merge`; the solver itself
@@ -215,6 +259,29 @@ in CI by default:
 
 ```bash
 uv run --group benchmark pytest benchmarks --benchmark-only
+```
+
+For a larger RBF-style interpolation profile with CPU/GPU and geodesic on/off
+variants:
+
+```bash
+uv run --group benchmark --group gpu pytest \
+  benchmarks/test_large_interpolation_benchmark.py --benchmark-only
+```
+
+For a small classic geodesic-acceleration convergence benchmark based on the GSL
+modified Rosenbrock example:
+
+```bash
+uv run --group benchmark pytest \
+  benchmarks/test_classic_geodesic_benchmark.py --benchmark-only
+```
+
+On machines with a CUDA-enabled JAX install, the optional GPU test checks that a
+jitted geodesic update runs on a GPU device:
+
+```bash
+uv run --group gpu pytest tests/test_gpu.py
 ```
 
 ## API reference

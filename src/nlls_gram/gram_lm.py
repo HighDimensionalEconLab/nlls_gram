@@ -2,6 +2,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
 from jax.flatten_util import ravel_pytree
 
 # General-JAX least-squares solver: a class exposing init() -> state and
@@ -21,20 +22,23 @@ class LMState(NamedTuple):
 
 class LMInfo(NamedTuple):
     loss: jax.Array  # min(old, new) sum of squared residuals
+    loss_old: jax.Array
+    loss_candidate: jax.Array
     accepted: jax.Array
     damping: jax.Array  # post-update damping
+    damping_factor: jax.Array
+    used_geodesic: jax.Array
+    acceleration_ratio: jax.Array
 
 
 # Classic Marquardt damping on min ||r(theta)||^2: accept the step iff the sum of
 # squared residuals decreases, multiplying the damping by damping_decrease on
-# acceptance and damping_increase on rejection. solve_method picks which linear
-# system is factored for the identical step:
-#   "gram":   step = -J' (J J' + damping I_n)^{-1} r   (n x n dual; right for n << p)
-#   "normal": step = -(J'J + damping I_p)^{-1} J' r    (p x p; right for p <~ n)
+# acceptance and damping_increase on rejection. The solver factors the small
+# damped Gram system, which is the intended use case for n_residuals << n_params:
+#   step = -J' (J J' + damping I_n)^{-1} r
 # regularization controls the damping metric:
 #   "identity": add damping * I
 #   "fletcher": add damping * diag(J'J), using the equivalent dual formula
-#               in gram mode
 class GramLevenbergMarquardt:
     def __init__(
         self,
@@ -43,19 +47,21 @@ class GramLevenbergMarquardt:
         init_damping=1e-3,
         damping_decrease=0.5,
         damping_increase=4.0,
-        solve_method="gram",
         regularization="identity",
+        geodesic_acceleration=False,
+        geodesic_acceptance_ratio=0.75,
     ):
-        if solve_method not in ("gram", "normal"):
-            raise ValueError(f"unknown solve_method: {solve_method}")
         if regularization not in ("identity", "fletcher"):
             raise ValueError(f"unknown regularization: {regularization}")
+        if init_damping <= 0:
+            raise ValueError("init_damping must be positive")
         self.residual_fn = residual_fn
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
-        self.solve_method = solve_method
         self.regularization = regularization
+        self.geodesic_acceleration = geodesic_acceleration
+        self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
 
     def init(self):
         return LMState(jnp.asarray(self.init_damping))
@@ -66,47 +72,83 @@ class GramLevenbergMarquardt:
         def residual_flat(th):
             return jnp.ravel(self.residual_fn(unravel(th), batch))
 
-        resid = residual_flat(theta)
+        resid, pullback = jax.vjp(residual_flat, theta)
+        residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
+        J = jax.vmap(lambda cotangent: pullback(cotangent)[0])(residual_basis)
         damping = jnp.asarray(state.damping, dtype=resid.dtype)
         damping_decrease = jnp.asarray(self.damping_decrease, dtype=resid.dtype)
         damping_increase = jnp.asarray(self.damping_increase, dtype=resid.dtype)
-        J = jax.jacrev(residual_flat)(theta)
         if self.regularization == "fletcher":
             fletcher_diagonal = jnp.maximum(
                 jnp.sum(J**2, axis=0), jnp.finfo(resid.dtype).eps
             )
-        if self.solve_method == "gram":
-            if self.regularization == "identity":
-                step = -J.T @ jnp.linalg.solve(
-                    J @ J.T + damping * jnp.eye(J.shape[0], dtype=resid.dtype),
-                    resid,
-                )
-            else:
-                weighted_JT = J.T / fletcher_diagonal[:, None]
-                step = -weighted_JT @ jnp.linalg.solve(
-                    J @ weighted_JT + damping * jnp.eye(J.shape[0], dtype=resid.dtype),
-                    resid,
-                )
+
+        if self.regularization == "identity":
+            gram_step_left = J.T
+            linear_matrix = J @ J.T
         else:
-            normal_matrix = J.T @ J
-            if self.regularization == "identity":
-                regularizer = jnp.eye(J.shape[1], dtype=resid.dtype)
-            else:
-                regularizer = jnp.diag(fletcher_diagonal)
-            step = -jnp.linalg.solve(normal_matrix + damping * regularizer, J.T @ resid)
-        resid_new = residual_flat(theta + step)
+            gram_step_left = J.T / fletcher_diagonal[:, None]
+            linear_matrix = J @ gram_step_left
+        linear_matrix = linear_matrix + damping * jnp.eye(J.shape[0], dtype=resid.dtype)
+        linear_factor = jsp_linalg.cho_factor(linear_matrix)
+
+        def solve_step(rhs):
+            return -gram_step_left @ jsp_linalg.cho_solve(linear_factor, rhs)
+
+        velocity = solve_step(resid)
+        resid_velocity = residual_flat(theta + velocity)
         loss_old = jnp.sum(resid**2)
-        loss_new = jnp.sum(resid_new**2)
-        improved = loss_new < loss_old
+        loss_velocity = jnp.sum(resid_velocity**2)
+        zero = jnp.zeros((), dtype=resid.dtype)
+
+        if self.geodesic_acceleration:
+            geodesic_acceptance_ratio = jnp.asarray(
+                self.geodesic_acceptance_ratio, dtype=resid.dtype
+            )
+
+            def first_jvp(th):
+                return jax.jvp(residual_flat, (th,), (velocity,))[1]
+
+            f_vv = jax.jvp(first_jvp, (theta,), (velocity,))[1]
+            acceleration = solve_step(f_vv)
+            accelerated_step = velocity + 0.5 * acceleration
+            resid_accelerated = residual_flat(theta + accelerated_step)
+            loss_accelerated = jnp.sum(resid_accelerated**2)
+            acceleration_ratio = (
+                2.0
+                * jnp.linalg.norm(acceleration)
+                / (jnp.linalg.norm(velocity) + jnp.finfo(resid.dtype).eps)
+            )
+            used_geodesic = (
+                (geodesic_acceptance_ratio > zero)
+                & (acceleration_ratio > zero)
+                & (acceleration_ratio <= geodesic_acceptance_ratio)
+                & (loss_accelerated <= loss_velocity)
+            )
+            step = jnp.where(used_geodesic, accelerated_step, velocity)
+            loss_candidate = jnp.where(used_geodesic, loss_accelerated, loss_velocity)
+        else:
+            step = velocity
+            loss_candidate = loss_velocity
+            used_geodesic = jnp.asarray(False)
+            acceleration_ratio = zero
+
+        improved = loss_candidate < loss_old
         theta_new = jnp.where(improved, theta + step, theta)
-        new_damping = jnp.where(
-            improved,
-            damping * damping_decrease,
-            damping * damping_increase,
-        )
-        loss = jnp.minimum(loss_new, loss_old)
+        damping_factor = jnp.where(improved, damping_decrease, damping_increase)
+        new_damping = damping * damping_factor
+        loss = jnp.minimum(loss_candidate, loss_old)
         return (
             unravel(theta_new),
             LMState(new_damping),
-            LMInfo(loss, improved, new_damping),
+            LMInfo(
+                loss,
+                loss_old,
+                loss_candidate,
+                improved,
+                new_damping,
+                damping_factor,
+                used_geodesic,
+                acceleration_ratio,
+            ),
         )

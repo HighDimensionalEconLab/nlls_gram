@@ -1,0 +1,83 @@
+import jax
+import jax.numpy as jnp
+import pytest
+
+from nlls_gram import GramLevenbergMarquardt
+
+
+def _devices(platform):
+    try:
+        return jax.devices(platform)
+    except RuntimeError:
+        return []
+
+
+def _make_large_interpolation_problem(*, platform, geodesic_acceleration):
+    device = _devices(platform)[0]
+    n_samples = 1024
+    n_centers = 8192
+
+    with jax.default_device(device):
+        x = jnp.linspace(-1.0, 1.0, n_samples)
+        centers = jnp.linspace(-1.2, 1.2, n_centers)
+        scaled_distance = (x[:, None] - centers[None, :]) / 0.08
+        features = jnp.exp(-0.5 * scaled_distance**2) / jnp.sqrt(n_centers)
+        theta_true = jnp.cos(jnp.linspace(0.0, 12.0, n_centers))
+        y = jnp.sin(features @ theta_true)
+        params = 0.05 * jnp.sin(jnp.linspace(0.0, 8.0, n_centers))
+        batch = (features, y)
+
+    def residual(theta, batch):
+        features, y = batch
+        return jnp.sin(features @ theta) - y
+
+    base_solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+    )
+    solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        geodesic_acceleration=geodesic_acceleration,
+    )
+
+    with jax.default_device(device):
+        state = base_solver.init()
+        state = type(state)(jnp.asarray(state.damping))
+
+    @jax.jit
+    def first_step(params, state):
+        return base_solver.update(params, state, batch)
+
+    params, state, _ = first_step(params, state)
+    jax.block_until_ready((params, state))
+
+    @jax.jit
+    def step(params, state):
+        return solver.update(params, state, batch)
+
+    return params, state, step
+
+
+@pytest.mark.parametrize("platform", ["cpu", "gpu"])
+@pytest.mark.parametrize("geodesic_acceleration", [False, True])
+def test_large_rbf_interpolation_second_update(
+    benchmark, platform, geodesic_acceleration
+):
+    if not _devices(platform):
+        pytest.skip(f"JAX {platform!r} backend is not available")
+
+    params, state, step = _make_large_interpolation_problem(
+        platform=platform,
+        geodesic_acceleration=geodesic_acceleration,
+    )
+
+    warmup = step(params, state)
+    jax.block_until_ready(warmup)
+
+    def run():
+        out = step(params, state)
+        jax.block_until_ready(out)
+        return out
+
+    benchmark(run)
