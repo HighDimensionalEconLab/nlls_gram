@@ -172,6 +172,13 @@ def test_init_damping_must_be_positive():
         GramLevenbergMarquardt(residual_fn, init_damping=0.0)
 
 
+def test_damping_update_factors_must_be_positive():
+    with pytest.raises(ValueError, match="damping_decrease must be positive"):
+        GramLevenbergMarquardt(residual_fn, damping_decrease=0.0)
+    with pytest.raises(ValueError, match="damping_increase must be positive"):
+        GramLevenbergMarquardt(residual_fn, damping_increase=0.0)
+
+
 def test_fletcher_diagonal_clip_bounds_must_be_valid():
     with pytest.raises(ValueError, match="fletcher_min_diagonal must be positive"):
         GramLevenbergMarquardt(

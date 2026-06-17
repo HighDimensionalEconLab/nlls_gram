@@ -57,6 +57,10 @@ class GramLevenbergMarquardt:
             raise ValueError(f"unknown regularization: {regularization}")
         if init_damping <= 0:
             raise ValueError("init_damping must be positive")
+        if damping_decrease <= 0:
+            raise ValueError("damping_decrease must be positive")
+        if damping_increase <= 0:
+            raise ValueError("damping_increase must be positive")
         if fletcher_min_diagonal <= 0:
             raise ValueError("fletcher_min_diagonal must be positive")
         if fletcher_max_diagonal < fletcher_min_diagonal:
@@ -125,19 +129,28 @@ class GramLevenbergMarquardt:
             f_vv = jax.jvp(first_jvp, (theta,), (velocity,))[1]
             acceleration = solve_step(f_vv)
             accelerated_step = velocity + 0.5 * acceleration
-            resid_accelerated = residual_flat(theta + accelerated_step)
-            loss_accelerated = jnp.sum(resid_accelerated**2)
             acceleration_ratio = (
                 2.0
                 * jnp.linalg.norm(acceleration)
                 / (jnp.linalg.norm(velocity) + jnp.finfo(resid.dtype).eps)
             )
-            used_geodesic = (
+            ratio_accepted = (
                 (geodesic_acceptance_ratio > zero)
                 & (acceleration_ratio > zero)
                 & (acceleration_ratio <= geodesic_acceptance_ratio)
-                & (loss_accelerated <= loss_velocity)
             )
+
+            def accelerated_loss(_):
+                resid_accelerated = residual_flat(theta + accelerated_step)
+                return jnp.sum(resid_accelerated**2)
+
+            loss_accelerated = jax.lax.cond(
+                ratio_accepted,
+                accelerated_loss,
+                lambda _: jnp.asarray(jnp.inf, dtype=resid.dtype),
+                operand=None,
+            )
+            used_geodesic = ratio_accepted & (loss_accelerated <= loss_velocity)
             step = jnp.where(used_geodesic, accelerated_step, velocity)
             loss_candidate = jnp.where(used_geodesic, loss_accelerated, loss_velocity)
         else:
