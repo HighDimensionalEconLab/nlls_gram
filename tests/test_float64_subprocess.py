@@ -75,6 +75,38 @@ jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, target))(theta, stat
 assert "f32" not in jaxpr, jaxpr
 
 
+def linear_residual(theta, batch):
+    matrix, target = batch
+    return matrix @ theta - target
+
+
+matrix = jnp.asarray([[1.0, 2.0], [3.0, -1.0], [2.0, 0.5]], dtype=jnp.float64)
+target = jnp.asarray([1.0, 2.0, -1.0], dtype=jnp.float64)
+theta = jnp.asarray([0.0, 0.0], dtype=jnp.float64)
+solver = GramLevenbergMarquardt(
+    linear_residual,
+    init_damping=1e-2,
+    linear_solver="lsmr",
+    iterative_tol=1e-10,
+    iterative_maxiter=20,
+)
+state = solver.init()
+theta, state, info = solver.update(theta, state, (matrix, target))
+
+assert theta.dtype == jnp.float64
+assert state.damping.dtype == jnp.float64
+assert info.loss.dtype == jnp.float64
+assert info.loss_old.dtype == jnp.float64
+assert info.loss_candidate.dtype == jnp.float64
+assert info.damping.dtype == jnp.float64
+assert info.damping_factor.dtype == jnp.float64
+assert info.acceleration_ratio.dtype == jnp.float64
+jaxpr = str(
+    jax.make_jaxpr(lambda p, s: solver.update(p, s, (matrix, target)))(theta, state)
+)
+assert "f32" not in jaxpr, jaxpr
+
+
 class LinearModel(nnx.Module):
     def __init__(self):
         self.linear = nnx.Linear(

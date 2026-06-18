@@ -4,6 +4,8 @@ import pytest
 
 from nlls_gram import GramLevenbergMarquardt
 
+ITERATIVE_MAXITER = 8
+
 
 def _devices(platform):
     try:
@@ -12,7 +14,9 @@ def _devices(platform):
         return []
 
 
-def _make_large_interpolation_problem(*, platform, geodesic_acceleration):
+def _make_large_interpolation_problem(
+    *, platform, linear_solver, formulation, geodesic_acceleration
+):
     device = _devices(platform)[0]
     n_samples = 1024
     n_centers = 8192
@@ -31,13 +35,24 @@ def _make_large_interpolation_problem(*, platform, geodesic_acceleration):
         features, y = batch
         return jnp.sin(features @ theta) - y
 
-    base_solver = GramLevenbergMarquardt(
-        residual,
-        init_damping=1e-2,
-    )
+    solver_kwargs = {
+        "init_damping": 1e-2,
+        "linear_solver": linear_solver,
+        "formulation": formulation,
+    }
+    if linear_solver in ("cg", "lsmr"):
+        solver_kwargs.update(
+            {
+                "iterative_tol": 0.0,
+                "iterative_atol": 0.0,
+                "iterative_maxiter": ITERATIVE_MAXITER,
+            }
+        )
+
+    base_solver = GramLevenbergMarquardt(residual, **solver_kwargs)
     solver = GramLevenbergMarquardt(
         residual,
-        init_damping=1e-2,
+        **solver_kwargs,
         geodesic_acceleration=geodesic_acceleration,
     )
 
@@ -60,15 +75,26 @@ def _make_large_interpolation_problem(*, platform, geodesic_acceleration):
 
 
 @pytest.mark.parametrize("platform", ["cpu", "gpu"])
+@pytest.mark.parametrize(
+    ("linear_solver", "formulation"),
+    [
+        ("cholesky", "gram"),
+        ("cg", "gram"),
+        ("cg", "normal"),
+        ("lsmr", "gram"),
+    ],
+)
 @pytest.mark.parametrize("geodesic_acceleration", [False, True])
 def test_large_rbf_interpolation_second_update(
-    benchmark, platform, geodesic_acceleration
+    benchmark, platform, linear_solver, formulation, geodesic_acceleration
 ):
     if not _devices(platform):
         pytest.skip(f"JAX {platform!r} backend is not available")
 
     params, state, step = _make_large_interpolation_problem(
         platform=platform,
+        linear_solver=linear_solver,
+        formulation=formulation,
         geodesic_acceleration=geodesic_acceleration,
     )
 

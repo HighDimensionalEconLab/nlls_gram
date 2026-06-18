@@ -170,6 +170,83 @@ print(iterations_to_threshold("identity"))  # ~16
 print(iterations_to_threshold("fletcher"))  # ~4
 ```
 
+## Iterative solves
+
+The default `linear_solver="cholesky"` materializes the dense Gram matrix and
+uses a Cholesky factorization. For larger identity-regularized problems, use an
+iterative solver with JAX JVP/VJP linearization instead of materializing `J`:
+
+Iterative solvers default to a small fixed iteration budget:
+`iterative_tol=0.0`, `iterative_atol=0.0`, and `iterative_maxiter=8`. This avoids
+extra tolerance-driven convergence work and is intended for low-rank local
+linear solves. Set a positive `iterative_tol` or `iterative_atol` if you want
+early convergence checks instead.
+
+For fixed-budget CG in residual space, use:
+
+```python
+solver = GramLevenbergMarquardt(
+    residual_fn,
+    init_damping=1e-2,
+    linear_solver="cg",
+    formulation="gram",
+    iterative_tol=0.0,
+    iterative_atol=0.0,
+    iterative_maxiter=8,
+)
+```
+
+For fixed-budget CG in parameter space, use:
+
+```python
+solver = GramLevenbergMarquardt(
+    residual_fn,
+    init_damping=1e-2,
+    linear_solver="cg",
+    formulation="normal",
+    iterative_tol=0.0,
+    iterative_atol=0.0,
+    iterative_maxiter=8,
+)
+```
+
+CG currently supports only `regularization="identity"`. `formulation="gram"`
+solves in residual space, so the Krylov vectors have length equal to the number
+of residuals. `formulation="normal"` solves in parameter space, so the Krylov
+vectors have length equal to the number of parameters. Both use matrix-free JVPs
+for `J @ v` and VJPs/linear transposes for `J.T @ u`; choose the formulation
+based on which vector space is smaller and better conditioned.
+
+`linear_solver="lsmr"` uses Lineax LSMR on the damped least-squares problem
+directly:
+
+```text
+min_s ||J s + r||^2 + lambda ||s||^2
+```
+
+For fixed-budget LSMR, use:
+
+```python
+solver = GramLevenbergMarquardt(
+    residual_fn,
+    init_damping=1e-2,
+    linear_solver="lsmr",
+    iterative_tol=0.0,
+    iterative_atol=0.0,
+    iterative_maxiter=8,
+    lsmr_conlim=float("inf"),
+)
+```
+
+It uses the augmented operator `[J; sqrt(lambda) I]`, so matrix-vector products
+call JAX JVPs for `J @ s` and transposed products call VJPs/linear transposes for
+`J.T @ u`. LSMR does not use the Gram or normal formulation. Its default
+`lsmr_conlim=float("inf")` prevents condition-limit early termination; Lineax
+still computes LSMR's internal norm estimates each iteration. Iterative solvers
+can reduce memory and factorization cost on larger dense GPU problems, but each
+iteration performs matrix-free Jacobian-vector and transpose-vector products, so
+the Cholesky default remains better for small residual dimensions.
+
 ## Geodesic acceleration
 
 Geodesic acceleration is off by default. When enabled, the solver uses analytic
@@ -266,8 +343,8 @@ in CI by default:
 uv run --group benchmark pytest benchmarks --benchmark-only
 ```
 
-For a larger RBF-style interpolation profile with CPU/GPU and geodesic on/off
-variants:
+For a larger RBF-style interpolation profile with CPU/GPU, Cholesky/CG/LSMR,
+Gram/normal CG, and geodesic on/off variants:
 
 ```bash
 uv run --group benchmark --group gpu pytest \

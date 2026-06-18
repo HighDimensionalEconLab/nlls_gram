@@ -167,6 +167,45 @@ def test_unknown_regularization_raises():
         GramLevenbergMarquardt(residual_fn, regularization="marquardt")
 
 
+def test_unknown_linear_solver_raises():
+    with pytest.raises(ValueError, match="unknown linear_solver"):
+        GramLevenbergMarquardt(residual_fn, linear_solver="qr")
+
+
+def test_unknown_formulation_raises():
+    with pytest.raises(ValueError, match="unknown formulation"):
+        GramLevenbergMarquardt(residual_fn, formulation="qr")
+
+
+def test_normal_formulation_requires_cg():
+    with pytest.raises(ValueError, match='formulation="normal" requires'):
+        GramLevenbergMarquardt(residual_fn, formulation="normal")
+    with pytest.raises(ValueError, match="formulation is only used"):
+        GramLevenbergMarquardt(
+            residual_fn,
+            linear_solver="lsmr",
+            formulation="normal",
+        )
+
+
+def test_cg_requires_identity_regularization():
+    with pytest.raises(ValueError, match='linear_solver="cg" only supports'):
+        GramLevenbergMarquardt(
+            residual_fn,
+            linear_solver="cg",
+            regularization="fletcher",
+        )
+
+
+def test_lsmr_requires_identity_regularization():
+    with pytest.raises(ValueError, match='linear_solver="lsmr" only supports'):
+        GramLevenbergMarquardt(
+            residual_fn,
+            linear_solver="lsmr",
+            regularization="fletcher",
+        )
+
+
 def test_init_damping_must_be_positive():
     with pytest.raises(ValueError, match="init_damping must be positive"):
         GramLevenbergMarquardt(residual_fn, init_damping=0.0)
@@ -177,6 +216,25 @@ def test_damping_update_factors_must_be_positive():
         GramLevenbergMarquardt(residual_fn, damping_decrease=0.0)
     with pytest.raises(ValueError, match="damping_increase must be positive"):
         GramLevenbergMarquardt(residual_fn, damping_increase=0.0)
+
+
+def test_iterative_options_must_be_valid():
+    with pytest.raises(ValueError, match="iterative_tol must be nonnegative"):
+        GramLevenbergMarquardt(residual_fn, linear_solver="cg", iterative_tol=-1.0)
+    with pytest.raises(ValueError, match="iterative_atol must be nonnegative"):
+        GramLevenbergMarquardt(residual_fn, linear_solver="cg", iterative_atol=-1.0)
+    with pytest.raises(ValueError, match="iterative_maxiter must be positive or None"):
+        GramLevenbergMarquardt(residual_fn, linear_solver="cg", iterative_maxiter=0)
+    with pytest.raises(ValueError, match="iterative_maxiter must be set"):
+        GramLevenbergMarquardt(
+            residual_fn,
+            linear_solver="cg",
+            iterative_tol=0.0,
+            iterative_atol=0.0,
+            iterative_maxiter=None,
+        )
+    with pytest.raises(ValueError, match="lsmr_conlim must be positive"):
+        GramLevenbergMarquardt(residual_fn, linear_solver="lsmr", lsmr_conlim=0.0)
 
 
 def test_fletcher_diagonal_clip_bounds_must_be_valid():
@@ -215,6 +273,202 @@ def test_default_float32_params_keep_float32_outputs():
     assert info.damping.dtype == jnp.float32
     assert info.damping_factor.dtype == jnp.float32
     assert info.acceleration_ratio.dtype == jnp.float32
+
+
+def test_cg_step_matches_cholesky_identity_step():
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    params = {"a": 1.0, "b": 0.0}
+
+    cholesky_solver = GramLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    cg_solver = GramLevenbergMarquardt(
+        residual_fn,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+    )
+
+    cholesky_params, cholesky_state, cholesky_info = cholesky_solver.update(
+        params, cholesky_solver.init(), (x, y)
+    )
+    cg_params, cg_state, cg_info = cg_solver.update(params, cg_solver.init(), (x, y))
+
+    assert bool(cg_info.accepted) == bool(cholesky_info.accepted)
+    assert not bool(cg_info.used_geodesic)
+    assert jnp.allclose(cg_params["a"], cholesky_params["a"], rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(cg_params["b"], cholesky_params["b"], rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(cg_state.damping, cholesky_state.damping)
+    assert jnp.allclose(
+        cg_info.loss,
+        cholesky_info.loss,
+        rtol=REGRESSION_RTOL,
+        atol=REGRESSION_ATOL,
+    )
+    assert cg_params["a"].dtype == jnp.float32
+    assert cg_info.loss.dtype == jnp.float32
+
+
+def test_normal_cg_step_matches_gram_cg_identity_step():
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    params = {"a": 1.0, "b": 0.0}
+
+    gram_solver = GramLevenbergMarquardt(
+        residual_fn,
+        init_damping=1e-2,
+        linear_solver="cg",
+        formulation="gram",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+    )
+    normal_solver = GramLevenbergMarquardt(
+        residual_fn,
+        init_damping=1e-2,
+        linear_solver="cg",
+        formulation="normal",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+    )
+
+    gram_params, gram_state, gram_info = gram_solver.update(
+        params, gram_solver.init(), (x, y)
+    )
+    normal_params, normal_state, normal_info = normal_solver.update(
+        params, normal_solver.init(), (x, y)
+    )
+
+    assert bool(normal_info.accepted) == bool(gram_info.accepted)
+    assert not bool(normal_info.used_geodesic)
+    assert jnp.allclose(
+        normal_params["a"],
+        gram_params["a"],
+        rtol=REGRESSION_RTOL,
+        atol=REGRESSION_ATOL,
+    )
+    assert jnp.allclose(
+        normal_params["b"],
+        gram_params["b"],
+        rtol=REGRESSION_RTOL,
+        atol=REGRESSION_ATOL,
+    )
+    assert jnp.allclose(normal_state.damping, gram_state.damping)
+    assert jnp.allclose(
+        normal_info.loss,
+        gram_info.loss,
+        rtol=REGRESSION_RTOL,
+        atol=REGRESSION_ATOL,
+    )
+
+
+def test_lsmr_step_matches_closed_form_damped_linear_solution():
+    def residual(theta, batch):
+        matrix, target = batch
+        return matrix @ theta - target
+
+    matrix = jnp.array([[1.0, 2.0], [3.0, -1.0], [2.0, 0.5]])
+    target = jnp.array([1.0, 2.0, -1.0])
+    theta0 = jnp.array([0.0, 0.0])
+    init_damping = 0.1
+
+    solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=init_damping,
+        linear_solver="lsmr",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+    )
+    theta, state, info = solver.update(theta0, solver.init(), (matrix, target))
+
+    expected_step = jnp.linalg.solve(
+        matrix.T @ matrix + init_damping * jnp.eye(matrix.shape[1]),
+        matrix.T @ target,
+    )
+    expected_loss = jnp.sum((matrix @ expected_step - target) ** 2)
+
+    assert bool(info.accepted)
+    assert not bool(info.used_geodesic)
+    assert jnp.allclose(theta, expected_step, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(info.loss, expected_loss, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(state.damping, init_damping * 0.5)
+    assert theta.dtype == jnp.float32
+    assert info.loss.dtype == jnp.float32
+
+
+def test_cg_update_jits():
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+    solver = GramLevenbergMarquardt(
+        residual_fn,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+    )
+
+    @jax.jit
+    def train_step(params, state):
+        return solver.update(params, state, (x, y))
+
+    params, state, info = train_step(params, solver.init())
+
+    assert bool(info.accepted)
+    assert jnp.isfinite(info.loss)
+    assert jnp.isfinite(state.damping)
+    assert params["a"].dtype == jnp.float32
+    assert params["b"].dtype == jnp.float32
+
+
+def test_normal_cg_update_jits():
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+    solver = GramLevenbergMarquardt(
+        residual_fn,
+        init_damping=1e-2,
+        linear_solver="cg",
+        formulation="normal",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+    )
+
+    @jax.jit
+    def train_step(params, state):
+        return solver.update(params, state, (x, y))
+
+    params, state, info = train_step(params, solver.init())
+
+    assert bool(info.accepted)
+    assert jnp.isfinite(info.loss)
+    assert jnp.isfinite(state.damping)
+    assert params["a"].dtype == jnp.float32
+    assert params["b"].dtype == jnp.float32
+
+
+def test_lsmr_update_jits():
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+    solver = GramLevenbergMarquardt(
+        residual_fn,
+        init_damping=1e-2,
+        linear_solver="lsmr",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+    )
+
+    @jax.jit
+    def train_step(params, state):
+        return solver.update(params, state, (x, y))
+
+    params, state, info = train_step(params, solver.init())
+
+    assert bool(info.accepted)
+    assert jnp.isfinite(info.loss)
+    assert jnp.isfinite(state.damping)
+    assert params["a"].dtype == jnp.float32
+    assert params["b"].dtype == jnp.float32
 
 
 def test_geodesic_acceptance_ratio_zero_falls_back_to_velocity_step():
@@ -278,6 +532,128 @@ def test_geodesic_acceleration_matches_closed_form_quadratic_step():
     assert info.acceleration_ratio.dtype == jnp.float32
     assert jnp.allclose(new_theta, expected_theta, rtol=1e-6, atol=1e-6)
     assert jnp.allclose(info.acceleration_ratio, expected_ratio, rtol=1e-6)
+
+
+def test_cg_geodesic_acceleration_matches_cholesky():
+    def residual(theta, target):
+        return jnp.array([theta[0] ** 2 - target])
+
+    theta0 = jnp.array([1.9])
+    target = 4.0
+
+    cholesky_solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1e-6,
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=1.0,
+    )
+    cg_solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1e-6,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=10,
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=1.0,
+    )
+
+    cholesky_theta, _, cholesky_info = cholesky_solver.update(
+        theta0, cholesky_solver.init(), target
+    )
+    cg_theta, _, cg_info = cg_solver.update(theta0, cg_solver.init(), target)
+
+    assert bool(cg_info.accepted)
+    assert bool(cg_info.used_geodesic)
+    assert jnp.allclose(cg_theta, cholesky_theta, rtol=1e-6, atol=1e-6)
+    assert jnp.allclose(
+        cg_info.acceleration_ratio,
+        cholesky_info.acceleration_ratio,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_normal_cg_geodesic_acceleration_matches_gram_cg():
+    def residual(theta, target):
+        return jnp.array([theta[0] ** 2 - target])
+
+    theta0 = jnp.array([1.9])
+    target = 4.0
+
+    gram_solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1e-6,
+        linear_solver="cg",
+        formulation="gram",
+        iterative_tol=1e-7,
+        iterative_maxiter=10,
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=1.0,
+    )
+    normal_solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1e-6,
+        linear_solver="cg",
+        formulation="normal",
+        iterative_tol=1e-7,
+        iterative_maxiter=10,
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=1.0,
+    )
+
+    gram_theta, _, gram_info = gram_solver.update(theta0, gram_solver.init(), target)
+    normal_theta, _, normal_info = normal_solver.update(
+        theta0, normal_solver.init(), target
+    )
+
+    assert bool(normal_info.accepted)
+    assert bool(normal_info.used_geodesic)
+    assert jnp.allclose(normal_theta, gram_theta, rtol=1e-6, atol=1e-6)
+    assert jnp.allclose(
+        normal_info.acceleration_ratio,
+        gram_info.acceleration_ratio,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_lsmr_geodesic_acceleration_matches_cholesky():
+    def residual(theta, target):
+        return jnp.array([theta[0] ** 2 - target])
+
+    theta0 = jnp.array([1.9])
+    target = 4.0
+
+    cholesky_solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1e-6,
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=1.0,
+    )
+    lsmr_solver = GramLevenbergMarquardt(
+        residual,
+        init_damping=1e-6,
+        linear_solver="lsmr",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=1.0,
+    )
+
+    cholesky_theta, _, cholesky_info = cholesky_solver.update(
+        theta0, cholesky_solver.init(), target
+    )
+    lsmr_theta, _, lsmr_info = lsmr_solver.update(theta0, lsmr_solver.init(), target)
+
+    assert bool(lsmr_info.accepted)
+    assert bool(lsmr_info.used_geodesic)
+    assert jnp.allclose(lsmr_theta, cholesky_theta, rtol=1e-6, atol=1e-6)
+    assert jnp.allclose(
+        lsmr_info.acceleration_ratio,
+        cholesky_info.acceleration_ratio,
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_geodesic_acceleration_jits():
