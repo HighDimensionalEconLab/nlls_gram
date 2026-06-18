@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nlls_gram import GramLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 ITERATIVE_MAXITER = 8
 
@@ -15,7 +15,7 @@ def _devices(platform):
 
 
 def _make_large_interpolation_problem(
-    *, platform, linear_solver, formulation, geodesic_acceleration
+    *, platform, linear_solver, geodesic_acceleration
 ):
     device = _devices(platform)[0]
     n_samples = 1024
@@ -38,7 +38,6 @@ def _make_large_interpolation_problem(
     solver_kwargs = {
         "init_damping": 1e-2,
         "linear_solver": linear_solver,
-        "formulation": formulation,
     }
     if linear_solver in ("cg", "lsmr"):
         solver_kwargs.update(
@@ -49,8 +48,8 @@ def _make_large_interpolation_problem(
             }
         )
 
-    base_solver = GramLevenbergMarquardt(residual, **solver_kwargs)
-    solver = GramLevenbergMarquardt(
+    base_solver = UnderdeterminedLevenbergMarquardt(residual, **solver_kwargs)
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         **solver_kwargs,
         geodesic_acceleration=geodesic_acceleration,
@@ -76,17 +75,17 @@ def _make_large_interpolation_problem(
 
 @pytest.mark.parametrize("platform", ["cpu", "gpu"])
 @pytest.mark.parametrize(
-    ("linear_solver", "formulation"),
+    "linear_solver",
     [
-        ("cholesky", "gram"),
-        ("cg", "gram"),
-        ("cg", "normal"),
-        ("lsmr", "gram"),
+        "cholesky",
+        "qr",
+        "cg",
+        "lsmr",
     ],
 )
 @pytest.mark.parametrize("geodesic_acceleration", [False, True])
 def test_large_rbf_interpolation_second_update(
-    benchmark, platform, linear_solver, formulation, geodesic_acceleration
+    benchmark, platform, linear_solver, geodesic_acceleration
 ):
     if not _devices(platform):
         pytest.skip(f"JAX {platform!r} backend is not available")
@@ -94,7 +93,6 @@ def test_large_rbf_interpolation_second_update(
     params, state, step = _make_large_interpolation_problem(
         platform=platform,
         linear_solver=linear_solver,
-        formulation=formulation,
         geodesic_acceleration=geodesic_acceleration,
     )
 

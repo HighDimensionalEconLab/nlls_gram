@@ -1,16 +1,18 @@
 # nlls_gram
 
 Levenberg-Marquardt nonlinear least-squares solvers for JAX, with dense
-Gram/dual solves and optional matrix-free iterative solves.
+dual Cholesky/QR solves and optional matrix-free iterative solves.
 
-`GramLevenbergMarquardt` minimizes `||r(params)||^2` for a user-supplied
+`UnderdeterminedLevenbergMarquardt` minimizes `||r(params)||^2` for a user-supplied
 `residual_fn(params, batch)`, where `params` is any JAX pytree (a flat array, a
 dict, `nnx.state(model, nnx.Param)`, ...). It follows an `init`/`update` protocol:
 `update(params, state, batch)` returns the **new params pytree** (same structure),
 the next state, and an `LMInfo`. The default dense solver factors the small
-`n x n` Gram (dual) system, which is useful when there are many more parameters
-than residual rows. Optional iterative solvers provide matrix-free CG in Gram or
-normal form and LSMR on the damped least-squares formulation.
+residual-space Gram (dual) system. For a Jacobian `J` with shape `m x n`, this
+means an `m x m` solve, which is useful when there are many more parameters than
+residual rows. `jac="vjp"` is the only supported Jacobian materialization mode.
+Optional solvers provide a dense QR stability path, matrix-free Gram-space CG,
+and LSMR on the damped least-squares formulation.
 
 The solver interface is general JAX — it knows nothing about
 `flax`/`nnx`/`optax` — and the package depends on `jax` plus `lineax` for LSMR.
@@ -55,7 +57,7 @@ runs in float32:
 import jax
 import jax.numpy as jnp
 
-from nlls_gram import GramLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
 # residual_fn(params, batch) -> 1-D residual array; the solver minimizes its SSQ.
@@ -68,7 +70,7 @@ x = jnp.linspace(0.0, 2.0, 20)
 y = 2.0 * jnp.exp(-1.0 * x)
 
 params = {"a": 1.0, "b": 0.0}
-solver = GramLevenbergMarquardt(residual_fn, init_damping=1e-2)
+solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
 lm_state = solver.init()
 
 
@@ -97,7 +99,7 @@ jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
 
-from nlls_gram import GramLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 dtype = jnp.float64
 
@@ -115,7 +117,7 @@ params = {
     "b": jnp.asarray(0.0, dtype=dtype),
 }
 
-solver = GramLevenbergMarquardt(residual_fn, init_damping=1e-2)
+solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
 lm_state = solver.init()
 
 for _ in range(50):
@@ -137,7 +139,7 @@ or extremely sensitive parameter directions do not dominate the Gram solve.
 ```python
 import jax.numpy as jnp
 
-from nlls_gram import GramLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 x = jnp.linspace(0.0, 2.0, 50)
 y = 2.0 * jnp.exp(-1.0 * x)
@@ -152,7 +154,7 @@ def residual_fn(params, batch):
 
 def iterations_to_threshold(regularization):
     params = {"a": 1.0, "b_scaled": 0.0}
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         regularization=regularization,
@@ -171,11 +173,35 @@ print(iterations_to_threshold("identity"))  # ~16
 print(iterations_to_threshold("fletcher"))  # ~4
 ```
 
-## Iterative solves
+## Linear solvers
 
-The default `linear_solver="cholesky"` materializes the dense Gram matrix and
-uses a Cholesky factorization. For larger identity-regularized problems, use an
-iterative solver with JAX JVP/VJP linearization instead of materializing `J`:
+The default `linear_solver="cholesky"` materializes `J.T` with VJPs, forms the
+dense residual-space Gram matrix `J @ J.T`, and uses a Cholesky factorization.
+For `J` with shape `m x n`, where `m` is the number of residuals and `n` is the
+number of parameters, this is an `m x m` factorization. This is the old Gram/dual
+formulation and remains the default because it is usually the fastest path for
+overparameterized problems with small residual dimension.
+
+When the Gram/Cholesky path is too poorly conditioned, use the more numerically
+stable QR direct solve:
+
+```python
+solver = UnderdeterminedLevenbergMarquardt(
+    residual_fn,
+    init_damping=1e-2,
+    linear_solver="qr",
+)
+```
+
+QR materializes `J.T` with VJPs and factors the transpose-side problem. The
+original Jacobian is fat in the intended overparameterized setting, but `J.T` is
+tall-skinny, so this path can be substantially slower than Gram/Cholesky on CPU
+and GPU. Use it when the extra numerical stability is worth the cost. It solves
+the damped subproblem through a small augmented QR system, without forming
+`J @ J.T` or `J.T @ J`. QR currently supports only `regularization="identity"`.
+
+For larger identity-regularized problems, use an iterative solver with JAX
+JVP/VJP linearization instead of materializing `J`:
 
 Iterative solvers default to a small fixed iteration budget:
 `iterative_tol=0.0`, `iterative_atol=0.0`, and `iterative_maxiter=8`. This avoids
@@ -183,40 +209,22 @@ extra tolerance-driven convergence work and is intended for low-rank local
 linear solves. Set a positive `iterative_tol` or `iterative_atol` if you want
 early convergence checks instead.
 
-For fixed-budget CG in residual space, use:
+For fixed-budget Gram-space CG, use:
 
 ```python
-solver = GramLevenbergMarquardt(
+solver = UnderdeterminedLevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
     linear_solver="cg",
-    formulation="gram",
     iterative_tol=0.0,
     iterative_atol=0.0,
     iterative_maxiter=8,
 )
 ```
 
-For fixed-budget CG in parameter space, use:
-
-```python
-solver = GramLevenbergMarquardt(
-    residual_fn,
-    init_damping=1e-2,
-    linear_solver="cg",
-    formulation="normal",
-    iterative_tol=0.0,
-    iterative_atol=0.0,
-    iterative_maxiter=8,
-)
-```
-
-CG currently supports only `regularization="identity"`. `formulation="gram"`
-solves in residual space, so the Krylov vectors have length equal to the number
-of residuals. `formulation="normal"` solves in parameter space, so the Krylov
-vectors have length equal to the number of parameters. Both use matrix-free JVPs
-for `J @ v` and VJPs/linear transposes for `J.T @ u`; choose the formulation
-based on which vector space is smaller and better conditioned.
+CG currently supports only `regularization="identity"`. It solves in residual
+space, so the Krylov vectors have length equal to the number of residuals. It
+uses matrix-free JVPs for `J @ v` and VJPs/linear transposes for `J.T @ u`.
 
 `linear_solver="lsmr"` uses Lineax LSMR on the damped least-squares problem
 directly:
@@ -228,7 +236,7 @@ min_s ||J s + r||^2 + lambda ||s||^2
 For fixed-budget LSMR, use:
 
 ```python
-solver = GramLevenbergMarquardt(
+solver = UnderdeterminedLevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
     linear_solver="lsmr",
@@ -241,21 +249,21 @@ solver = GramLevenbergMarquardt(
 
 It uses the augmented operator `[J; sqrt(lambda) I]`, so matrix-vector products
 call JAX JVPs for `J @ s` and transposed products call VJPs/linear transposes for
-`J.T @ u`. LSMR does not use the Gram or normal formulation. Its default
+`J.T @ u`. LSMR does not use the dense Gram or QR factorizations. Its default
 `lsmr_conlim=float("inf")` prevents condition-limit early termination; Lineax
 still computes LSMR's internal norm estimates each iteration. Iterative solvers
 can reduce memory and factorization cost on larger dense GPU problems, but each
 iteration performs matrix-free Jacobian-vector and transpose-vector products, so
-the Cholesky default remains better for small residual dimensions.
+the dense direct solvers remain better for small residual dimensions.
 
 ## Geodesic acceleration
 
 Geodesic acceleration is off by default. When enabled, the solver uses analytic
-JAX forward-mode JVPs to build an accelerated candidate; it does not use finite
-differences.
+JAX forward-over-forward JVPs to build an accelerated candidate; it does not use
+finite differences.
 
 ```python
-solver = GramLevenbergMarquardt(
+solver = UnderdeterminedLevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
     geodesic_acceleration=True,
@@ -287,7 +295,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from nlls_gram import GramLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
 class ExpModel(nnx.Module):
@@ -313,7 +321,7 @@ def residual_fn(trainable, batch):
     return model(x) - y
 
 
-solver = GramLevenbergMarquardt(residual_fn, init_damping=1e-2)
+solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
 lm_state = solver.init()
 for _ in range(50):
     trainable, lm_state, info = solver.update(trainable, lm_state, (x, y))
@@ -344,8 +352,8 @@ in CI by default:
 uv run --group benchmark pytest benchmarks --benchmark-only
 ```
 
-For a larger RBF-style interpolation profile with CPU/GPU, Cholesky/CG/LSMR,
-Gram/normal CG, and geodesic on/off variants:
+For a larger RBF-style interpolation profile with CPU/GPU,
+Cholesky/QR/CG/LSMR, and geodesic on/off variants:
 
 ```bash
 uv run --group benchmark --group gpu pytest \
@@ -369,7 +377,7 @@ uv run --group gpu pytest tests/test_gpu.py
 
 ## API reference
 
-::: nlls_gram.GramLevenbergMarquardt
+::: nlls_gram.UnderdeterminedLevenbergMarquardt
 
 ::: nlls_gram.LMState
 

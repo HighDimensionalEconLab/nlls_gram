@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-from nlls_gram import GramLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
 def _gsl_rosenbrock_residual(theta, batch):
@@ -12,7 +12,7 @@ def _gsl_rosenbrock_residual(theta, batch):
 
 def _make_gsl_rosenbrock_step(*, geodesic_acceleration):
     theta = jnp.array([-0.5, 1.75])
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         _gsl_rosenbrock_residual,
         init_damping=1.0,
         geodesic_acceleration=geodesic_acceleration,

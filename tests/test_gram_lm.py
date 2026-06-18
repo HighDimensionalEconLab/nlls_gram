@@ -2,7 +2,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nlls_gram import GramLevenbergMarquardt
+import nlls_gram
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
 def residual_fn(params, batch):
@@ -14,13 +15,17 @@ REGRESSION_ATOL = 5e-5
 REGRESSION_RTOL = 1e-5
 
 
+def test_old_solver_name_is_not_exported():
+    assert not hasattr(nlls_gram, "GramLevenbergMarquardt")
+
+
 def test_recovers_known_parameters_with_jitted_step():
     a_true, b_true = 2.0, -1.0
     x = jnp.linspace(0.0, 2.0, 20)
     y = a_true * jnp.exp(b_true * x)
 
     params = {"a": 1.0, "b": 0.0}
-    solver = GramLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     lm_state = solver.init()
 
     @jax.jit
@@ -41,8 +46,8 @@ def test_default_regularization_matches_explicit_identity():
     y = 2.0 * jnp.exp(-1.0 * x)
     params = {"a": 1.0, "b": 0.0}
 
-    default_solver = GramLevenbergMarquardt(residual_fn, init_damping=1e-2)
-    identity_solver = GramLevenbergMarquardt(
+    default_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    identity_solver = UnderdeterminedLevenbergMarquardt(
         residual_fn, init_damping=1e-2, regularization="identity"
     )
 
@@ -68,7 +73,7 @@ def test_flat_array_params():
     y = 2.0 * jnp.exp(-1.0 * x)
 
     params = jnp.array([1.0, 0.0])
-    solver = GramLevenbergMarquardt(residual, init_damping=1e-2)
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
     lm_state = solver.init()
 
     for _ in range(50):
@@ -88,7 +93,7 @@ def test_linear_problem_matches_closed_form_solution():
     params = {"a": 0.0}
     init_damping = 1e-4
 
-    solver = GramLevenbergMarquardt(residual, init_damping=init_damping)
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=init_damping)
     new_params, _, info = solver.update(params, solver.init(), (x, y))
     expected_a = jnp.sum(x * y) / (jnp.sum(x**2) + init_damping)
     expected_loss = jnp.sum((expected_a * x - y) ** 2)
@@ -115,7 +120,7 @@ def test_update_calls_residual_and_uses_values():
     y = 2.0 * x
     params = {"a": 0.0}
 
-    solver = GramLevenbergMarquardt(residual, init_damping=1e-4)
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-4)
     new_params, _, info = solver.update(params, solver.init(), (x, y))
 
     assert calls["count"] >= 2
@@ -135,7 +140,7 @@ def test_default_disabled_geodesic_uses_minimal_residual_evaluations():
     y = 2.0 * x
     params = {"a": 0.0}
 
-    solver = GramLevenbergMarquardt(residual, init_damping=1e-4)
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-4)
     solver.update(params, solver.init(), (x, y))
 
     assert calls["count"] == 2
@@ -146,7 +151,7 @@ def test_rejected_step_leaves_params_unchanged():
     y = jnp.ones_like(x)
     params = {"a": 1.0, "b": 0.0}
 
-    solver = GramLevenbergMarquardt(residual_fn)
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn)
     state = solver.init()
     new_params, new_state, info = solver.update(params, state, (x, y))
 
@@ -164,33 +169,27 @@ def test_rejected_step_leaves_params_unchanged():
 
 def test_unknown_regularization_raises():
     with pytest.raises(ValueError, match="unknown regularization"):
-        GramLevenbergMarquardt(residual_fn, regularization="marquardt")
+        UnderdeterminedLevenbergMarquardt(residual_fn, regularization="marquardt")
 
 
 def test_unknown_linear_solver_raises():
     with pytest.raises(ValueError, match="unknown linear_solver"):
-        GramLevenbergMarquardt(residual_fn, linear_solver="qr")
+        UnderdeterminedLevenbergMarquardt(residual_fn, linear_solver="svd")
 
 
-def test_unknown_formulation_raises():
-    with pytest.raises(ValueError, match="unknown formulation"):
-        GramLevenbergMarquardt(residual_fn, formulation="qr")
+def test_unknown_jac_raises():
+    with pytest.raises(ValueError, match='only jac="vjp" is supported'):
+        UnderdeterminedLevenbergMarquardt(residual_fn, jac="jvp")
 
 
-def test_normal_formulation_requires_cg():
-    with pytest.raises(ValueError, match='formulation="normal" requires'):
-        GramLevenbergMarquardt(residual_fn, formulation="normal")
-    with pytest.raises(ValueError, match="formulation is only used"):
-        GramLevenbergMarquardt(
-            residual_fn,
-            linear_solver="lsmr",
-            formulation="normal",
-        )
+def test_formulation_argument_is_removed():
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        UnderdeterminedLevenbergMarquardt(residual_fn, formulation="gram")
 
 
 def test_cg_requires_identity_regularization():
     with pytest.raises(ValueError, match='linear_solver="cg" only supports'):
-        GramLevenbergMarquardt(
+        UnderdeterminedLevenbergMarquardt(
             residual_fn,
             linear_solver="cg",
             regularization="fletcher",
@@ -199,34 +198,49 @@ def test_cg_requires_identity_regularization():
 
 def test_lsmr_requires_identity_regularization():
     with pytest.raises(ValueError, match='linear_solver="lsmr" only supports'):
-        GramLevenbergMarquardt(
+        UnderdeterminedLevenbergMarquardt(
             residual_fn,
             linear_solver="lsmr",
             regularization="fletcher",
         )
 
 
+def test_qr_requires_identity_regularization():
+    with pytest.raises(ValueError, match='linear_solver="qr" only supports'):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn,
+            linear_solver="qr",
+            regularization="fletcher",
+        )
+
+
 def test_init_damping_must_be_positive():
     with pytest.raises(ValueError, match="init_damping must be positive"):
-        GramLevenbergMarquardt(residual_fn, init_damping=0.0)
+        UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=0.0)
 
 
 def test_damping_update_factors_must_be_positive():
     with pytest.raises(ValueError, match="damping_decrease must be positive"):
-        GramLevenbergMarquardt(residual_fn, damping_decrease=0.0)
+        UnderdeterminedLevenbergMarquardt(residual_fn, damping_decrease=0.0)
     with pytest.raises(ValueError, match="damping_increase must be positive"):
-        GramLevenbergMarquardt(residual_fn, damping_increase=0.0)
+        UnderdeterminedLevenbergMarquardt(residual_fn, damping_increase=0.0)
 
 
 def test_iterative_options_must_be_valid():
     with pytest.raises(ValueError, match="iterative_tol must be nonnegative"):
-        GramLevenbergMarquardt(residual_fn, linear_solver="cg", iterative_tol=-1.0)
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, linear_solver="cg", iterative_tol=-1.0
+        )
     with pytest.raises(ValueError, match="iterative_atol must be nonnegative"):
-        GramLevenbergMarquardt(residual_fn, linear_solver="cg", iterative_atol=-1.0)
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, linear_solver="cg", iterative_atol=-1.0
+        )
     with pytest.raises(ValueError, match="iterative_maxiter must be positive or None"):
-        GramLevenbergMarquardt(residual_fn, linear_solver="cg", iterative_maxiter=0)
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, linear_solver="cg", iterative_maxiter=0
+        )
     with pytest.raises(ValueError, match="iterative_maxiter must be set"):
-        GramLevenbergMarquardt(
+        UnderdeterminedLevenbergMarquardt(
             residual_fn,
             linear_solver="cg",
             iterative_tol=0.0,
@@ -234,12 +248,14 @@ def test_iterative_options_must_be_valid():
             iterative_maxiter=None,
         )
     with pytest.raises(ValueError, match="lsmr_conlim must be positive"):
-        GramLevenbergMarquardt(residual_fn, linear_solver="lsmr", lsmr_conlim=0.0)
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, linear_solver="lsmr", lsmr_conlim=0.0
+        )
 
 
 def test_fletcher_diagonal_clip_bounds_must_be_valid():
     with pytest.raises(ValueError, match="fletcher_min_diagonal must be positive"):
-        GramLevenbergMarquardt(
+        UnderdeterminedLevenbergMarquardt(
             residual_fn,
             regularization="fletcher",
             fletcher_min_diagonal=0.0,
@@ -248,7 +264,7 @@ def test_fletcher_diagonal_clip_bounds_must_be_valid():
         ValueError,
         match="fletcher_max_diagonal must be greater than or equal",
     ):
-        GramLevenbergMarquardt(
+        UnderdeterminedLevenbergMarquardt(
             residual_fn,
             regularization="fletcher",
             fletcher_min_diagonal=1.0,
@@ -261,7 +277,7 @@ def test_default_float32_params_keep_float32_outputs():
     y = 2.0 * jnp.exp(-1.0 * x)
     params = {"a": 1.0, "b": 0.0}
 
-    solver = GramLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     new_params, new_state, info = solver.update(params, solver.init(), (x, y))
 
     assert new_params["a"].dtype == jnp.float32
@@ -280,8 +296,8 @@ def test_cg_step_matches_cholesky_identity_step():
     y = 2.0 * jnp.exp(-1.0 * x)
     params = {"a": 1.0, "b": 0.0}
 
-    cholesky_solver = GramLevenbergMarquardt(residual_fn, init_damping=1e-2)
-    cg_solver = GramLevenbergMarquardt(
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    cg_solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         linear_solver="cg",
@@ -309,56 +325,47 @@ def test_cg_step_matches_cholesky_identity_step():
     assert cg_info.loss.dtype == jnp.float32
 
 
-def test_normal_cg_step_matches_gram_cg_identity_step():
+def test_qr_step_matches_cholesky_identity_step():
     x = jnp.linspace(0.0, 2.0, 20)
     y = 2.0 * jnp.exp(-1.0 * x)
     params = {"a": 1.0, "b": 0.0}
 
-    gram_solver = GramLevenbergMarquardt(
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
-        linear_solver="cg",
-        formulation="gram",
-        iterative_tol=1e-7,
-        iterative_maxiter=20,
     )
-    normal_solver = GramLevenbergMarquardt(
-        residual_fn,
-        init_damping=1e-2,
-        linear_solver="cg",
-        formulation="normal",
-        iterative_tol=1e-7,
-        iterative_maxiter=20,
+    qr_solver = UnderdeterminedLevenbergMarquardt(
+        residual_fn, init_damping=1e-2, linear_solver="qr"
     )
 
-    gram_params, gram_state, gram_info = gram_solver.update(
-        params, gram_solver.init(), (x, y)
+    cholesky_params, cholesky_state, cholesky_info = cholesky_solver.update(
+        params, cholesky_solver.init(), (x, y)
     )
-    normal_params, normal_state, normal_info = normal_solver.update(
-        params, normal_solver.init(), (x, y)
-    )
+    qr_params, qr_state, qr_info = qr_solver.update(params, qr_solver.init(), (x, y))
 
-    assert bool(normal_info.accepted) == bool(gram_info.accepted)
-    assert not bool(normal_info.used_geodesic)
+    assert bool(qr_info.accepted) == bool(cholesky_info.accepted)
+    assert not bool(qr_info.used_geodesic)
     assert jnp.allclose(
-        normal_params["a"],
-        gram_params["a"],
+        qr_params["a"],
+        cholesky_params["a"],
         rtol=REGRESSION_RTOL,
         atol=REGRESSION_ATOL,
     )
     assert jnp.allclose(
-        normal_params["b"],
-        gram_params["b"],
+        qr_params["b"],
+        cholesky_params["b"],
         rtol=REGRESSION_RTOL,
         atol=REGRESSION_ATOL,
     )
-    assert jnp.allclose(normal_state.damping, gram_state.damping)
+    assert jnp.allclose(qr_state.damping, cholesky_state.damping)
     assert jnp.allclose(
-        normal_info.loss,
-        gram_info.loss,
+        qr_info.loss,
+        cholesky_info.loss,
         rtol=REGRESSION_RTOL,
         atol=REGRESSION_ATOL,
     )
+    assert qr_params["a"].dtype == jnp.float32
+    assert qr_info.loss.dtype == jnp.float32
 
 
 def test_lsmr_step_matches_closed_form_damped_linear_solution():
@@ -371,7 +378,7 @@ def test_lsmr_step_matches_closed_form_damped_linear_solution():
     theta0 = jnp.array([0.0, 0.0])
     init_damping = 0.1
 
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=init_damping,
         linear_solver="lsmr",
@@ -395,11 +402,102 @@ def test_lsmr_step_matches_closed_form_damped_linear_solution():
     assert info.loss.dtype == jnp.float32
 
 
+def test_qr_step_matches_closed_form_underdetermined_damped_solution():
+    def residual(theta, batch):
+        matrix, target = batch
+        return matrix @ theta - target
+
+    matrix = jnp.array([[1.0, 2.0, 0.5, -1.0], [0.0, 1.0, 3.0, 2.0]])
+    target = jnp.array([1.0, -2.0])
+    theta0 = jnp.zeros(matrix.shape[1])
+    init_damping = 0.1
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=init_damping,
+        linear_solver="qr",
+    )
+    theta, state, info = solver.update(theta0, solver.init(), (matrix, target))
+
+    expected_step = jnp.linalg.solve(
+        matrix.T @ matrix + init_damping * jnp.eye(matrix.shape[1]),
+        matrix.T @ target,
+    )
+    expected_loss = jnp.sum((matrix @ expected_step - target) ** 2)
+
+    assert bool(info.accepted)
+    assert not bool(info.used_geodesic)
+    assert jnp.allclose(theta, expected_step, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(info.loss, expected_loss, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(state.damping, init_damping * 0.5)
+    assert theta.dtype == jnp.float32
+    assert info.loss.dtype == jnp.float32
+
+
+def test_qr_float32_handles_ill_conditioned_case_where_cholesky_fails():
+    def residual(theta, batch):
+        matrix, target = batch
+        return matrix @ theta - target
+
+    matrix = jnp.array([[1.0, 0.0, 0.0, 0.0], [1.0, 1e-4, 0.0, 0.0]])
+    theta_true = jnp.array([1.0, 1.0, 0.0, 0.0])
+    target = matrix @ theta_true
+    theta0 = jnp.zeros(matrix.shape[1])
+
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-12,
+        linear_solver="cholesky",
+    )
+    qr_solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-12,
+        linear_solver="qr",
+    )
+
+    cholesky_theta, _, cholesky_info = cholesky_solver.update(
+        theta0, cholesky_solver.init(), (matrix, target)
+    )
+    qr_theta, _, qr_info = qr_solver.update(theta0, qr_solver.init(), (matrix, target))
+
+    assert jnp.all(jnp.isfinite(qr_theta))
+    assert jnp.isfinite(qr_info.loss_candidate)
+    assert bool(qr_info.accepted)
+    assert not bool(jnp.all(jnp.isfinite(cholesky_theta))) or not bool(
+        jnp.isfinite(cholesky_info.loss_candidate)
+    )
+    assert qr_info.loss_candidate < 1e-12
+
+
+def test_qr_update_is_differentiable():
+    def residual(theta, batch):
+        matrix, target = batch
+        return jnp.sin(matrix @ theta) - target
+
+    matrix = jnp.array([[1.0, 2.0, 0.5, -1.0], [0.0, 1.0, 3.0, 2.0]])
+    target = jnp.array([0.1, -0.2])
+    theta0 = jnp.array([0.2, -0.1, 0.05, 0.3])
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="qr",
+    )
+
+    def one_step_loss(theta):
+        _, _, info = solver.update(theta, solver.init(), (matrix, target))
+        return info.loss
+
+    grad = jax.grad(one_step_loss)(theta0)
+
+    assert grad.shape == theta0.shape
+    assert jnp.all(jnp.isfinite(grad))
+
+
 def test_cg_update_jits():
     x = jnp.linspace(0.0, 2.0, 20)
     y = 2.0 * jnp.exp(-1.0 * x)
     params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         linear_solver="cg",
@@ -420,17 +518,14 @@ def test_cg_update_jits():
     assert params["b"].dtype == jnp.float32
 
 
-def test_normal_cg_update_jits():
+def test_qr_update_jits():
     x = jnp.linspace(0.0, 2.0, 20)
     y = 2.0 * jnp.exp(-1.0 * x)
     params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
-        linear_solver="cg",
-        formulation="normal",
-        iterative_tol=1e-7,
-        iterative_maxiter=20,
+        linear_solver="qr",
     )
 
     @jax.jit
@@ -450,7 +545,7 @@ def test_lsmr_update_jits():
     x = jnp.linspace(0.0, 2.0, 20)
     y = 2.0 * jnp.exp(-1.0 * x)
     params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         linear_solver="lsmr",
@@ -478,7 +573,7 @@ def test_geodesic_acceptance_ratio_zero_falls_back_to_velocity_step():
     theta0 = jnp.array([1.9])
     target = 4.0
 
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
         geodesic_acceleration=True,
@@ -503,7 +598,7 @@ def test_geodesic_acceleration_matches_closed_form_quadratic_step():
     theta0 = jnp.array([1.9])
     target = 4.0
 
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
         geodesic_acceleration=True,
@@ -541,13 +636,13 @@ def test_cg_geodesic_acceleration_matches_cholesky():
     theta0 = jnp.array([1.9])
     target = 4.0
 
-    cholesky_solver = GramLevenbergMarquardt(
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
     )
-    cg_solver = GramLevenbergMarquardt(
+    cg_solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
         linear_solver="cg",
@@ -573,45 +668,38 @@ def test_cg_geodesic_acceleration_matches_cholesky():
     )
 
 
-def test_normal_cg_geodesic_acceleration_matches_gram_cg():
+def test_qr_geodesic_acceleration_matches_cholesky():
     def residual(theta, target):
         return jnp.array([theta[0] ** 2 - target])
 
     theta0 = jnp.array([1.9])
     target = 4.0
 
-    gram_solver = GramLevenbergMarquardt(
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
-        linear_solver="cg",
-        formulation="gram",
-        iterative_tol=1e-7,
-        iterative_maxiter=10,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
     )
-    normal_solver = GramLevenbergMarquardt(
+    qr_solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
-        linear_solver="cg",
-        formulation="normal",
-        iterative_tol=1e-7,
-        iterative_maxiter=10,
+        linear_solver="qr",
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
     )
 
-    gram_theta, _, gram_info = gram_solver.update(theta0, gram_solver.init(), target)
-    normal_theta, _, normal_info = normal_solver.update(
-        theta0, normal_solver.init(), target
+    cholesky_theta, _, cholesky_info = cholesky_solver.update(
+        theta0, cholesky_solver.init(), target
     )
+    qr_theta, _, qr_info = qr_solver.update(theta0, qr_solver.init(), target)
 
-    assert bool(normal_info.accepted)
-    assert bool(normal_info.used_geodesic)
-    assert jnp.allclose(normal_theta, gram_theta, rtol=1e-6, atol=1e-6)
+    assert bool(qr_info.accepted)
+    assert bool(qr_info.used_geodesic)
+    assert jnp.allclose(qr_theta, cholesky_theta, rtol=1e-6, atol=1e-6)
     assert jnp.allclose(
-        normal_info.acceleration_ratio,
-        gram_info.acceleration_ratio,
+        qr_info.acceleration_ratio,
+        cholesky_info.acceleration_ratio,
         rtol=1e-6,
         atol=1e-6,
     )
@@ -624,13 +712,13 @@ def test_lsmr_geodesic_acceleration_matches_cholesky():
     theta0 = jnp.array([1.9])
     target = 4.0
 
-    cholesky_solver = GramLevenbergMarquardt(
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
     )
-    lsmr_solver = GramLevenbergMarquardt(
+    lsmr_solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
         linear_solver="lsmr",
@@ -660,7 +748,7 @@ def test_geodesic_acceleration_jits():
     def residual(theta, target):
         return jnp.array([theta[0] ** 2 - target])
 
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
         geodesic_acceleration=True,
@@ -686,7 +774,7 @@ def test_geodesic_acceleration_reduces_iterations_on_gsl_rosenbrock_example():
 
     def iterations_to_threshold(geodesic_acceleration):
         theta = jnp.array([-0.5, 1.75])
-        solver = GramLevenbergMarquardt(
+        solver = UnderdeterminedLevenbergMarquardt(
             residual,
             init_damping=1.0,
             geodesic_acceleration=geodesic_acceleration,
@@ -712,7 +800,7 @@ def test_jitted_residual_with_jitted_geodesic_update():
     x = jnp.linspace(0.0, 2.0, 20)
     y = 2.0 * jnp.exp(-1.0 * x)
     params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         jax.jit(residual_fn),
         init_damping=1e-2,
         geodesic_acceleration=True,
@@ -736,7 +824,7 @@ def test_fletcher_step_matches_regression_values():
     x = jnp.linspace(0.0, 2.0, 20)
     y = 2.0 * jnp.exp(-1.0 * x)
     params = {"a": 1.0, "b": 0.0}
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         regularization="fletcher",
@@ -773,14 +861,14 @@ def test_fletcher_clips_tiny_diagonal_from_below():
         return jnp.array([theta[0] + 1e-4 * theta[1] - target])
 
     theta0 = jnp.array([0.0, 0.0])
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1.0,
         regularization="fletcher",
         fletcher_min_diagonal=1e-6,
         fletcher_max_diagonal=1e6,
     )
-    raw_solver = GramLevenbergMarquardt(
+    raw_solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1.0,
         regularization="fletcher",
@@ -805,7 +893,7 @@ def test_fletcher_clips_large_diagonal_from_above():
         return jnp.array([1e4 * theta[0] - target])
 
     theta0 = jnp.array([0.0])
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1.0,
         regularization="fletcher",
@@ -827,7 +915,7 @@ def test_geodesic_step_matches_regression_values():
     x = jnp.linspace(0.0, 2.0, 20)
     y = 2.0 * jnp.exp(-1.0 * x)
     params = {"a": 1.0, "b": 0.0}
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         geodesic_acceleration=True,
@@ -871,7 +959,7 @@ def test_fletcher_handles_unused_parameter():
     y = 2.0 * x
     params = {"a": 0.0, "unused": 10.0}
 
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-2,
         regularization="fletcher",
@@ -892,7 +980,7 @@ def test_fletcher_geodesic_handles_unused_parameter():
     y = 2.0 * jnp.exp(x)
     params = {"a": 1.0, "unused": 10.0}
 
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-2,
         regularization="fletcher",
@@ -918,7 +1006,7 @@ def test_fletcher_regularization_improves_scaled_parameter_case():
 
     def iterations_to_threshold(regularization):
         params = {"a": 1.0, "b_scaled": 0.0}
-        solver = GramLevenbergMarquardt(
+        solver = UnderdeterminedLevenbergMarquardt(
             residual,
             init_damping=1e-2,
             regularization=regularization,

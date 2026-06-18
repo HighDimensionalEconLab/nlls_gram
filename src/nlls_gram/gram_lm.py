@@ -35,17 +35,19 @@ class LMInfo(NamedTuple):
 
 # Classic Marquardt damping on min ||r(theta)||^2: accept the step iff the sum of
 # squared residuals decreases, multiplying the damping by damping_decrease on
-# acceptance and damping_increase on rejection. The solver factors the small
-# damped Gram system, which is the intended use case for n_residuals << n_params:
-#   step = -J' (J J' + damping I_n)^{-1} r
+# acceptance and damping_increase on rejection. The default solver factors the
+# small damped Gram system, which is the intended use case for n_residuals <<
+# n_params:
+#   step = -J' (J J' + damping I_m)^{-1} r
 # regularization controls the damping metric:
 #   "identity": add damping * I
 #   "fletcher": add damping * clipped_diag(J'J), using the equivalent dual formula
-class GramLevenbergMarquardt:
+class UnderdeterminedLevenbergMarquardt:
     def __init__(
         self,
         residual_fn,
         *,
+        jac="vjp",
         init_damping=1e-3,
         damping_decrease=0.5,
         damping_increase=4.0,
@@ -53,7 +55,6 @@ class GramLevenbergMarquardt:
         fletcher_min_diagonal=1e-6,
         fletcher_max_diagonal=1e6,
         linear_solver="cholesky",
-        formulation="gram",
         iterative_tol=0.0,
         iterative_atol=0.0,
         iterative_maxiter=8,
@@ -61,17 +62,13 @@ class GramLevenbergMarquardt:
         geodesic_acceleration=False,
         geodesic_acceptance_ratio=0.75,
     ):
+        if jac != "vjp":
+            raise ValueError(f'unknown jac: {jac}; only jac="vjp" is supported')
         if regularization not in ("identity", "fletcher"):
             raise ValueError(f"unknown regularization: {regularization}")
-        if linear_solver not in ("cholesky", "cg", "lsmr"):
+        if linear_solver not in ("cholesky", "qr", "cg", "lsmr"):
             raise ValueError(f"unknown linear_solver: {linear_solver}")
-        if formulation not in ("gram", "normal"):
-            raise ValueError(f"unknown formulation: {formulation}")
-        if formulation == "normal" and linear_solver == "cholesky":
-            raise ValueError('formulation="normal" requires linear_solver="cg"')
-        if formulation == "normal" and linear_solver == "lsmr":
-            raise ValueError('formulation is only used by linear_solver="cg"')
-        if linear_solver in ("cg", "lsmr") and regularization != "identity":
+        if linear_solver in ("qr", "cg", "lsmr") and regularization != "identity":
             raise ValueError(
                 f'linear_solver="{linear_solver}" only supports '
                 'regularization="identity"'
@@ -102,6 +99,7 @@ class GramLevenbergMarquardt:
         if lsmr_conlim <= 0:
             raise ValueError("lsmr_conlim must be positive")
         self.residual_fn = residual_fn
+        self.jac = jac
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
@@ -109,7 +107,6 @@ class GramLevenbergMarquardt:
         self.fletcher_min_diagonal = fletcher_min_diagonal
         self.fletcher_max_diagonal = fletcher_max_diagonal
         self.linear_solver = linear_solver
-        self.formulation = formulation
         self.iterative_tol = iterative_tol
         self.iterative_atol = iterative_atol
         self.iterative_maxiter = iterative_maxiter
@@ -140,35 +137,18 @@ class GramLevenbergMarquardt:
             def JT(cotangent):
                 return transpose_fn(cotangent)[0]
 
-            if self.formulation == "gram":
+            def gram_matvec(cotangent):
+                return jvp_fn(JT(cotangent)) + damping * cotangent
 
-                def gram_matvec(cotangent):
-                    return jvp_fn(JT(cotangent)) + damping * cotangent
-
-                def solve_step(rhs):
-                    dual_solution, _ = jsp_sparse_linalg.cg(
-                        gram_matvec,
-                        rhs,
-                        tol=self.iterative_tol,
-                        atol=self.iterative_atol,
-                        maxiter=self.iterative_maxiter,
-                    )
-                    return -JT(dual_solution)
-
-            else:
-
-                def normal_matvec(tangent):
-                    return JT(jvp_fn(tangent)) + damping * tangent
-
-                def solve_step(rhs):
-                    primal_solution, _ = jsp_sparse_linalg.cg(
-                        normal_matvec,
-                        JT(rhs),
-                        tol=self.iterative_tol,
-                        atol=self.iterative_atol,
-                        maxiter=self.iterative_maxiter,
-                    )
-                    return -primal_solution
+            def solve_step(rhs):
+                dual_solution, _ = jsp_sparse_linalg.cg(
+                    gram_matvec,
+                    rhs,
+                    tol=self.iterative_tol,
+                    atol=self.iterative_atol,
+                    maxiter=self.iterative_maxiter,
+                )
+                return -JT(dual_solution)
 
         elif self.linear_solver == "lsmr":
             sqrt_damping = jnp.sqrt(damping)
@@ -200,27 +180,70 @@ class GramLevenbergMarquardt:
 
         else:
             residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
-            J = jax.vmap(lambda cotangent: pullback(cotangent)[0])(residual_basis)
-            if self.regularization == "fletcher":
-                fletcher_diagonal = jnp.clip(
-                    jnp.sum(J**2, axis=0),
-                    jnp.asarray(self.fletcher_min_diagonal, dtype=resid.dtype),
-                    jnp.asarray(self.fletcher_max_diagonal, dtype=resid.dtype),
+            Jt = jax.vmap(lambda cotangent: pullback(cotangent)[0])(residual_basis).T
+
+            if self.linear_solver == "qr":
+                if Jt.shape[0] >= Jt.shape[1]:
+                    R = jnp.linalg.qr(Jt, mode="r")
+                    basis_eye = jnp.eye(R.shape[0], dtype=resid.dtype)
+                    augmented_matrix = jnp.concatenate(
+                        (R.T, jnp.sqrt(damping) * basis_eye),
+                        axis=0,
+                    )
+                    Qa, Ra = jnp.linalg.qr(augmented_matrix, mode="reduced")
+
+                    def solve_step(rhs):
+                        augmented_rhs = jnp.concatenate(
+                            (-rhs, jnp.zeros(R.shape[0], dtype=rhs.dtype))
+                        )
+                        z = jsp_linalg.solve_triangular(
+                            Ra,
+                            Qa.T @ augmented_rhs,
+                        )
+                        y = jsp_linalg.solve_triangular(R, z)
+                        return Jt @ y
+
+                else:
+                    Q, R = jnp.linalg.qr(Jt, mode="reduced")
+                    basis_eye = jnp.eye(R.shape[0], dtype=resid.dtype)
+                    augmented_matrix = jnp.concatenate(
+                        (R.T, jnp.sqrt(damping) * basis_eye),
+                        axis=0,
+                    )
+                    Qa, Ra = jnp.linalg.qr(augmented_matrix, mode="reduced")
+
+                    def solve_step(rhs):
+                        augmented_rhs = jnp.concatenate(
+                            (-rhs, jnp.zeros(R.shape[0], dtype=rhs.dtype))
+                        )
+                        z = jsp_linalg.solve_triangular(
+                            Ra,
+                            Qa.T @ augmented_rhs,
+                        )
+                        return Q @ z
+
+            else:
+                if self.regularization == "fletcher":
+                    fletcher_diagonal = jnp.clip(
+                        jnp.sum(Jt**2, axis=1),
+                        jnp.asarray(self.fletcher_min_diagonal, dtype=resid.dtype),
+                        jnp.asarray(self.fletcher_max_diagonal, dtype=resid.dtype),
+                    )
+
+                if self.regularization == "identity":
+                    gram_step_left = Jt
+                    linear_matrix = Jt.T @ Jt
+                else:
+                    gram_step_left = Jt / fletcher_diagonal[:, None]
+                    linear_matrix = Jt.T @ gram_step_left
+                linear_matrix = linear_matrix + damping * jnp.eye(
+                    resid.shape[0], dtype=resid.dtype
                 )
 
-            if self.regularization == "identity":
-                gram_step_left = J.T
-                linear_matrix = J @ J.T
-            else:
-                gram_step_left = J.T / fletcher_diagonal[:, None]
-                linear_matrix = J @ gram_step_left
-            linear_matrix = linear_matrix + damping * jnp.eye(
-                J.shape[0], dtype=resid.dtype
-            )
-            linear_factor = jsp_linalg.cho_factor(linear_matrix)
+                linear_factor = jsp_linalg.cho_factor(linear_matrix)
 
-            def solve_step(rhs):
-                return -gram_step_left @ jsp_linalg.cho_solve(linear_factor, rhs)
+                def solve_step(rhs):
+                    return -gram_step_left @ jsp_linalg.cho_solve(linear_factor, rhs)
 
         velocity = solve_step(resid)
         resid_velocity = residual_flat(theta + velocity)

@@ -10,7 +10,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from flax import nnx
 
-from nlls_gram import GramLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
 def assert_float64_tree(tree):
@@ -31,7 +31,7 @@ params = {
     "a": jnp.asarray(1.0, dtype=jnp.float64),
     "b": jnp.asarray(0.0, dtype=jnp.float64),
 }
-solver = GramLevenbergMarquardt(residual_fn, init_damping=1e-2)
+solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
 state = solver.init()
 for _ in range(5):
     params, state, info = solver.update(params, state, (x, y))
@@ -54,7 +54,7 @@ def quadratic_residual(theta, target):
 
 theta = jnp.asarray([1.9], dtype=jnp.float64)
 target = jnp.asarray(4.0, dtype=jnp.float64)
-solver = GramLevenbergMarquardt(
+solver = UnderdeterminedLevenbergMarquardt(
     quadratic_residual,
     init_damping=1e-12,
     geodesic_acceleration=True,
@@ -83,12 +83,40 @@ def linear_residual(theta, batch):
 matrix = jnp.asarray([[1.0, 2.0], [3.0, -1.0], [2.0, 0.5]], dtype=jnp.float64)
 target = jnp.asarray([1.0, 2.0, -1.0], dtype=jnp.float64)
 theta = jnp.asarray([0.0, 0.0], dtype=jnp.float64)
-solver = GramLevenbergMarquardt(
+solver = UnderdeterminedLevenbergMarquardt(
     linear_residual,
     init_damping=1e-2,
     linear_solver="lsmr",
     iterative_tol=1e-10,
     iterative_maxiter=20,
+)
+state = solver.init()
+theta, state, info = solver.update(theta, state, (matrix, target))
+
+assert theta.dtype == jnp.float64
+assert state.damping.dtype == jnp.float64
+assert info.loss.dtype == jnp.float64
+assert info.loss_old.dtype == jnp.float64
+assert info.loss_candidate.dtype == jnp.float64
+assert info.damping.dtype == jnp.float64
+assert info.damping_factor.dtype == jnp.float64
+assert info.acceleration_ratio.dtype == jnp.float64
+jaxpr = str(
+    jax.make_jaxpr(lambda p, s: solver.update(p, s, (matrix, target)))(theta, state)
+)
+assert "f32" not in jaxpr, jaxpr
+
+
+matrix = jnp.asarray(
+    [[1.0, 2.0, 0.5, -1.0], [0.0, 1.0, 3.0, 2.0]],
+    dtype=jnp.float64,
+)
+target = jnp.asarray([1.0, -2.0], dtype=jnp.float64)
+theta = jnp.zeros(matrix.shape[1], dtype=jnp.float64)
+solver = UnderdeterminedLevenbergMarquardt(
+    linear_residual,
+    init_damping=1e-2,
+    linear_solver="qr",
 )
 state = solver.init()
 theta, state, info = solver.update(theta, state, (matrix, target))
@@ -136,7 +164,7 @@ def nnx_residual_fn(params, batch):
     return model(x) - y
 
 
-solver = GramLevenbergMarquardt(nnx_residual_fn, init_damping=1e-12)
+solver = UnderdeterminedLevenbergMarquardt(nnx_residual_fn, init_damping=1e-12)
 state = solver.init()
 nnx_params, state, info = solver.update(nnx_params, state, (x_nnx, y_nnx))
 trained = nnx.merge(graphdef, nnx_params)

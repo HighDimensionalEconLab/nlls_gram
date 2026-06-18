@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from nlls_gram import GramLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
 class ExpModel(nnx.Module):
@@ -25,7 +25,7 @@ def test_nnx_state_params_recover_known_parameters():
         model = nnx.merge(graphdef, params)
         return model(xx) - yy
 
-    solver = GramLevenbergMarquardt(residual, init_damping=1e-2)
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
     lm_state = solver.init()
 
     @jax.jit
@@ -57,7 +57,7 @@ def test_nnx_wrt_filter_freezes_unselected_initialized_params():
         model = nnx.merge(graphdef, trainable, frozen)
         return model(xx) - yy
 
-    solver = GramLevenbergMarquardt(residual, init_damping=1e-2)
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
     lm_state = solver.init()
 
     @jax.jit

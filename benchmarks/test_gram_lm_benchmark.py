@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-from nlls_gram import GramLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
 def _make_problem(*, n_residuals, n_params):
@@ -15,7 +15,7 @@ def _make_problem(*, n_residuals, n_params):
         design, y = batch
         return jnp.sin(design @ theta) - y
 
-    solver = GramLevenbergMarquardt(residual, init_damping=1e-2)
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
     state = solver.init()
 
     @jax.jit

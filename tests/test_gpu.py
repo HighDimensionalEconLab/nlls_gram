@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nlls_gram import GramLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
 def _gpu_devices():
@@ -19,14 +19,16 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_jitted_geodesic_update_runs_on_gpu():
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
+def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
     def residual(theta, target):
         return jnp.array([theta[0] ** 2 - target])
 
     gpu = _gpu_devices()[0]
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
+        linear_solver=linear_solver,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
     )
@@ -52,14 +54,16 @@ def test_jitted_geodesic_update_runs_on_gpu():
     assert jnp.isfinite(info.acceleration_ratio)
 
 
-def test_jitted_geodesic_update_does_not_transfer_to_host():
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
+def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
     def residual(theta, target):
         return jnp.array([theta[0] ** 2 - target])
 
     gpu = _gpu_devices()[0]
-    solver = GramLevenbergMarquardt(
+    solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-6,
+        linear_solver=linear_solver,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
     )

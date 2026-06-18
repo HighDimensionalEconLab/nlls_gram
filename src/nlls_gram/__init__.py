@@ -1,19 +1,19 @@
-"""Gram/dual-form Levenberg-Marquardt nonlinear least-squares for JAX.
+"""Underdetermined Levenberg-Marquardt nonlinear least-squares for JAX.
 
-GramLevenbergMarquardt minimizes ||r(params)||^2 for a user-supplied
+UnderdeterminedLevenbergMarquardt minimizes ||r(params)||^2 for a user-supplied
 residual_fn(params, batch), where params is any JAX pytree (a flat array, a dict,
 nnx.state(model, nnx.Param), ...). It follows an init/update protocol:
 update(params, state, batch) returns the new params pytree (same structure), the
 next state, and an LMInfo. For overparameterized systems (p parameters >> n
-residual rows) it factors the small n x n gram (dual) system instead of the p x p
-normal equations. It intentionally does not expose a normal-equation mode. The
-solver depends only on jax/jax.numpy/jax.flatten_util.
+residual rows) the default solver factors the small residual-space gram (dual)
+system instead of the p x p normal equations. The solver depends only on JAX plus
+Lineax for LSMR.
 """
 
 from nlls_gram.gram_lm import (
-    GramLevenbergMarquardt,
     LMInfo,
     LMState,
+    UnderdeterminedLevenbergMarquardt,
 )
 
-__all__ = ["GramLevenbergMarquardt", "LMState", "LMInfo"]
+__all__ = ["UnderdeterminedLevenbergMarquardt", "LMState", "LMInfo"]
