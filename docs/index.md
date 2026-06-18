@@ -1,22 +1,23 @@
 # nlls_gram
 
-Gram/dual-form Levenberg-Marquardt nonlinear least-squares solvers for JAX.
+Levenberg-Marquardt nonlinear least-squares solvers for JAX, with dense
+Gram/dual solves and optional matrix-free iterative solves.
 
 `GramLevenbergMarquardt` minimizes `||r(params)||^2` for a user-supplied
 `residual_fn(params, batch)`, where `params` is any JAX pytree (a flat array, a
 dict, `nnx.state(model, nnx.Param)`, ...). It follows an `init`/`update` protocol:
 `update(params, state, batch)` returns the **new params pytree** (same structure),
-the next state, and an `LMInfo`. For overparameterized systems (many more
-parameters `p` than residual rows `n`) it factors the small `n x n` gram (dual)
-system instead of the `p x p` normal equations.
+the next state, and an `LMInfo`. The default dense solver factors the small
+`n x n` Gram (dual) system, which is useful when there are many more parameters
+than residual rows. Optional iterative solvers provide matrix-free CG in Gram or
+normal form and LSMR on the damped least-squares formulation.
 
-The solver depends only on `jax` — it knows nothing about `flax`/`nnx`/`optax`.
+The solver interface is general JAX — it knows nothing about
+`flax`/`nnx`/`optax` — and the package depends on `jax` plus `lineax` for LSMR.
 Dtypes flow from your `params`/residual, and the damping state follows the
 residual dtype; JAX decides `float32` vs `float64` via `jax_enable_x64`.
 `init_damping` must be positive; use a small positive value for near
-Gauss-Newton behavior. There is intentionally no normal-equation mode; use a
-different LM implementation when the Gram system is not the right shape for your
-problem.
+Gauss-Newton behavior.
 
 ## Install
 
