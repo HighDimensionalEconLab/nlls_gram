@@ -114,8 +114,15 @@ class UnderdeterminedLevenbergMarquardt:
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
 
-    def init(self):
-        return LMState(jnp.asarray(self.init_damping))
+    def init(self, dtype=None):
+        # Use a strongly-typed damping matching the problem dtype so init() and
+        # update() produce the same jit signature (a weakly-typed scalar here
+        # would force a recompile on the second step). dtype=None defers to JAX's
+        # default float type (float32, or float64 when x64 is enabled); pass an
+        # explicit dtype for problems that do not use the default float.
+        if dtype is None:
+            dtype = jnp.result_type(float)
+        return LMState(jnp.asarray(self.init_damping, dtype=dtype))
 
     def update(self, params, state, batch):
         theta, unravel = ravel_pytree(params)

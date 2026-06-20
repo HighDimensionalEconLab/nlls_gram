@@ -1024,3 +1024,24 @@ def test_fletcher_regularization_improves_scaled_parameter_case():
     assert identity_iterations >= 10
     assert fletcher_iterations <= 6
     assert fletcher_iterations < identity_iterations
+
+
+def test_init_state_matches_update_signature():
+    # init() and update() must produce the same jit signature for `damping`;
+    # a weakly-typed init scalar forced a recompile on the second step.
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    params = {"a": 1.0, "b": 0.0}
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+
+    state0 = solver.init()
+    _, state1, _ = solver.update(params, state0, (x, y))
+    d0, d1 = state0.damping, state1.damping
+    assert (d0.dtype, d0.weak_type, d0.shape) == (d1.dtype, d1.weak_type, d1.shape)
+    assert d0.weak_type is False
+    assert d0.dtype == jnp.result_type(float)
+
+
+def test_init_accepts_explicit_dtype():
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    assert solver.init(jnp.float32).damping.dtype == jnp.dtype("float32")
