@@ -1534,3 +1534,27 @@ def test_init_with_params_infers_dtype_from_residual():
     y = 2.0 * jnp.exp(-1.0 * x)
     state = solver.init(params={"a": 1.0, "b": 0.0}, aux=(x, y))
     assert state.damping.dtype == jnp.float32
+
+
+def test_cache_jacobian_off_leaves_no_trace_in_the_jaxpr():
+    # With caching (and geodesic) off there is no lax.cond in update at all,
+    # so the disabled flag provably adds zero compiled overhead.
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+
+    plain = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    cached = UnderdeterminedLevenbergMarquardt(
+        residual_fn, init_damping=1e-2, cache_jacobian=True
+    )
+    plain_jaxpr = str(
+        jax.make_jaxpr(lambda p, s: plain.update(p, s, (x, y)))(params, plain.init())
+    )
+    cached_jaxpr = str(
+        jax.make_jaxpr(lambda p, s: cached.update(p, s, (x, y)))(
+            params, cached.init(params=params, aux=(x, y))
+        )
+    )
+
+    assert "cond" not in plain_jaxpr
+    assert "cond" in cached_jaxpr
