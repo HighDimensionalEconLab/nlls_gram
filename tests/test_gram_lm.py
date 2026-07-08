@@ -1363,3 +1363,92 @@ def test_solve_callback_returning_none_leaves_loop_untouched(jit):
     )
 
     assert int(result.status) == LMStatus.CONVERGED
+
+
+def test_one_arg_residual_closes_over_data():
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+
+    def residual(params):
+        return params["a"] * jnp.exp(params["b"] * x) - y
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    result = solver.solve({"a": 1.0, "b": 0.0}, max_steps=50, atol=1e-6)
+
+    assert solver.residual_arity == 1
+    assert int(result.status) == LMStatus.CONVERGED
+    assert jnp.allclose(result.params["a"], 2.0, atol=1e-4)
+
+
+def test_two_arg_residual_takes_aux():
+    def residual(params, aux):
+        x, y = aux
+        return params["a"] * jnp.exp(params["b"] * x) - y
+
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    params, state, info = solver.update({"a": 1.0, "b": 0.0}, solver.init(), (x, y))
+
+    assert solver.residual_arity == 2
+    assert bool(info.accepted)
+
+
+def test_residual_arity_matches_three_arg_solver():
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    params = {"a": 1.0, "b": 0.0}
+
+    def one_arg(theta):
+        return residual_fn(theta, (x, y), None)
+
+    one_solver = UnderdeterminedLevenbergMarquardt(one_arg, init_damping=1e-2)
+    three_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    one_params, one_state, one_info = one_solver.update(params, one_solver.init())
+    three_params, three_state, three_info = three_solver.update(
+        params, three_solver.init(), (x, y)
+    )
+
+    assert jnp.allclose(one_params["a"], three_params["a"])
+    assert jnp.allclose(one_params["b"], three_params["b"])
+    assert jnp.allclose(one_info.loss, three_info.loss)
+    assert jnp.allclose(one_state.damping, three_state.damping)
+
+
+def test_aux_and_p_require_matching_residual_arity():
+    def one_arg(theta):
+        return theta
+
+    def two_arg(theta, aux):
+        return theta - aux
+
+    one_solver = UnderdeterminedLevenbergMarquardt(one_arg)
+    two_solver = UnderdeterminedLevenbergMarquardt(two_arg)
+    theta0 = jnp.zeros(1)
+
+    with pytest.raises(ValueError, match="takes only .params."):
+        one_solver.update(theta0, one_solver.init(), jnp.ones(1))
+    with pytest.raises(ValueError, match="takes only .params."):
+        one_solver.solve(theta0, jnp.ones(1))
+    with pytest.raises(ValueError, match="takes no p argument"):
+        two_solver.update(theta0, two_solver.init(), jnp.ones(1), jnp.ones(1))
+    with pytest.raises(ValueError, match="takes no p argument"):
+        two_solver.solve(theta0, jnp.ones(1), p=jnp.ones(1))
+
+
+def test_zero_or_many_arg_residual_rejected_at_construction():
+    with pytest.raises(ValueError, match="1 to 3 positional arguments"):
+        UnderdeterminedLevenbergMarquardt(lambda: jnp.zeros(1))
+    with pytest.raises(ValueError, match="1 to 3 positional arguments"):
+        UnderdeterminedLevenbergMarquardt(lambda a, b, c, d: a)
+
+
+def test_residual_with_default_args_counts_as_three_arg():
+    def residual(theta, aux=None, p=None):
+        del aux, p
+        return theta - 1.0
+
+    solver = UnderdeterminedLevenbergMarquardt(residual)
+    assert solver.residual_arity == 3
+    result = solver.solve(jnp.zeros(1), max_steps=30, atol=1e-6)
+    assert int(result.status) == LMStatus.CONVERGED

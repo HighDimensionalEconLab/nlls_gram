@@ -11,8 +11,9 @@ Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX pytrees, aimed
 at underdetermined or interpolating problems where the number of parameters is
 larger than the number of residuals.
 
-`UnderdeterminedLevenbergMarquardt` minimizes a user residual
-`residual_fn(params, aux, p)`. Parameters may be any JAX pytree; internally they
+`UnderdeterminedLevenbergMarquardt` minimizes a user residual taking
+`(params)`, `(params, aux)`, or `(params, aux, p)`, always in that order.
+Parameters may be any JAX pytree; internally they
 are flattened with `jax.flatten_util.ravel_pytree`. The default dense solver
 uses the residual-space Gram system, with QR, CG, and LSMR alternatives. Use
 `update(...)` for a single LM step or `solve(...)` for an internally jitted loop.
@@ -63,9 +64,8 @@ import jax.numpy as jnp
 from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
-def residual_fn(params, aux, p):
+def residual_fn(params, aux):
     x, y = aux
-    del p
     return params["a"] * jnp.exp(params["b"] * x) - y
 
 

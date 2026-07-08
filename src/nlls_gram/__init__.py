@@ -1,7 +1,8 @@
 """Metric-aware underdetermined Levenberg-Marquardt least-squares for JAX.
 
 UnderdeterminedLevenbergMarquardt minimizes ||r(params, aux, p)||^2 for a
-user-supplied residual function, where params is any JAX pytree (a flat array, a
+user-supplied residual function taking (params), (params, aux), or
+(params, aux, p), where params is any JAX pytree (a flat array, a
 dict, nnx.state(model, nnx.Param), ...). It follows an init/update protocol:
 update(params, state, aux=None, p=None) returns the new params pytree (same
 structure), the next state, and an LMInfo. solve(...) runs repeated LM steps with

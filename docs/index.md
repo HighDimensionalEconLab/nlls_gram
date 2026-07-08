@@ -23,25 +23,30 @@ uv add nlls-gram "jax[cuda13]"
 
 ## Residual and Data Interface
 
-The residual function is always called as:
+The residual function takes one, two, or three positional arguments — always
+in this order:
 
 ```python
+residual_fn(params)          # closes over its data
+residual_fn(params, aux)
 residual_fn(params, aux, p)
 ```
 
 - `params` is the pytree optimized by LM.
 - `aux` is arbitrary auxiliary data passed to `update(...)` or `solve(...)`.
 - `p` is optional read-only data, useful for fixed deep parameters or outer
-  perturbations.
+  perturbations; the implicit differentiation of `solve` is with respect to
+  `p`, so that requires the three-argument form.
 
-`aux` and `p` may be any JAX pytree. Residual functions can ignore either one:
-
-```python
-def residual_fn(params, aux, p):
-    x, y = aux
-    del p
-    return model(params, x) - y
-```
+`aux` and `p` may be any JAX pytree. The arity is inspected once at
+construction and the function is wrapped into the canonical three-argument
+form, so the compiled code is identical for all three; callables whose
+signature cannot be inspected (or that take `*args`) are assumed to take all
+three. The order is fixed: a two-argument residual always means
+`(params, aux)` — to use `p` without `aux`, write the three-argument form and
+ignore the second argument. Passing `aux` or `p` to `update`/`solve` when the
+residual does not accept it raises a `ValueError` rather than silently
+dropping it.
 
 `update(params, state, aux=None, p=None)` performs one LM step. The higher-level
 `solve(params, aux=None, *, p=None, ...)` loop repeatedly calls `update` and
@@ -219,9 +224,8 @@ import jax.numpy as jnp
 from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
-def residual_fn(params, aux, p):
+def residual_fn(params, aux):
     x, y = aux
-    del p
     return params["a"] * jnp.exp(params["b"] * x) - y
 
 
@@ -523,8 +527,10 @@ losses = result.user_state["loss"][: int(result.steps)]
 
 ## Migration from 0.x
 
-- `residual_fn(params, batch)` is now `residual_fn(params, aux, p)`;
-  `update(params, state, batch)` is `update(params, state, aux, p=None)`.
+- `residual_fn(params, batch)` is now `residual_fn(params, aux)` (or with a
+  third read-only `p` argument); `update(params, state, batch)` is
+  `update(params, state, aux, p=None)`. One-argument residuals that close
+  over their data are also accepted.
 - The four `metric_*` constructor kwargs and the dict-returning
   `metric_callbacks_from_cholesky` helper are replaced by a single
   `metric=Metric(...)` argument and `metric_from_cholesky(L)`.
@@ -654,6 +660,8 @@ import jax.numpy as jnp
 from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
+# p without aux still uses the three-argument form; the second argument is
+# simply ignored.
 def residual(theta, aux, p):
     del aux
     return jnp.array([theta[0] + 2.0 * theta[1] - p])
@@ -689,9 +697,8 @@ import jax.numpy as jnp
 from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_cholesky
 
 
-def residual_fn(theta, aux, p):
+def residual_fn(theta, aux):
     matrix, target = aux
-    del p
     return matrix @ theta - target
 
 

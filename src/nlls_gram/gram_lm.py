@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
@@ -15,7 +16,8 @@ from nlls_gram.metrics import Metric
 # convenience loop. params is ANY pytree
 # (a flat array, a dict, nnx.state(model, nnx.Param), ...); the solver only ravels
 # and unravels it with jax.flatten_util.ravel_pytree and calls the user's
-# residual_fn(params, aux, p). It knows nothing about flax/nnx/optax. update()
+# residual_fn, which may take (params), (params, aux), or (params, aux, p).
+# It knows nothing about flax/nnx/optax. update()
 # does not jit internally; solve(jit=True) wraps the loop in jax.jit. All
 # hyperparameters are static Python scalars; all data-dependent control flow is
 # traced (jnp.where), so a rejected step returns the unchanged params rather than
@@ -136,6 +138,43 @@ class UnderdeterminedLevenbergMarquardt:
         geodesic_acceleration=False,
         geodesic_acceptance_ratio=0.75,
     ):
+        # The residual may take (params), (params, aux), or (params, aux, p) —
+        # always in that order. Arity is inspected once here and the function
+        # is wrapped into the canonical 3-arg form, so the compiled code is
+        # identical for all three. Callables whose signature cannot be
+        # inspected (or that take *args) are assumed to be 3-arg.
+        try:
+            signature = inspect.signature(residual_fn)
+        except (TypeError, ValueError):
+            residual_arity = 3
+        else:
+            residual_arity = 0
+            for parameter in signature.parameters.values():
+                if parameter.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                ):
+                    residual_arity += 1
+                elif parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+                    residual_arity = 3
+                    break
+            if residual_arity < 1 or residual_arity > 3:
+                raise ValueError(
+                    "residual_fn must take 1 to 3 positional arguments: "
+                    "(params), (params, aux), or (params, aux, p)"
+                )
+        if residual_arity == 1:
+
+            def canonical_residual(params, aux, p):
+                return residual_fn(params)
+
+        elif residual_arity == 2:
+
+            def canonical_residual(params, aux, p):
+                return residual_fn(params, aux)
+
+        else:
+            canonical_residual = residual_fn
         if linear_solver not in ("cholesky", "qr", "cg", "lsmr"):
             raise ValueError(f"unknown linear_solver: {linear_solver}")
         if init_damping <= 0:
@@ -185,7 +224,8 @@ class UnderdeterminedLevenbergMarquardt:
             raise ValueError(
                 "geodesic_acceleration with a custom metric requires metric.norm"
             )
-        self.residual_fn = residual_fn
+        self.residual_fn = canonical_residual
+        self.residual_arity = residual_arity
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
@@ -245,6 +285,7 @@ class UnderdeterminedLevenbergMarquardt:
         )
 
     def update(self, params, state, aux=None, p=None):
+        self._check_residual_args(aux, p)
         theta, unravel = ravel_pytree(params)
 
         def residual_flat(th):
@@ -477,6 +518,7 @@ class UnderdeterminedLevenbergMarquardt:
         stop, override params/state/aux, or update user state. ``p`` is passed to
         the residual and callback but cannot be replaced by the action.
         """
+        self._check_residual_args(aux, p)
         if max_steps <= 0:
             raise ValueError("max_steps must be positive")
         if atol < 0:
@@ -623,6 +665,21 @@ class UnderdeterminedLevenbergMarquardt:
         if action.user_state is not None:
             user_state = action.user_state
         return action, params, state, aux, user_state
+
+    def _check_residual_args(self, aux, p):
+        # A residual that never sees aux/p must not have them silently
+        # dropped — in particular the implicit derivative with respect to p
+        # would be a silent zero.
+        if aux is not None and self.residual_arity < 2:
+            raise ValueError(
+                "aux was passed but residual_fn takes only (params); "
+                "use residual_fn(params, aux)"
+            )
+        if p is not None and self.residual_arity < 3:
+            raise ValueError(
+                "p was passed but residual_fn takes no p argument; "
+                "use residual_fn(params, aux, p)"
+            )
 
     def _converged(self, info, atol, gtol, xtol):
         atol_met = (atol > 0) & (jnp.sqrt(info.loss) < atol)
