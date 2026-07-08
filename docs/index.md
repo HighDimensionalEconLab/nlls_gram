@@ -49,7 +49,7 @@ residual does not accept it raises a `ValueError` rather than silently
 dropping it.
 
 `update(x, lm_state, args=None, p=None)` performs one LM step. The higher-level
-`solve(x, args=None, *, p=None, ...)` loop repeatedly calls `update` and
+`solve(x0, args=None, *, p=None, ...)` loop repeatedly calls `update` and
 returns an `LMSolveResult`.
 
 ### Auxiliary Outputs (`has_aux`)
@@ -72,7 +72,7 @@ Each step's `LMInfo.aux` holds the aux from the residual evaluation at the
 **pre-step** `x` (the linearization point — same convention as `loss_old`
 and `grad_norm`), at no extra cost; callbacks read it as `ctx.info.aux`,
 e.g. to early-stop on a diagnostic. The solve result additionally carries
-`result.aux`: the aux evaluated at the returned `(result.x, result.args)`
+`result.aux`: the aux evaluated at the returned `(result.x, result.args, result.p)`
 with one extra residual evaluation after the loop. This is well-defined for
 every status — the returned `x` is always the last accepted iterate — so it
 holds the final diagnostics whether or not the solve converged. With
@@ -126,6 +126,12 @@ The actual nonlinear step is accepted only if the unregularized residual sum of
 squares decreases. On acceptance, damping is multiplied by `damping_decrease`;
 on rejection, it is multiplied by `damping_increase`.
 
+Near the interpolation threshold, small-damping LM becomes metric
+Gauss-Newton, whose step is the minimum-\(M\)-norm solution of the linearized
+residual equations; large damping is steepest descent in the \(M\)-metric.
+[Metric Gauss-Newton and Minimum-Norm Steps](gauss_newton.md) derives both
+limits, the spectral-filter view, and the kernel/RKHS metric choices.
+
 ## The Metric Object
 
 A custom metric is passed as a single `metric=Metric(...)` argument. The
@@ -146,8 +152,9 @@ metric.
 Shape requirements:
 
 - `solve` must support vectors `(n_params,)` and matrices `(n_params, k)`.
-- `inv_sqrt` must support vectors `(n_params,)`, and should support matrices
-  when natural.
+- `inv_sqrt` must support vectors `(n_params,)`; matrices
+  `(n_params, n_residuals)` are additionally required for implicit
+  differentiation when the metric has no `solve`.
 - `inv_sqrt_transpose` must support matrices `(n_params, n_residuals)` for QR.
 - `norm` only needs to support vectors `(n_params,)`.
 
@@ -209,6 +216,11 @@ $$
 The implementation materializes \(S^\top J^\top\) via
 `metric.inv_sqrt_transpose(J.T)` and solves the resulting augmented QR problem.
 The returned parameter step is mapped back with `metric.inv_sqrt`.
+
+The triangular solves require \(S^\top J^\top\) to have full column rank
+(equivalently, \(J\) full row rank): a rank-deficient Jacobian produces a
+non-finite step even though the damped subproblem remains well-posed. Use
+`cholesky`, `cg`, or `lsmr` for rank-deficient problems.
 
 ### LSMR
 
@@ -301,8 +313,10 @@ x = result.x
 
 With all three at zero the solve runs until `max_steps` unless a callback
 stops it. The tolerances and `max_steps` are traced values: changing them
-between calls does not recompile the loop. `solve(jit=True)` is the default
-and jits the loop; use `jit=False` for debugging Python callbacks.
+between calls does not recompile the loop. They are validated in Python, so
+pass concrete numbers, not tracers from an enclosing `jax.jit`.
+`solve(jit=True)` is the default and jits the loop; use `jit=False` for
+debugging Python callbacks.
 
 The per-step diagnostics behind these rules are exposed on `LMInfo` as
 `grad_norm` (\(\|J^\top r\|_2\), nearly free in the dense paths since
@@ -337,7 +351,9 @@ Callbacks receive an `LMSolveContext`:
 
 A callback returns `None` or `LMSolveAction(...)`. Omitted action fields are left
 unchanged. The callback may set `stop`, `status`, `x`, `lm_state`, `args`, or
-`user_state`; it cannot replace `p`.
+`user_state`; it cannot replace `p`. When an action changes the values of `x`
+or `args`, that step's tolerance checks are skipped — the diagnostics describe
+the pre-action problem — and resume after the next update.
 
 Under `jit=True`, callbacks must be JAX-traceable and return the same pytree
 structure on every iteration. Use `jnp.where` or `jax.lax.cond` for
@@ -489,8 +505,8 @@ result = solver.solve(
 ```
 
 (`dataclasses` here is the standard-library module.) This recipe composes
-with `cache_jacobian=True` without extra care: any action that returns
-`x` or `args` invalidates the Jacobian cache automatically.
+with `cache_jacobian=True` without extra care: any action that changes the
+values of `x` or `args` invalidates the Jacobian cache automatically.
 
 ### Validation Early Stopping
 
@@ -596,7 +612,7 @@ losses = result.user_state["loss"][: int(result.steps)]
   callbacks at setup scope; an inline `lambda` at the call site recompiles
   every `solve`.
 - `max_steps`, `atol`, `gtol`, and `xtol` are traced values: sweeping them
-  does not recompile.
+  does not recompile (concrete numbers, not tracers).
 - Each `update` costs one residual linearization, one Jacobian
   materialization (`n_residuals` VJP passes in the dense paths), and one
   candidate residual evaluation; geodesic acceleration adds a
@@ -627,11 +643,13 @@ Caveats:
 
 - The cache is valid only while `x`, `args`, and `p` are all unchanged.
   Inside `solve`, invalidation is automatic: an accepted step invalidates it,
-  and so does any callback action that returns `x` or `args` (epoch
-  resampling needs no extra care). The one hazard is a **manual `update()`
-  loop** that changes `args` between steps (minibatching): the solver cannot
-  see the swap and a stale cache fails silently, with steps taken against the
-  old Jacobian — leave the cache off there, or reset with
+  and so does any callback action that actually changes the values of `x` or
+  `args` — the comparison is by value, so the `jnp.where` recipe pattern that
+  returns unchanged values every step keeps the cache, and epoch resampling
+  needs no extra care. The one hazard is a **manual `update()` loop** that
+  changes `args` or `p` between steps (minibatching): the solver cannot see
+  the swap and a stale cache fails silently, with steps taken against the old
+  Jacobian — leave the cache off there, or reset with
   `dataclasses.replace(lm_state, jacobian_valid=jnp.asarray(False))`.
 - The cache adds an `(n_params, n_residuals)` buffer to `LMState` for the
   whole solve — relevant on GPU memory budgets.

@@ -219,7 +219,7 @@ assert "f32" not in jaxpr, jaxpr
     assert result.returncode == 0, result.stderr + result.stdout
 
 
-def test_solve_with_float32_problem_under_x64_keeps_state_dtype_consistent():
+def test_solve_with_float32_problem_under_x64_keeps_lm_state_dtype_consistent():
     # solve(lm_state=None) must carry the damping in the residual dtype, not
     # the default float, or the while_loop carry mismatches update()'s output
     # for float32 problems under x64.

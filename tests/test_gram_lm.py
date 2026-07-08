@@ -69,7 +69,7 @@ def test_default_metric_matches_explicit_identity_metric_solve():
     assert jnp.allclose(default_info.loss, identity_info.loss)
 
 
-def test_flat_array_params():
+def test_flat_array_x():
     def residual(theta, args, p):
         ts, ys = args
         return theta[0] * jnp.exp(theta[1] * ts) - ys
@@ -153,7 +153,7 @@ def test_default_disabled_geodesic_uses_minimal_residual_evaluations():
     assert calls["count"] == 2
 
 
-def test_rejected_step_leaves_params_unchanged():
+def test_rejected_step_leaves_x_unchanged():
     ts = jnp.linspace(0.0, 2.0, 5)
     ys = jnp.ones_like(ts)
     x = {"a": 1.0, "b": 0.0}
@@ -218,7 +218,7 @@ def test_iterative_options_must_be_valid():
         )
 
 
-def test_default_float32_params_keep_float32_outputs():
+def test_default_float32_x_keeps_float32_outputs():
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": 1.0, "b": 0.0}
@@ -811,6 +811,28 @@ def test_metric_from_cholesky_matches_dense_metric():
     )
 
 
+def test_metric_selects_minimum_norm_interpolating_step():
+    # r(theta) = theta_0 + theta_1 - 1 at theta = 0: every interpolating step
+    # satisfies s_0 + s_1 = 1, and with tiny damping the update is the metric
+    # Gauss-Newton step — the minimum-M-norm solution (docs worked example).
+    def residual(theta, args, p):
+        del args, p
+        return jnp.array([theta[0] + theta[1] - 1.0])
+
+    theta0 = jnp.zeros(2)
+
+    identity_solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-9)
+    x_identity, _, _ = identity_solver.update(theta0, identity_solver.init(theta0))
+    assert jnp.allclose(x_identity, jnp.array([0.5, 0.5]), atol=1e-5)
+
+    L = jnp.linalg.cholesky(jnp.diag(jnp.array([1.0, 4.0])))
+    metric_solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-9, metric=metric_from_cholesky(L)
+    )
+    x_metric, _, _ = metric_solver.update(theta0, metric_solver.init(theta0))
+    assert jnp.allclose(x_metric, jnp.array([0.8, 0.2]), atol=1e-5)
+
+
 @pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
 def test_metric_step_matches_closed_form_solution(linear_solver):
     def residual(theta, args, p):
@@ -987,7 +1009,7 @@ def test_custom_metric_update_jits_and_matches_closed_form_solution():
     assert jnp.isfinite(info.loss)
 
 
-def test_init_state_matches_update_signature():
+def test_init_lm_state_matches_update_signature():
     # init() and update() must produce the same jit signature for `damping`
     # (strongly typed, matching dtype), or the second step recompiles.
     ts = jnp.linspace(0.0, 2.0, 20)
@@ -1003,7 +1025,7 @@ def test_init_state_matches_update_signature():
     assert d0.dtype == jnp.result_type(float)
 
 
-def test_solve_converges_with_aux_and_p_jit_modes():
+def test_solve_converges_with_args_and_p_jit_modes():
     def residual(theta, args, p):
         return theta - (args + p)
 
@@ -1055,14 +1077,14 @@ def test_solve_callback_can_abort_on_nonfinite_candidate():
     assert not jnp.isfinite(result.info.loss_candidate)
 
 
-def test_solve_callback_updates_aux_and_user_state():
+def test_solve_callback_updates_args_and_user_state():
     def residual(theta, args, p):
         del p
         return theta - args
 
     def callback(ctx):
-        next_aux = jnp.where(ctx.step == 1, jnp.asarray([2.0]), ctx.args)
-        return LMSolveAction(args=next_aux, user_state=ctx.user_state + ctx.info.loss)
+        next_args = jnp.where(ctx.step == 1, jnp.asarray([2.0]), ctx.args)
+        return LMSolveAction(args=next_args, user_state=ctx.user_state + ctx.info.loss)
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
     result = solver.solve(
@@ -1080,7 +1102,8 @@ def test_solve_callback_updates_aux_and_user_state():
     assert result.user_state > 0.0
 
 
-def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root():
+@pytest.mark.parametrize("jit", [True, False])
+def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root(jit):
     def residual(theta, args, p):
         del args
         return jnp.array([theta[0] + 2.0 * theta[1] - p])
@@ -1089,7 +1112,7 @@ def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root():
     theta0 = jnp.zeros(2)
 
     def solved_x(p):
-        return solver.solve(theta0, p=p, max_steps=80, atol=1e-6).x
+        return solver.solve(theta0, p=p, max_steps=80, atol=1e-6, jit=jit).x
 
     p = jnp.asarray(3.0)
     p_dot = jnp.asarray(0.7)
@@ -1347,6 +1370,55 @@ def test_callback_returning_args_invalidates_jacobian_cache():
     assert float(result.info.loss_old) == pytest.approx(4.0)
 
 
+def test_callback_returning_unchanged_args_keeps_jacobian_cache():
+    # Every candidate is NaN, so every step is rejected and the cache stays
+    # valid; a jit-style callback returning args with unchanged values must
+    # not invalidate it.
+    def residual(theta, args, p):
+        del p
+        return jnp.where(theta[0] == 0.0, theta + args, jnp.full_like(theta, jnp.nan))
+
+    def callback(ctx):
+        return LMSolveAction(args=ctx.args)
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1.0, cache_jacobian=True
+    )
+    result = solver.solve(
+        jnp.zeros(1), jnp.asarray([1.0]), max_steps=3, callback=callback
+    )
+
+    assert int(result.status) == LMStatus.MAX_STEPS
+    assert bool(result.lm_state.jacobian_valid)
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_callback_changing_args_defers_stale_convergence(jit):
+    # A callback that swaps args exactly when the old problem meets atol must
+    # not let solve report CONVERGED for the swapped (x, args) pair; the
+    # tolerances wait for a fresh update against the new args.
+    def residual(theta, args, p):
+        return theta - args
+
+    def callback(ctx):
+        swap = (jnp.sqrt(ctx.info.loss) < 1e-3) & (ctx.args[0] < 50.0)
+        return LMSolveAction(args=jnp.where(swap, jnp.asarray([100.0]), ctx.args))
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    result = solver.solve(
+        jnp.zeros(1),
+        jnp.ones(1),
+        max_steps=400,
+        atol=1e-3,
+        callback=callback,
+        jit=jit,
+    )
+
+    assert int(result.status) == LMStatus.CONVERGED
+    assert float(result.args[0]) == pytest.approx(100.0)
+    assert jnp.allclose(result.x, result.args, atol=1e-2)
+
+
 def test_solve_callback_history_buffer_matches_update_loop():
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
@@ -1429,7 +1501,7 @@ def test_one_arg_residual_closes_over_data():
     assert jnp.allclose(result.x["a"], 2.0, atol=1e-4)
 
 
-def test_two_arg_residual_takes_aux():
+def test_two_arg_residual_takes_args():
     def residual(x, args):
         ts, ys = args
         return x["a"] * jnp.exp(x["b"] * ts) - ys
@@ -1465,7 +1537,7 @@ def test_residual_arity_matches_three_arg_solver():
     assert jnp.allclose(one_state.damping, three_state.damping)
 
 
-def test_aux_and_p_require_matching_residual_arity():
+def test_args_and_p_require_matching_residual_arity():
     def one_arg(theta):
         return theta
 
@@ -1551,7 +1623,7 @@ def test_cache_jacobian_solve_converges_and_matches_plain():
     assert jnp.allclose(cached_result.x["b"], -1.0, atol=1e-4)
 
 
-def test_cache_jacobian_requires_sized_state():
+def test_cache_jacobian_requires_sized_lm_state():
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, cache_jacobian=True)
     with pytest.raises(ValueError, match="no Jacobian cache"):
         solver.update(
@@ -1579,7 +1651,7 @@ def test_cache_jacobian_is_inert_for_non_cholesky_solvers():
     assert bool(info.accepted)
 
 
-def test_init_with_params_infers_dtype_from_residual():
+def test_init_infers_dtype_from_residual():
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
@@ -1620,7 +1692,7 @@ def aux_residual_fn(x, args):
 
 
 @pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
-def test_has_aux_reports_aux_at_pre_step_params(linear_solver):
+def test_has_aux_reports_aux_at_pre_step_x(linear_solver):
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": 1.0, "b": 0.0}

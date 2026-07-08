@@ -42,6 +42,21 @@ $$
 
 so the natural parameter metric is \(M=K\), not the Euclidean metric.
 
+Near the interpolation threshold the residuals are small, damping falls, and
+LM becomes metric Gauss-Newton: each step is the minimum-\(M\)-norm correction
+solving the linearized residual equations,
+
+$$
+s = -M^{-1}J^\top\left(JM^{-1}J^\top\right)^{-1}r
+= \arg\min_s \|s\|_M
+\;\;\text{s.t.}\;\;
+r + Js = 0.
+$$
+
+With an RKHS metric this selects minimum-RKHS-norm corrections — kernel
+methods let you control exactly which norm that is. The docs derive this and
+the large-damping limit (metric gradient descent).
+
 ## Install
 
 ```bash
@@ -129,7 +144,8 @@ the exact callback contract, branch formulas, and validation rules.
 ## Solvers
 
 - `linear_solver="cholesky"`: dense residual-space Gram solve, the default.
-- `linear_solver="qr"`: dense QR solve of the whitened-step problem.
+- `linear_solver="qr"`: dense QR solve of the whitened-step problem (requires
+  a full-row-rank Jacobian).
 - `linear_solver="cg"`: matrix-free residual-space CG.
 - `linear_solver="lsmr"`: matrix-free Lineax LSMR on the damped least-squares
   problem.

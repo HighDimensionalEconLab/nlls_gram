@@ -111,6 +111,17 @@ class LMSolveResult:
     aux: Any = None
 
 
+def _tree_changed(new, old):
+    new_leaves, new_treedef = jax.tree_util.tree_flatten(new)
+    old_leaves, old_treedef = jax.tree_util.tree_flatten(old)
+    if new_treedef != old_treedef:
+        return jnp.asarray(True)
+    changed = jnp.asarray(False)
+    for new_leaf, old_leaf in zip(new_leaves, old_leaves, strict=True):
+        changed = changed | ~jnp.array_equal(new_leaf, old_leaf)
+    return changed
+
+
 def _zero_tangent_leaf(leaf):
     if leaf is None:
         return None
@@ -756,22 +767,27 @@ class UnderdeterminedLevenbergMarquardt:
 
     def _apply_action(self, action, x, lm_state, args, user_state):
         action = self._action_or_default(action)
+        # The step's diagnostics and the cached Jacobian describe the
+        # pre-action (x, args), so both are stale iff the action actually
+        # changed the values — a traced comparison, so a jit-style callback
+        # that returns the field every step with unchanged values (the
+        # jnp.where recipe pattern) changes nothing.
+        problem_changed = jnp.asarray(False)
         if action.x is not None:
+            problem_changed = problem_changed | _tree_changed(action.x, x)
             x = action.x
         if action.lm_state is not None:
             lm_state = action.lm_state
         if action.args is not None:
+            problem_changed = problem_changed | _tree_changed(action.args, args)
             args = action.args
         if action.user_state is not None:
             user_state = action.user_state
-        # An action returning x or args may have moved the point the cached
-        # Jacobian was computed at, so invalidate conservatively. The check is
-        # structural (presence of the field), so it composes with jit.
         if self.cache_jacobian and (action.x is not None or action.args is not None):
             lm_state = dataclasses.replace(
-                lm_state, jacobian_valid=jnp.asarray(False, dtype=jnp.bool_)
+                lm_state, jacobian_valid=lm_state.jacobian_valid & ~problem_changed
             )
-        return action, x, lm_state, args, user_state
+        return action, x, lm_state, args, user_state, problem_changed
 
     def _check_residual_args(self, args, p):
         # Silently dropping args/p a residual never sees would, in particular,
@@ -842,7 +858,7 @@ class UnderdeterminedLevenbergMarquardt:
                     info,
                 )
                 action = callback(ctx)
-            action, x, lm_state, args, user_state = self._apply_action(
+            action, x, lm_state, args, user_state, problem_changed = self._apply_action(
                 action, x, lm_state, args, user_state
             )
             if action.stop is not None and bool(action.stop):
@@ -852,7 +868,11 @@ class UnderdeterminedLevenbergMarquardt:
                     else int(action.status)
                 )
                 break
-            if bool(self._converged(info, atol, gtol, xtol)):
+            # info describes the pre-action (x, args); if the action changed
+            # them, the tolerances must wait for a fresh update.
+            if bool(self._converged(info, atol, gtol, xtol)) and not bool(
+                problem_changed
+            ):
                 status = LMStatus.CONVERGED
                 break
         else:
@@ -942,7 +962,7 @@ def _solve_loop_impl(
                 info,
             )
             action = callback(ctx)
-        action, x, lm_state, args, user_state = solver._apply_action(
+        action, x, lm_state, args, user_state, problem_changed = solver._apply_action(
             action, x, lm_state, args, user_state
         )
 
@@ -954,7 +974,9 @@ def _solve_loop_impl(
             if action.status is None
             else jnp.asarray(action.status, dtype=jnp.int32)
         )
-        converged = solver._converged(info, atol, gtol, xtol)
+        # info describes the pre-action (x, args); if the action changed them,
+        # the tolerances must wait for a fresh update.
+        converged = solver._converged(info, atol, gtol, xtol) & ~problem_changed
         reached_max = step >= max_steps
         stop = current_nonfinite | callback_stop | converged | reached_max
         status = jnp.where(
