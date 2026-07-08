@@ -689,7 +689,19 @@ residual_fn(x, args, p)
 
 It does not mean LM hyperparameters such as `init_damping`, `max_steps`,
 `atol`, callback choices, or metric callbacks. The custom rule treats `args` and
-the initial guess `x0` as fixed for this derivative.
+the initial guess `x0` as fixed for this derivative (their tangents are zero,
+not an error).
+
+There is no setup stage that AD must trace through: the whole iteration —
+every update, callback, and the final aux evaluation — sits inside one
+`jax.custom_jvp` boundary, so derivative information flows only through the
+implicit rule at the returned solution. `init` is differentiation-inert (its
+outputs are constants whose shapes and dtypes come from one residual
+evaluation), so calling it by hand inside a differentiated function, or
+implicitly via `cache_jacobian=True`, contributes exactly zero to any
+derivative. `result.aux` is likewise a non-differentiated output. One
+construction-time caveat: the solver (including any `Metric` callbacks) is a
+static object — do not build it from traced values.
 
 ### Root Selection and the Metric
 

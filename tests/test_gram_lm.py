@@ -1808,3 +1808,47 @@ def test_solve_callback_wall_clock_time_limit():
         user_state=jnp.asarray([time.perf_counter(), 1e9]),
     )
     assert int(result.status) == LMStatus.CONVERGED
+
+
+def test_solve_implicit_ad_unaffected_by_cache_init_inside_trace():
+    # With cache_jacobian=True, solve(lm_state=None) calls init() — one
+    # residual evaluation outside the custom_jvp boundary. Its outputs are
+    # shape-derived constants, so the implicit JVP/VJP wrt p must be
+    # identical to the uncached solver's.
+    def residual(theta, args, p):
+        del args
+        return jnp.array([theta[0] + 2.0 * theta[1] - p])
+
+    cached = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, cache_jacobian=True
+    )
+    plain = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+
+    def solved_x(solver, p):
+        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(3.0), jnp.asarray(0.7)
+    _, cached_dot = jax.jvp(lambda q: solved_x(cached, q), (p,), (p_dot,))
+    _, plain_dot = jax.jvp(lambda q: solved_x(plain, q), (p,), (p_dot,))
+    assert jnp.allclose(cached_dot, jnp.array([0.7 / 5.0, 1.4 / 5.0]), atol=1e-6)
+    assert jnp.allclose(cached_dot, plain_dot, atol=1e-7)
+
+    _, pullback = jax.vjp(lambda q: solved_x(cached, q), p)
+    (p_bar,) = pullback(jnp.array([3.0, 4.0]))
+    assert jnp.allclose(p_bar, (3.0 + 2.0 * 4.0) / 5.0, atol=1e-6)
+
+
+def test_solve_derivative_wrt_x0_is_zero_by_contract():
+    # The implicit rule differentiates only wrt p; the initial guess is
+    # treated as fixed, so tangents on x0 are zero rather than an error.
+    def residual(theta, args, p):
+        del args
+        return jnp.array([theta[0] + 2.0 * theta[1] - p])
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+
+    def solved_x(x0):
+        return solver.solve(x0, p=jnp.asarray(3.0), max_steps=80, atol=1e-6).x
+
+    _, x0_dot = jax.jvp(solved_x, (jnp.zeros(2),), (jnp.ones(2),))
+    assert jnp.allclose(x0_dot, jnp.zeros(2))
