@@ -740,8 +740,7 @@ def test_geodesic_acceleration_jits():
 
 
 def test_geodesic_acceleration_reduces_iterations_on_gsl_rosenbrock_example():
-    def residual(theta, args, p):
-        del args
+    def residual(theta, _, p):
         return jnp.array([100.0 * (theta[1] - theta[0] ** 2), 1.0 - theta[0]])
 
     def iterations_to_threshold(geodesic_acceleration):
@@ -825,8 +824,7 @@ def test_metric_selects_minimum_norm_interpolating_step():
     # r(theta) = theta_0 + theta_1 - 1 at theta = 0: every interpolating step
     # satisfies s_0 + s_1 = 1, and with tiny damping the update is the metric
     # Gauss-Newton step — the minimum-M-norm solution (docs worked example).
-    def residual(theta, args, p):
-        del args, p
+    def residual(theta, _, __):
         return jnp.array([theta[0] + theta[1] - 1.0])
 
     theta0 = jnp.zeros(2)
@@ -930,8 +928,7 @@ def test_geodesic_step_matches_regression_values():
 
 @pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
 def test_metric_geodesic_acceleration_ratio_uses_metric_norm(linear_solver):
-    def residual(theta, args, p):
-        del args
+    def residual(theta, _, p):
         return jnp.array(
             [
                 theta[0] ** 2 + theta[1] - 1.0,
@@ -1068,8 +1065,7 @@ def test_solve_reports_max_steps_without_atol_convergence():
 
 
 def test_solve_callback_can_abort_on_nonfinite_candidate():
-    def residual(theta, args, p):
-        del args, p
+    def residual(theta, _, __):
         return jnp.where(theta[0] > 0.0, theta + 1.0, jnp.asarray([jnp.nan]))
 
     def callback(ctx):
@@ -1088,8 +1084,7 @@ def test_solve_callback_can_abort_on_nonfinite_candidate():
 
 
 def test_solve_callback_updates_args_and_user_state():
-    def residual(theta, args, p):
-        del p
+    def residual(theta, args, _):
         return theta - args
 
     def callback(ctx):
@@ -1114,8 +1109,7 @@ def test_solve_callback_updates_args_and_user_state():
 
 @pytest.mark.parametrize("jit", [True, False])
 def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root(jit):
-    def residual(theta, args, p):
-        del args
+    def residual(theta, _, p):
         return jnp.array([theta[0] + 2.0 * theta[1] - p])
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
@@ -1141,8 +1135,7 @@ def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root(jit):
 
 @pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
 def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
-    def residual(theta, args, p):
-        del args
+    def residual(theta, _, p):
         return jnp.array([theta[0] + 2.0 * theta[1] - p])
 
     metric_matrix = jnp.array([[4.0, 0.0], [0.0, 1.0]])
@@ -1222,8 +1215,7 @@ def test_grad_norm_and_step_norm_match_closed_form(linear_solver):
 def test_rejected_step_still_reports_step_norm():
     # The candidate step leaves theta = 0, producing a NaN residual, so every
     # step is rejected; the attempted step norm must still be reported.
-    def residual(theta, args, p):
-        del args, p
+    def residual(theta, _, __):
         return jnp.where(theta[0] == 0.0, theta + 1.0, jnp.full_like(theta, jnp.nan))
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1.0)
@@ -1266,8 +1258,7 @@ def test_solve_xtol_reports_converged_on_accepted_step(jit):
 
 
 def test_solve_xtol_ignores_rejected_steps():
-    def residual(theta, args, p):
-        del args, p
+    def residual(theta, _, __):
         return jnp.where(theta[0] == 0.0, theta + 1.0, jnp.full_like(theta, jnp.nan))
 
     solver = UnderdeterminedLevenbergMarquardt(
@@ -1281,8 +1272,7 @@ def test_solve_xtol_ignores_rejected_steps():
 
 
 def test_max_damping_caps_growth_under_repeated_rejection():
-    def residual(theta, args, p):
-        del args, p
+    def residual(theta, _, __):
         return jnp.where(theta[0] == 0.0, theta + 1.0, jnp.full_like(theta, jnp.nan))
 
     capped = UnderdeterminedLevenbergMarquardt(
@@ -1325,8 +1315,7 @@ def test_solve_does_not_retrace_on_loop_control_changes():
 def test_solve_callback_epoch_boundary_resamples_args_and_resets_damping(
     cache_jacobian,
 ):
-    def residual(theta, args, p):
-        del p
+    def residual(theta, args, _):
         return theta - args
 
     steps_per_epoch = 3
@@ -1366,8 +1355,7 @@ def test_callback_returning_args_invalidates_jacobian_cache():
     # the cache is therefore valid; when the callback swaps args at step 2,
     # step 3 must recompute the residual with the new args. A stale cache
     # would report loss_old = 1 (old args) instead of 4 (new args).
-    def residual(theta, args, p):
-        del p
+    def residual(theta, args, _):
         return jnp.where(theta[0] == 0.0, theta + args, jnp.full_like(theta, jnp.nan))
 
     def callback(ctx):
@@ -1389,8 +1377,7 @@ def test_callback_returning_unchanged_args_keeps_jacobian_cache():
     # Every candidate is NaN, so every step is rejected and the cache stays
     # valid; a jit-style callback returning args with unchanged values must
     # not invalidate it.
-    def residual(theta, args, p):
-        del p
+    def residual(theta, args, _):
         return jnp.where(theta[0] == 0.0, theta + args, jnp.full_like(theta, jnp.nan))
 
     def callback(ctx):
@@ -1438,8 +1425,7 @@ def test_callback_changing_args_defers_stale_convergence(jit):
 def test_callback_echoing_nan_args_still_converges(jit):
     # An unchanged NaN sentinel in echoed args is not a change (equal_nan
     # comparison) and must not defer the tolerance checks.
-    def residual(theta, args, p):
-        del args, p
+    def residual(theta, _, __):
         return theta - 1.0
 
     def callback(ctx):
@@ -1460,8 +1446,7 @@ def test_callback_echoing_nan_args_still_converges(jit):
 
 
 def test_callback_bare_lm_state_with_cache_raises_clear_error():
-    def residual(theta, args, p):
-        del p
+    def residual(theta, args, _):
         return theta - args
 
     def callback(ctx):
@@ -1516,8 +1501,7 @@ def test_callback_grows_cg_budget_when_loss_small(jit):
     matrix = jnp.diag(jnp.logspace(0.0, 1.5, 8))
     target = jnp.linspace(1.0, 2.0, 8)
 
-    def residual(theta, args, p):
-        del args, p
+    def residual(theta, _, __):
         return matrix @ theta - target
 
     def grow_budget(ctx):
@@ -1546,8 +1530,7 @@ def test_callback_grows_cg_budget_when_loss_small(jit):
 def test_callback_resets_max_damping_cap():
     # Every step rejects (NaN candidates), so damping grows; the callback
     # tightens the traced cap mid-solve.
-    def residual(theta, args, p):
-        del p
+    def residual(theta, args, _):
         return jnp.where(theta[0] == 0.0, theta + args, jnp.full_like(theta, jnp.nan))
 
     def cap_damping(ctx):
@@ -1573,8 +1556,7 @@ def test_callback_grows_lsmr_budget_when_loss_small():
     matrix = jnp.diag(jnp.logspace(0.0, 1.5, 8))
     target = jnp.linspace(1.0, 2.0, 8)
 
-    def residual(theta, args, p):
-        del args, p
+    def residual(theta, _, __):
         return matrix @ theta - target
 
     def grow_budget(ctx):
@@ -1772,8 +1754,7 @@ def test_zero_or_many_arg_residual_rejected_at_construction():
 
 
 def test_residual_with_default_args_counts_as_three_arg():
-    def residual(theta, args=None, p=None):
-        del args, p
+    def residual(theta, _=None, __=None):
         return theta - 1.0
 
     solver = UnderdeterminedLevenbergMarquardt(residual)
@@ -2016,8 +1997,7 @@ def test_solve_result_aux_none_without_has_aux():
 
 
 def test_solve_implicit_jvp_works_with_has_aux():
-    def residual(theta, args, p):
-        del args
+    def residual(theta, _, p):
         return jnp.array([theta[0] + 2.0 * theta[1] - p]), {"level": theta[0]}
 
     solver = UnderdeterminedLevenbergMarquardt(
@@ -2042,8 +2022,7 @@ def test_solve_implicit_jvp_of_aux_wrt_p(jit):
     # dm/dp = theta1/5 + 2*theta0/5 + 2p = 4p/25 + 2p through both the
     # solution path and the direct p path. The int32 aux leaf must not
     # break the rule.
-    def residual(theta, args, p):
-        del args
+    def residual(theta, _, p):
         aux = {
             "m": theta[0] * theta[1] + p**2,
             "count": jnp.asarray(1, dtype=jnp.int32),
@@ -2081,8 +2060,7 @@ def test_solve_implicit_jvp_of_aux_with_pytree_p():
     # theta* = (s/5, 2s/5) with s = p["scale"]; aux vec = (theta0*s, theta1)
     # has d/ds = (theta0 + s/5, 2/5) = (2s/5, 2/5). The int32 p leaf takes a
     # float0 tangent and the int32 aux leaf produces one.
-    def residual(theta, args, p):
-        del args
+    def residual(theta, _, p):
         aux = {
             "vec": jnp.array([theta[0] * p["scale"], theta[1]]),
             "count": jnp.asarray(1, dtype=jnp.int32),
@@ -2123,8 +2101,7 @@ def test_solve_implicit_jvp_of_aux_with_pytree_p():
 
 
 def test_solve_implicit_vjp_of_aux_wrt_p():
-    def residual(theta, args, p):
-        del args
+    def residual(theta, _, p):
         aux = {
             "m": theta[0] * theta[1] + p**2,
             "count": jnp.asarray(1, dtype=jnp.int32),
@@ -2219,8 +2196,7 @@ def test_solve_implicit_ad_unaffected_by_cache_init_inside_trace():
     # residual evaluation outside the custom_jvp boundary. Its outputs are
     # shape-derived constants, so the implicit JVP/VJP wrt p must be
     # identical to the uncached solver's.
-    def residual(theta, args, p):
-        del args
+    def residual(theta, _, p):
         return jnp.array([theta[0] + 2.0 * theta[1] - p])
 
     cached = UnderdeterminedLevenbergMarquardt(
@@ -2245,8 +2221,7 @@ def test_solve_implicit_ad_unaffected_by_cache_init_inside_trace():
 def test_solve_derivative_wrt_x0_is_zero_by_contract():
     # The implicit rule differentiates only wrt p; the initial guess is
     # treated as fixed, so tangents on x0 are zero rather than an error.
-    def residual(theta, args, p):
-        del args
+    def residual(theta, _, p):
         return jnp.array([theta[0] + 2.0 * theta[1] - p])
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)

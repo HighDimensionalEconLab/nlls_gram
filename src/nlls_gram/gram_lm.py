@@ -1063,13 +1063,11 @@ def _solve_loop_impl(
     )
 
     def cond(carry):
-        _, _, _, _, _, step, status, stop = carry
-        del status
+        _, _, _, _, _, step, _, stop = carry
         return (~stop) & (step < max_steps)
 
     def body(carry):
-        x, lm_state, args, user_state, info, step, status, stop = carry
-        del info, status, stop
+        x, lm_state, args, user_state, _, step, _, _ = carry
         x_old, lm_state_old = x, lm_state
         x, lm_state, info = solver.update(x, lm_state, args, p)
         step = step + jnp.asarray(1, dtype=jnp.int32)

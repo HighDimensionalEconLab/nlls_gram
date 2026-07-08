@@ -4,8 +4,7 @@ import jax.numpy as jnp
 from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
-def _gsl_rosenbrock_residual(theta, args, p):
-    del args
+def _gsl_rosenbrock_residual(theta, _, p):
     # GSL's geodesic acceleration example uses this modified Rosenbrock canyon.
     return jnp.array([100.0 * (theta[1] - theta[0] ** 2), 1.0 - theta[0]])
 
