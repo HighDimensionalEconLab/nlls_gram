@@ -265,6 +265,10 @@ class UnderdeterminedLevenbergMarquardt:
                 return transpose_fn(cotangent)[0]
 
             grad = JT(resid)
+            # Typed tolerances keep CG's internal scalar ops in the residual
+            # dtype when x64 is enabled for a float32 problem.
+            cg_tol = jnp.asarray(self.iterative_tol, dtype=resid.dtype)
+            cg_atol = jnp.asarray(self.iterative_atol, dtype=resid.dtype)
 
             def gram_matvec(cotangent):
                 return jvp_fn(self.metric_solve(JT(cotangent))) + damping * cotangent
@@ -273,8 +277,8 @@ class UnderdeterminedLevenbergMarquardt:
                 dual_solution, _ = jsp_sparse_linalg.cg(
                     gram_matvec,
                     rhs,
-                    tol=self.iterative_tol,
-                    atol=self.iterative_atol,
+                    tol=cg_tol,
+                    atol=cg_atol,
                     maxiter=self.iterative_maxiter,
                 )
                 return -self.metric_solve(JT(dual_solution))
@@ -717,12 +721,13 @@ def _solve_loop_impl(
     callback,
 ):
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
-    atol = jnp.asarray(atol)
-    gtol = jnp.asarray(gtol)
-    xtol = jnp.asarray(xtol)
     info = solver._initial_info(params, state, aux, p)
     # Recast so the while_loop carry dtype matches what update() returns (the
-    # residual dtype), which init()'s default float may disagree with.
+    # residual dtype), which init()'s default float may disagree with; the
+    # tolerances likewise so all comparisons run in the residual dtype.
+    atol = jnp.asarray(atol, dtype=info.loss.dtype)
+    gtol = jnp.asarray(gtol, dtype=info.loss.dtype)
+    xtol = jnp.asarray(xtol, dtype=info.loss.dtype)
     state = LMState(jnp.asarray(state.damping, dtype=info.loss.dtype))
     initial_state = state
     step = jnp.asarray(0, dtype=jnp.int32)

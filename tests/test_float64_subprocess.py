@@ -48,6 +48,14 @@ assert info.grad_norm.dtype == jnp.float64
 assert info.step_norm.dtype == jnp.float64
 jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, (x, y)))(params, state))
 assert "f32" not in jaxpr, jaxpr
+solve_jaxpr = str(
+    jax.make_jaxpr(
+        lambda p: solver.solve(
+            p, (x, y), max_steps=20, atol=1e-8, gtol=1e-10, xtol=1e-10
+        ).params
+    )(params)
+)
+assert "f32" not in solve_jaxpr, solve_jaxpr
 
 
 def quadratic_residual(theta, target, p):
@@ -77,6 +85,12 @@ assert info.grad_norm.dtype == jnp.float64
 assert info.step_norm.dtype == jnp.float64
 jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, target))(theta, state))
 assert "f32" not in jaxpr, jaxpr
+solve_jaxpr = str(
+    jax.make_jaxpr(
+        lambda p: solver.solve(p, target, max_steps=20, atol=1e-10).params
+    )(theta)
+)
+assert "f32" not in solve_jaxpr, solve_jaxpr
 
 
 def linear_residual(theta, aux, p):
@@ -233,6 +247,20 @@ for jit in (True, False):
     assert int(result.status) == LMStatus.CONVERGED, int(result.status)
     assert result.state.damping.dtype == jnp.float32, result.state.damping.dtype
     assert result.params.dtype == jnp.float32
+
+# All compute ops must stay float32; only call-boundary scalars (tolerances,
+# default-dtype init damping) may arrive as f64 before being converted.
+jaxpr = str(
+    jax.make_jaxpr(
+        lambda p, a: solver.solve(
+            p, a, max_steps=40, atol=1e-5, gtol=1e-6, xtol=1e-6
+        ).params
+    )(jnp.zeros(1, dtype=jnp.float32), jnp.ones(1, dtype=jnp.float32))
+)
+for line in jaxpr.splitlines():
+    stripped = line.strip()
+    if " = " in stripped and ":f64[" in stripped.split(" = ")[0]:
+        assert "convert_element_type" in stripped, stripped
 """
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],

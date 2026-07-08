@@ -754,15 +754,26 @@ with a custom metric.
 
 ## Dtypes and Pytrees
 
-Dtypes flow from `params` and the residual. `init(dtype=None)` uses JAX's default
-floating dtype; pass an explicit dtype if needed. Enable x64 before creating
-arrays if the problem should run in float64:
+Dtypes flow from `params` and the residual: every internal scalar (damping,
+damping factors, tolerances, metric quantities) is cast to the residual dtype,
+so a float32 problem computes purely in float32 and a float64 problem purely
+in float64 — no example needs explicit dtypes beyond its data. Enable x64
+before creating arrays if the problem should run in float64:
 
 ```python
 import jax
 
 jax.config.update("jax_enable_x64", True)
 ```
+
+`init(dtype=None)` uses JAX's default floating dtype; pass an explicit dtype
+only when the problem does not use the default float (e.g. a float32 problem
+with x64 enabled). Even then, `solve` recasts the damping and tolerances to
+the residual dtype, so a default `init()` still produces a pure-float32 solve;
+the explicit dtype only matters for keeping a jitted `update` loop's signature
+stable across steps. One known exception: `linear_solver="lsmr"` currently
+fails for float32 problems when x64 is enabled, due to a dtype-promotion bug
+inside Lineax's LSMR; the other three solvers handle that mixed configuration.
 
 `update` optimizes exactly the `params` pytree you pass. With Flax NNX, pass only
 the trainable state to the solver and merge it with frozen state inside
