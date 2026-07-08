@@ -10,9 +10,13 @@ optional callback control. With has_aux=True the residual returns
 (residual, aux) and the aux output is reported on LMInfo. An optional Metric
 defines a positive-definite parameter-space metric for LM damping. The solver
 depends only on JAX plus Lineax for LSMR.
+
+Tuning heuristics (solver selection, damping, inner-solve scheduling):
+https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/
 """
 
 from nlls_gram.gram_lm import (
+    LMHyperparams,
     LMInfo,
     LMSolveAction,
     LMSolveContext,
@@ -26,6 +30,7 @@ from nlls_gram.metrics import Metric, metric_from_cholesky
 __all__ = [
     "UnderdeterminedLevenbergMarquardt",
     "LMState",
+    "LMHyperparams",
     "LMInfo",
     "LMStatus",
     "LMSolveAction",

@@ -1,0 +1,9 @@
+# nlls_gram
+
+> Metric-aware underdetermined Levenberg-Marquardt nonlinear least squares for JAX pytrees (residual count m << parameter count n). Per-step update(), a jitted solve() loop with resettable hyperparameters and callbacks, implicit differentiation with respect to external parameters p, and pluggable parameter-space metrics (kernel/RKHS).
+
+## Docs
+
+- [Tuning guide — read first for solver selection and hyperparameter heuristics](https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/)
+- [Main docs — API contracts, solve loop, callbacks, cookbook, implicit AD](https://highdimensionaleconlab.github.io/nlls_gram/)
+- [Metric Gauss-Newton — minimum-norm math and kernel metric choices](https://highdimensionaleconlab.github.io/nlls_gram/gauss_newton/)

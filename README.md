@@ -157,6 +157,12 @@ of the chosen linear solver.
 
 Full docs: https://highdimensionaleconlab.github.io/nlls_gram/
 
+Working with an AI assistant? Point it at
+[`docs/tuning_guide.md`](https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/)
+if it doesn't pick it up automatically — solver selection, damping heuristics,
+inner-solve scheduling, and failure signatures, written to be read by humans
+and agents alike (also indexed via the site's `llms.txt`).
+
 For a broader JAX nonlinear solver library, see
 [Optimistix](https://github.com/patrick-kidger/optimistix). `nlls_gram` is more
 specialized: it focuses on underdetermined nonlinear least-squares, residual

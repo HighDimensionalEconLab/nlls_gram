@@ -33,14 +33,61 @@ class LMStatus:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
+class LMHyperparams:
+    """Per-step LM hyperparameters, carried in ``LMState.hyper``.
+
+    All fields are traced values, so a ``solve`` callback can reset them —
+    e.g. grow the inner CG budget as the loss falls — via
+    ``dataclasses.replace(ctx.lm_state, hyper=dataclasses.replace(
+    ctx.lm_state.hyper, iterative_maxiter=...))``. A field constructed as
+    ``None`` (uncapped ``max_damping``, unlimited ``iterative_maxiter``) is
+    compiled out and stays ``None``. Static configuration (``linear_solver``,
+    ``geodesic_acceleration``, ``cache_jacobian``, ``has_aux``, the metric)
+    shapes the compiled program and lives on the solver, not here.
+    """
+
+    damping_decrease: jax.Array
+    damping_increase: jax.Array
+    max_damping: jax.Array | None
+    geodesic_acceptance_ratio: jax.Array
+    iterative_tol: jax.Array
+    iterative_atol: jax.Array
+    iterative_maxiter: jax.Array | None
+    lsmr_conlim: jax.Array
+
+
+def _cast_hyper(hyper, dtype):
+    if hyper is None:
+        return None
+    return LMHyperparams(
+        jnp.asarray(hyper.damping_decrease, dtype=dtype),
+        jnp.asarray(hyper.damping_increase, dtype=dtype),
+        None
+        if hyper.max_damping is None
+        else jnp.asarray(hyper.max_damping, dtype=dtype),
+        jnp.asarray(hyper.geodesic_acceptance_ratio, dtype=dtype),
+        jnp.asarray(hyper.iterative_tol, dtype=dtype),
+        jnp.asarray(hyper.iterative_atol, dtype=dtype),
+        None
+        if hyper.iterative_maxiter is None
+        else jnp.asarray(hyper.iterative_maxiter, dtype=jnp.int32),
+        jnp.asarray(hyper.lsmr_conlim, dtype=dtype),
+    )
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
 class LMState:
     damping: jax.Array
     # Jacobian cache (cache_jacobian=True only): residual, J', and aux at the
     # current x; jacobian_valid means the last step was rejected so x did not move.
-    resid: Any = None
-    Jt: Any = None
-    jacobian_valid: Any = None
-    aux: Any = None
+    resid: jax.Array | None = None
+    Jt: jax.Array | None = None
+    jacobian_valid: jax.Array | None = None
+    aux: Any = None  # arbitrary residual aux pytree
+    # LMHyperparams from init()/solve(); None falls back to the constructor
+    # values (identical compiled code).
+    hyper: LMHyperparams | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -279,15 +326,34 @@ class UnderdeterminedLevenbergMarquardt:
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
 
+    def hyperparams(self, dtype=None):
+        """``LMHyperparams`` built from the constructor values."""
+        return LMHyperparams(
+            jnp.asarray(self.damping_decrease, dtype=dtype),
+            jnp.asarray(self.damping_increase, dtype=dtype),
+            None
+            if self.max_damping is None
+            else jnp.asarray(self.max_damping, dtype=dtype),
+            jnp.asarray(self.geodesic_acceptance_ratio, dtype=dtype),
+            jnp.asarray(self.iterative_tol, dtype=dtype),
+            jnp.asarray(self.iterative_atol, dtype=dtype),
+            None
+            if self.iterative_maxiter is None
+            else jnp.asarray(self.iterative_maxiter, dtype=jnp.int32),
+            jnp.asarray(self.lsmr_conlim, dtype=dtype),
+        )
+
     def init(self, x0, args=None, *, p=None):
-        # One residual evaluation types the damping to match what update()
-        # returns (keeping the jit signature and solve-loop carry stable) and
-        # sizes the Jacobian cache buffers when cache_jacobian=True.
+        # One residual evaluation types the damping and hyperparameters to
+        # match what update() returns (keeping the jit signature and
+        # solve-loop carry stable) and sizes the Jacobian cache buffers when
+        # cache_jacobian=True.
         self._check_residual_args(args, p)
         residual, aux = self._residual_and_aux(x0, args, p)
         damping = jnp.asarray(self.init_damping, dtype=residual.dtype)
+        hyper = self.hyperparams(residual.dtype)
         if not self.cache_jacobian:
-            return LMState(damping)
+            return LMState(damping, hyper=hyper)
         theta, _ = ravel_pytree(x0)
         return LMState(
             damping,
@@ -295,6 +361,7 @@ class UnderdeterminedLevenbergMarquardt:
             jnp.zeros((theta.size, residual.size), dtype=residual.dtype),
             jnp.asarray(False, dtype=jnp.bool_),
             jax.tree.map(jnp.zeros_like, aux),
+            hyper,
         )
 
     def _residual_and_aux(self, x, args, p):
@@ -389,8 +456,16 @@ class UnderdeterminedLevenbergMarquardt:
                 resid, pullback = jax.vjp(residual_flat, theta)
                 aux = None
         damping = jnp.asarray(lm_state.damping, dtype=resid.dtype)
-        damping_decrease = jnp.asarray(self.damping_decrease, dtype=resid.dtype)
-        damping_increase = jnp.asarray(self.damping_increase, dtype=resid.dtype)
+        # Traced hyperparameters from the lm_state when present (resettable by
+        # solve callbacks); the None fallback compiles to the same constants
+        # as reading the constructor values directly.
+        hyper = (
+            lm_state.hyper
+            if lm_state.hyper is not None
+            else self.hyperparams(resid.dtype)
+        )
+        damping_decrease = jnp.asarray(hyper.damping_decrease, dtype=resid.dtype)
+        damping_increase = jnp.asarray(hyper.damping_increase, dtype=resid.dtype)
 
         if self.linear_solver == "cg":
             transpose_fn = jax.linear_transpose(jvp_fn, theta)
@@ -400,8 +475,8 @@ class UnderdeterminedLevenbergMarquardt:
 
             grad = JT(resid)
             # Typed tolerances keep CG's scalars in the residual dtype under x64.
-            cg_tol = jnp.asarray(self.iterative_tol, dtype=resid.dtype)
-            cg_atol = jnp.asarray(self.iterative_atol, dtype=resid.dtype)
+            cg_tol = jnp.asarray(hyper.iterative_tol, dtype=resid.dtype)
+            cg_atol = jnp.asarray(hyper.iterative_atol, dtype=resid.dtype)
 
             def gram_matvec(cotangent):
                 return jvp_fn(self.metric_solve(JT(cotangent))) + damping * cotangent
@@ -412,7 +487,7 @@ class UnderdeterminedLevenbergMarquardt:
                     rhs,
                     tol=cg_tol,
                     atol=cg_atol,
-                    maxiter=self.iterative_maxiter,
+                    maxiter=hyper.iterative_maxiter,
                 )
                 return -self.metric_solve(JT(dual_solution))
 
@@ -435,10 +510,10 @@ class UnderdeterminedLevenbergMarquardt:
                 jax.ShapeDtypeStruct(theta.shape, theta.dtype),
             )
             lsmr_solver = lx.LSMR(
-                rtol=self.iterative_tol,
-                atol=self.iterative_atol,
-                max_steps=self.iterative_maxiter,
-                conlim=self.lsmr_conlim,
+                rtol=jnp.asarray(hyper.iterative_tol, dtype=resid.dtype),
+                atol=jnp.asarray(hyper.iterative_atol, dtype=resid.dtype),
+                max_steps=hyper.iterative_maxiter,
+                conlim=jnp.asarray(hyper.lsmr_conlim, dtype=resid.dtype),
             )
 
             def solve_step(rhs):
@@ -524,7 +599,7 @@ class UnderdeterminedLevenbergMarquardt:
         # Geodesic second-order correction, solved with the same factorization.
         if self.geodesic_acceleration:
             geodesic_acceptance_ratio = jnp.asarray(
-                self.geodesic_acceptance_ratio, dtype=resid.dtype
+                hyper.geodesic_acceptance_ratio, dtype=resid.dtype
             )
 
             def first_jvp(th):
@@ -572,15 +647,19 @@ class UnderdeterminedLevenbergMarquardt:
         # Damping update: decrease on acceptance, increase on rejection.
         damping_factor = jnp.where(improved, damping_decrease, damping_increase)
         new_damping = damping * damping_factor
-        if self.max_damping is not None:
+        if hyper.max_damping is not None:
             new_damping = jnp.minimum(
-                new_damping, jnp.asarray(self.max_damping, dtype=resid.dtype)
+                new_damping, jnp.asarray(hyper.max_damping, dtype=resid.dtype)
             )
         loss = jnp.where(improved, loss_candidate, loss_old)
+        # The input hyper (not the fallback) passes through so the loop carry
+        # structure and dtypes are stable.
         if self.cache_jacobian:
-            new_lm_state = LMState(new_damping, resid, Jt, ~improved, aux)
+            new_lm_state = LMState(
+                new_damping, resid, Jt, ~improved, aux, lm_state.hyper
+            )
         else:
-            new_lm_state = LMState(new_damping)
+            new_lm_state = LMState(new_damping, hyper=lm_state.hyper)
         return (
             unravel(theta_new),
             new_lm_state,
@@ -636,12 +715,14 @@ class UnderdeterminedLevenbergMarquardt:
         if xtol < 0:
             raise ValueError("xtol must be nonnegative")
         if lm_state is None:
-            # The loop recasts the damping dtype itself; only the Jacobian
-            # cache needs an eager init() for the shapes.
+            # The loop recasts the damping and hyperparameter dtypes itself;
+            # only the Jacobian cache needs an eager init() for the shapes.
             if self.cache_jacobian:
                 lm_state = self.init(x0, args, p=p)
             else:
-                lm_state = LMState(jnp.asarray(self.init_damping))
+                lm_state = LMState(
+                    jnp.asarray(self.init_damping), hyper=self.hyperparams()
+                )
 
         @jax.custom_jvp
         def solve_with_implicit_p(
@@ -832,7 +913,9 @@ class UnderdeterminedLevenbergMarquardt:
     ):
         info = self._initial_info(x, lm_state, args, p)
         lm_state = dataclasses.replace(
-            lm_state, damping=jnp.asarray(lm_state.damping, dtype=info.loss.dtype)
+            lm_state,
+            damping=jnp.asarray(lm_state.damping, dtype=info.loss.dtype),
+            hyper=_cast_hyper(lm_state.hyper, info.loss.dtype),
         )
         initial_lm_state = lm_state
         status = LMStatus.RUNNING
@@ -919,13 +1002,15 @@ def _solve_loop_impl(
 ):
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
     info = solver._initial_info(x, lm_state, args, p)
-    # Recast damping and tolerances to the residual dtype so the while_loop
-    # carry matches what update() returns.
+    # Recast damping, hyperparameters, and tolerances to the residual dtype so
+    # the while_loop carry matches what update() returns.
     atol = jnp.asarray(atol, dtype=info.loss.dtype)
     gtol = jnp.asarray(gtol, dtype=info.loss.dtype)
     xtol = jnp.asarray(xtol, dtype=info.loss.dtype)
     lm_state = dataclasses.replace(
-        lm_state, damping=jnp.asarray(lm_state.damping, dtype=info.loss.dtype)
+        lm_state,
+        damping=jnp.asarray(lm_state.damping, dtype=info.loss.dtype),
+        hyper=_cast_hyper(lm_state.hyper, info.loss.dtype),
     )
     initial_lm_state = lm_state
     step = jnp.asarray(0, dtype=jnp.int32)

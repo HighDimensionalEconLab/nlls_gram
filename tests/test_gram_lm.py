@@ -1459,6 +1459,95 @@ def test_callback_bare_lm_state_with_cache_raises_clear_error():
         solver.solve(jnp.zeros(1), jnp.ones(1), max_steps=3, callback=callback)
 
 
+def test_init_populates_typed_hyperparams():
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    lm_state = solver.init({"a": 1.0, "b": 0.0}, (ts, ys))
+
+    assert lm_state.hyper.damping_decrease.dtype == jnp.float32
+    assert lm_state.hyper.iterative_maxiter.dtype == jnp.int32
+    assert lm_state.hyper.max_damping is None
+
+
+def test_bare_lm_state_matches_hyper_lm_state_update():
+    # hyper=None falls back to the constructor values, so both states must
+    # produce the same step.
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+
+    x_hyper, _, info_hyper = solver.update(x, solver.init(x, (ts, ys)), (ts, ys))
+    x_bare, _, info_bare = solver.update(
+        x, LMState(jnp.asarray(1e-2, dtype=jnp.float32)), (ts, ys)
+    )
+
+    assert jnp.allclose(x_hyper["a"], x_bare["a"])
+    assert jnp.allclose(x_hyper["b"], x_bare["b"])
+    assert jnp.allclose(info_hyper.loss, info_bare.loss)
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_callback_grows_cg_budget_when_loss_small(jit):
+    # The cookbook schedule: cheap CG steps far from the solution, accurate
+    # ones near it, inside a single solve call.
+    matrix = jnp.diag(jnp.logspace(0.0, 1.5, 8))
+    target = jnp.linspace(1.0, 2.0, 8)
+
+    def residual(theta, args, p):
+        del args, p
+        return matrix @ theta - target
+
+    def grow_budget(ctx):
+        grown = jnp.asarray(40, dtype=jnp.int32)
+        new_maxiter = jnp.where(
+            ctx.info.loss < 1.0, grown, ctx.lm_state.hyper.iterative_maxiter
+        )
+        new_hyper = dataclasses.replace(
+            ctx.lm_state.hyper, iterative_maxiter=new_maxiter
+        )
+        return LMSolveAction(
+            lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper)
+        )
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-1, linear_solver="cg", iterative_maxiter=2
+    )
+    theta0 = jnp.zeros(8)
+    fixed = solver.solve(theta0, max_steps=60, jit=jit)
+    scheduled = solver.solve(theta0, max_steps=60, callback=grow_budget, jit=jit)
+
+    assert int(scheduled.lm_state.hyper.iterative_maxiter) == 40
+    assert float(scheduled.info.loss) < 1e-2 * float(fixed.info.loss)
+
+
+def test_callback_resets_max_damping_cap():
+    # Every step rejects (NaN candidates), so damping grows; the callback
+    # tightens the traced cap mid-solve.
+    def residual(theta, args, p):
+        del p
+        return jnp.where(theta[0] == 0.0, theta + args, jnp.full_like(theta, jnp.nan))
+
+    def cap_damping(ctx):
+        new_hyper = dataclasses.replace(
+            ctx.lm_state.hyper, max_damping=jnp.asarray(10.0, dtype=jnp.float32)
+        )
+        return LMSolveAction(
+            lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper)
+        )
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1.0, max_damping=1e6
+    )
+    result = solver.solve(
+        jnp.zeros(1), jnp.asarray([1.0]), max_steps=20, callback=cap_damping
+    )
+
+    assert int(result.status) == LMStatus.MAX_STEPS
+    assert float(result.lm_state.damping) <= 10.0
+
+
 def test_solve_callback_history_buffer_matches_update_loop():
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)

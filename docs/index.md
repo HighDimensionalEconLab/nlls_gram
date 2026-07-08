@@ -355,6 +355,30 @@ unchanged. The callback may set `stop`, `status`, `x`, `lm_state`, `args`, or
 or `args`, that step's tolerance checks are skipped — the diagnostics describe
 the pre-action problem — and resume after the next update.
 
+### Resettable Hyperparameters
+
+`init()` and `solve()` populate `lm_state.hyper` with an `LMHyperparams` of
+traced per-step values: `damping_decrease`, `damping_increase`, `max_damping`,
+`geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`,
+`iterative_maxiter`, and `lsmr_conlim`. Because they ride in the lm_state, a
+callback can reset any of them mid-solve — exactly like a damping reset:
+
+```python
+new_hyper = dataclasses.replace(
+    ctx.lm_state.hyper, iterative_maxiter=jnp.asarray(40, jnp.int32)
+)
+return LMSolveAction(lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper))
+```
+
+Two contracts: knobs constructed as `None` (uncapped `max_damping`, unlimited
+`iterative_maxiter`) are compiled out and stay `None` — a callback cannot turn
+them on; and replacement values must be arrays of the same dtype (use
+`jnp.asarray`/`jnp.where`), since they live in the jitted loop carry. Static
+configuration — `linear_solver`, `geodesic_acceleration`, `cache_jacobian`,
+`has_aux`, the metric — shapes the compiled program and stays on the solver.
+A hand-built `LMState(damping)` with `hyper=None` falls back to the
+constructor values and compiles to the same program as before.
+
 Under `jit=True`, callbacks must be JAX-traceable and return the same pytree
 structure on every iteration. Use `jnp.where` or `jax.lax.cond` for
 data-dependent choices rather than Python `if` statements over arrays.
@@ -507,6 +531,39 @@ result = solver.solve(
 (`dataclasses` here is the standard-library module.) This recipe composes
 with `cache_jacobian=True` without extra care: any action that changes the
 values of `x` or `args` invalidates the Jacobian cache automatically.
+
+### Scheduled Inner-Solve Accuracy
+
+With `linear_solver="cg"`, cheap inexact steps are fine far from the solution
+(the accept/reject test absorbs them), but near convergence step quality
+limits the rate. Grow the CG budget once the loss crosses a threshold —
+one solve call, so implicit differentiation still applies:
+
+```python
+solver = UnderdeterminedLevenbergMarquardt(
+    residual_fn, linear_solver="cg", iterative_maxiter=2
+)
+
+
+def grow_budget(ctx):
+    new_maxiter = jnp.where(
+        ctx.info.loss < 1e-2,
+        jnp.asarray(40, jnp.int32),
+        ctx.lm_state.hyper.iterative_maxiter,
+    )
+    new_hyper = dataclasses.replace(ctx.lm_state.hyper, iterative_maxiter=new_maxiter)
+    return LMSolveAction(lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper))
+
+
+result = solver.solve(x0, args, max_steps=200, atol=1e-8, callback=grow_budget)
+```
+
+Alternatively, a relative `iterative_tol` adapts the inner accuracy
+automatically (CG's stopping test scales with the right-hand side, which is
+the shrinking outer residual). For a dense endgame instead, chain two solves:
+a coarse CG stage, then a Cholesky solver warm-started with `result.x` and
+`result.lm_state` — the implicit derivative is unaffected since it is defined
+at the returned solution only.
 
 ### Validation Early Stopping
 
@@ -957,6 +1014,8 @@ narrower and focuses on underdetermined LM with explicit parameter-space metrics
 ::: nlls_gram.metric_from_cholesky
 
 ::: nlls_gram.LMState
+
+::: nlls_gram.LMHyperparams
 
 ::: nlls_gram.LMInfo
 
