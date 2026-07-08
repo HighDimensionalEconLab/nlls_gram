@@ -43,3 +43,4 @@ extra_javascript:
 
 nav:
   - Home: index.md
+  - Metric Gauss-Newton: gauss_newton.md
