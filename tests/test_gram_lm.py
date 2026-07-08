@@ -1747,3 +1747,56 @@ def test_solve_implicit_jvp_works_with_has_aux():
 
     x, x_dot = jax.jvp(solved_x, (jnp.asarray(3.0),), (jnp.asarray(0.7),))
     assert jnp.allclose(x_dot, jnp.array([0.7 / 5.0, 1.4 / 5.0]), atol=1e-6)
+
+
+def test_solve_callback_wall_clock_time_limit():
+    # The cookbook recipe: read the host clock via io_callback with the start
+    # time and budget carried in user_state.
+    import time
+
+    import numpy as np
+    from jax.experimental import io_callback
+
+    time_limit_status = 100
+
+    def over_time_budget(start_and_budget, _step):
+        start, budget = start_and_budget
+        return np.bool_(time.perf_counter() - float(start) > float(budget))
+
+    def time_limit_callback(ctx):
+        timed_out = io_callback(
+            over_time_budget,
+            jax.ShapeDtypeStruct((), jnp.bool_),
+            ctx.user_state,
+            ctx.step,
+        )
+        return LMSolveAction(stop=timed_out, status=time_limit_status)
+
+    def residual(x, args):
+        return jnp.sin(x) - args
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    x0 = jnp.zeros(64)
+    target = jnp.full(64, 0.5)
+
+    # exhausted budget: stops immediately with the custom status
+    result = solver.solve(
+        x0,
+        target,
+        max_steps=50,
+        callback=time_limit_callback,
+        user_state=jnp.asarray([time.perf_counter(), 0.0]),
+    )
+    assert int(result.status) == time_limit_status
+    assert int(result.steps) == 1
+
+    # generous budget: runs to a normal stopping rule
+    result = solver.solve(
+        x0,
+        target,
+        max_steps=50,
+        atol=1e-6,
+        callback=time_limit_callback,
+        user_state=jnp.asarray([time.perf_counter(), 1e9]),
+    )
+    assert int(result.status) == LMStatus.CONVERGED

@@ -507,6 +507,54 @@ def validation_callback(ctx):
 Evaluating validation metrics every step costs a residual pass per step; gate
 it on an epoch boundary with `jax.lax.cond` if it is expensive.
 
+### Wall-Clock Time Limit
+
+There is no traced clock in JAX, so a jitted loop reads the current time from
+the host with `jax.experimental.io_callback`. The start time and budget ride
+in `user_state` (traced values — a closure would bake the start time into the
+compiled loop and force a recompile per solve), and passing `ctx.step` to the
+host call keeps it from being hoisted out of the loop:
+
+```python
+import time
+
+import numpy as np
+from jax.experimental import io_callback
+
+TIME_LIMIT_STATUS = 100  # any int outside the LMStatus constants
+
+
+def over_time_budget(start_and_budget, _step):
+    start, budget = start_and_budget
+    return np.bool_(time.perf_counter() - float(start) > float(budget))
+
+
+def time_limit_callback(ctx):
+    timed_out = io_callback(
+        over_time_budget,
+        jax.ShapeDtypeStruct((), jnp.bool_),
+        ctx.user_state,  # (start_time, budget_seconds)
+        ctx.step,  # loop-varying arg so the call cannot be hoisted
+    )
+    return LMSolveAction(stop=timed_out, status=TIME_LIMIT_STATUS)
+
+
+result = solver.solve(
+    x0,
+    args,
+    max_steps=100_000,
+    callback=time_limit_callback,
+    user_state=jnp.asarray([time.perf_counter(), 15.0]),
+)
+timed_out = int(result.status) == TIME_LIMIT_STATUS
+```
+
+The host round-trip costs a fraction of a millisecond per step — negligible
+for substantial problems, but prefer the host-loop pattern when steps are
+microseconds. Under the default float32, storing `time.perf_counter()` in
+`user_state` can round the start time by up to ~0.1s on long-uptime systems;
+treat the budget as coarse.
+
 ### Fixed-Size History Recording
 
 Record per-step diagnostics into preallocated buffers sized by `max_steps`,
