@@ -12,8 +12,8 @@ from jax.flatten_util import ravel_pytree
 
 from nlls_gram.metrics import Metric
 
-# General-JAX least-squares solver: a class exposing init() -> state,
-# update(x, state, args, p) -> (new_x, state, info), and a solve()
+# General-JAX least-squares solver: a class exposing init() -> lm_state,
+# update(x, lm_state, args, p) -> (new_x, lm_state, info), and a solve()
 # convenience loop. x is ANY pytree
 # (a flat array, a dict, nnx.state(model, nnx.Param), ...); the solver only ravels
 # and unravels it with jax.flatten_util.ravel_pytree and calls the user's
@@ -78,7 +78,7 @@ class LMSolveAction:
     stop: Any = None
     status: Any = None
     x: Any = None
-    state: Any = None
+    lm_state: Any = None
     args: Any = None
     user_state: Any = None
 
@@ -91,9 +91,9 @@ class LMSolveContext:
     step: jax.Array
     x: Any
     x_old: Any
-    state: LMState
-    state_old: LMState
-    initial_state: LMState
+    lm_state: LMState
+    lm_state_old: LMState
+    initial_lm_state: LMState
     args: Any
     p: Any
     user_state: Any
@@ -106,7 +106,7 @@ class LMSolveResult:
     """Final result returned by ``solve``."""
 
     x: Any
-    state: LMState
+    lm_state: LMState
     info: LMInfo
     steps: jax.Array
     status: jax.Array
@@ -301,7 +301,7 @@ class UnderdeterminedLevenbergMarquardt:
             return jnp.ravel(value), aux
         return jnp.ravel(self.residual_fn(x, args, p)), None
 
-    def _initial_info(self, x, state, args, p):
+    def _initial_info(self, x, lm_state, args, p):
         # grad_norm is a +inf sentinel (computing it would cost a Jacobian
         # before the first step) and step_norm is zero; neither can satisfy
         # gtol/xtol before any update has run.
@@ -314,7 +314,7 @@ class UnderdeterminedLevenbergMarquardt:
             loss,
             loss,
             jnp.asarray(False, dtype=jnp.bool_),
-            jnp.asarray(state.damping, dtype=residual.dtype),
+            jnp.asarray(lm_state.damping, dtype=residual.dtype),
             one,
             jnp.asarray(False, dtype=jnp.bool_),
             zero,
@@ -323,7 +323,7 @@ class UnderdeterminedLevenbergMarquardt:
             aux,
         )
 
-    def update(self, x, state, args=None, p=None):
+    def update(self, x, lm_state, args=None, p=None):
         self._check_residual_args(args, p)
         theta, unravel = ravel_pytree(x)
 
@@ -350,10 +350,10 @@ class UnderdeterminedLevenbergMarquardt:
                 resid, jvp_fn = jax.linearize(residual_flat, theta)
                 aux = None
         elif self.cache_jacobian:
-            if state.jacobian_valid is None:
+            if lm_state.jacobian_valid is None:
                 raise ValueError(
-                    "cache_jacobian=True but the state has no Jacobian cache; "
-                    "create the state with init(x, args, p=p)"
+                    "cache_jacobian=True but the lm_state has no Jacobian cache; "
+                    "create the lm_state with init(x, args, p=p)"
                 )
 
             def compute_resid_and_jt(_):
@@ -369,10 +369,10 @@ class UnderdeterminedLevenbergMarquardt:
                 return resid, Jt, aux
 
             def reuse_resid_and_jt(_):
-                return state.resid, state.Jt, state.aux
+                return lm_state.resid, lm_state.Jt, lm_state.aux
 
             resid, Jt, aux = jax.lax.cond(
-                state.jacobian_valid,
+                lm_state.jacobian_valid,
                 reuse_resid_and_jt,
                 compute_resid_and_jt,
                 operand=None,
@@ -383,7 +383,7 @@ class UnderdeterminedLevenbergMarquardt:
             else:
                 resid, pullback = jax.vjp(residual_flat, theta)
                 aux = None
-        damping = jnp.asarray(state.damping, dtype=resid.dtype)
+        damping = jnp.asarray(lm_state.damping, dtype=resid.dtype)
         damping_decrease = jnp.asarray(self.damping_decrease, dtype=resid.dtype)
         damping_increase = jnp.asarray(self.damping_increase, dtype=resid.dtype)
 
@@ -568,12 +568,12 @@ class UnderdeterminedLevenbergMarquardt:
             )
         loss = jnp.where(improved, loss_candidate, loss_old)
         if self.cache_jacobian:
-            new_state = LMState(new_damping, resid, Jt, ~improved, aux)
+            new_lm_state = LMState(new_damping, resid, Jt, ~improved, aux)
         else:
-            new_state = LMState(new_damping)
+            new_lm_state = LMState(new_damping)
         return (
             unravel(theta_new),
-            new_state,
+            new_lm_state,
             LMInfo(
                 loss,
                 loss_old,
@@ -595,7 +595,7 @@ class UnderdeterminedLevenbergMarquardt:
         args=None,
         *,
         p=None,
-        state=None,
+        lm_state=None,
         max_steps=256,
         atol=0.0,
         gtol=0.0,
@@ -613,7 +613,7 @@ class UnderdeterminedLevenbergMarquardt:
         threshold; each tolerance set to ``0`` disables that check, and all
         three report ``LMStatus.CONVERGED``. ``callback`` receives an
         ``LMSolveContext`` after each step and may return an ``LMSolveAction`` to
-        stop, override x/state/args, or update user state. ``p`` is passed to
+        stop, override x/lm_state/args, or update user lm_state. ``p`` is passed to
         the residual and callback but cannot be replaced by the action.
         """
         self._check_residual_args(args, p)
@@ -625,22 +625,22 @@ class UnderdeterminedLevenbergMarquardt:
             raise ValueError("gtol must be nonnegative")
         if xtol < 0:
             raise ValueError("xtol must be nonnegative")
-        if state is None:
+        if lm_state is None:
             # init() would evaluate the residual eagerly just for the dtype,
             # which the loop's recast makes unnecessary; only the Jacobian
             # cache genuinely needs the shapes.
             if self.cache_jacobian:
-                state = self.init(x0, args, p=p)
+                lm_state = self.init(x0, args, p=p)
             else:
-                state = LMState(jnp.asarray(self.init_damping))
+                lm_state = LMState(jnp.asarray(self.init_damping))
 
         @jax.custom_jvp
         def solve_with_implicit_p(
-            x, state, args, p, user_state, max_steps, atol, gtol, xtol
+            x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
         ):
             return self._solve_impl(
                 x,
-                state,
+                lm_state,
                 args,
                 p,
                 user_state,
@@ -654,10 +654,10 @@ class UnderdeterminedLevenbergMarquardt:
 
         @solve_with_implicit_p.defjvp
         def solve_with_implicit_p_jvp(primals, tangents):
-            x, state, args, p, user_state, max_steps, atol, gtol, xtol = primals
+            x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol = primals
             _, _, _, p_dot, _, _, _, _, _ = tangents
             result = solve_with_implicit_p(
-                x, state, args, p, user_state, max_steps, atol, gtol, xtol
+                x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
             )
             x_dot = self._implicit_x_tangent_from_p(
                 result.x, result.args, result.p, p_dot
@@ -667,7 +667,7 @@ class UnderdeterminedLevenbergMarquardt:
                 result,
                 LMSolveResult(
                     x_dot,
-                    zero_result.state,
+                    zero_result.lm_state,
                     zero_result.info,
                     zero_result.steps,
                     zero_result.status,
@@ -679,13 +679,13 @@ class UnderdeterminedLevenbergMarquardt:
             )
 
         return solve_with_implicit_p(
-            x0, state, args, p, user_state, max_steps, atol, gtol, xtol
+            x0, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
         )
 
     def _solve_impl(
         self,
         x,
-        state,
+        lm_state,
         args,
         p,
         user_state,
@@ -700,7 +700,7 @@ class UnderdeterminedLevenbergMarquardt:
             return _solve_loop_jit(
                 self,
                 x,
-                state,
+                lm_state,
                 args,
                 p,
                 user_state,
@@ -712,7 +712,7 @@ class UnderdeterminedLevenbergMarquardt:
             )
         return self._solve_python(
             x,
-            state,
+            lm_state,
             args,
             p,
             user_state,
@@ -757,12 +757,12 @@ class UnderdeterminedLevenbergMarquardt:
             return LMSolveAction()
         return action
 
-    def _apply_action(self, action, x, state, args, user_state):
+    def _apply_action(self, action, x, lm_state, args, user_state):
         action = self._action_or_default(action)
         if action.x is not None:
             x = action.x
-        if action.state is not None:
-            state = action.state
+        if action.lm_state is not None:
+            lm_state = action.lm_state
         if action.args is not None:
             args = action.args
         if action.user_state is not None:
@@ -772,10 +772,10 @@ class UnderdeterminedLevenbergMarquardt:
         # check is structural (did the action include the field), which is why
         # it composes with jit: values are traced, presence is not.
         if self.cache_jacobian and (action.x is not None or action.args is not None):
-            state = dataclasses.replace(
-                state, jacobian_valid=jnp.asarray(False, dtype=jnp.bool_)
+            lm_state = dataclasses.replace(
+                lm_state, jacobian_valid=jnp.asarray(False, dtype=jnp.bool_)
             )
-        return action, x, state, args, user_state
+        return action, x, lm_state, args, user_state
 
     def _check_residual_args(self, args, p):
         # A residual that never sees args/p must not have them silently
@@ -801,7 +801,7 @@ class UnderdeterminedLevenbergMarquardt:
     def _solve_python(
         self,
         x,
-        state,
+        lm_state,
         args,
         p,
         user_state,
@@ -811,11 +811,11 @@ class UnderdeterminedLevenbergMarquardt:
         xtol,
         callback,
     ):
-        info = self._initial_info(x, state, args, p)
-        state = dataclasses.replace(
-            state, damping=jnp.asarray(state.damping, dtype=info.loss.dtype)
+        info = self._initial_info(x, lm_state, args, p)
+        lm_state = dataclasses.replace(
+            lm_state, damping=jnp.asarray(lm_state.damping, dtype=info.loss.dtype)
         )
-        initial_state = state
+        initial_lm_state = lm_state
         status = LMStatus.RUNNING
         steps = 0
         if not bool(jnp.isfinite(info.loss)):
@@ -827,8 +827,8 @@ class UnderdeterminedLevenbergMarquardt:
             if status != LMStatus.RUNNING:
                 steps -= 1
                 break
-            x_old, state_old = x, state
-            x, state, info = self.update(x, state, args, p)
+            x_old, lm_state_old = x, lm_state
+            x, lm_state, info = self.update(x, lm_state, args, p)
             if not bool(jnp.isfinite(info.loss)):
                 status = LMStatus.NONFINITE
                 break
@@ -838,17 +838,17 @@ class UnderdeterminedLevenbergMarquardt:
                     jnp.asarray(steps, dtype=jnp.int32),
                     x,
                     x_old,
-                    state,
-                    state_old,
-                    initial_state,
+                    lm_state,
+                    lm_state_old,
+                    initial_lm_state,
                     args,
                     p,
                     user_state,
                     info,
                 )
                 action = callback(ctx)
-            action, x, state, args, user_state = self._apply_action(
-                action, x, state, args, user_state
+            action, x, lm_state, args, user_state = self._apply_action(
+                action, x, lm_state, args, user_state
             )
             if action.stop is not None and bool(action.stop):
                 status = (
@@ -870,7 +870,7 @@ class UnderdeterminedLevenbergMarquardt:
             final_aux = self._residual_and_aux(x, args, p)[1]
         return LMSolveResult(
             x,
-            state,
+            lm_state,
             info,
             jnp.asarray(steps, dtype=jnp.int32),
             jnp.asarray(status, dtype=jnp.int32),
@@ -884,7 +884,7 @@ class UnderdeterminedLevenbergMarquardt:
 def _solve_loop_impl(
     solver,
     x,
-    state,
+    lm_state,
     args,
     p,
     user_state,
@@ -895,17 +895,17 @@ def _solve_loop_impl(
     callback,
 ):
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
-    info = solver._initial_info(x, state, args, p)
+    info = solver._initial_info(x, lm_state, args, p)
     # Recast so the while_loop carry dtype matches what update() returns (the
     # residual dtype), which init()'s default float may disagree with; the
     # tolerances likewise so all comparisons run in the residual dtype.
     atol = jnp.asarray(atol, dtype=info.loss.dtype)
     gtol = jnp.asarray(gtol, dtype=info.loss.dtype)
     xtol = jnp.asarray(xtol, dtype=info.loss.dtype)
-    state = dataclasses.replace(
-        state, damping=jnp.asarray(state.damping, dtype=info.loss.dtype)
+    lm_state = dataclasses.replace(
+        lm_state, damping=jnp.asarray(lm_state.damping, dtype=info.loss.dtype)
     )
-    initial_state = state
+    initial_lm_state = lm_state
     step = jnp.asarray(0, dtype=jnp.int32)
     initial_nonfinite = ~jnp.isfinite(info.loss)
     initial_converged = solver._converged(info, atol, gtol, xtol)
@@ -926,10 +926,10 @@ def _solve_loop_impl(
         return (~stop) & (step < max_steps)
 
     def body(carry):
-        x, state, args, user_state, info, step, status, stop = carry
+        x, lm_state, args, user_state, info, step, status, stop = carry
         del info, status, stop
-        x_old, state_old = x, state
-        x, state, info = solver.update(x, state, args, p)
+        x_old, lm_state_old = x, lm_state
+        x, lm_state, info = solver.update(x, lm_state, args, p)
         step = step + jnp.asarray(1, dtype=jnp.int32)
         current_nonfinite = ~jnp.isfinite(info.loss)
 
@@ -939,17 +939,17 @@ def _solve_loop_impl(
                 step,
                 x,
                 x_old,
-                state,
-                state_old,
-                initial_state,
+                lm_state,
+                lm_state_old,
+                initial_lm_state,
                 args,
                 p,
                 user_state,
                 info,
             )
             action = callback(ctx)
-        action, x, state, args, user_state = solver._apply_action(
-            action, x, state, args, user_state
+        action, x, lm_state, args, user_state = solver._apply_action(
+            action, x, lm_state, args, user_state
         )
 
         callback_stop = (
@@ -980,18 +980,20 @@ def _solve_loop_impl(
                 ),
             ),
         )
-        return x, state, args, user_state, info, step, status, stop
+        return x, lm_state, args, user_state, info, step, status, stop
 
     carry = jax.lax.while_loop(
         cond,
         body,
-        (x, state, args, user_state, info, step, status, stop),
+        (x, lm_state, args, user_state, info, step, status, stop),
     )
-    x, state, args, user_state, info, step, status, _ = carry
+    x, lm_state, args, user_state, info, step, status, _ = carry
     final_aux = None
     if solver.has_aux:
         final_aux = solver._residual_and_aux(x, args, p)[1]
-    return LMSolveResult(x, state, info, step, status, args, p, user_state, final_aux)
+    return LMSolveResult(
+        x, lm_state, info, step, status, args, p, user_state, final_aux
+    )
 
 
 _solve_loop_jit = jax.jit(_solve_loop_impl, static_argnums=(0, 10))

@@ -32,12 +32,12 @@ params = {
     "b": jnp.asarray(0.0, dtype=jnp.float64),
 }
 solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-state = solver.init(params, (x, y))
+lm_state = solver.init(params, (x, y))
 for _ in range(5):
-    params, state, info = solver.update(params, state, (x, y))
+    params, lm_state, info = solver.update(params, lm_state, (x, y))
 
 assert_float64_tree(params)
-assert state.damping.dtype == jnp.float64
+assert lm_state.damping.dtype == jnp.float64
 assert info.loss.dtype == jnp.float64
 assert info.loss_old.dtype == jnp.float64
 assert info.loss_candidate.dtype == jnp.float64
@@ -46,7 +46,7 @@ assert info.damping_factor.dtype == jnp.float64
 assert info.acceleration_ratio.dtype == jnp.float64
 assert info.grad_norm.dtype == jnp.float64
 assert info.step_norm.dtype == jnp.float64
-jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, (x, y)))(params, state))
+jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, (x, y)))(params, lm_state))
 assert "f32" not in jaxpr, jaxpr
 solve_jaxpr = str(
     jax.make_jaxpr(
@@ -70,11 +70,11 @@ solver = UnderdeterminedLevenbergMarquardt(
     geodesic_acceleration=True,
     geodesic_acceptance_ratio=1.0,
 )
-state = solver.init(theta, target)
-theta, state, info = solver.update(theta, state, target)
+lm_state = solver.init(theta, target)
+theta, lm_state, info = solver.update(theta, lm_state, target)
 
 assert theta.dtype == jnp.float64
-assert state.damping.dtype == jnp.float64
+assert lm_state.damping.dtype == jnp.float64
 assert info.loss.dtype == jnp.float64
 assert info.loss_old.dtype == jnp.float64
 assert info.loss_candidate.dtype == jnp.float64
@@ -83,7 +83,7 @@ assert info.damping_factor.dtype == jnp.float64
 assert info.acceleration_ratio.dtype == jnp.float64
 assert info.grad_norm.dtype == jnp.float64
 assert info.step_norm.dtype == jnp.float64
-jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, target))(theta, state))
+jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, target))(theta, lm_state))
 assert "f32" not in jaxpr, jaxpr
 solve_jaxpr = str(
     jax.make_jaxpr(
@@ -108,11 +108,11 @@ solver = UnderdeterminedLevenbergMarquardt(
     iterative_tol=1e-10,
     iterative_maxiter=20,
 )
-state = solver.init(theta, (matrix, target))
-theta, state, info = solver.update(theta, state, (matrix, target))
+lm_state = solver.init(theta, (matrix, target))
+theta, lm_state, info = solver.update(theta, lm_state, (matrix, target))
 
 assert theta.dtype == jnp.float64
-assert state.damping.dtype == jnp.float64
+assert lm_state.damping.dtype == jnp.float64
 assert info.loss.dtype == jnp.float64
 assert info.loss_old.dtype == jnp.float64
 assert info.loss_candidate.dtype == jnp.float64
@@ -122,7 +122,7 @@ assert info.acceleration_ratio.dtype == jnp.float64
 assert info.grad_norm.dtype == jnp.float64
 assert info.step_norm.dtype == jnp.float64
 jaxpr = str(
-    jax.make_jaxpr(lambda p, s: solver.update(p, s, (matrix, target)))(theta, state)
+    jax.make_jaxpr(lambda p, s: solver.update(p, s, (matrix, target)))(theta, lm_state)
 )
 assert "f32" not in jaxpr, jaxpr
 
@@ -138,11 +138,11 @@ solver = UnderdeterminedLevenbergMarquardt(
     init_damping=1e-2,
     linear_solver="qr",
 )
-state = solver.init(theta, (matrix, target))
-theta, state, info = solver.update(theta, state, (matrix, target))
+lm_state = solver.init(theta, (matrix, target))
+theta, lm_state, info = solver.update(theta, lm_state, (matrix, target))
 
 assert theta.dtype == jnp.float64
-assert state.damping.dtype == jnp.float64
+assert lm_state.damping.dtype == jnp.float64
 assert info.loss.dtype == jnp.float64
 assert info.loss_old.dtype == jnp.float64
 assert info.loss_candidate.dtype == jnp.float64
@@ -152,7 +152,7 @@ assert info.acceleration_ratio.dtype == jnp.float64
 assert info.grad_norm.dtype == jnp.float64
 assert info.step_norm.dtype == jnp.float64
 jaxpr = str(
-    jax.make_jaxpr(lambda p, s: solver.update(p, s, (matrix, target)))(theta, state)
+    jax.make_jaxpr(lambda p, s: solver.update(p, s, (matrix, target)))(theta, lm_state)
 )
 assert "f32" not in jaxpr, jaxpr
 
@@ -187,14 +187,14 @@ def nnx_residual_fn(params, args, p):
 
 
 solver = UnderdeterminedLevenbergMarquardt(nnx_residual_fn, init_damping=1e-12)
-state = solver.init(nnx_params, (x_nnx, y_nnx))
-nnx_params, state, info = solver.update(nnx_params, state, (x_nnx, y_nnx))
+lm_state = solver.init(nnx_params, (x_nnx, y_nnx))
+nnx_params, lm_state, info = solver.update(nnx_params, lm_state, (x_nnx, y_nnx))
 trained = nnx.merge(graphdef, nnx_params)
 
 assert_float64_tree(nnx_params)
 assert trained.linear.kernel[...].dtype == jnp.float64
 assert jnp.allclose(trained.linear.kernel[...], jnp.asarray([[2.0]], dtype=jnp.float64))
-assert state.damping.dtype == jnp.float64
+assert lm_state.damping.dtype == jnp.float64
 assert info.loss.dtype == jnp.float64
 assert info.loss_old.dtype == jnp.float64
 assert info.loss_candidate.dtype == jnp.float64
@@ -205,7 +205,7 @@ assert info.grad_norm.dtype == jnp.float64
 assert info.step_norm.dtype == jnp.float64
 jaxpr = str(
     jax.make_jaxpr(lambda p, s: solver.update(p, s, (x_nnx, y_nnx)))(
-        nnx_params, state
+        nnx_params, lm_state
     )
 )
 assert "f32" not in jaxpr, jaxpr
@@ -220,7 +220,7 @@ assert "f32" not in jaxpr, jaxpr
 
 
 def test_solve_with_float32_problem_under_x64_keeps_state_dtype_consistent():
-    # Regression: solve(state=None) used to build the damping in the default
+    # Regression: solve(lm_state=None) used to build the damping in the default
     # float (float64 under x64) while update() returned it in the residual
     # dtype, mismatching the while_loop carry for float32 problems.
     script = r"""
@@ -245,7 +245,7 @@ for jit in (True, False):
         jit=jit,
     )
     assert int(result.status) == LMStatus.CONVERGED, int(result.status)
-    assert result.state.damping.dtype == jnp.float32, result.state.damping.dtype
+    assert result.lm_state.damping.dtype == jnp.float32, result.lm_state.damping.dtype
     assert result.x.dtype == jnp.float32
 
 # All compute ops must stay float32; only call-boundary scalars (tolerances,

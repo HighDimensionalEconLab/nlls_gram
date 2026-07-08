@@ -16,23 +16,23 @@ def _make_problem(*, n_residuals, n_params):
         return jnp.sin(design @ theta) - y
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
-    state = solver.init(params, (design, y))
+    lm_state = solver.init(params, (design, y))
 
     @jax.jit
-    def step(params, state):
-        return solver.update(params, state, (design, y))
+    def step(params, lm_state):
+        return solver.update(params, lm_state, (design, y))
 
-    return params, state, step
+    return params, lm_state, step
 
 
 def _benchmark_update(benchmark, *, n_residuals, n_params):
-    params, state, step = _make_problem(n_residuals=n_residuals, n_params=n_params)
+    params, lm_state, step = _make_problem(n_residuals=n_residuals, n_params=n_params)
 
-    warmup = step(params, state)
+    warmup = step(params, lm_state)
     jax.block_until_ready(warmup)
 
     def run():
-        out = step(params, state)
+        out = step(params, lm_state)
         jax.block_until_ready(out)
         return out
 

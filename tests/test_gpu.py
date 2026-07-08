@@ -36,13 +36,13 @@ def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
     with jax.default_device(gpu):
         theta = jnp.asarray([1.9])
         target = jnp.asarray(4.0)
-        state = solver.init(theta, target)
+        lm_state = solver.init(theta, target)
 
     @jax.jit
-    def step(theta, state, target):
-        return solver.update(theta, state, target)
+    def step(theta, lm_state, target):
+        return solver.update(theta, lm_state, target)
 
-    theta_new, state_new, info = step(theta, state, target)
+    theta_new, state_new, info = step(theta, lm_state, target)
     theta_new.block_until_ready()
 
     assert bool(info.accepted)
@@ -71,15 +71,15 @@ def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
     with jax.default_device(gpu):
         theta = jnp.asarray([1.9])
         target = jnp.asarray(4.0)
-        state = solver.init(theta, target)
+        lm_state = solver.init(theta, target)
 
     @jax.jit
-    def step(theta, state, target):
-        return solver.update(theta, state, target)
+    def step(theta, lm_state, target):
+        return solver.update(theta, lm_state, target)
 
-    jax.block_until_ready(step(theta, state, target))
+    jax.block_until_ready(step(theta, lm_state, target))
     with jax.transfer_guard_device_to_host("disallow"):
-        theta_new, state_new, info = step(theta, state, target)
+        theta_new, state_new, info = step(theta, lm_state, target)
         jax.block_until_ready((theta_new, state_new, info))
 
     for leaf in jax.tree.leaves((theta_new, state_new, info)):

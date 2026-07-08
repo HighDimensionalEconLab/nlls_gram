@@ -57,20 +57,20 @@ def _make_large_interpolation_problem(
         geodesic_acceleration=geodesic_acceleration,
     )
 
-    state = jax.device_put(base_solver.init(params, args), device)
+    lm_state = jax.device_put(base_solver.init(params, args), device)
 
     @jax.jit
-    def first_step(params, state):
-        return base_solver.update(params, state, args)
+    def first_step(params, lm_state):
+        return base_solver.update(params, lm_state, args)
 
-    params, state, _ = first_step(params, state)
-    jax.block_until_ready((params, state))
+    params, lm_state, _ = first_step(params, lm_state)
+    jax.block_until_ready((params, lm_state))
 
     @jax.jit
-    def step(params, state):
-        return solver.update(params, state, args)
+    def step(params, lm_state):
+        return solver.update(params, lm_state, args)
 
-    return params, state, step
+    return params, lm_state, step
 
 
 @pytest.mark.parametrize("platform", ["cpu", "gpu"])
@@ -90,17 +90,17 @@ def test_large_rbf_interpolation_second_update(
     if not _devices(platform):
         pytest.skip(f"JAX {platform!r} backend is not available")
 
-    params, state, step = _make_large_interpolation_problem(
+    params, lm_state, step = _make_large_interpolation_problem(
         platform=platform,
         linear_solver=linear_solver,
         geodesic_acceleration=geodesic_acceleration,
     )
 
-    warmup = step(params, state)
+    warmup = step(params, lm_state)
     jax.block_until_ready(warmup)
 
     def run():
-        out = step(params, state)
+        out = step(params, lm_state)
         jax.block_until_ready(out)
         return out
 

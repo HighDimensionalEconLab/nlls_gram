@@ -48,7 +48,7 @@ ignore the second argument. Passing `args` or `p` to `update`/`solve` when the
 residual does not accept it raises a `ValueError` rather than silently
 dropping it.
 
-`update(x, state, args=None, p=None)` performs one LM step. The higher-level
+`update(x, lm_state, args=None, p=None)` performs one LM step. The higher-level
 `solve(x, args=None, *, p=None, ...)` loop repeatedly calls `update` and
 returns an `LMSolveResult`.
 
@@ -261,16 +261,16 @@ ys = 2.0 * jnp.exp(-1.0 * ts)
 x = {"a": 1.0, "b": 0.0}
 
 solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-state = solver.init(x, (ts, ys))
+lm_state = solver.init(x, (ts, ys))
 
 
 @jax.jit
-def train_step(x, state):
-    return solver.update(x, state, (ts, ys))
+def train_step(x, lm_state):
+    return solver.update(x, lm_state, (ts, ys))
 
 
 for _ in range(50):
-    x, state, info = train_step(x, state)
+    x, lm_state, info = train_step(x, lm_state)
 
 print(x["a"], x["b"])
 ```
@@ -330,13 +330,13 @@ Callbacks receive an `LMSolveContext`:
 | Field | Meaning |
 | --- | --- |
 | `step` | One-based step number just completed. |
-| `x`, `state`, `info` | Accepted/rejected step result and LM diagnostics. |
-| `x_old`, `state_old` | Values before that step. |
-| `initial_state` | State supplied to `solve` or created by `init`. |
+| `x`, `lm_state`, `info` | Accepted/rejected step result and LM diagnostics. |
+| `x_old`, `lm_state_old` | Values before that step. |
+| `initial_lm_state` | State supplied to `solve` or created by `init`. |
 | `args`, `p`, `user_state` | Current auxiliary data, read-only external data, and user state. |
 
 A callback returns `None` or `LMSolveAction(...)`. Omitted action fields are left
-unchanged. The callback may set `stop`, `status`, `x`, `state`, `args`, or
+unchanged. The callback may set `stop`, `status`, `x`, `lm_state`, `args`, or
 `user_state`; it cannot replace `p`.
 
 Under `jit=True`, callbacks must be JAX-traceable and return the same pytree
@@ -387,10 +387,10 @@ import time
 
 train_step = jax.jit(solver.update)
 
-state = solver.init(x, args)
+lm_state = solver.init(x, args)
 start = time.perf_counter()
 for step in range(max_steps):
-    x, state, info = train_step(x, state, args)
+    x, lm_state, info = train_step(x, lm_state, args)
     if not bool(jnp.isfinite(info.loss_candidate)):
         break  # diverged
     if float(info.loss) < loss_threshold:
@@ -413,7 +413,7 @@ def logging_callback(ctx):
         "step {step}: loss={loss:.3e} damping={damping:.1e}",
         step=ctx.step,
         loss=ctx.info.loss,
-        damping=ctx.state.damping,
+        damping=ctx.lm_state.damping,
     )
 
 
@@ -430,7 +430,7 @@ def logging_callback(ctx):
             "step {step}: loss={loss:.3e} damping={damping:.1e}",
             step=ctx.step,
             loss=ctx.info.loss,
-            damping=ctx.state.damping,
+            damping=ctx.lm_state.damping,
         )
 
     jax.lax.cond(ctx.step % 10 == 0, log, lambda _: None, operand=None)
@@ -471,12 +471,12 @@ def epoch_callback(ctx):
     new_args = jax.tree.map(
         lambda new, old: jnp.where(boundary, new, old), resampled, ctx.args
     )
-    new_state = dataclasses.replace(
-        ctx.state,
-        damping=jnp.where(boundary, ctx.initial_state.damping, ctx.state.damping),
+    new_lm_state = dataclasses.replace(
+        ctx.lm_state,
+        damping=jnp.where(boundary, ctx.initial_lm_state.damping, ctx.lm_state.damping),
     )
     new_key = jnp.where(boundary, key, ctx.user_state)
-    return LMSolveAction(args=new_args, state=new_state, user_state=new_key)
+    return LMSolveAction(args=new_args, lm_state=new_lm_state, user_state=new_key)
 
 
 result = solver.solve(
@@ -620,7 +620,7 @@ matrix-free solvers never materialize a Jacobian, so it is ignored for them.
 solver = UnderdeterminedLevenbergMarquardt(
     residual_fn, init_damping=1e-2, cache_jacobian=True
 )
-state = solver.init(x0, args)  # x0 required to size the cache
+lm_state = solver.init(x0, args)  # x0 required to size the cache
 ```
 
 Caveats:
@@ -631,13 +631,13 @@ Caveats:
   resampling and similar recipes need no extra care — the step after a data
   swap always recomputes). The one remaining hazard is a **manual `update()`
   loop** that changes `args` between steps (minibatching): there the solver
-  cannot see the swap, so either leave the cache off or reset the state with
-  `dataclasses.replace(state, jacobian_valid=jnp.asarray(False))`. A stale
+  cannot see the swap, so either leave the cache off or reset the lm_state with
+  `dataclasses.replace(lm_state, jacobian_valid=jnp.asarray(False))`. A stale
   cache fails silently, with steps taken against the old Jacobian.
 - `LMState` now carries an `(n_params, n_residuals)` buffer for the whole
   solve — relevant on GPU memory budgets.
-- Callbacks that rebuild the state must preserve the cache fields — use
-  `dataclasses.replace(ctx.state, damping=...)`, not a bare
+- Callbacks that rebuild the lm_state must preserve the cache fields — use
+  `dataclasses.replace(ctx.lm_state, damping=...)`, not a bare
   `LMState(damping)`.
 - When rejections never happen the cache costs essentially nothing at run
   time (measured at or below noise on CPU and GPU), so for fixed-data
@@ -649,12 +649,15 @@ Caveats:
 - The optimized pytree is now called `x` (`x0` for the initial guess in
   `solve`/`init`), freeing "parameters" for the structural parameters `p`;
   `result.params` is now `result.x`.
+- The solver state is now `lm_state` everywhere (`solve(lm_state=...)`,
+  `ctx.lm_state`/`lm_state_old`/`initial_lm_state`, `result.lm_state`,
+  `LMSolveAction(lm_state=...)`), disambiguating it from `user_state`.
 - `residual_fn(params, batch)` is now `residual_fn(x, args)` (or with a
   third read-only `p` argument); `update(params, state, batch)` is
-  `update(x, state, args, p=None)`. One-argument residuals that close
+  `update(x, lm_state, args, p=None)`. One-argument residuals that close
   over their data are also accepted. The name `args` follows Optimistix;
   `aux` is reserved for extra residual *outputs* via `has_aux=True`.
-- `init(dtype)` is now `init(x0, args, p=...)` — the state dtype is
+- `init(dtype)` is now `init(x0, args, p=...)` — the lm_state dtype is
   inferred from one residual evaluation instead of being passed by hand.
   `solve` no longer takes `dtype`.
 - The four `metric_*` constructor kwargs and the dict-returning
@@ -900,7 +903,7 @@ jax.config.update("jax_enable_x64", True)
 ```
 
 `init(x0, args, p=...)` mirrors `update`'s data arguments: it evaluates
-the residual once and types the state (and any Jacobian cache buffers) from
+the residual once and types the lm_state (and any Jacobian cache buffers) from
 the actual problem, so there is no dtype argument to get wrong — including
 for problems that do not use the default float (e.g. a float32 problem with
 x64 enabled). `solve` likewise recasts the damping and tolerances to the

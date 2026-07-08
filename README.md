@@ -74,16 +74,16 @@ ys = 2.0 * jnp.exp(-1.0 * ts)
 x = {"a": 1.0, "b": 0.0}
 
 solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-state = solver.init(x, (ts, ys))
+lm_state = solver.init(x, (ts, ys))
 
 
 @jax.jit
-def train_step(x, state):
-    return solver.update(x, state, (ts, ys))
+def train_step(x, lm_state):
+    return solver.update(x, lm_state, (ts, ys))
 
 
 for _ in range(50):
-    x, state, info = train_step(x, state)
+    x, lm_state, info = train_step(x, lm_state)
 
 print(x["a"], x["b"])  # approximately 2.0, -1.0
 ```
