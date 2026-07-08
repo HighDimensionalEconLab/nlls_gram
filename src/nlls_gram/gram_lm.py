@@ -205,8 +205,8 @@ class UnderdeterminedLevenbergMarquardt:
         lsmr_conlim=float("inf"),
         metric=None,
         has_aux=False,
-        cache_jacobian=False,
-        geodesic_acceleration=False,
+        cache_jacobian=True,
+        geodesic_acceleration=True,
         geodesic_acceptance_ratio=0.75,
     ):
         # The residual may take (x), (x, args), or (x, args, p), always in that
@@ -292,7 +292,9 @@ class UnderdeterminedLevenbergMarquardt:
                 )
         if has_custom_metric and geodesic_acceleration and metric.norm is None:
             raise ValueError(
-                "geodesic_acceleration with a custom metric requires metric.norm"
+                "geodesic_acceleration (on by default) with a custom metric "
+                "requires metric.norm; provide it or pass "
+                "geodesic_acceleration=False"
             )
         self.residual_fn = canonical_residual
         self.residual_arity = residual_arity

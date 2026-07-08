@@ -164,8 +164,9 @@ Validation rules:
   `metric.solve`.
 - For `linear_solver in {"qr", "lsmr"}`, a custom metric requires both
   `metric.inv_sqrt` and `metric.inv_sqrt_transpose`.
-- If `geodesic_acceleration=True` and a custom metric is supplied,
-  `metric.norm` is required.
+- If geodesic acceleration is enabled (the default) and a custom metric is
+  supplied, `metric.norm` is required — supply it or pass
+  `geodesic_acceleration=False`.
 - The solver does not infer `norm`, `inv_sqrt`, or `inv_sqrt_transpose` from
   `solve`.
 
@@ -687,7 +688,8 @@ losses = result.user_state["loss"][: int(result.steps)]
 
 A rejected LM step leaves the parameters unchanged, so the next update's
 residual and Jacobian are identical — only the damping changed. With
-`cache_jacobian=True` the solver carries `(resid, Jt)` in `LMState` and a
+`cache_jacobian=True` (the default) the solver carries `(resid, Jt)` in
+`LMState` and a
 rejected step's successor skips the residual evaluation and the
 `n_residuals` VJP passes, re-solving only the small damped system (roughly
 2x faster per rejected step; more when the residual is expensive relative to
@@ -695,9 +697,7 @@ the Gram assembly). The flag only affects `linear_solver="cholesky"` — the
 matrix-free solvers never materialize a Jacobian, so it is ignored for them.
 
 ```python
-solver = UnderdeterminedLevenbergMarquardt(
-    residual_fn, init_damping=1e-2, cache_jacobian=True
-)
+solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
 lm_state = solver.init(x0, args)  # x0 required to size the cache
 ```
 
@@ -719,8 +719,9 @@ Caveats:
   `dataclasses.replace(ctx.lm_state, damping=...)`, not a bare
   `LMState(damping)`.
 - When rejections never happen the cache costs essentially nothing at run
-  time, so for fixed-data problems it is safe to enable unconditionally; it
-  is off by default only because of the manual-loop hazard.
+  time, which is why it is on by default; pass `cache_jacobian=False` for
+  manual minibatch loops (the hazard above) or when the buffer does not fit
+  GPU memory.
 
 ## Implicit Differentiation
 
@@ -942,9 +943,10 @@ iteration; it changes the step being solved for.
 
 ## Geodesic Acceleration
 
-Geodesic acceleration is off by default. When enabled, the solver computes the
-second-order residual directional term with JAX forward-over-forward JVPs. The
-same metric-damped linear solve computes the acceleration.
+Geodesic acceleration is on by default (`geodesic_acceleration=False`
+disables it). The solver computes the second-order residual directional term
+with JAX forward-over-forward JVPs; the same metric-damped linear solve
+computes the acceleration.
 
 With a custom metric, the acceptance ratio uses the metric norm:
 

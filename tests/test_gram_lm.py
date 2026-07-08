@@ -53,7 +53,9 @@ def test_default_metric_matches_explicit_identity_metric_solve():
 
     default_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     identity_solver = UnderdeterminedLevenbergMarquardt(
-        residual_fn, init_damping=1e-2, metric=Metric(solve=lambda x: x)
+        residual_fn,
+        init_damping=1e-2,
+        metric=Metric(solve=lambda x: x, norm=jnp.linalg.norm),
     )
 
     default_x, default_state, default_info = default_solver.update(
@@ -133,7 +135,13 @@ def test_update_calls_residual_and_uses_values():
     assert jnp.allclose(new_x["a"], 2.0, atol=1e-4)
 
 
-def test_default_disabled_geodesic_uses_minimal_residual_evaluations():
+def test_defaults_enable_geodesic_and_jacobian_cache():
+    solver = UnderdeterminedLevenbergMarquardt(lambda x: x)
+    assert solver.geodesic_acceleration
+    assert solver.cache_jacobian
+
+
+def test_geodesic_off_uses_minimal_residual_evaluations():
     calls = {"count": 0}
 
     def residual(x, args, p):
@@ -145,7 +153,9 @@ def test_default_disabled_geodesic_uses_minimal_residual_evaluations():
     ys = 2.0 * ts
     x = {"a": 0.0}
 
-    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-4)
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-4, geodesic_acceleration=False, cache_jacobian=False
+    )
     lm_state = solver.init(x, (ts, ys))
     calls["count"] = 0
     solver.update(x, lm_state, (ts, ys))
@@ -1152,6 +1162,9 @@ def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
         init_damping=1e-2,
         linear_solver=linear_solver,
         metric=metric,
+        # The qr case deliberately supplies a square-root-only metric (no
+        # norm), which the geodesic default would reject at construction.
+        geodesic_acceleration=False,
     )
 
     def solved_x(p):
@@ -1291,7 +1304,9 @@ def test_solve_does_not_retrace_on_loop_control_changes():
         traces["count"] += 1
         return theta - args
 
-    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, cache_jacobian=False
+    )
     solver.solve(jnp.array([0.0]), jnp.array([1.0]), max_steps=10, atol=1e-6)
     count_after_first = traces["count"]
     solver.solve(
@@ -1480,7 +1495,9 @@ def test_bare_lm_state_matches_hyper_lm_state_update():
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": 1.0, "b": 0.0}
-    solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual_fn, init_damping=1e-2, cache_jacobian=False
+    )
 
     x_hyper, _, info_hyper = solver.update(x, solver.init(x, (ts, ys)), (ts, ys))
     x_bare, _, info_bare = solver.update(
@@ -1773,8 +1790,9 @@ def test_cache_jacobian_single_step_matches_fresh_solver_after_rejection():
     ys = 2.0 * jnp.exp(-1.0 * ts)
     args = (ts, ys)
     kw = {"init_damping": 1e-8, "damping_decrease": 0.01, "damping_increase": 100.0}
+    kw["geodesic_acceleration"] = False  # float noise can flip its gate
     cached = UnderdeterminedLevenbergMarquardt(residual_fn, cache_jacobian=True, **kw)
-    plain = UnderdeterminedLevenbergMarquardt(residual_fn, **kw)
+    plain = UnderdeterminedLevenbergMarquardt(residual_fn, cache_jacobian=False, **kw)
 
     x = {"a": 1.0, "b": 3.0}
     lm_state = cached.init(x0=x, args=args)
@@ -1853,7 +1871,12 @@ def test_cache_jacobian_off_leaves_no_trace_in_the_jaxpr():
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
 
-    plain = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    plain = UnderdeterminedLevenbergMarquardt(
+        residual_fn,
+        init_damping=1e-2,
+        cache_jacobian=False,
+        geodesic_acceleration=False,
+    )
     cached = UnderdeterminedLevenbergMarquardt(
         residual_fn, init_damping=1e-2, cache_jacobian=True
     )

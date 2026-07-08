@@ -9,26 +9,23 @@ and `n` the parameter count; the package targets `m << n`.
 ## Starting Point
 
 ```python
-solver = UnderdeterminedLevenbergMarquardt(
-    residual_fn,
-    geodesic_acceleration=True,
-    cache_jacobian=True,  # if data is fixed during the solve
-)
+solver = UnderdeterminedLevenbergMarquardt(residual_fn)
 result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
 ```
 
 - **`linear_solver="cholesky"` (the default) is the best first choice for
   small-to-medium `m`** — it factors the small `m × m` Gram system, so `n`
   only enters through matvecs.
-- **Enable `geodesic_acceleration=True` by default.** It costs one extra
+- **Geodesic acceleration is on by default** — it costs one extra
   directional derivative per step (plus one residual evaluation when the
   acceptance gate passes), the accept/reject test makes it safe, and on
   curved residuals it substantially cuts step counts. Near-linear problems
-  gain little — turn it off there if the extra evaluation matters.
-- **`cache_jacobian=True` makes rejected steps ~2x cheaper** at the cost of
-  an `(n_params, n_residuals)` state buffer (mind GPU memory at large `n`).
-  Leave it off for manual `update()` loops that swap `args`/`p` between steps
-  (stale-cache hazard).
+  gain little — `geodesic_acceleration=False` if the extra evaluation
+  matters. With a custom metric it requires `metric.norm`.
+- **The Jacobian cache is on by default** (rejected steps ~2x cheaper) at
+  the cost of an `(n_params, n_residuals)` state buffer. Pass
+  `cache_jacobian=False` for manual `update()` loops that swap `args`/`p`
+  between steps (stale-cache hazard) or when the buffer strains GPU memory.
 - Set `atol`/`gtol` rather than relying on `max_steps`: a converged solve
   that runs to `max_steps` wastes exactly the steps you didn't bound.
 
