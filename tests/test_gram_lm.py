@@ -1336,3 +1336,30 @@ def test_solve_callback_history_buffer_matches_update_loop():
         assert float(result.user_state["damping"][i]) == pytest.approx(
             float(loop_state.damping), rel=1e-6
         )
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_solve_callback_returning_none_leaves_loop_untouched(jit):
+    # The cookbook logging pattern: observe the context, return None.
+    def residual(theta, aux, p):
+        return theta - aux
+
+    def logging_callback(ctx):
+        def log(_):
+            jax.debug.print(
+                "step {step}: loss={loss:.3e}", step=ctx.step, loss=ctx.info.loss
+            )
+
+        jax.lax.cond(ctx.step % 10 == 0, log, lambda _: None, operand=None)
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    result = solver.solve(
+        jnp.array([0.0]),
+        jnp.array([1.0]),
+        max_steps=40,
+        atol=1e-6,
+        callback=logging_callback,
+        jit=jit,
+    )
+
+    assert int(result.status) == LMStatus.CONVERGED

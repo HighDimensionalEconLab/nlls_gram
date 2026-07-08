@@ -371,6 +371,44 @@ for step in range(max_steps):
 Reading `float(info.loss)` synchronizes with the device; for maximum
 throughput read diagnostics once per epoch rather than once per step.
 
+### Logging
+
+The simplest callback logs and returns `None`, which means "no stop, no
+overrides". Inside the jitted loop, printing goes through `jax.debug.print`:
+
+```python
+def logging_callback(ctx):
+    jax.debug.print(
+        "step {step}: loss={loss:.3e} damping={damping:.1e}",
+        step=ctx.step,
+        loss=ctx.info.loss,
+        damping=ctx.state.damping,
+    )
+
+
+result = solver.solve(params, aux, atol=1e-8, callback=logging_callback)
+```
+
+To log every `k`-th step, gate the print with `jax.lax.cond` rather than a
+Python `if`, since `ctx.step` is traced:
+
+```python
+def logging_callback(ctx):
+    def log(_):
+        jax.debug.print(
+            "step {step}: loss={loss:.3e} damping={damping:.1e}",
+            step=ctx.step,
+            loss=ctx.info.loss,
+            damping=ctx.state.damping,
+        )
+
+    jax.lax.cond(ctx.step % 10 == 0, log, lambda _: None, operand=None)
+```
+
+With `solve(..., jit=False)` the same callback runs as ordinary Python, so
+plain `print(float(ctx.info.loss))`, debuggers, and host-side libraries all
+work.
+
 ### Divergence Stop
 
 The default LM response to a nonfinite candidate is to reject the step and
