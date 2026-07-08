@@ -8,6 +8,8 @@ import jax.scipy.sparse.linalg as jsp_sparse_linalg
 import lineax as lx
 from jax.flatten_util import ravel_pytree
 
+from nlls_gram.metrics import Metric
+
 # General-JAX least-squares solver: a class exposing init() -> state,
 # update(params, state, aux, p) -> (new_params, state, info), and a solve()
 # convenience loop. params is ANY pytree
@@ -48,6 +50,8 @@ class LMInfo:
     damping_factor: jax.Array
     used_geodesic: jax.Array
     acceleration_ratio: jax.Array
+    grad_norm: jax.Array  # ||J' r|| at the pre-step params
+    step_norm: jax.Array  # ||candidate step||, reported even when rejected
 
 
 @jax.tree_util.register_dataclass
@@ -119,24 +123,19 @@ class UnderdeterminedLevenbergMarquardt:
         self,
         residual_fn,
         *,
-        jac="vjp",
         init_damping=1e-3,
         damping_decrease=0.5,
         damping_increase=4.0,
+        max_damping=None,
         linear_solver="cholesky",
         iterative_tol=0.0,
         iterative_atol=0.0,
         iterative_maxiter=8,
         lsmr_conlim=float("inf"),
-        metric_solve=None,
-        metric_norm=None,
-        metric_inv_sqrt=None,
-        metric_inv_sqrt_transpose=None,
+        metric=None,
         geodesic_acceleration=False,
         geodesic_acceptance_ratio=0.75,
     ):
-        if jac != "vjp":
-            raise ValueError(f'unknown jac: {jac}; only jac="vjp" is supported')
         if linear_solver not in ("cholesky", "qr", "cg", "lsmr"):
             raise ValueError(f"unknown linear_solver: {linear_solver}")
         if init_damping <= 0:
@@ -145,6 +144,8 @@ class UnderdeterminedLevenbergMarquardt:
             raise ValueError("damping_decrease must be positive")
         if damping_increase <= 0:
             raise ValueError("damping_increase must be positive")
+        if max_damping is not None and max_damping < init_damping:
+            raise ValueError("max_damping must be at least init_damping")
         if iterative_tol < 0:
             raise ValueError("iterative_tol must be nonnegative")
         if iterative_atol < 0:
@@ -157,54 +158,57 @@ class UnderdeterminedLevenbergMarquardt:
             )
         if lsmr_conlim <= 0:
             raise ValueError("lsmr_conlim must be positive")
+        if metric is None:
+            metric = Metric()
         has_custom_metric = any(
             cb is not None
             for cb in (
-                metric_solve,
-                metric_norm,
-                metric_inv_sqrt,
-                metric_inv_sqrt_transpose,
+                metric.solve,
+                metric.norm,
+                metric.inv_sqrt,
+                metric.inv_sqrt_transpose,
             )
         )
         if has_custom_metric and linear_solver in ("cholesky", "cg"):
-            if metric_solve is None:
+            if metric.solve is None:
                 raise ValueError(
                     f'linear_solver="{linear_solver}" with a custom metric requires '
-                    "metric_solve"
+                    "metric.solve"
                 )
         if has_custom_metric and linear_solver in ("qr", "lsmr"):
-            if metric_inv_sqrt is None or metric_inv_sqrt_transpose is None:
+            if metric.inv_sqrt is None or metric.inv_sqrt_transpose is None:
                 raise ValueError(
                     f'linear_solver="{linear_solver}" with a custom metric requires '
-                    "metric_inv_sqrt and metric_inv_sqrt_transpose"
+                    "metric.inv_sqrt and metric.inv_sqrt_transpose"
                 )
-        if has_custom_metric and geodesic_acceleration and metric_norm is None:
+        if has_custom_metric and geodesic_acceleration and metric.norm is None:
             raise ValueError(
-                "geodesic_acceleration with a custom metric requires metric_norm"
+                "geodesic_acceleration with a custom metric requires metric.norm"
             )
         self.residual_fn = residual_fn
-        self.jac = jac
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
+        self.max_damping = max_damping
         self.linear_solver = linear_solver
         self.iterative_tol = iterative_tol
         self.iterative_atol = iterative_atol
         self.iterative_maxiter = iterative_maxiter
         self.lsmr_conlim = lsmr_conlim
+        self.metric = metric
         self._has_custom_metric = has_custom_metric
-        self._has_metric_solve = metric_solve is not None
-        self.metric_solve = (lambda x: x) if metric_solve is None else metric_solve
+        self._has_metric_solve = metric.solve is not None
+        self.metric_solve = (lambda x: x) if metric.solve is None else metric.solve
         self.metric_norm = (
-            (lambda x: jnp.linalg.norm(x)) if metric_norm is None else metric_norm
+            (lambda x: jnp.linalg.norm(x)) if metric.norm is None else metric.norm
         )
         self.metric_inv_sqrt = (
-            (lambda x: x) if metric_inv_sqrt is None else metric_inv_sqrt
+            (lambda x: x) if metric.inv_sqrt is None else metric.inv_sqrt
         )
         self.metric_inv_sqrt_transpose = (
             (lambda x: x)
-            if metric_inv_sqrt_transpose is None
-            else metric_inv_sqrt_transpose
+            if metric.inv_sqrt_transpose is None
+            else metric.inv_sqrt_transpose
         )
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
@@ -220,6 +224,9 @@ class UnderdeterminedLevenbergMarquardt:
         return LMState(jnp.asarray(self.init_damping, dtype=dtype))
 
     def _initial_info(self, params, state, aux, p):
+        # grad_norm is a +inf sentinel (computing it would cost a Jacobian
+        # before the first step) and step_norm is zero; neither can satisfy
+        # gtol/xtol before any update has run.
         residual = jnp.ravel(self.residual_fn(params, aux, p))
         loss = jnp.sum(residual**2)
         zero = jnp.zeros((), dtype=residual.dtype)
@@ -232,6 +239,8 @@ class UnderdeterminedLevenbergMarquardt:
             jnp.asarray(state.damping, dtype=residual.dtype),
             one,
             jnp.asarray(False, dtype=jnp.bool_),
+            zero,
+            jnp.asarray(jnp.inf, dtype=residual.dtype),
             zero,
         )
 
@@ -255,6 +264,8 @@ class UnderdeterminedLevenbergMarquardt:
             def JT(cotangent):
                 return transpose_fn(cotangent)[0]
 
+            grad = JT(resid)
+
             def gram_matvec(cotangent):
                 return jvp_fn(self.metric_solve(JT(cotangent))) + damping * cotangent
 
@@ -269,6 +280,8 @@ class UnderdeterminedLevenbergMarquardt:
                 return -self.metric_solve(JT(dual_solution))
 
         elif self.linear_solver == "lsmr":
+            transpose_fn = jax.linear_transpose(jvp_fn, theta)
+            grad = transpose_fn(resid)[0]
             sqrt_damping = jnp.sqrt(damping)
             zero_tangent = jnp.zeros_like(theta)
 
@@ -304,6 +317,7 @@ class UnderdeterminedLevenbergMarquardt:
         else:
             residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
             Jt = jax.vmap(lambda cotangent: pullback(cotangent)[0])(residual_basis).T
+            grad = Jt @ resid
 
             if self.linear_solver == "qr":
                 transformed_Jt = self.metric_inv_sqrt_transpose(Jt)
@@ -409,6 +423,10 @@ class UnderdeterminedLevenbergMarquardt:
         theta_new = jnp.where(improved, theta + step, theta)
         damping_factor = jnp.where(improved, damping_decrease, damping_increase)
         new_damping = damping * damping_factor
+        if self.max_damping is not None:
+            new_damping = jnp.minimum(
+                new_damping, jnp.asarray(self.max_damping, dtype=resid.dtype)
+            )
         loss = jnp.where(improved, loss_candidate, loss_old)
         return (
             unravel(theta_new),
@@ -422,6 +440,8 @@ class UnderdeterminedLevenbergMarquardt:
                 damping_factor,
                 used_geodesic,
                 acceleration_ratio,
+                jnp.linalg.norm(grad),
+                jnp.linalg.norm(step),
             ),
         )
 
@@ -435,6 +455,8 @@ class UnderdeterminedLevenbergMarquardt:
         dtype=None,
         max_steps=256,
         atol=0.0,
+        gtol=0.0,
+        xtol=0.0,
         callback=None,
         user_state=None,
         jit=True,
@@ -442,8 +464,11 @@ class UnderdeterminedLevenbergMarquardt:
         """Run repeated LM updates until a stopping rule fires.
 
         Parameters are the same as ``update`` plus loop controls. ``max_steps``
-        is always enforced; ``atol`` stops when the residual norm is below the
-        threshold, with ``atol=0`` disabling this check. ``callback`` receives an
+        is always enforced. ``atol`` stops when the residual norm is below the
+        threshold, ``gtol`` when the gradient norm ``||J' r||`` is below the
+        threshold, and ``xtol`` when an accepted step has norm below the
+        threshold; each tolerance set to ``0`` disables that check, and all
+        three report ``LMStatus.CONVERGED``. ``callback`` receives an
         ``LMSolveContext`` after each step and may return an ``LMSolveAction`` to
         stop, override params/state/aux, or update user state. ``p`` is passed to
         the residual and callback but cannot be replaced by the action.
@@ -452,13 +477,19 @@ class UnderdeterminedLevenbergMarquardt:
             raise ValueError("max_steps must be positive")
         if atol < 0:
             raise ValueError("atol must be nonnegative")
+        if gtol < 0:
+            raise ValueError("gtol must be nonnegative")
+        if xtol < 0:
+            raise ValueError("xtol must be nonnegative")
         if state is not None and dtype is not None:
             raise ValueError("dtype is only used when state is None")
         if state is None:
             state = self.init(dtype)
 
         @jax.custom_jvp
-        def solve_with_implicit_p(params, state, aux, p, user_state, max_steps, atol):
+        def solve_with_implicit_p(
+            params, state, aux, p, user_state, max_steps, atol, gtol, xtol
+        ):
             return self._solve_impl(
                 params,
                 state,
@@ -467,16 +498,18 @@ class UnderdeterminedLevenbergMarquardt:
                 user_state,
                 max_steps,
                 atol,
+                gtol,
+                xtol,
                 callback,
                 jit,
             )
 
         @solve_with_implicit_p.defjvp
         def solve_with_implicit_p_jvp(primals, tangents):
-            params, state, aux, p, user_state, max_steps, atol = primals
-            _, _, _, p_dot, _, _, _ = tangents
+            params, state, aux, p, user_state, max_steps, atol, gtol, xtol = primals
+            _, _, _, p_dot, _, _, _, _, _ = tangents
             result = solve_with_implicit_p(
-                params, state, aux, p, user_state, max_steps, atol
+                params, state, aux, p, user_state, max_steps, atol, gtol, xtol
             )
             params_dot = self._implicit_params_tangent_from_p(
                 result.params, result.aux, result.p, p_dot
@@ -496,7 +529,9 @@ class UnderdeterminedLevenbergMarquardt:
                 ),
             )
 
-        return solve_with_implicit_p(params, state, aux, p, user_state, max_steps, atol)
+        return solve_with_implicit_p(
+            params, state, aux, p, user_state, max_steps, atol, gtol, xtol
+        )
 
     def _solve_impl(
         self,
@@ -507,11 +542,14 @@ class UnderdeterminedLevenbergMarquardt:
         user_state,
         max_steps,
         atol,
+        gtol,
+        xtol,
         callback,
         jit,
     ):
         if jit:
-            return self._solve_jit(
+            return _solve_loop_jit(
+                self,
                 params,
                 state,
                 aux,
@@ -519,6 +557,8 @@ class UnderdeterminedLevenbergMarquardt:
                 user_state,
                 max_steps,
                 atol,
+                gtol,
+                xtol,
                 callback,
             )
         return self._solve_python(
@@ -529,6 +569,8 @@ class UnderdeterminedLevenbergMarquardt:
             user_state,
             max_steps,
             atol,
+            gtol,
+            xtol,
             callback,
         )
 
@@ -578,28 +620,11 @@ class UnderdeterminedLevenbergMarquardt:
             user_state = action.user_state
         return action, params, state, aux, user_state
 
-    def _solve_jit(
-        self,
-        params,
-        state,
-        aux,
-        p,
-        user_state,
-        max_steps,
-        atol,
-        callback,
-    ):
-        return _solve_loop_jit(
-            self,
-            params,
-            state,
-            aux,
-            p,
-            user_state,
-            max_steps,
-            atol,
-            callback,
-        )
+    def _converged(self, info, atol, gtol, xtol):
+        atol_met = (atol > 0) & (jnp.sqrt(info.loss) < atol)
+        gtol_met = (gtol > 0) & (info.grad_norm < gtol)
+        xtol_met = (xtol > 0) & info.accepted & (info.step_norm < xtol)
+        return atol_met | gtol_met | xtol_met
 
     def _solve_python(
         self,
@@ -610,15 +635,18 @@ class UnderdeterminedLevenbergMarquardt:
         user_state,
         max_steps,
         atol,
+        gtol,
+        xtol,
         callback,
     ):
-        initial_state = state
         info = self._initial_info(params, state, aux, p)
+        state = LMState(jnp.asarray(state.damping, dtype=info.loss.dtype))
+        initial_state = state
         status = LMStatus.RUNNING
         steps = 0
         if not bool(jnp.isfinite(info.loss)):
             status = LMStatus.NONFINITE
-        elif atol > 0 and bool(jnp.sqrt(info.loss) < atol):
+        elif bool(self._converged(info, atol, gtol, xtol)):
             status = LMStatus.CONVERGED
 
         for steps in range(1, max_steps + 1):
@@ -655,7 +683,7 @@ class UnderdeterminedLevenbergMarquardt:
                     else int(action.status)
                 )
                 break
-            if atol > 0 and bool(jnp.sqrt(info.loss) < atol):
+            if bool(self._converged(info, atol, gtol, xtol)):
                 status = LMStatus.CONVERGED
                 break
         else:
@@ -684,15 +712,22 @@ def _solve_loop_impl(
     user_state,
     max_steps,
     atol,
+    gtol,
+    xtol,
     callback,
 ):
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
     atol = jnp.asarray(atol)
-    initial_state = state
+    gtol = jnp.asarray(gtol)
+    xtol = jnp.asarray(xtol)
     info = solver._initial_info(params, state, aux, p)
+    # Recast so the while_loop carry dtype matches what update() returns (the
+    # residual dtype), which init()'s default float may disagree with.
+    state = LMState(jnp.asarray(state.damping, dtype=info.loss.dtype))
+    initial_state = state
     step = jnp.asarray(0, dtype=jnp.int32)
     initial_nonfinite = ~jnp.isfinite(info.loss)
-    initial_converged = (atol > 0) & (jnp.sqrt(info.loss) < atol)
+    initial_converged = solver._converged(info, atol, gtol, xtol)
     stop = initial_nonfinite | initial_converged
     status = jnp.where(
         initial_nonfinite,
@@ -744,7 +779,7 @@ def _solve_loop_impl(
             if action.status is None
             else jnp.asarray(action.status, dtype=jnp.int32)
         )
-        converged = (atol > 0) & (jnp.sqrt(info.loss) < atol)
+        converged = solver._converged(info, atol, gtol, xtol)
         reached_max = step >= max_steps
         stop = current_nonfinite | callback_stop | converged | reached_max
         status = jnp.where(
@@ -775,4 +810,4 @@ def _solve_loop_impl(
     return LMSolveResult(params, state, info, step, status, aux, p, user_state)
 
 
-_solve_loop_jit = jax.jit(_solve_loop_impl, static_argnums=(0, 8))
+_solve_loop_jit = jax.jit(_solve_loop_impl, static_argnums=(0, 10))

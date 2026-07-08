@@ -44,6 +44,8 @@ assert info.loss_candidate.dtype == jnp.float64
 assert info.damping.dtype == jnp.float64
 assert info.damping_factor.dtype == jnp.float64
 assert info.acceleration_ratio.dtype == jnp.float64
+assert info.grad_norm.dtype == jnp.float64
+assert info.step_norm.dtype == jnp.float64
 jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, (x, y)))(params, state))
 assert "f32" not in jaxpr, jaxpr
 
@@ -71,6 +73,8 @@ assert info.loss_candidate.dtype == jnp.float64
 assert info.damping.dtype == jnp.float64
 assert info.damping_factor.dtype == jnp.float64
 assert info.acceleration_ratio.dtype == jnp.float64
+assert info.grad_norm.dtype == jnp.float64
+assert info.step_norm.dtype == jnp.float64
 jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, target))(theta, state))
 assert "f32" not in jaxpr, jaxpr
 
@@ -101,6 +105,8 @@ assert info.loss_candidate.dtype == jnp.float64
 assert info.damping.dtype == jnp.float64
 assert info.damping_factor.dtype == jnp.float64
 assert info.acceleration_ratio.dtype == jnp.float64
+assert info.grad_norm.dtype == jnp.float64
+assert info.step_norm.dtype == jnp.float64
 jaxpr = str(
     jax.make_jaxpr(lambda p, s: solver.update(p, s, (matrix, target)))(theta, state)
 )
@@ -129,6 +135,8 @@ assert info.loss_candidate.dtype == jnp.float64
 assert info.damping.dtype == jnp.float64
 assert info.damping_factor.dtype == jnp.float64
 assert info.acceleration_ratio.dtype == jnp.float64
+assert info.grad_norm.dtype == jnp.float64
+assert info.step_norm.dtype == jnp.float64
 jaxpr = str(
     jax.make_jaxpr(lambda p, s: solver.update(p, s, (matrix, target)))(theta, state)
 )
@@ -179,12 +187,52 @@ assert info.loss_candidate.dtype == jnp.float64
 assert info.damping.dtype == jnp.float64
 assert info.damping_factor.dtype == jnp.float64
 assert info.acceleration_ratio.dtype == jnp.float64
+assert info.grad_norm.dtype == jnp.float64
+assert info.step_norm.dtype == jnp.float64
 jaxpr = str(
     jax.make_jaxpr(lambda p, s: solver.update(p, s, (x_nnx, y_nnx)))(
         nnx_params, state
     )
 )
 assert "f32" not in jaxpr, jaxpr
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_solve_with_float32_problem_under_x64_keeps_state_dtype_consistent():
+    # Regression: solve(state=None) used to build the damping in the default
+    # float (float64 under x64) while update() returned it in the residual
+    # dtype, mismatching the while_loop carry for float32 problems.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import LMStatus, UnderdeterminedLevenbergMarquardt
+
+
+def residual(theta, aux, p):
+    return theta - aux
+
+
+solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+for jit in (True, False):
+    result = solver.solve(
+        jnp.zeros(1, dtype=jnp.float32),
+        jnp.ones(1, dtype=jnp.float32),
+        max_steps=40,
+        atol=1e-5,
+        jit=jit,
+    )
+    assert int(result.status) == LMStatus.CONVERGED, int(result.status)
+    assert result.state.damping.dtype == jnp.float32, result.state.damping.dtype
+    assert result.params.dtype == jnp.float32
 """
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],

@@ -3,12 +3,13 @@ import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 import pytest
 
-import nlls_gram
 from nlls_gram import (
     LMSolveAction,
+    LMState,
     LMStatus,
+    Metric,
     UnderdeterminedLevenbergMarquardt,
-    metric_callbacks_from_cholesky,
+    metric_from_cholesky,
 )
 
 
@@ -19,10 +20,6 @@ def residual_fn(params, aux, p):
 
 REGRESSION_ATOL = 5e-5
 REGRESSION_RTOL = 1e-5
-
-
-def test_old_solver_name_is_not_exported():
-    assert not hasattr(nlls_gram, "GramLevenbergMarquardt")
 
 
 def test_recovers_known_parameters_with_jitted_step():
@@ -54,7 +51,7 @@ def test_default_metric_matches_explicit_identity_metric_solve():
 
     default_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     identity_solver = UnderdeterminedLevenbergMarquardt(
-        residual_fn, init_damping=1e-2, metric_solve=lambda x: x
+        residual_fn, init_damping=1e-2, metric=Metric(solve=lambda x: x)
     )
 
     default_params, default_state, default_info = default_solver.update(
@@ -178,16 +175,6 @@ def test_unknown_linear_solver_raises():
         UnderdeterminedLevenbergMarquardt(residual_fn, linear_solver="svd")
 
 
-def test_unknown_jac_raises():
-    with pytest.raises(ValueError, match='only jac="vjp" is supported'):
-        UnderdeterminedLevenbergMarquardt(residual_fn, jac="jvp")
-
-
-def test_formulation_argument_is_removed():
-    with pytest.raises(TypeError, match="unexpected keyword argument"):
-        UnderdeterminedLevenbergMarquardt(residual_fn, formulation="gram")
-
-
 def test_init_damping_must_be_positive():
     with pytest.raises(ValueError, match="init_damping must be positive"):
         UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=0.0)
@@ -244,6 +231,32 @@ def test_default_float32_params_keep_float32_outputs():
     assert info.damping.dtype == jnp.float32
     assert info.damping_factor.dtype == jnp.float32
     assert info.acceleration_ratio.dtype == jnp.float32
+    assert info.grad_norm.dtype == jnp.float32
+    assert info.step_norm.dtype == jnp.float32
+
+
+def test_max_damping_below_init_damping_raises():
+    with pytest.raises(ValueError, match="max_damping must be at least"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, init_damping=1e-2, max_damping=1e-3
+        )
+
+
+def test_metric_requirements_per_linear_solver():
+    with pytest.raises(ValueError, match="metric.solve"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, metric=Metric(norm=jnp.linalg.norm)
+        )
+    with pytest.raises(ValueError, match="metric.inv_sqrt"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, linear_solver="qr", metric=Metric(solve=lambda x: x)
+        )
+    with pytest.raises(ValueError, match="metric.norm"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn,
+            geodesic_acceleration=True,
+            metric=Metric(solve=lambda x: x),
+        )
 
 
 def test_cg_step_matches_cholesky_identity_step():
@@ -751,7 +764,7 @@ def test_jitted_residual_with_jitted_geodesic_update():
     assert params["b"].dtype == jnp.float32
 
 
-def test_metric_callbacks_from_cholesky_match_dense_metric():
+def test_metric_from_cholesky_matches_dense_metric():
     L = jnp.array(
         [
             [2.0, 0.0, 0.0],
@@ -759,27 +772,25 @@ def test_metric_callbacks_from_cholesky_match_dense_metric():
             [-0.2, 0.4, 1.2],
         ]
     )
-    metric = L @ L.T
-    callbacks = metric_callbacks_from_cholesky(L)
+    metric_matrix = L @ L.T
+    metric = metric_from_cholesky(L)
     vector = jnp.array([0.5, -1.0, 2.0])
     matrix = jnp.array([[1.0, -0.5], [0.2, 2.0], [-1.0, 0.25]])
 
-    expected_solve_vector = jnp.linalg.solve(metric, vector)
-    expected_solve_matrix = jnp.linalg.solve(metric, matrix)
-    expected_norm = jnp.sqrt(vector @ metric @ vector)
+    expected_solve_vector = jnp.linalg.solve(metric_matrix, vector)
+    expected_solve_matrix = jnp.linalg.solve(metric_matrix, matrix)
+    expected_norm = jnp.sqrt(vector @ metric_matrix @ vector)
     expected_inv_sqrt = jsp_linalg.solve_triangular(L.T, matrix, lower=False)
     expected_inv_sqrt_transpose = jsp_linalg.solve_triangular(L, matrix, lower=True)
 
-    assert jnp.allclose(callbacks["metric_solve"](vector), expected_solve_vector)
-    assert jnp.allclose(callbacks["metric_solve"](matrix), expected_solve_matrix)
-    assert jnp.allclose(callbacks["metric_norm"](vector), expected_norm)
-    assert jnp.allclose(callbacks["metric_inv_sqrt"](matrix), expected_inv_sqrt)
+    assert jnp.allclose(metric.solve(vector), expected_solve_vector)
+    assert jnp.allclose(metric.solve(matrix), expected_solve_matrix)
+    assert jnp.allclose(metric.norm(vector), expected_norm)
+    assert jnp.allclose(metric.inv_sqrt(matrix), expected_inv_sqrt)
     assert jnp.allclose(
-        callbacks["metric_inv_sqrt_transpose"](matrix),
+        metric.inv_sqrt_transpose(matrix),
         expected_inv_sqrt_transpose,
     )
-    with pytest.raises(NotImplementedError, match="lower=True"):
-        metric_callbacks_from_cholesky(L.T, lower=False)
 
 
 @pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
@@ -799,8 +810,7 @@ def test_metric_step_matches_closed_form_solution(linear_solver):
             [-0.2, 0.4, 1.2],
         ]
     )
-    metric = L @ L.T
-    callbacks = metric_callbacks_from_cholesky(L)
+    metric_matrix = L @ L.T
     solver_kwargs = {}
     if linear_solver in ("cg", "lsmr"):
         solver_kwargs = {"iterative_tol": 1e-7, "iterative_maxiter": 30}
@@ -809,13 +819,13 @@ def test_metric_step_matches_closed_form_solution(linear_solver):
         residual,
         init_damping=init_damping,
         linear_solver=linear_solver,
-        **callbacks,
+        metric=metric_from_cholesky(L),
         **solver_kwargs,
     )
     theta, state, info = solver.update(theta0, solver.init(), (matrix, target))
 
     expected_step = jnp.linalg.solve(
-        matrix.T @ matrix + init_damping * metric,
+        matrix.T @ matrix + init_damping * metric_matrix,
         matrix.T @ target,
     )
     expected_loss = jnp.sum((matrix @ expected_step - target) ** 2)
@@ -880,8 +890,8 @@ def test_metric_geodesic_acceleration_ratio_uses_metric_norm(linear_solver):
     theta0 = jnp.array([0.4, 1.2])
     init_damping = 0.1
     L = jnp.array([[3.0, 0.0], [0.2, 0.5]])
-    metric = L @ L.T
-    callbacks = metric_callbacks_from_cholesky(L)
+    metric_matrix = L @ L.T
+    metric = metric_from_cholesky(L)
     solver_kwargs = {}
     if linear_solver in ("cg", "lsmr"):
         solver_kwargs = {"iterative_tol": 1e-7, "iterative_maxiter": 30}
@@ -891,7 +901,7 @@ def test_metric_geodesic_acceleration_ratio_uses_metric_norm(linear_solver):
         linear_solver=linear_solver,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=100.0,
-        **callbacks,
+        metric=metric,
         **solver_kwargs,
     )
 
@@ -899,14 +909,14 @@ def test_metric_geodesic_acceleration_ratio_uses_metric_norm(linear_solver):
 
     resid = residual(theta0, None, None)
     jacobian = jnp.array([[2.0 * theta0[0], 1.0], [1.0, 2.0 * theta0[1]]])
-    normal_matrix = jacobian.T @ jacobian + init_damping * metric
+    normal_matrix = jacobian.T @ jacobian + init_damping * metric_matrix
     velocity = -jnp.linalg.solve(normal_matrix, jacobian.T @ resid)
     f_vv = jnp.array([2.0 * velocity[0] ** 2, 2.0 * velocity[1] ** 2])
     acceleration = -jnp.linalg.solve(normal_matrix, jacobian.T @ f_vv)
     metric_ratio = (
         2.0
-        * callbacks["metric_norm"](acceleration)
-        / (callbacks["metric_norm"](velocity) + jnp.finfo(theta0.dtype).eps)
+        * metric.norm(acceleration)
+        / (metric.norm(velocity) + jnp.finfo(theta0.dtype).eps)
     )
     euclidean_ratio = (
         2.0
@@ -933,12 +943,12 @@ def test_custom_metric_update_jits_and_matches_closed_form_solution():
             [-0.2, 0.4, 1.2],
         ]
     )
-    metric = L @ L.T
+    metric_matrix = L @ L.T
     init_damping = 0.1
     solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=init_damping,
-        **metric_callbacks_from_cholesky(L),
+        metric=metric_from_cholesky(L),
     )
 
     @jax.jit
@@ -947,7 +957,7 @@ def test_custom_metric_update_jits_and_matches_closed_form_solution():
 
     theta, state, info = train_step(theta0, solver.init())
     expected_step = jnp.linalg.solve(
-        matrix.T @ matrix + init_damping * metric,
+        matrix.T @ matrix + init_damping * metric_matrix,
         matrix.T @ target,
     )
 
@@ -1087,23 +1097,23 @@ def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
         del aux
         return jnp.array([theta[0] + 2.0 * theta[1] - p])
 
-    metric = jnp.array([[4.0, 0.0], [0.0, 1.0]])
-    metric_inverse = jnp.linalg.inv(metric)
+    metric_matrix = jnp.array([[4.0, 0.0], [0.0, 1.0]])
+    metric_inverse = jnp.linalg.inv(metric_matrix)
     jacobian = jnp.array([[1.0, 2.0]])
-    callbacks = metric_callbacks_from_cholesky(jnp.linalg.cholesky(metric))
-    metric_kwargs = (
-        callbacks
+    full_metric = metric_from_cholesky(jnp.linalg.cholesky(metric_matrix))
+    metric = (
+        full_metric
         if linear_solver == "cholesky"
-        else {
-            "metric_inv_sqrt": callbacks["metric_inv_sqrt"],
-            "metric_inv_sqrt_transpose": callbacks["metric_inv_sqrt_transpose"],
-        }
+        else Metric(
+            inv_sqrt=full_metric.inv_sqrt,
+            inv_sqrt_transpose=full_metric.inv_sqrt_transpose,
+        )
     )
     solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=1e-2,
         linear_solver=linear_solver,
-        **metric_kwargs,
+        metric=metric,
     )
 
     def solved_params(p):
@@ -1118,3 +1128,211 @@ def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
     ).ravel()
 
     assert jnp.allclose(params_dot, expected_params_dot, atol=1e-6)
+
+
+@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
+def test_grad_norm_and_step_norm_match_closed_form(linear_solver):
+    def residual(theta, aux, p):
+        matrix, target = aux
+        return matrix @ theta - target
+
+    matrix = jnp.array([[1.0, 2.0, 0.5, -1.0], [0.0, 1.0, 3.0, 2.0]])
+    target = jnp.array([1.0, -2.0])
+    theta0 = jnp.zeros(matrix.shape[1])
+    init_damping = 0.1
+    solver_kwargs = {}
+    if linear_solver in ("cg", "lsmr"):
+        solver_kwargs = {"iterative_tol": 1e-7, "iterative_maxiter": 30}
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=init_damping,
+        linear_solver=linear_solver,
+        **solver_kwargs,
+    )
+    _, _, info = solver.update(theta0, solver.init(), (matrix, target))
+
+    expected_grad = matrix.T @ (matrix @ theta0 - target)
+    expected_step = jnp.linalg.solve(
+        matrix.T @ matrix + init_damping * jnp.eye(matrix.shape[1]),
+        matrix.T @ target,
+    )
+
+    assert jnp.allclose(
+        info.grad_norm, jnp.linalg.norm(expected_grad), rtol=1e-5, atol=1e-5
+    )
+    assert jnp.allclose(
+        info.step_norm, jnp.linalg.norm(expected_step), rtol=1e-5, atol=1e-5
+    )
+
+
+def test_rejected_step_still_reports_step_norm():
+    # The candidate step leaves theta = 0, producing a NaN residual, so every
+    # step is rejected; the attempted step norm must still be reported.
+    def residual(theta, aux, p):
+        del aux, p
+        return jnp.where(theta[0] == 0.0, theta + 1.0, jnp.full_like(theta, jnp.nan))
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1.0)
+    _, _, info = solver.update(jnp.zeros(1), solver.init())
+
+    assert not bool(info.accepted)
+    assert float(info.step_norm) == pytest.approx(0.5)
+    assert float(info.grad_norm) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_solve_gtol_reports_converged(jit):
+    def residual(theta, aux, p):
+        return theta - aux
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    result = solver.solve(
+        jnp.array([0.0]), jnp.array([1.0]), max_steps=50, gtol=1e-6, jit=jit
+    )
+
+    assert int(result.status) == LMStatus.CONVERGED
+    assert float(result.info.grad_norm) < 1e-6
+    assert int(result.steps) < 50
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_solve_xtol_reports_converged_on_accepted_step(jit):
+    def residual(theta, aux, p):
+        return theta - aux
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    result = solver.solve(
+        jnp.array([0.0]), jnp.array([1.0]), max_steps=50, xtol=1e-6, jit=jit
+    )
+
+    assert int(result.status) == LMStatus.CONVERGED
+    assert bool(result.info.accepted)
+    assert float(result.info.step_norm) < 1e-6
+    assert int(result.steps) < 50
+
+
+def test_solve_xtol_ignores_rejected_steps():
+    def residual(theta, aux, p):
+        del aux, p
+        return jnp.where(theta[0] == 0.0, theta + 1.0, jnp.full_like(theta, jnp.nan))
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1.0, max_damping=1e6
+    )
+    result = solver.solve(jnp.zeros(1), max_steps=30, xtol=10.0)
+
+    assert int(result.status) == LMStatus.MAX_STEPS
+    assert int(result.steps) == 30
+    assert not bool(result.info.accepted)
+
+
+def test_max_damping_caps_growth_under_repeated_rejection():
+    def residual(theta, aux, p):
+        del aux, p
+        return jnp.where(theta[0] == 0.0, theta + 1.0, jnp.full_like(theta, jnp.nan))
+
+    capped = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-3, max_damping=1e4
+    )
+    result = capped.solve(jnp.zeros(1), max_steps=100)
+    assert int(result.status) == LMStatus.MAX_STEPS
+    assert float(result.state.damping) == pytest.approx(1e4)
+
+    uncapped = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-3)
+    result = uncapped.solve(jnp.zeros(1), max_steps=100)
+    assert not jnp.isfinite(result.state.damping)
+
+
+def test_solve_does_not_retrace_on_loop_control_changes():
+    traces = {"count": 0}
+
+    def residual(theta, aux, p):
+        traces["count"] += 1
+        return theta - aux
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    solver.solve(jnp.array([0.0]), jnp.array([1.0]), max_steps=10, atol=1e-6)
+    count_after_first = traces["count"]
+    solver.solve(
+        jnp.array([0.0]),
+        jnp.array([1.0]),
+        max_steps=25,
+        atol=1e-8,
+        gtol=1e-9,
+        xtol=1e-9,
+    )
+
+    assert traces["count"] == count_after_first
+
+
+def test_solve_callback_epoch_boundary_resamples_aux_and_resets_damping():
+    def residual(theta, aux, p):
+        del p
+        return theta - aux
+
+    steps_per_epoch = 3
+
+    def callback(ctx):
+        boundary = ctx.step % steps_per_epoch == 0
+        new_aux = jnp.where(boundary, ctx.aux + 1.0, ctx.aux)
+        new_state = LMState(
+            jnp.where(boundary, ctx.initial_state.damping, ctx.state.damping)
+        )
+        epochs = ctx.user_state + jnp.where(boundary, 1, 0)
+        return LMSolveAction(aux=new_aux, state=new_state, user_state=epochs)
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    result = solver.solve(
+        jnp.array([0.0]),
+        jnp.array([1.0]),
+        max_steps=7,
+        callback=callback,
+        user_state=jnp.asarray(0),
+    )
+
+    assert int(result.status) == LMStatus.MAX_STEPS
+    assert int(result.user_state) == 2
+    assert jnp.allclose(result.aux, jnp.array([3.0]))
+    # Step 6 reset damping to init; the accepted step 7 halved it once.
+    assert float(result.state.damping) == pytest.approx(5e-3)
+
+
+def test_solve_callback_history_buffer_matches_update_loop():
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    params = {"a": 1.0, "b": 0.0}
+    max_steps = 5
+
+    def callback(ctx):
+        history = {
+            "loss": jax.lax.dynamic_update_slice(
+                ctx.user_state["loss"], ctx.info.loss[None], (ctx.step - 1,)
+            ),
+            "damping": jax.lax.dynamic_update_slice(
+                ctx.user_state["damping"], ctx.info.damping[None], (ctx.step - 1,)
+            ),
+        }
+        return LMSolveAction(user_state=history)
+
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    result = solver.solve(
+        params,
+        (x, y),
+        max_steps=max_steps,
+        callback=callback,
+        user_state={
+            "loss": jnp.zeros(max_steps),
+            "damping": jnp.zeros(max_steps),
+        },
+    )
+
+    loop_params, loop_state = params, solver.init()
+    for i in range(max_steps):
+        loop_params, loop_state, info = solver.update(loop_params, loop_state, (x, y))
+        assert float(result.user_state["loss"][i]) == pytest.approx(
+            float(info.loss), rel=1e-4, abs=1e-8
+        )
+        assert float(result.user_state["damping"][i]) == pytest.approx(
+            float(loop_state.damping), rel=1e-6
+        )

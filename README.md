@@ -95,6 +95,11 @@ result = solver.solve(params, (x, y), max_steps=50, atol=1e-8)
 params = result.params
 ```
 
+`solve` stops on a residual-norm `atol`, gradient-norm `gtol`, or
+accepted-step-norm `xtol` (each `0.0` disables), always enforces `max_steps`,
+and takes a traceable callback for custom stopping, epoch-style data
+resampling, and per-step history recording; the docs have a cookbook.
+
 `solve(...).params` also supports custom implicit JVP/VJP with respect to `p`;
 the docs give the metric-minimum-norm formula and a minimal `jax.jvp` /
 `jax.vjp` example. The metric matters for underdetermined roots because it
@@ -108,21 +113,18 @@ For a dense SPD metric \(M = LL^\top\), use the Cholesky helper:
 ```python
 import jax.numpy as jnp
 
-from nlls_gram import (
-    UnderdeterminedLevenbergMarquardt,
-    metric_callbacks_from_cholesky,
-)
+from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_cholesky
 
 L = jnp.linalg.cholesky(metric_matrix)
 solver = UnderdeterminedLevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
-    **metric_callbacks_from_cholesky(L),
+    metric=metric_from_cholesky(L),
 )
 ```
 
-The callbacks act on the flattened parameter vector. The docs give the exact
-callback contract, branch formulas, and validation rules.
+The `Metric` callbacks act on the flattened parameter vector. The docs give
+the exact callback contract, branch formulas, and validation rules.
 
 ## Solvers
 

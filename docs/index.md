@@ -94,51 +94,44 @@ The actual nonlinear step is accepted only if the unregularized residual sum of
 squares decreases. On acceptance, damping is multiplied by `damping_decrease`;
 on rejection, it is multiplied by `damping_increase`.
 
-## Metric Callbacks
+## The Metric Object
 
-Metric callbacks operate on the flattened parameter vector produced internally by
-`ravel_pytree`. Let \(P=M^{-1}\), and let \(S\) satisfy \(SS^\top=M^{-1}\).
+A custom metric is passed as a single `metric=Metric(...)` argument. The
+`Metric` dataclass holds up to four callbacks that operate on the flattened
+parameter vector produced internally by `ravel_pytree`. Let \(P=M^{-1}\), and
+let \(S\) satisfy \(SS^\top=M^{-1}\).
 
-| Callback | Meaning |
+| Field | Meaning |
 | --- | --- |
-| `metric_solve(x)` | \(M^{-1}x = Px\) |
-| `metric_norm(x)` | \(\sqrt{x^\top Mx}\) |
-| `metric_inv_sqrt(x)` | \(Sx\) |
-| `metric_inv_sqrt_transpose(x)` | \(S^\top x\) |
+| `solve(x)` | \(M^{-1}x = Px\) |
+| `norm(x)` | \(\sqrt{x^\top Mx}\) |
+| `inv_sqrt(x)` | \(Sx\) |
+| `inv_sqrt_transpose(x)` | \(S^\top x\) |
 
-Defaults are the identity metric:
-
-```python
-metric_solve = lambda x: x
-metric_norm = lambda x: jnp.linalg.norm(x)
-metric_inv_sqrt = lambda x: x
-metric_inv_sqrt_transpose = lambda x: x
-```
+Fields left as `None` (and `metric=None` itself) default to the identity
+metric.
 
 Shape requirements:
 
-- `metric_solve` must support vectors `(n_params,)` and matrices
-  `(n_params, k)`.
-- `metric_inv_sqrt` must support vectors `(n_params,)`, and should support
-  matrices when natural.
-- `metric_inv_sqrt_transpose` must support matrices
-  `(n_params, n_residuals)` for QR.
-- `metric_norm` only needs to support vectors `(n_params,)`.
+- `solve` must support vectors `(n_params,)` and matrices `(n_params, k)`.
+- `inv_sqrt` must support vectors `(n_params,)`, and should support matrices
+  when natural.
+- `inv_sqrt_transpose` must support matrices `(n_params, n_residuals)` for QR.
+- `norm` only needs to support vectors `(n_params,)`.
 
 Validation rules:
 
-- If all metric callbacks are omitted, the identity metric is used.
 - For `linear_solver in {"cholesky", "cg"}`, a custom metric requires
-  `metric_solve`.
+  `metric.solve`.
 - For `linear_solver in {"qr", "lsmr"}`, a custom metric requires both
-  `metric_inv_sqrt` and `metric_inv_sqrt_transpose`.
+  `metric.inv_sqrt` and `metric.inv_sqrt_transpose`.
 - If `geodesic_acceleration=True` and a custom metric is supplied,
-  `metric_norm` is required.
-- The solver does not infer `metric_norm`, `metric_inv_sqrt`, or
-  `metric_inv_sqrt_transpose` from `metric_solve`.
+  `metric.norm` is required.
+- The solver does not infer `norm`, `inv_sqrt`, or `inv_sqrt_transpose` from
+  `solve`.
 
-`metric_norm` is separate because `metric_solve` applies \(M^{-1}\), while the
-norm needs \(M\):
+`norm` is separate because `solve` applies \(M^{-1}\), while the norm needs
+\(M\):
 
 $$
 \|x\|_M = \sqrt{x^\top Mx}.
@@ -153,7 +146,7 @@ recoverable from an arbitrary solve callback.
 ### Cholesky
 
 The default `linear_solver="cholesky"` materializes \(J^\top\), applies
-`metric_solve`, and factors the residual-space dual system
+`metric.solve`, and factors the residual-space dual system
 
 $$
 (J P J^\top + \lambda I)y = r,
@@ -182,8 +175,8 @@ $$
 $$
 
 The implementation materializes \(S^\top J^\top\) via
-`metric_inv_sqrt_transpose(J.T)` and solves the resulting augmented QR problem.
-The returned parameter step is mapped back with `metric_inv_sqrt`.
+`metric.inv_sqrt_transpose(J.T)` and solves the resulting augmented QR problem.
+The returned parameter step is mapped back with `metric.inv_sqrt`.
 
 ### LSMR
 
@@ -203,19 +196,19 @@ It returns \(s=Sz\). Iterative solvers default to a small fixed budget:
 
 ## Cholesky Metric Helper
 
-For a dense metric \(M=LL^\top\), use:
+For a dense metric \(M=LL^\top\) with \(L\) lower triangular (the form
+returned by `jnp.linalg.cholesky`), use:
 
 ```python
 import jax.numpy as jnp
 
-from nlls_gram import metric_callbacks_from_cholesky
+from nlls_gram import metric_from_cholesky
 
 L = jnp.linalg.cholesky(metric_matrix)
-callbacks = metric_callbacks_from_cholesky(L)
+metric = metric_from_cholesky(L)
 ```
 
-The helper returns all four callbacks. It currently expects `lower=True`, the
-default returned by `jnp.linalg.cholesky`.
+The helper returns a `Metric` with all four callbacks filled in.
 
 ## Minimal Example
 
@@ -266,11 +259,30 @@ result = solver.solve(
 params = result.params
 ```
 
-`max_steps` is always enforced. `atol` is an optional residual-norm tolerance:
-the solve converges when \(\sqrt{\sum_i r_i^2} < \texttt{atol}\). The default
-`atol=0.0` disables tolerance stopping, so the solve runs until `max_steps`
-unless a callback stops it. `solve(jit=True)` is the default and jits the loop;
-use `jit=False` for debugging Python callbacks.
+`max_steps` is always enforced. Three optional tolerances stop with
+`LMStatus.CONVERGED`; each defaults to `0.0`, which disables that check:
+
+- `atol`: residual norm, \(\sqrt{\sum_i r_i^2} < \texttt{atol}\).
+- `gtol`: gradient norm, \(\|J^\top r\|_2 < \texttt{gtol}\), evaluated at the
+  pre-step parameters of the step just taken.
+- `xtol`: step norm, \(\|s\|_2 < \texttt{xtol}\), checked only when the step
+  was accepted (rejected steps say nothing about stationarity).
+
+With all three at zero the solve runs until `max_steps` unless a callback
+stops it. The tolerances and `max_steps` are traced values: changing them
+between calls does not recompile the loop. `solve(jit=True)` is the default
+and jits the loop; use `jit=False` for debugging Python callbacks.
+
+The per-step diagnostics behind these rules are exposed on `LMInfo` as
+`grad_norm` (\(\|J^\top r\|_2\), nearly free in the dense paths since
+\(J^\top\) is already materialized) and `step_norm` (norm of the candidate
+step, reported even when the step is rejected). Before the first update the
+loop's `LMInfo` uses sentinels `grad_norm=inf` and `step_norm=0`, so `gtol`
+and `xtol` cannot fire at step zero.
+
+Repeated rejections multiply the damping by `damping_increase` without bound,
+which can overflow in float32. The constructor's `max_damping` clamps the
+damping from above; leave it `None` for uncapped classic behavior.
 
 Status codes are integer constants:
 
@@ -326,6 +338,161 @@ result = solver.solve(
 
 The per-step `update(...)` API remains useful when you want to write the outer
 loop yourself or manage host-side logging.
+
+## Cookbook
+
+Recipes for common training-loop patterns. The first is host-side; the rest
+run entirely inside `solve(jit=True)`.
+
+### Host Loop
+
+Use `update()` with your own Python loop whenever you need things jit cannot
+express: wall-clock time budgets, pandas/host-side logging, data whose shape
+changes between epochs, or acceptance gates that restart from a fresh
+initialization. Use `solve()` when the whole loop fits in jit.
+
+```python
+import time
+
+train_step = jax.jit(solver.update)
+
+state = solver.init()
+start = time.perf_counter()
+for step in range(max_steps):
+    params, state, info = train_step(params, state, aux)
+    if not bool(jnp.isfinite(info.loss_candidate)):
+        break  # diverged
+    if float(info.loss) < loss_threshold:
+        break
+    if time.perf_counter() - start > max_train_time:
+        break
+```
+
+Reading `float(info.loss)` synchronizes with the device; for maximum
+throughput read diagnostics once per epoch rather than once per step.
+
+### Divergence Stop
+
+The default LM response to a nonfinite candidate is to reject the step and
+increase damping, which often recovers. To instead treat it as terminal
+divergence:
+
+```python
+def divergence_callback(ctx):
+    nonfinite = ~jnp.isfinite(ctx.info.loss_candidate)
+    return LMSolveAction(stop=nonfinite, status=LMStatus.NONFINITE)
+```
+
+### Epoch Resampling and Damping Reset
+
+Hold a data lifetime fixed for `steps_per_epoch` LM steps, then resample the
+collocation/simulation data and reset the damping. The PRNG key lives in
+`user_state`. Note the contract: action fields are static in *structure* but
+dynamic in *value* — a conditional override must always return the field,
+selected with `jnp.where`, rather than sometimes returning `None`.
+
+```python
+steps_per_epoch = 16
+
+
+def epoch_callback(ctx):
+    boundary = ctx.step % steps_per_epoch == 0
+    key, subkey = jax.random.split(ctx.user_state)
+    resampled = sample_data(subkey)
+    new_aux = jax.tree.map(
+        lambda new, old: jnp.where(boundary, new, old), resampled, ctx.aux
+    )
+    new_state = LMState(
+        jnp.where(boundary, ctx.initial_state.damping, ctx.state.damping)
+    )
+    new_key = jnp.where(boundary, key, ctx.user_state)
+    return LMSolveAction(aux=new_aux, state=new_state, user_state=new_key)
+
+
+result = solver.solve(
+    params,
+    sample_data(key0),
+    max_steps=800,
+    callback=epoch_callback,
+    user_state=key1,
+)
+```
+
+### Validation Early Stopping
+
+Compute held-out metrics in the callback and stop when they jointly clear
+their thresholds:
+
+```python
+def validation_callback(ctx):
+    val_residual = validation_residual_fn(ctx.params, val_data)
+    val_mse = jnp.mean(val_residual**2)
+    return LMSolveAction(stop=val_mse < val_threshold)
+```
+
+Evaluating validation metrics every step costs a residual pass per step; gate
+it on an epoch boundary with `jax.lax.cond` if it is expensive.
+
+### Fixed-Size History Recording
+
+Record per-step diagnostics into preallocated buffers sized by `max_steps`,
+then plot after the solve:
+
+```python
+max_steps = 200
+
+
+def history_callback(ctx):
+    history = {
+        "loss": jax.lax.dynamic_update_slice(
+            ctx.user_state["loss"], ctx.info.loss[None], (ctx.step - 1,)
+        ),
+        "damping": jax.lax.dynamic_update_slice(
+            ctx.user_state["damping"], ctx.info.damping[None], (ctx.step - 1,)
+        ),
+    }
+    return LMSolveAction(user_state=history)
+
+
+result = solver.solve(
+    params,
+    aux,
+    max_steps=max_steps,
+    callback=history_callback,
+    user_state={
+        "loss": jnp.zeros(max_steps),
+        "damping": jnp.zeros(max_steps),
+    },
+)
+losses = result.user_state["loss"][: int(result.steps)]
+```
+
+## Performance Notes
+
+- The solver instance and the callback are static arguments of the internal
+  jitted loop, keyed by object identity. Construct the solver once and define
+  callbacks at setup scope; an inline `lambda` at the call site recompiles
+  every `solve`.
+- `max_steps`, `atol`, `gtol`, and `xtol` are traced values: sweeping them
+  does not recompile.
+- Each `update` costs one residual linearization, one Jacobian
+  materialization (`n_residuals` VJP passes in the dense paths), and one
+  candidate residual evaluation; geodesic acceleration adds a
+  forward-over-forward directional derivative and, only when the ratio gate
+  passes, one more residual evaluation.
+- Dtypes flow from `params` and the residual; keep everything in one dtype to
+  avoid promotions.
+
+## Migration from 0.x
+
+- `residual_fn(params, batch)` is now `residual_fn(params, aux, p)`;
+  `update(params, state, batch)` is `update(params, state, aux, p=None)`.
+- The four `metric_*` constructor kwargs and the dict-returning
+  `metric_callbacks_from_cholesky` helper are replaced by a single
+  `metric=Metric(...)` argument and `metric_from_cholesky(L)`.
+- The `jac="vjp"` kwarg was removed (VJP is the only implementation).
+- `LMState`/`LMInfo` are frozen dataclasses, not NamedTuples: use attribute
+  access, not tuple unpacking.
 
 ## Implicit Differentiation
 
@@ -417,10 +584,10 @@ $$
 J_p\dot p.
 $$
 
-In code, \(P x\) is applied with `metric_solve(x)` when available. If a QR/LSMR
+In code, \(P x\) is applied with `metric.solve(x)` when available. If a QR/LSMR
 metric is supplied only through square-root callbacks, the same inverse metric is
-applied as \(P x = S S^\top x\) using `metric_inv_sqrt` and
-`metric_inv_sqrt_transpose`.
+applied as \(P x = S S^\top x\) using `metric.inv_sqrt` and
+`metric.inv_sqrt_transpose`.
 
 ### VJP
 
@@ -481,10 +648,7 @@ Here \(J_\theta=[1,2]\), so the identity-metric tangent is
 ```python
 import jax.numpy as jnp
 
-from nlls_gram import (
-    UnderdeterminedLevenbergMarquardt,
-    metric_callbacks_from_cholesky,
-)
+from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_cholesky
 
 
 def residual_fn(theta, aux, p):
@@ -499,7 +663,7 @@ L = jnp.linalg.cholesky(metric_matrix)
 solver = UnderdeterminedLevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
-    **metric_callbacks_from_cholesky(L),
+    metric=metric_from_cholesky(L),
 )
 ```
 
@@ -512,7 +676,7 @@ dense inverse:
 ```python
 import jax.scipy.sparse.linalg as jsp_sparse_linalg
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt
+from nlls_gram import Metric, UnderdeterminedLevenbergMarquardt
 
 
 def metric_matvec(x):
@@ -528,7 +692,7 @@ solver = UnderdeterminedLevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
     linear_solver="cg",
-    metric_solve=metric_solve,
+    metric=Metric(solve=metric_solve),
 )
 ```
 
@@ -547,7 +711,7 @@ $$
 \frac{2\|a\|_M}{\|v\|_M + \epsilon}.
 $$
 
-Therefore `metric_norm` is required whenever geodesic acceleration is combined
+Therefore `metric.norm` is required whenever geodesic acceleration is combined
 with a custom metric.
 
 ## Dtypes and Pytrees
@@ -598,7 +762,9 @@ narrower and focuses on underdetermined LM with explicit parameter-space metrics
 
 ::: nlls_gram.UnderdeterminedLevenbergMarquardt
 
-::: nlls_gram.metric_callbacks_from_cholesky
+::: nlls_gram.Metric
+
+::: nlls_gram.metric_from_cholesky
 
 ::: nlls_gram.LMState
 

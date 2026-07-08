@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nlls-gram"
-version = "0.6.0"
+version = "1.0.0"
 description = "Metric-aware underdetermined Levenberg-Marquardt least-squares for JAX"
 readme = "README.md"
 license = "MIT"
@@ -19,7 +19,7 @@ keywords = [
     "optimization",
 ]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
