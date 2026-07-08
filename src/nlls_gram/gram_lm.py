@@ -877,9 +877,7 @@ class UnderdeterminedLevenbergMarquardt:
                 lm_state.hyper is None
                 or jax.tree_util.tree_structure(previous_hyper)
                 != jax.tree_util.tree_structure(lm_state.hyper)
-                or [
-                    leaf.dtype for leaf in jax.tree_util.tree_leaves(previous_hyper)
-                ]
+                or [leaf.dtype for leaf in jax.tree_util.tree_leaves(previous_hyper)]
                 != [leaf.dtype for leaf in jax.tree_util.tree_leaves(lm_state.hyper)]
             ):
                 raise ValueError(
