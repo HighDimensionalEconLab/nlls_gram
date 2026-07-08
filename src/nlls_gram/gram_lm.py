@@ -12,18 +12,13 @@ from jax.flatten_util import ravel_pytree
 
 from nlls_gram.metrics import Metric
 
-# General-JAX least-squares solver: a class exposing init() -> lm_state,
-# update(x, lm_state, args, p) -> (new_x, lm_state, info), and a solve()
-# convenience loop. x is ANY pytree
-# (a flat array, a dict, nnx.state(model, nnx.Param), ...); the solver only ravels
-# and unravels it with jax.flatten_util.ravel_pytree and calls the user's
-# residual_fn, which may take (x), (x, args), or (x, args, p).
-# It knows nothing about flax/nnx/optax. update()
-# does not jit internally; solve(jit=True) wraps the loop in jax.jit. All
-# hyperparameters are static Python scalars; all data-dependent control flow is
+# init() -> lm_state, update(x, lm_state, args, p) -> (new_x, lm_state, info),
+# plus a solve() convenience loop. x is ANY pytree; the solver only ravels and
+# unravels it with ravel_pytree and knows nothing about flax/nnx/optax.
+# update() does not jit internally; solve(jit=True) wraps the loop in jax.jit.
+# Hyperparameters are static Python scalars; data-dependent control flow is
 # traced (jnp.where), so a rejected step returns the unchanged x rather than
-# branching. Dtypes flow from x/residual; damping scalars are converted to
-# the residual dtype.
+# branching. Dtypes flow from the residual; damping scalars are cast to match.
 
 
 class LMStatus:
@@ -40,10 +35,8 @@ class LMStatus:
 @dataclass(frozen=True)
 class LMState:
     damping: jax.Array
-    # Jacobian cache, populated only when cache_jacobian=True: the residual
-    # (and its aux output when has_aux=True) and J' at the current x,
-    # and whether they are still valid (the last step was rejected, so x
-    # did not move).
+    # Jacobian cache (cache_jacobian=True only): residual, J', and aux at the
+    # current x; jacobian_valid means the last step was rejected so x did not move.
     resid: Any = None
     Jt: Any = None
     jacobian_valid: Any = None
@@ -113,9 +106,8 @@ class LMSolveResult:
     args: Any
     p: Any
     user_state: Any
-    # With has_aux=True: the residual's aux output evaluated at the returned
-    # (x, args, p) — one extra residual evaluation, well-defined for
-    # every status since x are always the last accepted iterate.
+    # With has_aux=True: aux evaluated at the returned (x, args, p) — one extra
+    # residual evaluation, well-defined for every status.
     aux: Any = None
 
 
@@ -128,13 +120,16 @@ def _zero_tangent_leaf(leaf):
     return jnp.zeros_like(leaf)
 
 
-# Classic Marquardt damping on min ||r(theta)||^2: accept the step iff the sum of
-# squared residuals decreases, multiplying the damping by damping_decrease on
-# acceptance and damping_increase on rejection. The default solver factors the
-# small damped Gram system, which is the intended use case for n_residuals <<
-# n_params. With metric M and P = M^{-1}, the dense dual step is:
-#   step = -P J' (J P J' + damping I_m)^{-1} r
 class UnderdeterminedLevenbergMarquardt:
+    """Metric-damped Levenberg-Marquardt for ``min ||r(x, args, p)||^2`` over a
+    JAX pytree ``x``, specialized to ``n_residuals << n_params``: the default
+    path factors the small damped Gram system in residual space. With metric
+    ``M`` and ``P = M^{-1}``, the dense dual step is
+    ``step = -P J' (J P J' + damping I_m)^{-1} r``. Exposes per-step
+    ``update``, a jitted ``solve`` loop with callbacks, and implicit
+    differentiation of ``solve`` with respect to ``p``.
+    """
+
     def __init__(
         self,
         residual_fn,
@@ -154,11 +149,10 @@ class UnderdeterminedLevenbergMarquardt:
         geodesic_acceleration=False,
         geodesic_acceptance_ratio=0.75,
     ):
-        # The residual may take (x), (x, args), or (x, args, p) —
-        # always in that order. Arity is inspected once here and the function
-        # is wrapped into the canonical 3-arg form, so the compiled code is
-        # identical for all three. Callables whose signature cannot be
-        # inspected (or that take *args) are assumed to be 3-arg.
+        # The residual may take (x), (x, args), or (x, args, p), always in that
+        # order; it is wrapped into the canonical 3-arg form here so the
+        # compiled code is identical for all three. Uninspectable signatures
+        # (or *args) are assumed 3-arg.
         try:
             signature = inspect.signature(residual_fn)
         except (TypeError, ValueError):
@@ -252,10 +246,8 @@ class UnderdeterminedLevenbergMarquardt:
         self.iterative_maxiter = iterative_maxiter
         self.lsmr_conlim = lsmr_conlim
         self.metric = metric
-        # The cache only pays for the dense cholesky path, where rejected
-        # steps otherwise redo the m VJP passes at an unchanged point; the
-        # matrix-free solvers never materialize J, so there is nothing to
-        # cache and the flag is inert for them (and for qr).
+        # Only the dense cholesky path materializes J', so the flag is inert
+        # for the other solvers.
         self.cache_jacobian = cache_jacobian and linear_solver == "cholesky"
         self.has_aux = has_aux
         self._has_custom_metric = has_custom_metric
@@ -276,11 +268,9 @@ class UnderdeterminedLevenbergMarquardt:
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
 
     def init(self, x0, args=None, *, p=None):
-        # One residual evaluation infers the problem dtype, so the damping is
-        # strongly typed to match what update() returns (a mismatched or
-        # weakly-typed scalar here would force a recompile on the second step
-        # or break the solve loop carry). The same evaluation sizes the
-        # Jacobian cache buffers when cache_jacobian=True.
+        # One residual evaluation types the damping to match what update()
+        # returns (keeping the jit signature and solve-loop carry stable) and
+        # sizes the Jacobian cache buffers when cache_jacobian=True.
         self._check_residual_args(args, p)
         residual, aux = self._residual_and_aux(x0, args, p)
         damping = jnp.asarray(self.init_damping, dtype=residual.dtype)
@@ -325,6 +315,7 @@ class UnderdeterminedLevenbergMarquardt:
 
     def update(self, x, lm_state, args=None, p=None):
         self._check_residual_args(args, p)
+        # Linearize at x: flatten the pytree and view the residual over theta.
         theta, unravel = ravel_pytree(x)
 
         if self.has_aux:
@@ -343,6 +334,8 @@ class UnderdeterminedLevenbergMarquardt:
 
             residual_value = residual_flat
 
+        # Build J': matrix-free JVP/VJP closures for cg/lsmr; m VJP passes for
+        # the dense paths, reused from the cache after a rejected step.
         if self.linear_solver in ("cg", "lsmr"):
             if self.has_aux:
                 resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
@@ -394,8 +387,7 @@ class UnderdeterminedLevenbergMarquardt:
                 return transpose_fn(cotangent)[0]
 
             grad = JT(resid)
-            # Typed tolerances keep CG's internal scalar ops in the residual
-            # dtype when x64 is enabled for a float32 problem.
+            # Typed tolerances keep CG's scalars in the residual dtype under x64.
             cg_tol = jnp.asarray(self.iterative_tol, dtype=resid.dtype)
             cg_atol = jnp.asarray(self.iterative_atol, dtype=resid.dtype)
 
@@ -456,6 +448,7 @@ class UnderdeterminedLevenbergMarquardt:
             grad = Jt @ resid
 
             if self.linear_solver == "qr":
+                # Whitened factorization: augmented QR of S'J' with sqrt(damping).
                 transformed_Jt = self.metric_inv_sqrt_transpose(Jt)
                 if transformed_Jt.shape[0] >= transformed_Jt.shape[1]:
                     R = jnp.linalg.qr(transformed_Jt, mode="r")
@@ -497,6 +490,7 @@ class UnderdeterminedLevenbergMarquardt:
                         return self.metric_inv_sqrt(Q @ z)
 
             else:
+                # Damped Gram factorization: cholesky of J P J' + damping I.
                 gram_step_left = self.metric_solve(Jt)
                 linear_matrix = Jt.T @ gram_step_left
                 linear_matrix = linear_matrix + damping * jnp.eye(
@@ -508,12 +502,14 @@ class UnderdeterminedLevenbergMarquardt:
                 def solve_step(rhs):
                     return -gram_step_left @ jsp_linalg.cho_solve(linear_factor, rhs)
 
+        # Dual solve for the first-order step (velocity).
         velocity = solve_step(resid)
         resid_velocity = residual_value(theta + velocity)
         loss_old = jnp.sum(resid**2)
         loss_velocity = jnp.sum(resid_velocity**2)
         zero = jnp.zeros((), dtype=resid.dtype)
 
+        # Geodesic second-order correction, solved with the same factorization.
         if self.geodesic_acceleration:
             geodesic_acceptance_ratio = jnp.asarray(
                 self.geodesic_acceptance_ratio, dtype=resid.dtype
@@ -558,8 +554,10 @@ class UnderdeterminedLevenbergMarquardt:
             used_geodesic = jnp.asarray(False)
             acceleration_ratio = zero
 
+        # Accept iff the sum of squared residuals decreases and is finite.
         improved = jnp.isfinite(loss_candidate) & (loss_candidate < loss_old)
         theta_new = jnp.where(improved, theta + step, theta)
+        # Damping update: decrease on acceptance, increase on rejection.
         damping_factor = jnp.where(improved, damping_decrease, damping_increase)
         new_damping = damping * damping_factor
         if self.max_damping is not None:
@@ -612,8 +610,8 @@ class UnderdeterminedLevenbergMarquardt:
         threshold, and ``xtol`` when an accepted step has norm below the
         threshold; each tolerance set to ``0`` disables that check, and all
         three report ``LMStatus.CONVERGED``. ``callback`` receives an
-        ``LMSolveContext`` after each step and may return an ``LMSolveAction`` to
-        stop, override x/lm_state/args, or update user lm_state. ``p`` is passed to
+        ``LMSolveContext`` after each step and may return an ``LMSolveAction``
+        to stop or to override x/lm_state/args/user_state. ``p`` is passed to
         the residual and callback but cannot be replaced by the action.
         """
         self._check_residual_args(args, p)
@@ -626,9 +624,8 @@ class UnderdeterminedLevenbergMarquardt:
         if xtol < 0:
             raise ValueError("xtol must be nonnegative")
         if lm_state is None:
-            # init() would evaluate the residual eagerly just for the dtype,
-            # which the loop's recast makes unnecessary; only the Jacobian
-            # cache genuinely needs the shapes.
+            # The loop recasts the damping dtype itself; only the Jacobian
+            # cache needs an eager init() for the shapes.
             if self.cache_jacobian:
                 lm_state = self.init(x0, args, p=p)
             else:
@@ -767,10 +764,9 @@ class UnderdeterminedLevenbergMarquardt:
             args = action.args
         if action.user_state is not None:
             user_state = action.user_state
-        # A callback that returns x or args may have changed the point the
-        # cached Jacobian was computed at, so invalidate conservatively. The
-        # check is structural (did the action include the field), which is why
-        # it composes with jit: values are traced, presence is not.
+        # An action returning x or args may have moved the point the cached
+        # Jacobian was computed at, so invalidate conservatively. The check is
+        # structural (presence of the field), so it composes with jit.
         if self.cache_jacobian and (action.x is not None or action.args is not None):
             lm_state = dataclasses.replace(
                 lm_state, jacobian_valid=jnp.asarray(False, dtype=jnp.bool_)
@@ -778,9 +774,8 @@ class UnderdeterminedLevenbergMarquardt:
         return action, x, lm_state, args, user_state
 
     def _check_residual_args(self, args, p):
-        # A residual that never sees args/p must not have them silently
-        # dropped — in particular the implicit derivative with respect to p
-        # would be a silent zero.
+        # Silently dropping args/p a residual never sees would, in particular,
+        # make the implicit derivative with respect to p a silent zero.
         if args is not None and self.residual_arity < 2:
             raise ValueError(
                 "args was passed but residual_fn takes only (x); "
@@ -896,9 +891,8 @@ def _solve_loop_impl(
 ):
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
     info = solver._initial_info(x, lm_state, args, p)
-    # Recast so the while_loop carry dtype matches what update() returns (the
-    # residual dtype), which init()'s default float may disagree with; the
-    # tolerances likewise so all comparisons run in the residual dtype.
+    # Recast damping and tolerances to the residual dtype so the while_loop
+    # carry matches what update() returns.
     atol = jnp.asarray(atol, dtype=info.loss.dtype)
     gtol = jnp.asarray(gtol, dtype=info.loss.dtype)
     xtol = jnp.asarray(xtol, dtype=info.loss.dtype)

@@ -82,7 +82,7 @@ program.
 Callbacks passed to `solve` can replace `args` for later iterations, for example
 to regenerate collocation points or refresh simulation data. They receive `p`
 but cannot replace it; this keeps the optimized solution's dependence on
-external parameters explicit for future implicit-differentiation workflows.
+external parameters explicit for implicit differentiation.
 
 ## Mathematical Contract
 
@@ -319,7 +319,7 @@ Status codes are integer constants:
 
 | Status | Meaning |
 | --- | --- |
-| `LMStatus.CONVERGED` | Residual norm is below `atol`. |
+| `LMStatus.CONVERGED` | A tolerance (`atol`, `gtol`, or `xtol`) was met. |
 | `LMStatus.MAX_STEPS` | `max_steps` was reached. |
 | `LMStatus.NONFINITE` | The current loss is nonfinite, or a callback chose this status. |
 | `LMStatus.CALLBACK_STOP` | A callback stopped without a custom status. |
@@ -628,44 +628,19 @@ Caveats:
 - The cache is valid only while `x`, `args`, and `p` are all unchanged.
   Inside `solve`, invalidation is automatic: an accepted step invalidates it,
   and so does any callback action that returns `x` or `args` (epoch
-  resampling and similar recipes need no extra care — the step after a data
-  swap always recomputes). The one remaining hazard is a **manual `update()`
-  loop** that changes `args` between steps (minibatching): there the solver
-  cannot see the swap, so either leave the cache off or reset the lm_state with
-  `dataclasses.replace(lm_state, jacobian_valid=jnp.asarray(False))`. A stale
-  cache fails silently, with steps taken against the old Jacobian.
-- `LMState` now carries an `(n_params, n_residuals)` buffer for the whole
-  solve — relevant on GPU memory budgets.
+  resampling needs no extra care). The one hazard is a **manual `update()`
+  loop** that changes `args` between steps (minibatching): the solver cannot
+  see the swap and a stale cache fails silently, with steps taken against the
+  old Jacobian — leave the cache off there, or reset with
+  `dataclasses.replace(lm_state, jacobian_valid=jnp.asarray(False))`.
+- The cache adds an `(n_params, n_residuals)` buffer to `LMState` for the
+  whole solve — relevant on GPU memory budgets.
 - Callbacks that rebuild the lm_state must preserve the cache fields — use
   `dataclasses.replace(ctx.lm_state, damping=...)`, not a bare
   `LMState(damping)`.
 - When rejections never happen the cache costs essentially nothing at run
-  time (measured at or below noise on CPU and GPU), so for fixed-data
-  problems it is safe to enable unconditionally. It is off by default only
-  because of the manual-loop stale-cache hazard above.
-
-## Migration from 0.x
-
-- The optimized pytree is now called `x` (`x0` for the initial guess in
-  `solve`/`init`), freeing "parameters" for the structural parameters `p`;
-  `result.params` is now `result.x`.
-- The solver state is now `lm_state` everywhere (`solve(lm_state=...)`,
-  `ctx.lm_state`/`lm_state_old`/`initial_lm_state`, `result.lm_state`,
-  `LMSolveAction(lm_state=...)`), disambiguating it from `user_state`.
-- `residual_fn(params, batch)` is now `residual_fn(x, args)` (or with a
-  third read-only `p` argument); `update(params, state, batch)` is
-  `update(x, lm_state, args, p=None)`. One-argument residuals that close
-  over their data are also accepted. The name `args` follows Optimistix;
-  `aux` is reserved for extra residual *outputs* via `has_aux=True`.
-- `init(dtype)` is now `init(x0, args, p=...)` — the lm_state dtype is
-  inferred from one residual evaluation instead of being passed by hand.
-  `solve` no longer takes `dtype`.
-- The four `metric_*` constructor kwargs and the dict-returning
-  `metric_callbacks_from_cholesky` helper are replaced by a single
-  `metric=Metric(...)` argument and `metric_from_cholesky(L)`.
-- The `jac="vjp"` kwarg was removed (VJP is the only implementation).
-- `LMState`/`LMInfo` are frozen dataclasses, not NamedTuples: use attribute
-  access, not tuple unpacking.
+  time, so for fixed-data problems it is safe to enable unconditionally; it
+  is off by default only because of the manual-loop hazard.
 
 ## Implicit Differentiation
 
@@ -914,15 +889,14 @@ import jax
 jax.config.update("jax_enable_x64", True)
 ```
 
-`init(x0, args, p=...)` mirrors `update`'s data arguments: it evaluates
-the residual once and types the lm_state (and any Jacobian cache buffers) from
-the actual problem, so there is no dtype argument to get wrong — including
-for problems that do not use the default float (e.g. a float32 problem with
-x64 enabled). `solve` likewise recasts the damping and tolerances to the
-residual dtype internally. One known exception: `linear_solver="lsmr"`
-currently fails for float32 problems when x64 is enabled, due to a
-dtype-promotion bug inside Lineax's LSMR; the other three solvers handle that
-mixed configuration.
+`init(x0, args, p=...)` mirrors `update`'s data arguments: it evaluates the
+residual once and types the lm_state (and any Jacobian cache buffers) from the
+actual problem, so there is no dtype argument to get wrong — a float32
+problem stays float32 even with x64 enabled. `solve` likewise recasts the
+damping and tolerances to the residual dtype internally. One known exception:
+`linear_solver="lsmr"` fails for float32 problems when x64 is enabled, due to
+a dtype-promotion bug inside Lineax's LSMR; the other three solvers handle
+that mixed configuration.
 
 `update` optimizes exactly the `x` pytree you pass. With Flax NNX, pass only
 the trainable state to the solver and merge it with frozen state inside
