@@ -15,36 +15,36 @@ class ExpModel(nnx.Module):
 
 
 def test_nnx_state_params_recover_known_parameters():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
     model = ExpModel()
-    graphdef, params = nnx.split(model, nnx.Param)
+    graphdef, x = nnx.split(model, nnx.Param)
 
-    def residual(params, args, p):
-        xx, yy = args
-        model = nnx.merge(graphdef, params)
-        return model(xx) - yy
+    def residual(x, args, p):
+        ts, ys = args
+        model = nnx.merge(graphdef, x)
+        return model(ts) - ys
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
-    lm_state = solver.init(params, (x, y))
+    lm_state = solver.init(x, (ts, ys))
 
     @jax.jit
-    def train_step(params, lm_state, args):
-        return solver.update(params, lm_state, args)
+    def train_step(x, lm_state, args):
+        return solver.update(x, lm_state, args)
 
     info = None
     for _ in range(50):
-        params, lm_state, info = train_step(params, lm_state, (x, y))
+        x, lm_state, info = train_step(x, lm_state, (ts, ys))
 
-    trained = nnx.merge(graphdef, params)
+    trained = nnx.merge(graphdef, x)
     assert float(info.loss) < 1e-8
     assert jnp.allclose(trained.a[...], 2.0, atol=1e-4)
     assert jnp.allclose(trained.b[...], -1.0, atol=1e-4)
 
 
 def test_nnx_wrt_filter_freezes_unselected_initialized_params():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
     model = ExpModel(b0=-1.0)
 
     wrt = nnx.PathContains("a")
@@ -53,12 +53,12 @@ def test_nnx_wrt_filter_freezes_unselected_initialized_params():
     assert len(jax.tree.leaves(frozen)) == 1
 
     def residual(trainable, args, p):
-        xx, yy = args
+        ts, ys = args
         model = nnx.merge(graphdef, trainable, frozen)
-        return model(xx) - yy
+        return model(ts) - ys
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
-    lm_state = solver.init(trainable, (x, y))
+    lm_state = solver.init(trainable, (ts, ys))
 
     @jax.jit
     def train_step(trainable, lm_state, args):
@@ -66,7 +66,7 @@ def test_nnx_wrt_filter_freezes_unselected_initialized_params():
 
     info = None
     for _ in range(50):
-        trainable, lm_state, info = train_step(trainable, lm_state, (x, y))
+        trainable, lm_state, info = train_step(trainable, lm_state, (ts, ys))
 
     trained = nnx.merge(graphdef, trainable, frozen)
     assert float(info.loss) < 1e-8

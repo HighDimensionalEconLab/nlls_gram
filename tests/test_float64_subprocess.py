@@ -20,23 +20,23 @@ def assert_float64_tree(tree):
         assert leaf.dtype == jnp.float64, (leaf.dtype, leaf)
 
 
-def residual_fn(params, args, p):
-    x, y = args
-    return params["a"] * jnp.exp(params["b"] * x) - y
+def residual_fn(x, args, p):
+    ts, ys = args
+    return x["a"] * jnp.exp(x["b"] * ts) - ys
 
 
-x = jnp.linspace(0.0, 2.0, 20, dtype=jnp.float64)
-y = 2.0 * jnp.exp(-1.0 * x)
-params = {
+ts = jnp.linspace(0.0, 2.0, 20, dtype=jnp.float64)
+ys = 2.0 * jnp.exp(-1.0 * ts)
+x = {
     "a": jnp.asarray(1.0, dtype=jnp.float64),
     "b": jnp.asarray(0.0, dtype=jnp.float64),
 }
 solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-lm_state = solver.init(params, (x, y))
+lm_state = solver.init(x, (ts, ys))
 for _ in range(5):
-    params, lm_state, info = solver.update(params, lm_state, (x, y))
+    x, lm_state, info = solver.update(x, lm_state, (ts, ys))
 
-assert_float64_tree(params)
+assert_float64_tree(x)
 assert lm_state.damping.dtype == jnp.float64
 assert info.loss.dtype == jnp.float64
 assert info.loss_old.dtype == jnp.float64
@@ -46,14 +46,14 @@ assert info.damping_factor.dtype == jnp.float64
 assert info.acceleration_ratio.dtype == jnp.float64
 assert info.grad_norm.dtype == jnp.float64
 assert info.step_norm.dtype == jnp.float64
-jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, (x, y)))(params, lm_state))
+jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, (ts, ys)))(x, lm_state))
 assert "f32" not in jaxpr, jaxpr
 solve_jaxpr = str(
     jax.make_jaxpr(
         lambda p: solver.solve(
-            p, (x, y), max_steps=20, atol=1e-8, gtol=1e-10, xtol=1e-10
+            p, (ts, ys), max_steps=20, atol=1e-8, gtol=1e-10, xtol=1e-10
         ).x
-    )(params)
+    )(x)
 )
 assert "f32" not in solve_jaxpr, solve_jaxpr
 
@@ -180,10 +180,10 @@ x_nnx = jnp.linspace(0.0, 2.0, 20, dtype=jnp.float64).reshape(-1, 1)
 y_nnx = 2.0 * jnp.ravel(x_nnx)
 
 
-def nnx_residual_fn(params, args, p):
-    x, y = args
-    model = nnx.merge(graphdef, params)
-    return model(x) - y
+def nnx_residual_fn(x, args, p):
+    ts, ys = args
+    model = nnx.merge(graphdef, x)
+    return model(ts) - ys
 
 
 solver = UnderdeterminedLevenbergMarquardt(nnx_residual_fn, init_damping=1e-12)
@@ -220,9 +220,9 @@ assert "f32" not in jaxpr, jaxpr
 
 
 def test_solve_with_float32_problem_under_x64_keeps_state_dtype_consistent():
-    # Regression: solve(lm_state=None) used to build the damping in the default
-    # float (float64 under x64) while update() returned it in the residual
-    # dtype, mismatching the while_loop carry for float32 problems.
+    # solve(lm_state=None) must carry the damping in the residual dtype, not
+    # the default float, or the while_loop carry mismatches update()'s output
+    # for float32 problems under x64.
     script = r"""
 import jax
 jax.config.update("jax_enable_x64", True)

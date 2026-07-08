@@ -21,21 +21,20 @@ def _make_large_interpolation_problem(
     n_samples = 1024
     n_centers = 8192
 
-    x = jnp.linspace(-1.0, 1.0, n_samples)
+    ts = jnp.linspace(-1.0, 1.0, n_samples)
     centers = jnp.linspace(-1.2, 1.2, n_centers)
-    scaled_distance = (x[:, None] - centers[None, :]) / 0.08
+    scaled_distance = (ts[:, None] - centers[None, :]) / 0.08
     features = jnp.exp(-0.5 * scaled_distance**2) / jnp.sqrt(n_centers)
     theta_true = jnp.cos(jnp.linspace(0.0, 12.0, n_centers))
-    y = jnp.sin(features @ theta_true)
-    params = 0.05 * jnp.sin(jnp.linspace(0.0, 8.0, n_centers))
-    # device_put commits the arrays, which pins the jitted step to the target
-    # device; default_device placement alone lets them migrate to the GPU.
-    params = jax.device_put(params, device)
-    args = jax.device_put((features, y), device)
+    ys = jnp.sin(features @ theta_true)
+    x = 0.05 * jnp.sin(jnp.linspace(0.0, 8.0, n_centers))
+    # device_put commits the arrays so the jitted step stays on the target device.
+    x = jax.device_put(x, device)
+    args = jax.device_put((features, ys), device)
 
     def residual(theta, args, p):
-        features, y = args
-        return jnp.sin(features @ theta) - y
+        features, ys = args
+        return jnp.sin(features @ theta) - ys
 
     solver_kwargs = {
         "init_damping": 1e-2,
@@ -57,20 +56,20 @@ def _make_large_interpolation_problem(
         geodesic_acceleration=geodesic_acceleration,
     )
 
-    lm_state = jax.device_put(base_solver.init(params, args), device)
+    lm_state = jax.device_put(base_solver.init(x, args), device)
 
     @jax.jit
-    def first_step(params, lm_state):
-        return base_solver.update(params, lm_state, args)
+    def first_step(x, lm_state):
+        return base_solver.update(x, lm_state, args)
 
-    params, lm_state, _ = first_step(params, lm_state)
-    jax.block_until_ready((params, lm_state))
+    x, lm_state, _ = first_step(x, lm_state)
+    jax.block_until_ready((x, lm_state))
 
     @jax.jit
-    def step(params, lm_state):
-        return solver.update(params, lm_state, args)
+    def step(x, lm_state):
+        return solver.update(x, lm_state, args)
 
-    return params, lm_state, step
+    return x, lm_state, step
 
 
 @pytest.mark.parametrize("platform", ["cpu", "gpu"])
@@ -90,17 +89,17 @@ def test_large_rbf_interpolation_second_update(
     if not _devices(platform):
         pytest.skip(f"JAX {platform!r} backend is not available")
 
-    params, lm_state, step = _make_large_interpolation_problem(
+    x, lm_state, step = _make_large_interpolation_problem(
         platform=platform,
         linear_solver=linear_solver,
         geodesic_acceleration=geodesic_acceleration,
     )
 
-    warmup = step(params, lm_state)
+    warmup = step(x, lm_state)
     jax.block_until_ready(warmup)
 
     def run():
-        out = step(params, lm_state)
+        out = step(x, lm_state)
         jax.block_until_ready(out)
         return out
 

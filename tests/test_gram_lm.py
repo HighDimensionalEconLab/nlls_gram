@@ -15,9 +15,9 @@ from nlls_gram import (
 )
 
 
-def residual_fn(params, args, p):
-    x, y = args
-    return params["a"] * jnp.exp(params["b"] * x) - y
+def residual_fn(x, args, p):
+    ts, ys = args
+    return x["a"] * jnp.exp(x["b"] * ts) - ys
 
 
 REGRESSION_ATOL = 5e-5
@@ -26,85 +26,85 @@ REGRESSION_RTOL = 1e-5
 
 def test_recovers_known_parameters_with_jitted_step():
     a_true, b_true = 2.0, -1.0
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = a_true * jnp.exp(b_true * x)
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = a_true * jnp.exp(b_true * ts)
 
-    params = {"a": 1.0, "b": 0.0}
+    x = {"a": 1.0, "b": 0.0}
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-    lm_state = solver.init(params, (x, y))
+    lm_state = solver.init(x, (ts, ys))
 
     @jax.jit
-    def train_step(params, lm_state, args):
-        return solver.update(params, lm_state, args)
+    def train_step(x, lm_state, args):
+        return solver.update(x, lm_state, args)
 
     info = None
     for _ in range(50):
-        params, lm_state, info = train_step(params, lm_state, (x, y))
+        x, lm_state, info = train_step(x, lm_state, (ts, ys))
 
     assert float(info.loss) < 1e-8
-    assert jnp.allclose(params["a"], a_true, atol=1e-4)
-    assert jnp.allclose(params["b"], b_true, atol=1e-4)
+    assert jnp.allclose(x["a"], a_true, atol=1e-4)
+    assert jnp.allclose(x["b"], b_true, atol=1e-4)
 
 
 def test_default_metric_matches_explicit_identity_metric_solve():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
 
     default_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     identity_solver = UnderdeterminedLevenbergMarquardt(
         residual_fn, init_damping=1e-2, metric=Metric(solve=lambda x: x)
     )
 
-    default_params, default_state, default_info = default_solver.update(
-        params, default_solver.init(params, (x, y)), (x, y)
+    default_x, default_state, default_info = default_solver.update(
+        x, default_solver.init(x, (ts, ys)), (ts, ys)
     )
-    identity_params, identity_state, identity_info = identity_solver.update(
-        params, identity_solver.init(params, (x, y)), (x, y)
+    identity_x, identity_state, identity_info = identity_solver.update(
+        x, identity_solver.init(x, (ts, ys)), (ts, ys)
     )
 
-    assert jnp.allclose(default_params["a"], identity_params["a"])
-    assert jnp.allclose(default_params["b"], identity_params["b"])
+    assert jnp.allclose(default_x["a"], identity_x["a"])
+    assert jnp.allclose(default_x["b"], identity_x["b"])
     assert jnp.allclose(default_state.damping, identity_state.damping)
     assert jnp.allclose(default_info.loss, identity_info.loss)
 
 
 def test_flat_array_params():
     def residual(theta, args, p):
-        x, y = args
-        return theta[0] * jnp.exp(theta[1] * x) - y
+        ts, ys = args
+        return theta[0] * jnp.exp(theta[1] * ts) - ys
 
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
 
-    params = jnp.array([1.0, 0.0])
+    x = jnp.array([1.0, 0.0])
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
-    lm_state = solver.init(params, (x, y))
+    lm_state = solver.init(x, (ts, ys))
 
     for _ in range(50):
-        params, lm_state, _ = solver.update(params, lm_state, (x, y))
+        x, lm_state, _ = solver.update(x, lm_state, (ts, ys))
 
-    assert params.shape == (2,)
-    assert jnp.allclose(params, jnp.array([2.0, -1.0]), atol=1e-4)
+    assert x.shape == (2,)
+    assert jnp.allclose(x, jnp.array([2.0, -1.0]), atol=1e-4)
 
 
 def test_linear_problem_matches_closed_form_solution():
-    def residual(params, args, p):
-        x, y = args
-        return params["a"] * x - y
+    def residual(x, args, p):
+        ts, ys = args
+        return x["a"] * ts - ys
 
-    x = jnp.array([1.0, 2.0, 3.0])
-    y = 2.0 * x
-    params = {"a": 0.0}
+    ts = jnp.array([1.0, 2.0, 3.0])
+    ys = 2.0 * ts
+    x = {"a": 0.0}
     init_damping = 1e-4
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=init_damping)
-    new_params, _, info = solver.update(params, solver.init(params, (x, y)), (x, y))
-    expected_a = jnp.sum(x * y) / (jnp.sum(x**2) + init_damping)
-    expected_loss = jnp.sum((expected_a * x - y) ** 2)
+    new_x, _, info = solver.update(x, solver.init(x, (ts, ys)), (ts, ys))
+    expected_a = jnp.sum(ts * ys) / (jnp.sum(ts**2) + init_damping)
+    expected_loss = jnp.sum((expected_a * ts - ys) ** 2)
 
     assert bool(info.accepted)
-    assert jnp.allclose(new_params["a"], expected_a, atol=1e-6)
+    assert jnp.allclose(new_x["a"], expected_a, atol=1e-6)
     assert jnp.allclose(info.loss, expected_loss, atol=1e-10)
     assert float(info.loss_old) == pytest.approx(56.0)
     assert jnp.allclose(info.loss_candidate, expected_loss, atol=1e-10)
@@ -116,55 +116,55 @@ def test_linear_problem_matches_closed_form_solution():
 def test_update_calls_residual_and_uses_values():
     calls = {"count": 0}
 
-    def residual(params, args, p):
+    def residual(x, args, p):
         calls["count"] += 1
-        x, y = args
-        return params["a"] * x - y
+        ts, ys = args
+        return x["a"] * ts - ys
 
-    x = jnp.array([1.0, 2.0, 3.0])
-    y = 2.0 * x
-    params = {"a": 0.0}
+    ts = jnp.array([1.0, 2.0, 3.0])
+    ys = 2.0 * ts
+    x = {"a": 0.0}
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-4)
-    new_params, _, info = solver.update(params, solver.init(params, (x, y)), (x, y))
+    new_x, _, info = solver.update(x, solver.init(x, (ts, ys)), (ts, ys))
 
     assert calls["count"] >= 2
     assert bool(info.accepted)
-    assert jnp.allclose(new_params["a"], 2.0, atol=1e-4)
+    assert jnp.allclose(new_x["a"], 2.0, atol=1e-4)
 
 
 def test_default_disabled_geodesic_uses_minimal_residual_evaluations():
     calls = {"count": 0}
 
-    def residual(params, args, p):
+    def residual(x, args, p):
         calls["count"] += 1
-        x, y = args
-        return params["a"] * x - y
+        ts, ys = args
+        return x["a"] * ts - ys
 
-    x = jnp.array([1.0, 2.0, 3.0])
-    y = 2.0 * x
-    params = {"a": 0.0}
+    ts = jnp.array([1.0, 2.0, 3.0])
+    ys = 2.0 * ts
+    x = {"a": 0.0}
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-4)
-    lm_state = solver.init(params, (x, y))
+    lm_state = solver.init(x, (ts, ys))
     calls["count"] = 0
-    solver.update(params, lm_state, (x, y))
+    solver.update(x, lm_state, (ts, ys))
 
     assert calls["count"] == 2
 
 
 def test_rejected_step_leaves_params_unchanged():
-    x = jnp.linspace(0.0, 2.0, 5)
-    y = jnp.ones_like(x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 5)
+    ys = jnp.ones_like(ts)
+    x = {"a": 1.0, "b": 0.0}
 
     solver = UnderdeterminedLevenbergMarquardt(residual_fn)
-    lm_state = solver.init(params, (x, y))
-    new_params, new_lm_state, info = solver.update(params, lm_state, (x, y))
+    lm_state = solver.init(x, (ts, ys))
+    new_x, new_lm_state, info = solver.update(x, lm_state, (ts, ys))
 
     assert not bool(info.accepted)
-    assert jnp.allclose(new_params["a"], params["a"])
-    assert jnp.allclose(new_params["b"], params["b"])
+    assert jnp.allclose(new_x["a"], x["a"])
+    assert jnp.allclose(new_x["b"], x["b"])
     assert float(new_lm_state.damping) > float(lm_state.damping)
     assert float(info.loss) == pytest.approx(0.0)
     assert float(info.loss_old) == pytest.approx(0.0)
@@ -219,17 +219,15 @@ def test_iterative_options_must_be_valid():
 
 
 def test_default_float32_params_keep_float32_outputs():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
 
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-    new_params, new_lm_state, info = solver.update(
-        params, solver.init(params, (x, y)), (x, y)
-    )
+    new_x, new_lm_state, info = solver.update(x, solver.init(x, (ts, ys)), (ts, ys))
 
-    assert new_params["a"].dtype == jnp.float32
-    assert new_params["b"].dtype == jnp.float32
+    assert new_x["a"].dtype == jnp.float32
+    assert new_x["b"].dtype == jnp.float32
     assert new_lm_state.damping.dtype == jnp.float32
     assert info.loss.dtype == jnp.float32
     assert info.loss_old.dtype == jnp.float32
@@ -266,9 +264,9 @@ def test_metric_requirements_per_linear_solver():
 
 
 def test_cg_step_matches_cholesky_identity_step():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
 
     cholesky_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     cg_solver = UnderdeterminedLevenbergMarquardt(
@@ -279,17 +277,15 @@ def test_cg_step_matches_cholesky_identity_step():
         iterative_maxiter=20,
     )
 
-    cholesky_params, cholesky_state, cholesky_info = cholesky_solver.update(
-        params, cholesky_solver.init(params, (x, y)), (x, y)
+    cholesky_x, cholesky_state, cholesky_info = cholesky_solver.update(
+        x, cholesky_solver.init(x, (ts, ys)), (ts, ys)
     )
-    cg_params, cg_state, cg_info = cg_solver.update(
-        params, cg_solver.init(params, (x, y)), (x, y)
-    )
+    cg_x, cg_state, cg_info = cg_solver.update(x, cg_solver.init(x, (ts, ys)), (ts, ys))
 
     assert bool(cg_info.accepted) == bool(cholesky_info.accepted)
     assert not bool(cg_info.used_geodesic)
-    assert jnp.allclose(cg_params["a"], cholesky_params["a"], rtol=1e-5, atol=1e-5)
-    assert jnp.allclose(cg_params["b"], cholesky_params["b"], rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(cg_x["a"], cholesky_x["a"], rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(cg_x["b"], cholesky_x["b"], rtol=1e-5, atol=1e-5)
     assert jnp.allclose(cg_state.damping, cholesky_state.damping)
     assert jnp.allclose(
         cg_info.loss,
@@ -297,14 +293,14 @@ def test_cg_step_matches_cholesky_identity_step():
         rtol=REGRESSION_RTOL,
         atol=REGRESSION_ATOL,
     )
-    assert cg_params["a"].dtype == jnp.float32
+    assert cg_x["a"].dtype == jnp.float32
     assert cg_info.loss.dtype == jnp.float32
 
 
 def test_qr_step_matches_cholesky_identity_step():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
 
     cholesky_solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
@@ -314,24 +310,22 @@ def test_qr_step_matches_cholesky_identity_step():
         residual_fn, init_damping=1e-2, linear_solver="qr"
     )
 
-    cholesky_params, cholesky_state, cholesky_info = cholesky_solver.update(
-        params, cholesky_solver.init(params, (x, y)), (x, y)
+    cholesky_x, cholesky_state, cholesky_info = cholesky_solver.update(
+        x, cholesky_solver.init(x, (ts, ys)), (ts, ys)
     )
-    qr_params, qr_state, qr_info = qr_solver.update(
-        params, qr_solver.init(params, (x, y)), (x, y)
-    )
+    qr_x, qr_state, qr_info = qr_solver.update(x, qr_solver.init(x, (ts, ys)), (ts, ys))
 
     assert bool(qr_info.accepted) == bool(cholesky_info.accepted)
     assert not bool(qr_info.used_geodesic)
     assert jnp.allclose(
-        qr_params["a"],
-        cholesky_params["a"],
+        qr_x["a"],
+        cholesky_x["a"],
         rtol=REGRESSION_RTOL,
         atol=REGRESSION_ATOL,
     )
     assert jnp.allclose(
-        qr_params["b"],
-        cholesky_params["b"],
+        qr_x["b"],
+        cholesky_x["b"],
         rtol=REGRESSION_RTOL,
         atol=REGRESSION_ATOL,
     )
@@ -342,7 +336,7 @@ def test_qr_step_matches_cholesky_identity_step():
         rtol=REGRESSION_RTOL,
         atol=REGRESSION_ATOL,
     )
-    assert qr_params["a"].dtype == jnp.float32
+    assert qr_x["a"].dtype == jnp.float32
     assert qr_info.loss.dtype == jnp.float32
 
 
@@ -454,9 +448,9 @@ def test_qr_float32_handles_ill_conditioned_case_where_cholesky_fails():
 
 
 def test_cg_update_jits():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
     solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
@@ -466,22 +460,22 @@ def test_cg_update_jits():
     )
 
     @jax.jit
-    def train_step(params, lm_state):
-        return solver.update(params, lm_state, (x, y))
+    def train_step(x, lm_state):
+        return solver.update(x, lm_state, (ts, ys))
 
-    params, lm_state, info = train_step(params, solver.init(params, (x, y)))
+    x, lm_state, info = train_step(x, solver.init(x, (ts, ys)))
 
     assert bool(info.accepted)
     assert jnp.isfinite(info.loss)
     assert jnp.isfinite(lm_state.damping)
-    assert params["a"].dtype == jnp.float32
-    assert params["b"].dtype == jnp.float32
+    assert x["a"].dtype == jnp.float32
+    assert x["b"].dtype == jnp.float32
 
 
 def test_qr_update_jits():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
     solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
@@ -489,22 +483,22 @@ def test_qr_update_jits():
     )
 
     @jax.jit
-    def train_step(params, lm_state):
-        return solver.update(params, lm_state, (x, y))
+    def train_step(x, lm_state):
+        return solver.update(x, lm_state, (ts, ys))
 
-    params, lm_state, info = train_step(params, solver.init(params, (x, y)))
+    x, lm_state, info = train_step(x, solver.init(x, (ts, ys)))
 
     assert bool(info.accepted)
     assert jnp.isfinite(info.loss)
     assert jnp.isfinite(lm_state.damping)
-    assert params["a"].dtype == jnp.float32
-    assert params["b"].dtype == jnp.float32
+    assert x["a"].dtype == jnp.float32
+    assert x["b"].dtype == jnp.float32
 
 
 def test_lsmr_update_jits():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
     solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
@@ -514,16 +508,16 @@ def test_lsmr_update_jits():
     )
 
     @jax.jit
-    def train_step(params, lm_state):
-        return solver.update(params, lm_state, (x, y))
+    def train_step(x, lm_state):
+        return solver.update(x, lm_state, (ts, ys))
 
-    params, lm_state, info = train_step(params, solver.init(params, (x, y)))
+    x, lm_state, info = train_step(x, solver.init(x, (ts, ys)))
 
     assert bool(info.accepted)
     assert jnp.isfinite(info.loss)
     assert jnp.isfinite(lm_state.damping)
-    assert params["a"].dtype == jnp.float32
-    assert params["b"].dtype == jnp.float32
+    assert x["a"].dtype == jnp.float32
+    assert x["b"].dtype == jnp.float32
 
 
 def test_geodesic_acceptance_ratio_zero_falls_back_to_velocity_step():
@@ -765,9 +759,9 @@ def test_geodesic_acceleration_reduces_iterations_on_gsl_rosenbrock_example():
 
 
 def test_jitted_residual_with_jitted_geodesic_update():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
     solver = UnderdeterminedLevenbergMarquardt(
         jax.jit(residual_fn),
         init_damping=1e-2,
@@ -775,17 +769,17 @@ def test_jitted_residual_with_jitted_geodesic_update():
     )
 
     @jax.jit
-    def train_step(params, lm_state):
-        return solver.update(params, lm_state, (x, y))
+    def train_step(x, lm_state):
+        return solver.update(x, lm_state, (ts, ys))
 
-    params, lm_state, info = train_step(params, solver.init(params, (x, y)))
+    x, lm_state, info = train_step(x, solver.init(x, (ts, ys)))
 
     assert bool(info.accepted)
     assert jnp.isfinite(info.loss)
     assert jnp.isfinite(info.acceleration_ratio)
     assert jnp.isfinite(lm_state.damping)
-    assert params["a"].dtype == jnp.float32
-    assert params["b"].dtype == jnp.float32
+    assert x["a"].dtype == jnp.float32
+    assert x["b"].dtype == jnp.float32
 
 
 def test_metric_from_cholesky_matches_dense_metric():
@@ -864,9 +858,9 @@ def test_metric_step_matches_closed_form_solution(linear_solver):
 
 
 def test_geodesic_step_matches_regression_values():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
     solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
@@ -874,20 +868,18 @@ def test_geodesic_step_matches_regression_values():
         geodesic_acceptance_ratio=10.0,
     )
 
-    new_params, lm_state, info = solver.update(
-        params, solver.init(params, (x, y)), (x, y)
-    )
+    new_x, lm_state, info = solver.update(x, solver.init(x, (ts, ys)), (ts, ys))
 
     assert bool(info.accepted)
     assert bool(info.used_geodesic)
     assert jnp.allclose(
-        new_params["a"],
+        new_x["a"],
         jnp.asarray(1.9073810577392578),
         rtol=REGRESSION_RTOL,
         atol=REGRESSION_ATOL,
     )
     assert jnp.allclose(
-        new_params["b"],
+        new_x["b"],
         jnp.asarray(-0.9168586730957031),
         rtol=REGRESSION_RTOL,
         atol=REGRESSION_ATOL,
@@ -996,16 +988,16 @@ def test_custom_metric_update_jits_and_matches_closed_form_solution():
 
 
 def test_init_state_matches_update_signature():
-    # init() and update() must produce the same jit signature for `damping`;
-    # a weakly-typed init scalar forced a recompile on the second step.
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    # init() and update() must produce the same jit signature for `damping`
+    # (strongly typed, matching dtype), or the second step recompiles.
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
 
-    state0 = solver.init(params, (x, y))
-    _, state1, _ = solver.update(params, state0, (x, y))
-    d0, d1 = state0.damping, state1.damping
+    lm_state0 = solver.init(x, (ts, ys))
+    _, lm_state1, _ = solver.update(x, lm_state0, (ts, ys))
+    d0, d1 = lm_state0.damping, lm_state1.damping
     assert (d0.dtype, d0.weak_type, d0.shape) == (d1.dtype, d1.weak_type, d1.shape)
     assert d0.weak_type is False
     assert d0.dtype == jnp.result_type(float)
@@ -1096,21 +1088,21 @@ def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root():
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
     theta0 = jnp.zeros(2)
 
-    def solved_params(p):
+    def solved_x(p):
         return solver.solve(theta0, p=p, max_steps=80, atol=1e-6).x
 
     p = jnp.asarray(3.0)
     p_dot = jnp.asarray(0.7)
-    params, params_dot = jax.jvp(solved_params, (p,), (p_dot,))
-    expected_params = jnp.array([3.0 / 5.0, 6.0 / 5.0])
-    expected_params_dot = jnp.array([p_dot / 5.0, 2.0 * p_dot / 5.0])
+    x, x_dot = jax.jvp(solved_x, (p,), (p_dot,))
+    expected_x = jnp.array([3.0 / 5.0, 6.0 / 5.0])
+    expected_x_dot = jnp.array([p_dot / 5.0, 2.0 * p_dot / 5.0])
 
-    _, pullback = jax.vjp(solved_params, p)
+    _, pullback = jax.vjp(solved_x, p)
     (p_cotangent,) = pullback(jnp.array([3.0, 4.0]))
     expected_p_cotangent = (3.0 + 2.0 * 4.0) / 5.0
 
-    assert jnp.allclose(params, expected_params, atol=1e-5)
-    assert jnp.allclose(params_dot, expected_params_dot, atol=1e-6)
+    assert jnp.allclose(x, expected_x, atol=1e-5)
+    assert jnp.allclose(x_dot, expected_x_dot, atol=1e-6)
     assert jnp.allclose(p_cotangent, expected_p_cotangent, atol=1e-6)
 
 
@@ -1139,18 +1131,18 @@ def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
         metric=metric,
     )
 
-    def solved_params(p):
+    def solved_x(p):
         return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
 
     p_dot = jnp.asarray(0.7)
-    _, params_dot = jax.jvp(solved_params, (jnp.asarray(3.0),), (p_dot,))
-    expected_params_dot = (
+    _, x_dot = jax.jvp(solved_x, (jnp.asarray(3.0),), (p_dot,))
+    expected_x_dot = (
         metric_inverse
         @ jacobian.T
         @ jnp.linalg.solve(jacobian @ metric_inverse @ jacobian.T, jnp.array([p_dot]))
     ).ravel()
 
-    assert jnp.allclose(params_dot, expected_params_dot, atol=1e-6)
+    assert jnp.allclose(x_dot, expected_x_dot, atol=1e-6)
 
 
 @pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
@@ -1356,9 +1348,9 @@ def test_callback_returning_args_invalidates_jacobian_cache():
 
 
 def test_solve_callback_history_buffer_matches_update_loop():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
     max_steps = 5
 
     def callback(ctx):
@@ -1374,8 +1366,8 @@ def test_solve_callback_history_buffer_matches_update_loop():
 
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     result = solver.solve(
-        params,
-        (x, y),
+        x,
+        (ts, ys),
         max_steps=max_steps,
         callback=callback,
         user_state={
@@ -1384,14 +1376,14 @@ def test_solve_callback_history_buffer_matches_update_loop():
         },
     )
 
-    loop_params, loop_state = params, solver.init(params, (x, y))
+    loop_x, loop_lm_state = x, solver.init(x, (ts, ys))
     for i in range(max_steps):
-        loop_params, loop_state, info = solver.update(loop_params, loop_state, (x, y))
+        loop_x, loop_lm_state, info = solver.update(loop_x, loop_lm_state, (ts, ys))
         assert float(result.user_state["loss"][i]) == pytest.approx(
             float(info.loss), rel=1e-4, abs=1e-8
         )
         assert float(result.user_state["damping"][i]) == pytest.approx(
-            float(loop_state.damping), rel=1e-6
+            float(loop_lm_state.damping), rel=1e-6
         )
 
 
@@ -1423,11 +1415,11 @@ def test_solve_callback_returning_none_leaves_loop_untouched(jit):
 
 
 def test_one_arg_residual_closes_over_data():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
 
-    def residual(params):
-        return params["a"] * jnp.exp(params["b"] * x) - y
+    def residual(x):
+        return x["a"] * jnp.exp(x["b"] * ts) - ys
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
     result = solver.solve({"a": 1.0, "b": 0.0}, max_steps=50, atol=1e-6)
@@ -1438,39 +1430,37 @@ def test_one_arg_residual_closes_over_data():
 
 
 def test_two_arg_residual_takes_aux():
-    def residual(params, args):
-        x, y = args
-        return params["a"] * jnp.exp(params["b"] * x) - y
+    def residual(x, args):
+        ts, ys = args
+        return x["a"] * jnp.exp(x["b"] * ts) - ys
 
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
-    params0 = {"a": 1.0, "b": 0.0}
-    params, lm_state, info = solver.update(
-        params0, solver.init(params0, (x, y)), (x, y)
-    )
+    x0 = {"a": 1.0, "b": 0.0}
+    x, lm_state, info = solver.update(x0, solver.init(x0, (ts, ys)), (ts, ys))
 
     assert solver.residual_arity == 2
     assert bool(info.accepted)
 
 
 def test_residual_arity_matches_three_arg_solver():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
 
     def one_arg(theta):
-        return residual_fn(theta, (x, y), None)
+        return residual_fn(theta, (ts, ys), None)
 
     one_solver = UnderdeterminedLevenbergMarquardt(one_arg, init_damping=1e-2)
     three_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-    one_params, one_state, one_info = one_solver.update(params, one_solver.init(params))
-    three_params, three_state, three_info = three_solver.update(
-        params, three_solver.init(params, (x, y)), (x, y)
+    one_x, one_state, one_info = one_solver.update(x, one_solver.init(x))
+    three_x, three_state, three_info = three_solver.update(
+        x, three_solver.init(x, (ts, ys)), (ts, ys)
     )
 
-    assert jnp.allclose(one_params["a"], three_params["a"])
-    assert jnp.allclose(one_params["b"], three_params["b"])
+    assert jnp.allclose(one_x["a"], three_x["a"])
+    assert jnp.allclose(one_x["b"], three_x["b"])
     assert jnp.allclose(one_info.loss, three_info.loss)
     assert jnp.allclose(one_state.damping, three_state.damping)
 
@@ -1520,40 +1510,40 @@ def test_cache_jacobian_single_step_matches_fresh_solver_after_rejection():
     # After a rejection the cached solver reuses (resid, Jt); its next step
     # must match a fresh no-cache solver started at the identical (theta,
     # damping) up to float noise.
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    args = (x, y)
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    args = (ts, ys)
     kw = {"init_damping": 1e-8, "damping_decrease": 0.01, "damping_increase": 100.0}
     cached = UnderdeterminedLevenbergMarquardt(residual_fn, cache_jacobian=True, **kw)
     plain = UnderdeterminedLevenbergMarquardt(residual_fn, **kw)
 
-    params = {"a": 1.0, "b": 3.0}
-    lm_state = cached.init(x0=params, args=args)
+    x = {"a": 1.0, "b": 3.0}
+    lm_state = cached.init(x0=x, args=args)
     reuse_steps = 0
     for _ in range(12):
-        params_prev, state_prev = params, lm_state
-        params, lm_state, info = cached.update(params, lm_state, args)
+        x_prev, state_prev = x, lm_state
+        x, lm_state, info = cached.update(x, lm_state, args)
         if bool(state_prev.jacobian_valid):
             reuse_steps += 1
-            ref_params, _, ref_info = plain.update(
-                params_prev, LMState(state_prev.damping), args
-            )
+            ref_x, _, ref_info = plain.update(x_prev, LMState(state_prev.damping), args)
             assert bool(ref_info.accepted) == bool(info.accepted)
-            assert jnp.allclose(ref_params["a"], params["a"], rtol=1e-5, atol=1e-6)
-            assert jnp.allclose(ref_params["b"], params["b"], rtol=1e-5, atol=1e-6)
+            assert jnp.allclose(ref_x["a"], x["a"], rtol=1e-5, atol=1e-6)
+            assert jnp.allclose(ref_x["b"], x["b"], rtol=1e-5, atol=1e-6)
     assert reuse_steps > 0
 
 
 def test_cache_jacobian_solve_converges_and_matches_plain():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
     cached = UnderdeterminedLevenbergMarquardt(
         residual_fn, init_damping=1e-2, cache_jacobian=True
     )
     plain = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
 
-    cached_result = cached.solve({"a": 1.0, "b": 0.0}, (x, y), max_steps=50, atol=1e-6)
-    plain_result = plain.solve({"a": 1.0, "b": 0.0}, (x, y), max_steps=50, atol=1e-6)
+    cached_result = cached.solve(
+        {"a": 1.0, "b": 0.0}, (ts, ys), max_steps=50, atol=1e-6
+    )
+    plain_result = plain.solve({"a": 1.0, "b": 0.0}, (ts, ys), max_steps=50, atol=1e-6)
 
     assert int(cached_result.status) == LMStatus.CONVERGED
     assert int(plain_result.status) == LMStatus.CONVERGED
@@ -1580,42 +1570,42 @@ def test_cache_jacobian_is_inert_for_non_cholesky_solvers():
         iterative_maxiter=20,
     )
     assert not solver.cache_jacobian
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
-    lm_state = solver.init(params, (x, y))
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
+    lm_state = solver.init(x, (ts, ys))
     assert lm_state.jacobian_valid is None
-    _, _, info = solver.update(params, lm_state, (x, y))
+    _, _, info = solver.update(x, lm_state, (ts, ys))
     assert bool(info.accepted)
 
 
 def test_init_with_params_infers_dtype_from_residual():
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    lm_state = solver.init(x0={"a": 1.0, "b": 0.0}, args=(x, y))
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    lm_state = solver.init(x0={"a": 1.0, "b": 0.0}, args=(ts, ys))
     assert lm_state.damping.dtype == jnp.float32
 
 
 def test_cache_jacobian_off_leaves_no_trace_in_the_jaxpr():
     # With caching (and geodesic) off there is no lax.cond in update at all,
     # so the disabled flag provably adds zero compiled overhead.
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
 
     plain = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     cached = UnderdeterminedLevenbergMarquardt(
         residual_fn, init_damping=1e-2, cache_jacobian=True
     )
     plain_jaxpr = str(
-        jax.make_jaxpr(lambda p, s: plain.update(p, s, (x, y)))(
-            params, plain.init(params, (x, y))
+        jax.make_jaxpr(lambda p, s: plain.update(p, s, (ts, ys)))(
+            x, plain.init(x, (ts, ys))
         )
     )
     cached_jaxpr = str(
-        jax.make_jaxpr(lambda p, s: cached.update(p, s, (x, y)))(
-            params, cached.init(x0=params, args=(x, y))
+        jax.make_jaxpr(lambda p, s: cached.update(p, s, (ts, ys)))(
+            x, cached.init(x0=x, args=(ts, ys))
         )
     )
 
@@ -1623,17 +1613,17 @@ def test_cache_jacobian_off_leaves_no_trace_in_the_jaxpr():
     assert "cond" in cached_jaxpr
 
 
-def aux_residual_fn(params, args):
-    x, y = args
-    r = params["a"] * jnp.exp(params["b"] * x) - y
+def aux_residual_fn(x, args):
+    ts, ys = args
+    r = x["a"] * jnp.exp(x["b"] * ts) - ys
     return r, {"mean_abs": jnp.mean(jnp.abs(r)), "max_abs": jnp.max(jnp.abs(r))}
 
 
 @pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
 def test_has_aux_reports_aux_at_pre_step_params(linear_solver):
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
     solver_kwargs = {}
     if linear_solver in ("cg", "lsmr"):
         solver_kwargs = {"iterative_tol": 1e-7, "iterative_maxiter": 20}
@@ -1645,10 +1635,10 @@ def test_has_aux_reports_aux_at_pre_step_params(linear_solver):
         linear_solver=linear_solver,
         **solver_kwargs,
     )
-    lm_state = solver.init(params, (x, y))
-    _, _, info = solver.update(params, lm_state, (x, y))
+    lm_state = solver.init(x, (ts, ys))
+    _, _, info = solver.update(x, lm_state, (ts, ys))
 
-    r, expected = aux_residual_fn(params, (x, y))
+    r, expected = aux_residual_fn(x, (ts, ys))
     assert float(info.aux["mean_abs"]) == pytest.approx(
         float(expected["mean_abs"]), rel=1e-6
     )
@@ -1659,8 +1649,8 @@ def test_has_aux_reports_aux_at_pre_step_params(linear_solver):
 
 
 def test_has_aux_flows_to_solve_callback_and_result():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
 
     def callback(ctx):
         return LMSolveAction(stop=ctx.info.aux["max_abs"] < 1e-4)
@@ -1668,32 +1658,34 @@ def test_has_aux_flows_to_solve_callback_and_result():
     solver = UnderdeterminedLevenbergMarquardt(
         aux_residual_fn, init_damping=1e-2, has_aux=True, geodesic_acceleration=True
     )
-    result = solver.solve({"a": 1.0, "b": 0.0}, (x, y), max_steps=50, callback=callback)
+    result = solver.solve(
+        {"a": 1.0, "b": 0.0}, (ts, ys), max_steps=50, callback=callback
+    )
 
     assert int(result.status) == LMStatus.CALLBACK_STOP
     assert float(result.info.aux["max_abs"]) < 1e-4
 
 
 def test_has_aux_works_with_jacobian_cache():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
 
     solver = UnderdeterminedLevenbergMarquardt(
         aux_residual_fn, init_damping=1e-2, has_aux=True, cache_jacobian=True
     )
-    result = solver.solve(params, (x, y), max_steps=50, atol=1e-6)
+    result = solver.solve(x, (ts, ys), max_steps=50, atol=1e-6)
 
     assert int(result.status) == LMStatus.CONVERGED
     assert float(result.info.aux["mean_abs"]) < 1e-4
 
 
 def test_has_aux_off_keeps_info_aux_none():
-    x = jnp.linspace(0.0, 2.0, 20)
-    y = 2.0 * jnp.exp(-1.0 * x)
-    params = {"a": 1.0, "b": 0.0}
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-    _, _, info = solver.update(params, solver.init(params, (x, y)), (x, y))
+    _, _, info = solver.update(x, solver.init(x, (ts, ys)), (ts, ys))
     assert info.aux is None
 
 
