@@ -36,7 +36,7 @@ def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
     with jax.default_device(gpu):
         theta = jnp.asarray([1.9])
         target = jnp.asarray(4.0)
-        state = solver.init()
+        state = solver.init(theta, target)
 
     @jax.jit
     def step(theta, state, target):
@@ -71,7 +71,7 @@ def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
     with jax.default_device(gpu):
         theta = jnp.asarray([1.9])
         target = jnp.asarray(4.0)
-        state = solver.init()
+        state = solver.init(theta, target)
 
     @jax.jit
     def step(theta, state, target):

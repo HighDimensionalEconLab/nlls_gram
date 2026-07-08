@@ -31,10 +31,10 @@ def _make_large_interpolation_problem(
     # device_put commits the arrays, which pins the jitted step to the target
     # device; default_device placement alone lets them migrate to the GPU.
     params = jax.device_put(params, device)
-    aux = jax.device_put((features, y), device)
+    args = jax.device_put((features, y), device)
 
-    def residual(theta, aux, p):
-        features, y = aux
+    def residual(theta, args, p):
+        features, y = args
         return jnp.sin(features @ theta) - y
 
     solver_kwargs = {
@@ -57,18 +57,18 @@ def _make_large_interpolation_problem(
         geodesic_acceleration=geodesic_acceleration,
     )
 
-    state = jax.device_put(base_solver.init(), device)
+    state = jax.device_put(base_solver.init(params, args), device)
 
     @jax.jit
     def first_step(params, state):
-        return base_solver.update(params, state, aux)
+        return base_solver.update(params, state, args)
 
     params, state, _ = first_step(params, state)
     jax.block_until_ready((params, state))
 
     @jax.jit
     def step(params, state):
-        return solver.update(params, state, aux)
+        return solver.update(params, state, args)
 
     return params, state, step
 

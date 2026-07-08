@@ -13,11 +13,11 @@ from jax.flatten_util import ravel_pytree
 from nlls_gram.metrics import Metric
 
 # General-JAX least-squares solver: a class exposing init() -> state,
-# update(params, state, aux, p) -> (new_params, state, info), and a solve()
+# update(params, state, args, p) -> (new_params, state, info), and a solve()
 # convenience loop. params is ANY pytree
 # (a flat array, a dict, nnx.state(model, nnx.Param), ...); the solver only ravels
 # and unravels it with jax.flatten_util.ravel_pytree and calls the user's
-# residual_fn, which may take (params), (params, aux), or (params, aux, p).
+# residual_fn, which may take (params), (params, args), or (params, args, p).
 # It knows nothing about flax/nnx/optax. update()
 # does not jit internally; solve(jit=True) wraps the loop in jax.jit. All
 # hyperparameters are static Python scalars; all data-dependent control flow is
@@ -41,11 +41,13 @@ class LMStatus:
 class LMState:
     damping: jax.Array
     # Jacobian cache, populated only when cache_jacobian=True: the residual
-    # and J' at the current params, and whether they are still valid (the
-    # last step was rejected, so params did not move).
+    # (and its aux output when has_aux=True) and J' at the current params,
+    # and whether they are still valid (the last step was rejected, so params
+    # did not move).
     resid: Any = None
     Jt: Any = None
     jacobian_valid: Any = None
+    aux: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -61,6 +63,7 @@ class LMInfo:
     acceleration_ratio: jax.Array
     grad_norm: jax.Array  # ||J' r|| at the pre-step params
     step_norm: jax.Array  # ||candidate step||, reported even when rejected
+    aux: Any = None  # residual aux output at the pre-step params (has_aux)
 
 
 @jax.tree_util.register_dataclass
@@ -76,7 +79,7 @@ class LMSolveAction:
     status: Any = None
     params: Any = None
     state: Any = None
-    aux: Any = None
+    args: Any = None
     user_state: Any = None
 
 
@@ -91,7 +94,7 @@ class LMSolveContext:
     state: LMState
     state_old: LMState
     initial_state: LMState
-    aux: Any
+    args: Any
     p: Any
     user_state: Any
     info: LMInfo
@@ -107,7 +110,7 @@ class LMSolveResult:
     info: LMInfo
     steps: jax.Array
     status: jax.Array
-    aux: Any
+    args: Any
     p: Any
     user_state: Any
 
@@ -142,11 +145,12 @@ class UnderdeterminedLevenbergMarquardt:
         iterative_maxiter=8,
         lsmr_conlim=float("inf"),
         metric=None,
+        has_aux=False,
         cache_jacobian=False,
         geodesic_acceleration=False,
         geodesic_acceptance_ratio=0.75,
     ):
-        # The residual may take (params), (params, aux), or (params, aux, p) —
+        # The residual may take (params), (params, args), or (params, args, p) —
         # always in that order. Arity is inspected once here and the function
         # is wrapped into the canonical 3-arg form, so the compiled code is
         # identical for all three. Callables whose signature cannot be
@@ -169,17 +173,17 @@ class UnderdeterminedLevenbergMarquardt:
             if residual_arity < 1 or residual_arity > 3:
                 raise ValueError(
                     "residual_fn must take 1 to 3 positional arguments: "
-                    "(params), (params, aux), or (params, aux, p)"
+                    "(params), (params, args), or (params, args, p)"
                 )
         if residual_arity == 1:
 
-            def canonical_residual(params, aux, p):
+            def canonical_residual(params, args, p):
                 return residual_fn(params)
 
         elif residual_arity == 2:
 
-            def canonical_residual(params, aux, p):
-                return residual_fn(params, aux)
+            def canonical_residual(params, args, p):
+                return residual_fn(params, args)
 
         else:
             canonical_residual = residual_fn
@@ -249,6 +253,7 @@ class UnderdeterminedLevenbergMarquardt:
         # matrix-free solvers never materialize J, so there is nothing to
         # cache and the flag is inert for them (and for qr).
         self.cache_jacobian = cache_jacobian and linear_solver == "cholesky"
+        self.has_aux = has_aux
         self._has_custom_metric = has_custom_metric
         self._has_metric_solve = metric.solve is not None
         self.metric_solve = (lambda x: x) if metric.solve is None else metric.solve
@@ -266,42 +271,37 @@ class UnderdeterminedLevenbergMarquardt:
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
 
-    def init(self, dtype=None, *, params=None, aux=None, p=None):
-        # Use a strongly-typed damping matching the problem dtype so init() and
-        # update() produce the same jit signature (a weakly-typed scalar here
-        # would force a recompile on the second step). dtype=None defers to JAX's
-        # default float type (float32, or float64 when x64 is enabled); passing
-        # params (with any aux/p the residual needs) infers the dtype from the
-        # residual instead, and is required when cache_jacobian=True so the
-        # Jacobian cache buffers can be sized.
-        if self.cache_jacobian and params is None:
-            raise ValueError(
-                "cache_jacobian=True requires init(params=...) (with aux/p as "
-                "needed) to size the Jacobian cache"
-            )
-        if params is not None:
-            self._check_residual_args(aux, p)
-            residual = jnp.ravel(self.residual_fn(params, aux, p))
-            if dtype is None:
-                dtype = residual.dtype
-        elif dtype is None:
-            dtype = jnp.result_type(float)
-        damping = jnp.asarray(self.init_damping, dtype=dtype)
+    def init(self, params, args=None, *, p=None):
+        # One residual evaluation infers the problem dtype, so the damping is
+        # strongly typed to match what update() returns (a mismatched or
+        # weakly-typed scalar here would force a recompile on the second step
+        # or break the solve loop carry). The same evaluation sizes the
+        # Jacobian cache buffers when cache_jacobian=True.
+        self._check_residual_args(args, p)
+        residual, aux = self._residual_and_aux(params, args, p)
+        damping = jnp.asarray(self.init_damping, dtype=residual.dtype)
         if not self.cache_jacobian:
             return LMState(damping)
         theta, _ = ravel_pytree(params)
         return LMState(
             damping,
-            jnp.zeros(residual.shape, dtype=dtype),
-            jnp.zeros((theta.size, residual.size), dtype=dtype),
+            jnp.zeros(residual.shape, dtype=residual.dtype),
+            jnp.zeros((theta.size, residual.size), dtype=residual.dtype),
             jnp.asarray(False, dtype=jnp.bool_),
+            jax.tree.map(jnp.zeros_like, aux),
         )
 
-    def _initial_info(self, params, state, aux, p):
+    def _residual_and_aux(self, params, args, p):
+        if self.has_aux:
+            value, aux = self.residual_fn(params, args, p)
+            return jnp.ravel(value), aux
+        return jnp.ravel(self.residual_fn(params, args, p)), None
+
+    def _initial_info(self, params, state, args, p):
         # grad_norm is a +inf sentinel (computing it would cost a Jacobian
         # before the first step) and step_norm is zero; neither can satisfy
         # gtol/xtol before any update has run.
-        residual = jnp.ravel(self.residual_fn(params, aux, p))
+        residual, aux = self._residual_and_aux(params, args, p)
         loss = jnp.sum(residual**2)
         zero = jnp.zeros((), dtype=residual.dtype)
         one = jnp.ones((), dtype=residual.dtype)
@@ -316,43 +316,69 @@ class UnderdeterminedLevenbergMarquardt:
             zero,
             jnp.asarray(jnp.inf, dtype=residual.dtype),
             zero,
+            aux,
         )
 
-    def update(self, params, state, aux=None, p=None):
-        self._check_residual_args(aux, p)
+    def update(self, params, state, args=None, p=None):
+        self._check_residual_args(args, p)
         theta, unravel = ravel_pytree(params)
 
-        def residual_flat(th):
-            return jnp.ravel(self.residual_fn(unravel(th), aux, p))
+        if self.has_aux:
+
+            def residual_flat(th):
+                value, aux = self.residual_fn(unravel(th), args, p)
+                return jnp.ravel(value), aux
+
+            def residual_value(th):
+                return residual_flat(th)[0]
+
+        else:
+
+            def residual_flat(th):
+                return jnp.ravel(self.residual_fn(unravel(th), args, p))
+
+            residual_value = residual_flat
 
         if self.linear_solver in ("cg", "lsmr"):
-            resid, jvp_fn = jax.linearize(residual_flat, theta)
+            if self.has_aux:
+                resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
+            else:
+                resid, jvp_fn = jax.linearize(residual_flat, theta)
+                aux = None
         elif self.cache_jacobian:
             if state.jacobian_valid is None:
                 raise ValueError(
                     "cache_jacobian=True but the state has no Jacobian cache; "
-                    "create the state with init(params=...)"
+                    "create the state with init(params, args, p=p)"
                 )
 
             def compute_resid_and_jt(_):
-                resid, pullback = jax.vjp(residual_flat, theta)
+                if self.has_aux:
+                    resid, pullback, aux = jax.vjp(residual_flat, theta, has_aux=True)
+                else:
+                    resid, pullback = jax.vjp(residual_flat, theta)
+                    aux = None
                 residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
                 Jt = jax.vmap(lambda cotangent: pullback(cotangent)[0])(
                     residual_basis
                 ).T
-                return resid, Jt
+                return resid, Jt, aux
 
             def reuse_resid_and_jt(_):
-                return state.resid, state.Jt
+                return state.resid, state.Jt, state.aux
 
-            resid, Jt = jax.lax.cond(
+            resid, Jt, aux = jax.lax.cond(
                 state.jacobian_valid,
                 reuse_resid_and_jt,
                 compute_resid_and_jt,
                 operand=None,
             )
         else:
-            resid, pullback = jax.vjp(residual_flat, theta)
+            if self.has_aux:
+                resid, pullback, aux = jax.vjp(residual_flat, theta, has_aux=True)
+            else:
+                resid, pullback = jax.vjp(residual_flat, theta)
+                aux = None
         damping = jnp.asarray(state.damping, dtype=resid.dtype)
         damping_decrease = jnp.asarray(self.damping_decrease, dtype=resid.dtype)
         damping_increase = jnp.asarray(self.damping_increase, dtype=resid.dtype)
@@ -479,7 +505,7 @@ class UnderdeterminedLevenbergMarquardt:
                     return -gram_step_left @ jsp_linalg.cho_solve(linear_factor, rhs)
 
         velocity = solve_step(resid)
-        resid_velocity = residual_flat(theta + velocity)
+        resid_velocity = residual_value(theta + velocity)
         loss_old = jnp.sum(resid**2)
         loss_velocity = jnp.sum(resid_velocity**2)
         zero = jnp.zeros((), dtype=resid.dtype)
@@ -490,7 +516,10 @@ class UnderdeterminedLevenbergMarquardt:
             )
 
             def first_jvp(th):
-                return jax.jvp(residual_flat, (th,), (velocity,))[1]
+                # [1] is the tangent with and without has_aux.
+                return jax.jvp(residual_flat, (th,), (velocity,), has_aux=self.has_aux)[
+                    1
+                ]
 
             f_vv = jax.jvp(first_jvp, (theta,), (velocity,))[1]
             acceleration = solve_step(f_vv)
@@ -507,7 +536,7 @@ class UnderdeterminedLevenbergMarquardt:
             )
 
             def accelerated_loss(_):
-                resid_accelerated = residual_flat(theta + accelerated_step)
+                resid_accelerated = residual_value(theta + accelerated_step)
                 return jnp.sum(resid_accelerated**2)
 
             loss_accelerated = jax.lax.cond(
@@ -535,7 +564,7 @@ class UnderdeterminedLevenbergMarquardt:
             )
         loss = jnp.where(improved, loss_candidate, loss_old)
         if self.cache_jacobian:
-            new_state = LMState(new_damping, resid, Jt, ~improved)
+            new_state = LMState(new_damping, resid, Jt, ~improved, aux)
         else:
             new_state = LMState(new_damping)
         return (
@@ -552,17 +581,17 @@ class UnderdeterminedLevenbergMarquardt:
                 acceleration_ratio,
                 jnp.linalg.norm(grad),
                 jnp.linalg.norm(step),
+                aux,
             ),
         )
 
     def solve(
         self,
         params,
-        aux=None,
+        args=None,
         *,
         p=None,
         state=None,
-        dtype=None,
         max_steps=256,
         atol=0.0,
         gtol=0.0,
@@ -580,10 +609,10 @@ class UnderdeterminedLevenbergMarquardt:
         threshold; each tolerance set to ``0`` disables that check, and all
         three report ``LMStatus.CONVERGED``. ``callback`` receives an
         ``LMSolveContext`` after each step and may return an ``LMSolveAction`` to
-        stop, override params/state/aux, or update user state. ``p`` is passed to
+        stop, override params/state/args, or update user state. ``p`` is passed to
         the residual and callback but cannot be replaced by the action.
         """
-        self._check_residual_args(aux, p)
+        self._check_residual_args(args, p)
         if max_steps <= 0:
             raise ValueError("max_steps must be positive")
         if atol < 0:
@@ -592,22 +621,23 @@ class UnderdeterminedLevenbergMarquardt:
             raise ValueError("gtol must be nonnegative")
         if xtol < 0:
             raise ValueError("xtol must be nonnegative")
-        if state is not None and dtype is not None:
-            raise ValueError("dtype is only used when state is None")
         if state is None:
+            # init() would evaluate the residual eagerly just for the dtype,
+            # which the loop's recast makes unnecessary; only the Jacobian
+            # cache genuinely needs the shapes.
             if self.cache_jacobian:
-                state = self.init(dtype, params=params, aux=aux, p=p)
+                state = self.init(params, args, p=p)
             else:
-                state = self.init(dtype)
+                state = LMState(jnp.asarray(self.init_damping))
 
         @jax.custom_jvp
         def solve_with_implicit_p(
-            params, state, aux, p, user_state, max_steps, atol, gtol, xtol
+            params, state, args, p, user_state, max_steps, atol, gtol, xtol
         ):
             return self._solve_impl(
                 params,
                 state,
-                aux,
+                args,
                 p,
                 user_state,
                 max_steps,
@@ -620,13 +650,13 @@ class UnderdeterminedLevenbergMarquardt:
 
         @solve_with_implicit_p.defjvp
         def solve_with_implicit_p_jvp(primals, tangents):
-            params, state, aux, p, user_state, max_steps, atol, gtol, xtol = primals
+            params, state, args, p, user_state, max_steps, atol, gtol, xtol = primals
             _, _, _, p_dot, _, _, _, _, _ = tangents
             result = solve_with_implicit_p(
-                params, state, aux, p, user_state, max_steps, atol, gtol, xtol
+                params, state, args, p, user_state, max_steps, atol, gtol, xtol
             )
             params_dot = self._implicit_params_tangent_from_p(
-                result.params, result.aux, result.p, p_dot
+                result.params, result.args, result.p, p_dot
             )
             zero_result = jax.tree.map(_zero_tangent_leaf, result)
             return (
@@ -637,21 +667,21 @@ class UnderdeterminedLevenbergMarquardt:
                     zero_result.info,
                     zero_result.steps,
                     zero_result.status,
-                    zero_result.aux,
+                    zero_result.args,
                     p_dot,
                     zero_result.user_state,
                 ),
             )
 
         return solve_with_implicit_p(
-            params, state, aux, p, user_state, max_steps, atol, gtol, xtol
+            params, state, args, p, user_state, max_steps, atol, gtol, xtol
         )
 
     def _solve_impl(
         self,
         params,
         state,
-        aux,
+        args,
         p,
         user_state,
         max_steps,
@@ -666,7 +696,7 @@ class UnderdeterminedLevenbergMarquardt:
                 self,
                 params,
                 state,
-                aux,
+                args,
                 p,
                 user_state,
                 max_steps,
@@ -678,7 +708,7 @@ class UnderdeterminedLevenbergMarquardt:
         return self._solve_python(
             params,
             state,
-            aux,
+            args,
             p,
             user_state,
             max_steps,
@@ -688,14 +718,14 @@ class UnderdeterminedLevenbergMarquardt:
             callback,
         )
 
-    def _implicit_params_tangent_from_p(self, params, aux, p, p_dot):
+    def _implicit_params_tangent_from_p(self, params, args, p, p_dot):
         if p is None:
             return jax.tree.map(_zero_tangent_leaf, params)
 
         theta, unravel = ravel_pytree(params)
 
         def residual_from_theta(theta_value):
-            return jnp.ravel(self.residual_fn(unravel(theta_value), aux, p))
+            return self._residual_and_aux(unravel(theta_value), args, p)[0]
 
         residual, theta_jvp = jax.linearize(residual_from_theta, theta)
         residual_basis = jnp.eye(residual.shape[0], dtype=residual.dtype)
@@ -703,7 +733,7 @@ class UnderdeterminedLevenbergMarquardt:
         Jt = jax.vmap(lambda cotangent: theta_transpose(cotangent)[0])(residual_basis).T
 
         def residual_from_p(p_value):
-            return jnp.ravel(self.residual_fn(params, aux, p_value))
+            return self._residual_and_aux(params, args, p_value)[0]
 
         residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
         gram_step_left = self._metric_inverse(Jt)
@@ -722,31 +752,41 @@ class UnderdeterminedLevenbergMarquardt:
             return LMSolveAction()
         return action
 
-    def _apply_action(self, action, params, state, aux, user_state):
+    def _apply_action(self, action, params, state, args, user_state):
         action = self._action_or_default(action)
         if action.params is not None:
             params = action.params
         if action.state is not None:
             state = action.state
-        if action.aux is not None:
-            aux = action.aux
+        if action.args is not None:
+            args = action.args
         if action.user_state is not None:
             user_state = action.user_state
-        return action, params, state, aux, user_state
+        # A callback that returns params or args may have changed the point the
+        # cached Jacobian was computed at, so invalidate conservatively. The
+        # check is structural (did the action include the field), which is why
+        # it composes with jit: values are traced, presence is not.
+        if self.cache_jacobian and (
+            action.params is not None or action.args is not None
+        ):
+            state = dataclasses.replace(
+                state, jacobian_valid=jnp.asarray(False, dtype=jnp.bool_)
+            )
+        return action, params, state, args, user_state
 
-    def _check_residual_args(self, aux, p):
-        # A residual that never sees aux/p must not have them silently
+    def _check_residual_args(self, args, p):
+        # A residual that never sees args/p must not have them silently
         # dropped — in particular the implicit derivative with respect to p
         # would be a silent zero.
-        if aux is not None and self.residual_arity < 2:
+        if args is not None and self.residual_arity < 2:
             raise ValueError(
-                "aux was passed but residual_fn takes only (params); "
-                "use residual_fn(params, aux)"
+                "args was passed but residual_fn takes only (params); "
+                "use residual_fn(params, args)"
             )
         if p is not None and self.residual_arity < 3:
             raise ValueError(
                 "p was passed but residual_fn takes no p argument; "
-                "use residual_fn(params, aux, p)"
+                "use residual_fn(params, args, p)"
             )
 
     def _converged(self, info, atol, gtol, xtol):
@@ -759,7 +799,7 @@ class UnderdeterminedLevenbergMarquardt:
         self,
         params,
         state,
-        aux,
+        args,
         p,
         user_state,
         max_steps,
@@ -768,7 +808,7 @@ class UnderdeterminedLevenbergMarquardt:
         xtol,
         callback,
     ):
-        info = self._initial_info(params, state, aux, p)
+        info = self._initial_info(params, state, args, p)
         state = dataclasses.replace(
             state, damping=jnp.asarray(state.damping, dtype=info.loss.dtype)
         )
@@ -785,7 +825,7 @@ class UnderdeterminedLevenbergMarquardt:
                 steps -= 1
                 break
             params_old, state_old = params, state
-            params, state, info = self.update(params, state, aux, p)
+            params, state, info = self.update(params, state, args, p)
             if not bool(jnp.isfinite(info.loss)):
                 status = LMStatus.NONFINITE
                 break
@@ -798,14 +838,14 @@ class UnderdeterminedLevenbergMarquardt:
                     state,
                     state_old,
                     initial_state,
-                    aux,
+                    args,
                     p,
                     user_state,
                     info,
                 )
                 action = callback(ctx)
-            action, params, state, aux, user_state = self._apply_action(
-                action, params, state, aux, user_state
+            action, params, state, args, user_state = self._apply_action(
+                action, params, state, args, user_state
             )
             if action.stop is not None and bool(action.stop):
                 status = (
@@ -828,7 +868,7 @@ class UnderdeterminedLevenbergMarquardt:
             info,
             jnp.asarray(steps, dtype=jnp.int32),
             jnp.asarray(status, dtype=jnp.int32),
-            aux,
+            args,
             p,
             user_state,
         )
@@ -838,7 +878,7 @@ def _solve_loop_impl(
     solver,
     params,
     state,
-    aux,
+    args,
     p,
     user_state,
     max_steps,
@@ -848,7 +888,7 @@ def _solve_loop_impl(
     callback,
 ):
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
-    info = solver._initial_info(params, state, aux, p)
+    info = solver._initial_info(params, state, args, p)
     # Recast so the while_loop carry dtype matches what update() returns (the
     # residual dtype), which init()'s default float may disagree with; the
     # tolerances likewise so all comparisons run in the residual dtype.
@@ -879,10 +919,10 @@ def _solve_loop_impl(
         return (~stop) & (step < max_steps)
 
     def body(carry):
-        params, state, aux, user_state, info, step, status, stop = carry
+        params, state, args, user_state, info, step, status, stop = carry
         del info, status, stop
         params_old, state_old = params, state
-        params, state, info = solver.update(params, state, aux, p)
+        params, state, info = solver.update(params, state, args, p)
         step = step + jnp.asarray(1, dtype=jnp.int32)
         current_nonfinite = ~jnp.isfinite(info.loss)
 
@@ -895,14 +935,14 @@ def _solve_loop_impl(
                 state,
                 state_old,
                 initial_state,
-                aux,
+                args,
                 p,
                 user_state,
                 info,
             )
             action = callback(ctx)
-        action, params, state, aux, user_state = solver._apply_action(
-            action, params, state, aux, user_state
+        action, params, state, args, user_state = solver._apply_action(
+            action, params, state, args, user_state
         )
 
         callback_stop = (
@@ -933,15 +973,15 @@ def _solve_loop_impl(
                 ),
             ),
         )
-        return params, state, aux, user_state, info, step, status, stop
+        return params, state, args, user_state, info, step, status, stop
 
     carry = jax.lax.while_loop(
         cond,
         body,
-        (params, state, aux, user_state, info, step, status, stop),
+        (params, state, args, user_state, info, step, status, stop),
     )
-    params, state, aux, user_state, info, step, status, _ = carry
-    return LMSolveResult(params, state, info, step, status, aux, p, user_state)
+    params, state, args, user_state, info, step, status, _ = carry
+    return LMSolveResult(params, state, info, step, status, args, p, user_state)
 
 
 _solve_loop_jit = jax.jit(_solve_loop_impl, static_argnums=(0, 10))

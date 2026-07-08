@@ -12,7 +12,7 @@ at underdetermined or interpolating problems where the number of parameters is
 larger than the number of residuals.
 
 `UnderdeterminedLevenbergMarquardt` minimizes a user residual taking
-`(params)`, `(params, aux)`, or `(params, aux, p)`, always in that order.
+`(params)`, `(params, args)`, or `(params, args, p)`, always in that order.
 Parameters may be any JAX pytree; internally they
 are flattened with `jax.flatten_util.ravel_pytree`. The default dense solver
 uses the residual-space Gram system, with QR, CG, and LSMR alternatives. Use
@@ -64,8 +64,8 @@ import jax.numpy as jnp
 from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
-def residual_fn(params, aux):
-    x, y = aux
+def residual_fn(params, args):
+    x, y = args
     return params["a"] * jnp.exp(params["b"] * x) - y
 
 
@@ -74,7 +74,7 @@ y = 2.0 * jnp.exp(-1.0 * x)
 params = {"a": 1.0, "b": 0.0}
 
 solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-state = solver.init()
+state = solver.init(params, (x, y))
 
 
 @jax.jit

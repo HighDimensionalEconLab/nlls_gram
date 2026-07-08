@@ -20,8 +20,8 @@ def assert_float64_tree(tree):
         assert leaf.dtype == jnp.float64, (leaf.dtype, leaf)
 
 
-def residual_fn(params, aux, p):
-    x, y = aux
+def residual_fn(params, args, p):
+    x, y = args
     return params["a"] * jnp.exp(params["b"] * x) - y
 
 
@@ -32,7 +32,7 @@ params = {
     "b": jnp.asarray(0.0, dtype=jnp.float64),
 }
 solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-state = solver.init()
+state = solver.init(params, (x, y))
 for _ in range(5):
     params, state, info = solver.update(params, state, (x, y))
 
@@ -70,7 +70,7 @@ solver = UnderdeterminedLevenbergMarquardt(
     geodesic_acceleration=True,
     geodesic_acceptance_ratio=1.0,
 )
-state = solver.init()
+state = solver.init(theta, target)
 theta, state, info = solver.update(theta, state, target)
 
 assert theta.dtype == jnp.float64
@@ -93,8 +93,8 @@ solve_jaxpr = str(
 assert "f32" not in solve_jaxpr, solve_jaxpr
 
 
-def linear_residual(theta, aux, p):
-    matrix, target = aux
+def linear_residual(theta, args, p):
+    matrix, target = args
     return matrix @ theta - target
 
 
@@ -108,7 +108,7 @@ solver = UnderdeterminedLevenbergMarquardt(
     iterative_tol=1e-10,
     iterative_maxiter=20,
 )
-state = solver.init()
+state = solver.init(theta, (matrix, target))
 theta, state, info = solver.update(theta, state, (matrix, target))
 
 assert theta.dtype == jnp.float64
@@ -138,7 +138,7 @@ solver = UnderdeterminedLevenbergMarquardt(
     init_damping=1e-2,
     linear_solver="qr",
 )
-state = solver.init()
+state = solver.init(theta, (matrix, target))
 theta, state, info = solver.update(theta, state, (matrix, target))
 
 assert theta.dtype == jnp.float64
@@ -180,14 +180,14 @@ x_nnx = jnp.linspace(0.0, 2.0, 20, dtype=jnp.float64).reshape(-1, 1)
 y_nnx = 2.0 * jnp.ravel(x_nnx)
 
 
-def nnx_residual_fn(params, aux, p):
-    x, y = aux
+def nnx_residual_fn(params, args, p):
+    x, y = args
     model = nnx.merge(graphdef, params)
     return model(x) - y
 
 
 solver = UnderdeterminedLevenbergMarquardt(nnx_residual_fn, init_damping=1e-12)
-state = solver.init()
+state = solver.init(nnx_params, (x_nnx, y_nnx))
 nnx_params, state, info = solver.update(nnx_params, state, (x_nnx, y_nnx))
 trained = nnx.merge(graphdef, nnx_params)
 
@@ -231,8 +231,8 @@ import jax.numpy as jnp
 from nlls_gram import LMStatus, UnderdeterminedLevenbergMarquardt
 
 
-def residual(theta, aux, p):
-    return theta - aux
+def residual(theta, args, p):
+    return theta - args
 
 
 solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)

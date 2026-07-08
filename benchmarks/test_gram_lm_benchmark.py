@@ -11,12 +11,12 @@ def _make_problem(*, n_residuals, n_params):
     y = jnp.sin(design @ theta_true)
     params = jnp.zeros(n_params)
 
-    def residual(theta, aux, p):
-        design, y = aux
+    def residual(theta, args, p):
+        design, y = args
         return jnp.sin(design @ theta) - y
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
-    state = solver.init()
+    state = solver.init(params, (design, y))
 
     @jax.jit
     def step(params, state):

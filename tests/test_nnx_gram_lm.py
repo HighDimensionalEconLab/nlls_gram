@@ -20,17 +20,17 @@ def test_nnx_state_params_recover_known_parameters():
     model = ExpModel()
     graphdef, params = nnx.split(model, nnx.Param)
 
-    def residual(params, aux, p):
-        xx, yy = aux
+    def residual(params, args, p):
+        xx, yy = args
         model = nnx.merge(graphdef, params)
         return model(xx) - yy
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
-    lm_state = solver.init()
+    lm_state = solver.init(params, (x, y))
 
     @jax.jit
-    def train_step(params, lm_state, aux):
-        return solver.update(params, lm_state, aux)
+    def train_step(params, lm_state, args):
+        return solver.update(params, lm_state, args)
 
     info = None
     for _ in range(50):
@@ -52,17 +52,17 @@ def test_nnx_wrt_filter_freezes_unselected_initialized_params():
     assert len(jax.tree.leaves(trainable)) == 1
     assert len(jax.tree.leaves(frozen)) == 1
 
-    def residual(trainable, aux, p):
-        xx, yy = aux
+    def residual(trainable, args, p):
+        xx, yy = args
         model = nnx.merge(graphdef, trainable, frozen)
         return model(xx) - yy
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
-    lm_state = solver.init()
+    lm_state = solver.init(trainable, (x, y))
 
     @jax.jit
-    def train_step(trainable, lm_state, aux):
-        return solver.update(trainable, lm_state, aux)
+    def train_step(trainable, lm_state, args):
+        return solver.update(trainable, lm_state, args)
 
     info = None
     for _ in range(50):
