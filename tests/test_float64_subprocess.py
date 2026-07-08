@@ -52,7 +52,7 @@ solve_jaxpr = str(
     jax.make_jaxpr(
         lambda p: solver.solve(
             p, (x, y), max_steps=20, atol=1e-8, gtol=1e-10, xtol=1e-10
-        ).params
+        ).x
     )(params)
 )
 assert "f32" not in solve_jaxpr, solve_jaxpr
@@ -87,7 +87,7 @@ jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, target))(theta, stat
 assert "f32" not in jaxpr, jaxpr
 solve_jaxpr = str(
     jax.make_jaxpr(
-        lambda p: solver.solve(p, target, max_steps=20, atol=1e-10).params
+        lambda p: solver.solve(p, target, max_steps=20, atol=1e-10).x
     )(theta)
 )
 assert "f32" not in solve_jaxpr, solve_jaxpr
@@ -246,7 +246,7 @@ for jit in (True, False):
     )
     assert int(result.status) == LMStatus.CONVERGED, int(result.status)
     assert result.state.damping.dtype == jnp.float32, result.state.damping.dtype
-    assert result.params.dtype == jnp.float32
+    assert result.x.dtype == jnp.float32
 
 # All compute ops must stay float32; only call-boundary scalars (tolerances,
 # default-dtype init damping) may arrive as f64 before being converted.
@@ -254,7 +254,7 @@ jaxpr = str(
     jax.make_jaxpr(
         lambda p, a: solver.solve(
             p, a, max_steps=40, atol=1e-5, gtol=1e-6, xtol=1e-6
-        ).params
+        ).x
     )(jnp.zeros(1, dtype=jnp.float32), jnp.ones(1, dtype=jnp.float32))
 )
 for line in jaxpr.splitlines():

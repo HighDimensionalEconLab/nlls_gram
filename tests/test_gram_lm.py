@@ -1021,8 +1021,8 @@ def test_solve_converges_with_aux_and_p_jit_modes():
 
     assert int(jit_result.status) == LMStatus.CONVERGED
     assert int(python_result.status) == LMStatus.CONVERGED
-    assert jnp.allclose(jit_result.params, jnp.array([2.0]), atol=1e-5)
-    assert jnp.allclose(jit_result.params, python_result.params, atol=1e-6)
+    assert jnp.allclose(jit_result.x, jnp.array([2.0]), atol=1e-5)
+    assert jnp.allclose(jit_result.x, python_result.x, atol=1e-6)
     assert jnp.allclose(jit_result.p, p)
     assert jit_result.steps <= 40
 
@@ -1054,7 +1054,7 @@ def test_solve_callback_can_abort_on_nonfinite_candidate():
 
     assert int(result.status) == LMStatus.NONFINITE
     assert int(result.steps) == 1
-    assert jnp.allclose(result.params, theta0)
+    assert jnp.allclose(result.x, theta0)
     assert jnp.isfinite(result.info.loss)
     assert not jnp.isfinite(result.info.loss_candidate)
 
@@ -1080,7 +1080,7 @@ def test_solve_callback_updates_aux_and_user_state():
     assert int(result.status) == LMStatus.MAX_STEPS
     assert int(result.steps) == 2
     assert jnp.allclose(result.args, jnp.array([2.0]))
-    assert result.params[0] > 1.0
+    assert result.x[0] > 1.0
     assert result.user_state > 0.0
 
 
@@ -1093,7 +1093,7 @@ def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root():
     theta0 = jnp.zeros(2)
 
     def solved_params(p):
-        return solver.solve(theta0, p=p, max_steps=80, atol=1e-6).params
+        return solver.solve(theta0, p=p, max_steps=80, atol=1e-6).x
 
     p = jnp.asarray(3.0)
     p_dot = jnp.asarray(0.7)
@@ -1136,7 +1136,7 @@ def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
     )
 
     def solved_params(p):
-        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).params
+        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
 
     p_dot = jnp.asarray(0.7)
     _, params_dot = jax.jvp(solved_params, (jnp.asarray(3.0),), (p_dot,))
@@ -1428,7 +1428,7 @@ def test_one_arg_residual_closes_over_data():
 
     assert solver.residual_arity == 1
     assert int(result.status) == LMStatus.CONVERGED
-    assert jnp.allclose(result.params["a"], 2.0, atol=1e-4)
+    assert jnp.allclose(result.x["a"], 2.0, atol=1e-4)
 
 
 def test_two_arg_residual_takes_aux():
@@ -1478,9 +1478,9 @@ def test_aux_and_p_require_matching_residual_arity():
     two_solver = UnderdeterminedLevenbergMarquardt(two_arg)
     theta0 = jnp.zeros(1)
 
-    with pytest.raises(ValueError, match="takes only .params."):
+    with pytest.raises(ValueError, match="takes only .x."):
         one_solver.update(theta0, one_solver.init(theta0), jnp.ones(1))
-    with pytest.raises(ValueError, match="takes only .params."):
+    with pytest.raises(ValueError, match="takes only .x."):
         one_solver.solve(theta0, jnp.ones(1))
     with pytest.raises(ValueError, match="takes no p argument"):
         two_solver.update(
@@ -1520,7 +1520,7 @@ def test_cache_jacobian_single_step_matches_fresh_solver_after_rejection():
     plain = UnderdeterminedLevenbergMarquardt(residual_fn, **kw)
 
     params = {"a": 1.0, "b": 3.0}
-    state = cached.init(params=params, args=args)
+    state = cached.init(x0=params, args=args)
     reuse_steps = 0
     for _ in range(12):
         params_prev, state_prev = params, state
@@ -1549,8 +1549,8 @@ def test_cache_jacobian_solve_converges_and_matches_plain():
 
     assert int(cached_result.status) == LMStatus.CONVERGED
     assert int(plain_result.status) == LMStatus.CONVERGED
-    assert jnp.allclose(cached_result.params["a"], 2.0, atol=1e-4)
-    assert jnp.allclose(cached_result.params["b"], -1.0, atol=1e-4)
+    assert jnp.allclose(cached_result.x["a"], 2.0, atol=1e-4)
+    assert jnp.allclose(cached_result.x["b"], -1.0, atol=1e-4)
 
 
 def test_cache_jacobian_requires_sized_state():
@@ -1585,7 +1585,7 @@ def test_init_with_params_infers_dtype_from_residual():
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     x = jnp.linspace(0.0, 2.0, 20)
     y = 2.0 * jnp.exp(-1.0 * x)
-    state = solver.init(params={"a": 1.0, "b": 0.0}, args=(x, y))
+    state = solver.init(x0={"a": 1.0, "b": 0.0}, args=(x, y))
     assert state.damping.dtype == jnp.float32
 
 
@@ -1607,7 +1607,7 @@ def test_cache_jacobian_off_leaves_no_trace_in_the_jaxpr():
     )
     cached_jaxpr = str(
         jax.make_jaxpr(lambda p, s: cached.update(p, s, (x, y)))(
-            params, cached.init(params=params, args=(x, y))
+            params, cached.init(x0=params, args=(x, y))
         )
     )
 
@@ -1687,3 +1687,63 @@ def test_has_aux_off_keeps_info_aux_none():
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
     _, _, info = solver.update(params, solver.init(params, (x, y)), (x, y))
     assert info.aux is None
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_solve_returns_final_aux_at_returned_x(jit):
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    solver = UnderdeterminedLevenbergMarquardt(
+        aux_residual_fn, init_damping=1e-2, has_aux=True
+    )
+    result = solver.solve(
+        {"a": 1.0, "b": 0.0}, (ts, ys), max_steps=50, atol=1e-6, jit=jit
+    )
+
+    assert int(result.status) == LMStatus.CONVERGED
+    _, expected = aux_residual_fn(result.x, (ts, ys))
+    assert float(result.aux["max_abs"]) == pytest.approx(
+        float(expected["max_abs"]), rel=1e-6, abs=1e-8
+    )
+    # the final aux is at the solution, tighter than the pre-step info.aux
+    assert float(result.aux["max_abs"]) <= float(result.info.aux["max_abs"])
+
+
+def test_solve_returns_final_aux_without_convergence():
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    solver = UnderdeterminedLevenbergMarquardt(
+        aux_residual_fn, init_damping=1e-2, has_aux=True
+    )
+    result = solver.solve({"a": 1.0, "b": 0.0}, (ts, ys), max_steps=3)
+
+    assert int(result.status) == LMStatus.MAX_STEPS
+    _, expected = aux_residual_fn(result.x, (ts, ys))
+    assert float(result.aux["max_abs"]) == pytest.approx(
+        float(expected["max_abs"]), rel=1e-6
+    )
+
+
+def test_solve_result_aux_none_without_has_aux():
+    def residual(theta, args):
+        return theta - args
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    result = solver.solve(jnp.zeros(1), jnp.ones(1), max_steps=20, atol=1e-6)
+    assert result.aux is None
+
+
+def test_solve_implicit_jvp_works_with_has_aux():
+    def residual(theta, args, p):
+        del args
+        return jnp.array([theta[0] + 2.0 * theta[1] - p]), {"level": theta[0]}
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, has_aux=True
+    )
+
+    def solved_x(p):
+        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
+
+    x, x_dot = jax.jvp(solved_x, (jnp.asarray(3.0),), (jnp.asarray(0.7),))
+    assert jnp.allclose(x_dot, jnp.array([0.7 / 5.0, 1.4 / 5.0]), atol=1e-6)

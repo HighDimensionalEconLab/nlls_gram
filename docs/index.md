@@ -4,7 +4,7 @@
 JAX pytrees. It is designed for underdetermined or interpolating problems where
 the parameter dimension is often larger than the residual dimension.
 
-The solver is intentionally small: users provide `residual_fn(params, args, p)`,
+The solver is intentionally small: users provide `residual_fn(x, args, p)`,
 and `UnderdeterminedLevenbergMarquardt` exposes `init()`, `update(...)`, and
 `solve(...)`. It does not depend on Flax, NNX, Optax, or any model framework.
 
@@ -27,12 +27,12 @@ The residual function takes one, two, or three positional arguments — always
 in this order:
 
 ```python
-residual_fn(params)          # closes over its data
-residual_fn(params, args)
-residual_fn(params, args, p)
+residual_fn(x)          # closes over its data
+residual_fn(x, args)
+residual_fn(x, args, p)
 ```
 
-- `params` is the pytree optimized by LM.
+- `x` is the pytree optimized by LM.
 - `args` is arbitrary auxiliary data passed to `update(...)` or `solve(...)`.
 - `p` is optional read-only data, useful for fixed deep parameters or outer
   perturbations; the implicit differentiation of `solve` is with respect to
@@ -43,13 +43,13 @@ construction and the function is wrapped into the canonical three-argument
 form, so the compiled code is identical for all three; callables whose
 signature cannot be inspected (or that take `*args`) are assumed to take all
 three. The order is fixed: a two-argument residual always means
-`(params, args)` — to use `p` without `args`, write the three-argument form and
+`(x, args)` — to use `p` without `args`, write the three-argument form and
 ignore the second argument. Passing `args` or `p` to `update`/`solve` when the
 residual does not accept it raises a `ValueError` rather than silently
 dropping it.
 
-`update(params, state, args=None, p=None)` performs one LM step. The higher-level
-`solve(params, args=None, *, p=None, ...)` loop repeatedly calls `update` and
+`update(x, state, args=None, p=None)` performs one LM step. The higher-level
+`solve(x, args=None, *, p=None, ...)` loop repeatedly calls `update` and
 returns an `LMSolveResult`.
 
 ### Auxiliary Outputs (`has_aux`)
@@ -60,8 +60,8 @@ of extra outputs the optimizer ignores — per-block diagnostics, validation
 metrics, anything already computed inside the residual:
 
 ```python
-def residual_fn(params, args):
-    r = model(params, args)
+def residual_fn(x, args):
+    r = model(x, args)
     return r, {"max_abs": jnp.max(jnp.abs(r))}
 
 
@@ -69,11 +69,15 @@ solver = UnderdeterminedLevenbergMarquardt(residual_fn, has_aux=True)
 ```
 
 Each step's `LMInfo.aux` holds the aux from the residual evaluation at the
-**pre-step** parameters (the linearization point — same convention as
-`loss_old` and `grad_norm`), at no extra cost. Callbacks read it as
-`ctx.info.aux`, e.g. to early-stop on a diagnostic, and the final value is on
-`result.info.aux`. With `has_aux=False`, `info.aux` is `None` and nothing is
-added to the compiled program.
+**pre-step** `x` (the linearization point — same convention as `loss_old`
+and `grad_norm`), at no extra cost; callbacks read it as `ctx.info.aux`,
+e.g. to early-stop on a diagnostic. The solve result additionally carries
+`result.aux`: the aux evaluated at the returned `(result.x, result.args)`
+with one extra residual evaluation after the loop. This is well-defined for
+every status — the returned `x` is always the last accepted iterate — so it
+holds the final diagnostics whether or not the solve converged. With
+`has_aux=False`, both are `None` and nothing is added to the compiled
+program.
 
 Callbacks passed to `solve` can replace `args` for later iterations, for example
 to regenerate collocation points or refresh simulation data. They receive `p`
@@ -247,28 +251,28 @@ import jax.numpy as jnp
 from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
-def residual_fn(params, args):
-    x, y = args
-    return params["a"] * jnp.exp(params["b"] * x) - y
+def residual_fn(x, args):
+    ts, ys = args
+    return x["a"] * jnp.exp(x["b"] * ts) - ys
 
 
-x = jnp.linspace(0.0, 2.0, 20)
-y = 2.0 * jnp.exp(-1.0 * x)
-params = {"a": 1.0, "b": 0.0}
+ts = jnp.linspace(0.0, 2.0, 20)
+ys = 2.0 * jnp.exp(-1.0 * ts)
+x = {"a": 1.0, "b": 0.0}
 
 solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-state = solver.init(params, (x, y))
+state = solver.init(x, (ts, ys))
 
 
 @jax.jit
-def train_step(params, state):
-    return solver.update(params, state, (x, y))
+def train_step(x, state):
+    return solver.update(x, state, (ts, ys))
 
 
 for _ in range(50):
-    params, state, info = train_step(params, state)
+    x, state, info = train_step(x, state)
 
-print(params["a"], params["b"])
+print(x["a"], x["b"])
 ```
 
 ## Solve Loop and Callbacks
@@ -277,13 +281,13 @@ print(params["a"], params["b"])
 
 ```python
 result = solver.solve(
-    params,
-    args=(x, y),
+    x,
+    args=(ts, ys),
     p=None,
     max_steps=100,
     atol=1e-8,
 )
-params = result.params
+x = result.x
 ```
 
 `max_steps` is always enforced. Three optional tolerances stop with
@@ -326,13 +330,13 @@ Callbacks receive an `LMSolveContext`:
 | Field | Meaning |
 | --- | --- |
 | `step` | One-based step number just completed. |
-| `params`, `state`, `info` | Accepted/rejected step result and LM diagnostics. |
-| `params_old`, `state_old` | Values before that step. |
+| `x`, `state`, `info` | Accepted/rejected step result and LM diagnostics. |
+| `x_old`, `state_old` | Values before that step. |
 | `initial_state` | State supplied to `solve` or created by `init`. |
 | `args`, `p`, `user_state` | Current auxiliary data, read-only external data, and user state. |
 
 A callback returns `None` or `LMSolveAction(...)`. Omitted action fields are left
-unchanged. The callback may set `stop`, `status`, `params`, `state`, `args`, or
+unchanged. The callback may set `stop`, `status`, `x`, `state`, `args`, or
 `user_state`; it cannot replace `p`.
 
 Under `jit=True`, callbacks must be JAX-traceable and return the same pytree
@@ -356,8 +360,8 @@ def stopping_callback(ctx):
 
 
 result = solver.solve(
-    params,
-    args=(x, y),
+    x,
+    args=(ts, ys),
     max_steps=100,
     callback=stopping_callback,
 )
@@ -383,10 +387,10 @@ import time
 
 train_step = jax.jit(solver.update)
 
-state = solver.init(params, args)
+state = solver.init(x, args)
 start = time.perf_counter()
 for step in range(max_steps):
-    params, state, info = train_step(params, state, args)
+    x, state, info = train_step(x, state, args)
     if not bool(jnp.isfinite(info.loss_candidate)):
         break  # diverged
     if float(info.loss) < loss_threshold:
@@ -413,7 +417,7 @@ def logging_callback(ctx):
     )
 
 
-result = solver.solve(params, args, atol=1e-8, callback=logging_callback)
+result = solver.solve(x, args, atol=1e-8, callback=logging_callback)
 ```
 
 To log every `k`-th step, gate the print with `jax.lax.cond` rather than a
@@ -476,7 +480,7 @@ def epoch_callback(ctx):
 
 
 result = solver.solve(
-    params,
+    x,
     sample_data(key0),
     max_steps=800,
     callback=epoch_callback,
@@ -486,7 +490,7 @@ result = solver.solve(
 
 (`dataclasses` here is the standard-library module.) This recipe composes
 with `cache_jacobian=True` without extra care: any action that returns
-`params` or `args` invalidates the Jacobian cache automatically.
+`x` or `args` invalidates the Jacobian cache automatically.
 
 ### Validation Early Stopping
 
@@ -495,7 +499,7 @@ their thresholds:
 
 ```python
 def validation_callback(ctx):
-    val_residual = validation_residual_fn(ctx.params, val_data)
+    val_residual = validation_residual_fn(ctx.x, val_data)
     val_mse = jnp.mean(val_residual**2)
     return LMSolveAction(stop=val_mse < val_threshold)
 ```
@@ -525,7 +529,7 @@ def history_callback(ctx):
 
 
 result = solver.solve(
-    params,
+    x,
     args,
     max_steps=max_steps,
     callback=history_callback,
@@ -550,7 +554,7 @@ losses = result.user_state["loss"][: int(result.steps)]
   candidate residual evaluation; geodesic acceleration adds a
   forward-over-forward directional derivative and, only when the ratio gate
   passes, one more residual evaluation.
-- Dtypes flow from `params` and the residual; keep everything in one dtype to
+- Dtypes flow from `x` and the residual; keep everything in one dtype to
   avoid promotions.
 
 ### Jacobian Caching Across Rejected Steps
@@ -568,14 +572,14 @@ matrix-free solvers never materialize a Jacobian, so it is ignored for them.
 solver = UnderdeterminedLevenbergMarquardt(
     residual_fn, init_damping=1e-2, cache_jacobian=True
 )
-state = solver.init(params=params, args=args)  # params required to size the cache
+state = solver.init(x0, args)  # x0 required to size the cache
 ```
 
 Caveats:
 
-- The cache is valid only while `params`, `args`, and `p` are all unchanged.
+- The cache is valid only while `x`, `args`, and `p` are all unchanged.
   Inside `solve`, invalidation is automatic: an accepted step invalidates it,
-  and so does any callback action that returns `params` or `args` (epoch
+  and so does any callback action that returns `x` or `args` (epoch
   resampling and similar recipes need no extra care — the step after a data
   swap always recomputes). The one remaining hazard is a **manual `update()`
   loop** that changes `args` between steps (minibatching): there the solver
@@ -594,12 +598,15 @@ Caveats:
 
 ## Migration from 0.x
 
-- `residual_fn(params, batch)` is now `residual_fn(params, args)` (or with a
+- The optimized pytree is now called `x` (`x0` for the initial guess in
+  `solve`/`init`), freeing "parameters" for the structural parameters `p`;
+  `result.params` is now `result.x`.
+- `residual_fn(params, batch)` is now `residual_fn(x, args)` (or with a
   third read-only `p` argument); `update(params, state, batch)` is
-  `update(params, state, args, p=None)`. One-argument residuals that close
+  `update(x, state, args, p=None)`. One-argument residuals that close
   over their data are also accepted. The name `args` follows Optimistix;
   `aux` is reserved for extra residual *outputs* via `has_aux=True`.
-- `init(dtype)` is now `init(params, args, p=...)` — the state dtype is
+- `init(dtype)` is now `init(x0, args, p=...)` — the state dtype is
   inferred from one residual evaluation instead of being passed by hand.
   `solve` no longer takes `dtype`.
 - The four `metric_*` constructor kwargs and the dict-returning
@@ -615,23 +622,23 @@ Caveats:
 parameters:
 
 ```python
-solver.solve(params0, args, p=p).params
+solver.solve(x0, args, p=p).x
 ```
 
 The custom rule is not defined on the per-step `update(...)` interface, and it
 does not differentiate through the LM iterations. It differentiates the residual
 equation at the returned solution. For implicit differentiation, use a fixed
-`args` and read the differentiated value from `result.params`.
+`args` and read the differentiated value from `result.x`.
 
 Here `p` means the external pytree argument passed to the residual function:
 
 ```python
-residual_fn(params, args, p)
+residual_fn(x, args, p)
 ```
 
 It does not mean LM hyperparameters such as `init_damping`, `max_steps`,
 `atol`, callback choices, or metric callbacks. The custom rule treats `args` and
-the initial guess `params0` as fixed for this derivative.
+the initial guess `x0` as fixed for this derivative.
 
 ### Root Selection and the Metric
 
@@ -707,7 +714,7 @@ applied as \(P x = S S^\top x\) using `metric.inv_sqrt` and
 ### VJP
 
 The transpose of the same map gives the VJP. For a cotangent
-\(\bar\theta\) on `result.params`, solve
+\(\bar\theta\) on `result.x`, solve
 
 $$
 (J_\theta P J_\theta^\top)y = J_\theta P\bar\theta,
@@ -742,17 +749,17 @@ solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
 theta0 = jnp.zeros(2)
 
 
-def solved_params(p):
-    return solver.solve(theta0, p=p, max_steps=80, atol=1e-6).params
+def solved_x(p):
+    return solver.solve(theta0, p=p, max_steps=80, atol=1e-6).x
 
 
 theta, theta_dot = jax.jvp(
-    solved_params,
+    solved_x,
     (jnp.asarray(3.0),),
     (jnp.asarray(0.7),),
 )
 
-theta, pullback = jax.vjp(solved_params, jnp.asarray(3.0))
+theta, pullback = jax.vjp(solved_x, jnp.asarray(3.0))
 (p_bar,) = pullback(jnp.array([3.0, 4.0]))
 ```
 
@@ -832,7 +839,7 @@ with a custom metric.
 
 ## Dtypes and Pytrees
 
-Dtypes flow from `params` and the residual: every internal scalar (damping,
+Dtypes flow from `x` and the residual: every internal scalar (damping,
 damping factors, tolerances, metric quantities) is cast to the residual dtype,
 so a float32 problem computes purely in float32 and a float64 problem purely
 in float64 — no example needs explicit dtypes beyond its data. Enable x64
@@ -844,7 +851,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 ```
 
-`init(params, args, p=...)` mirrors `update`'s data arguments: it evaluates
+`init(x0, args, p=...)` mirrors `update`'s data arguments: it evaluates
 the residual once and types the state (and any Jacobian cache buffers) from
 the actual problem, so there is no dtype argument to get wrong — including
 for problems that do not use the default float (e.g. a float32 problem with
@@ -854,7 +861,7 @@ currently fails for float32 problems when x64 is enabled, due to a
 dtype-promotion bug inside Lineax's LSMR; the other three solvers handle that
 mixed configuration.
 
-`update` optimizes exactly the `params` pytree you pass. With Flax NNX, pass only
+`update` optimizes exactly the `x` pytree you pass. With Flax NNX, pass only
 the trainable state to the solver and merge it with frozen state inside
 `residual_fn`; the solver itself remains NNX-agnostic.
 

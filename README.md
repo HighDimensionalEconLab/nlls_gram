@@ -12,9 +12,9 @@ at underdetermined or interpolating problems where the number of parameters is
 larger than the number of residuals.
 
 `UnderdeterminedLevenbergMarquardt` minimizes a user residual taking
-`(params)`, `(params, args)`, or `(params, args, p)`, always in that order.
-Parameters may be any JAX pytree; internally they
-are flattened with `jax.flatten_util.ravel_pytree`. The default dense solver
+`(x)`, `(x, args)`, or `(x, args, p)`, always in that order. The unknown `x`
+may be any JAX pytree; internally it
+is flattened with `jax.flatten_util.ravel_pytree`. The default dense solver
 uses the residual-space Gram system, with QR, CG, and LSMR alternatives. Use
 `update(...)` for a single LM step or `solve(...)` for an internally jitted loop.
 
@@ -64,35 +64,35 @@ import jax.numpy as jnp
 from nlls_gram import UnderdeterminedLevenbergMarquardt
 
 
-def residual_fn(params, args):
-    x, y = args
-    return params["a"] * jnp.exp(params["b"] * x) - y
+def residual_fn(x, args):
+    ts, ys = args
+    return x["a"] * jnp.exp(x["b"] * ts) - ys
 
 
-x = jnp.linspace(0.0, 2.0, 20)
-y = 2.0 * jnp.exp(-1.0 * x)
-params = {"a": 1.0, "b": 0.0}
+ts = jnp.linspace(0.0, 2.0, 20)
+ys = 2.0 * jnp.exp(-1.0 * ts)
+x = {"a": 1.0, "b": 0.0}
 
 solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-state = solver.init(params, (x, y))
+state = solver.init(x, (ts, ys))
 
 
 @jax.jit
-def train_step(params, state):
-    return solver.update(params, state, (x, y))
+def train_step(x, state):
+    return solver.update(x, state, (ts, ys))
 
 
 for _ in range(50):
-    params, state, info = train_step(params, state)
+    x, state, info = train_step(x, state)
 
-print(params["a"], params["b"])  # approximately 2.0, -1.0
+print(x["a"], x["b"])  # approximately 2.0, -1.0
 ```
 
 For a simple full solve loop:
 
 ```python
-result = solver.solve(params, (x, y), max_steps=50, atol=1e-8)
-params = result.params
+result = solver.solve(x, (ts, ys), max_steps=50, atol=1e-8)
+x = result.x
 ```
 
 `solve` stops on a residual-norm `atol`, gradient-norm `gtol`, or
@@ -100,7 +100,7 @@ accepted-step-norm `xtol` (each `0.0` disables), always enforces `max_steps`,
 and takes a traceable callback for custom stopping, epoch-style data
 resampling, and per-step history recording; the docs have a cookbook.
 
-`solve(...).params` also supports custom implicit JVP/VJP with respect to `p`;
+`solve(...).x` also supports custom implicit JVP/VJP with respect to `p`;
 the docs give the metric-minimum-norm formula and a minimal `jax.jvp` /
 `jax.vjp` example. The metric matters for underdetermined roots because it
 selects which tangent is the minimum-norm solution. The per-step `update(...)`
