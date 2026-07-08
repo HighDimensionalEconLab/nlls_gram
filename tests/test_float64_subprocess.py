@@ -20,8 +20,8 @@ def assert_float64_tree(tree):
         assert leaf.dtype == jnp.float64, (leaf.dtype, leaf)
 
 
-def residual_fn(params, batch):
-    x, y = batch
+def residual_fn(params, aux, p):
+    x, y = aux
     return params["a"] * jnp.exp(params["b"] * x) - y
 
 
@@ -48,7 +48,7 @@ jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, (x, y)))(params, sta
 assert "f32" not in jaxpr, jaxpr
 
 
-def quadratic_residual(theta, target):
+def quadratic_residual(theta, target, p):
     return jnp.array([theta[0] ** 2 - target])
 
 
@@ -75,8 +75,8 @@ jaxpr = str(jax.make_jaxpr(lambda p, s: solver.update(p, s, target))(theta, stat
 assert "f32" not in jaxpr, jaxpr
 
 
-def linear_residual(theta, batch):
-    matrix, target = batch
+def linear_residual(theta, aux, p):
+    matrix, target = aux
     return matrix @ theta - target
 
 
@@ -158,8 +158,8 @@ x_nnx = jnp.linspace(0.0, 2.0, 20, dtype=jnp.float64).reshape(-1, 1)
 y_nnx = 2.0 * jnp.ravel(x_nnx)
 
 
-def nnx_residual_fn(params, batch):
-    x, y = batch
+def nnx_residual_fn(params, aux, p):
+    x, y = aux
     model = nnx.merge(graphdef, params)
     return model(x) - y
 

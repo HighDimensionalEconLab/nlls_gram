@@ -11,8 +11,8 @@ def _make_problem(*, n_residuals, n_params):
     y = jnp.sin(design @ theta_true)
     params = jnp.zeros(n_params)
 
-    def residual(theta, batch):
-        design, y = batch
+    def residual(theta, aux, p):
+        design, y = aux
         return jnp.sin(design @ theta) - y
 
     solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)

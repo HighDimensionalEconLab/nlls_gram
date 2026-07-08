@@ -29,10 +29,10 @@ def _make_large_interpolation_problem(
         theta_true = jnp.cos(jnp.linspace(0.0, 12.0, n_centers))
         y = jnp.sin(features @ theta_true)
         params = 0.05 * jnp.sin(jnp.linspace(0.0, 8.0, n_centers))
-        batch = (features, y)
+        aux = (features, y)
 
-    def residual(theta, batch):
-        features, y = batch
+    def residual(theta, aux, p):
+        features, y = aux
         return jnp.sin(features @ theta) - y
 
     solver_kwargs = {
@@ -61,14 +61,14 @@ def _make_large_interpolation_problem(
 
     @jax.jit
     def first_step(params, state):
-        return base_solver.update(params, state, batch)
+        return base_solver.update(params, state, aux)
 
     params, state, _ = first_step(params, state)
     jax.block_until_ready((params, state))
 
     @jax.jit
     def step(params, state):
-        return solver.update(params, state, batch)
+        return solver.update(params, state, aux)
 
     return params, state, step
 

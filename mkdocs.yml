@@ -1,5 +1,5 @@
 site_name: nlls_gram
-site_description: Gram/dual-form Levenberg-Marquardt nonlinear least-squares for JAX
+site_description: Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX
 site_url: https://highdimensionaleconlab.github.io/nlls_gram/
 repo_url: https://github.com/HighDimensionalEconLab/nlls_gram
 repo_name: HighDimensionalEconLab/nlls_gram
@@ -31,10 +31,15 @@ plugins:
             show_source: true
 
 markdown_extensions:
+  - pymdownx.arithmatex:
+      generic: true
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.superfences
   - admonition
+
+extra_javascript:
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
 
 nav:
   - Home: index.md

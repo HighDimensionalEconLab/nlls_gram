@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nlls-gram"
-version = "0.5.1"
-description = "Underdetermined Levenberg-Marquardt nonlinear least-squares solvers for JAX"
+version = "0.6.0"
+description = "Metric-aware underdetermined Levenberg-Marquardt least-squares for JAX"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -14,6 +14,7 @@ authors = [{ name = "Jesse Perla", email = "jesseperla@gmail.com" }]
 keywords = [
     "levenberg-marquardt",
     "nonlinear-least-squares",
+    "metric",
     "jax",
     "optimization",
 ]
