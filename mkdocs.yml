@@ -43,5 +43,6 @@ extra_javascript:
 
 nav:
   - Home: index.md
+  - Implicit Differentiation: implicit_ad.md
   - Tuning Guide: tuning_guide.md
   - Metric Gauss-Newton: gauss_newton.md

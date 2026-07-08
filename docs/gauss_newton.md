@@ -182,7 +182,7 @@ $$
 | Kernel coefficients \(\alpha\) | \(\alpha^\top K \alpha\) | \(K\) | \(K^{-1}\) |
 | Function values \(u = f(t)\) | \(u^\top K^{-1} u\) | \(K^{-1}\) | \(K\) |
 
-The same choice governs [implicit differentiation](index.md#implicit-differentiation):
+The same choice governs [implicit differentiation](implicit_ad.md):
 in underdetermined problems the metric is part of the definition of the
 derivative, selecting the minimum-\(M\)-norm solution tangent.
 
@@ -209,8 +209,7 @@ import jax.numpy as jnp
 from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_cholesky
 
 
-def residual(theta, args, p):
-    del args, p
+def residual(theta, _, __):
     return jnp.array([theta[0] + theta[1] - 1.0])
 
 
@@ -236,5 +235,5 @@ Nonlinear LM run to convergence does not globally solve
 \(\min \|\theta\|_M\) subject to \(r(\theta) = 0\) — which root it reaches
 depends on the initialization and the step history. The safe claims are that
 near interpolation the steps are metric Gauss-Newton corrections, and that
-the [implicit derivative](index.md#implicit-differentiation) at the returned
+the [implicit derivative](implicit_ad.md) at the returned
 solution is exactly the minimum-\(M\)-norm tangent.
