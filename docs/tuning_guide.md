@@ -18,15 +18,17 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
 ```
 
 - **`linear_solver="cholesky"` (the default) is the best first choice for
-  small-to-medium `m`** — up to a few thousand residuals. It factors the
-  small `m × m` Gram system; `n` only enters through matvecs.
+  small-to-medium `m`** — it factors the small `m × m` Gram system, so `n`
+  only enters through matvecs.
 - **Enable `geodesic_acceleration=True` by default.** It costs one extra
-  directional derivative per step, the accept/reject test makes it safe, and
-  on curved residuals it substantially cuts step counts. Turn it off only
-  after measuring that it buys nothing on your problem.
-- **`cache_jacobian=True` is free in practice for fixed-data problems** and
-  makes rejected steps ~2x cheaper. Leave it off only for manual `update()`
-  loops that swap `args`/`p` between steps (stale-cache hazard).
+  directional derivative per step (plus one residual evaluation when the
+  acceptance gate passes), the accept/reject test makes it safe, and on
+  curved residuals it substantially cuts step counts. Near-linear problems
+  gain little — turn it off there if the extra evaluation matters.
+- **`cache_jacobian=True` makes rejected steps ~2x cheaper** at the cost of
+  an `(n_params, n_residuals)` state buffer (mind GPU memory at large `n`).
+  Leave it off for manual `update()` loops that swap `args`/`p` between steps
+  (stale-cache hazard).
 - Set `atol`/`gtol` rather than relying on `max_steps`: a converged solve
   that runs to `max_steps` wastes exactly the steps you didn't bound.
 
@@ -48,6 +50,10 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
 - `cg` returns an *approximate* step under its iteration budget. That is
   usually fine — LM's accept/reject absorbs inexactness — but see the
   scheduling pattern below.
+- `cholesky`/`cg` square the condition number (they factor `J P J'`). If the
+  Gram system is ill-conditioned or implicit derivatives must be accurate,
+  **enable `jax_enable_x64` first** — it fixes more numerical trouble than
+  any damping adjustment.
 
 ## Damping
 
@@ -83,18 +89,24 @@ exactly then). Three patterns, in order of preference:
 
 ## What Is Free to Sweep
 
-- **Free (traced, no recompile):** `max_steps`, `atol`/`gtol`/`xtol`, all
-  `LMHyperparams` fields, and the *values* of `x0`/`args`/`p`.
+- **Free (traced, no recompile):** `max_steps`, `atol`/`gtol`/`xtol`, the
+  array-valued `LMHyperparams` fields (same dtype; a knob compiled out as
+  `None` cannot be switched on), and the *values* of `x0`/`args`/`p`.
 - **Recompiles per value (static):** `linear_solver`,
   `geodesic_acceleration`, `cache_jacobian`, `has_aux`, the `Metric`
   callbacks, the callback function identity, and the solver instance itself.
   Construct solvers once at setup scope; an inline `lambda` callback at the
   call site recompiles every solve.
 
-For crude hyperparameter search: sweep `init_damping` on a log scale via
-`solve(lm_state=LMState(jnp.asarray(d), hyper=solver.hyperparams()))`-style
-restarts or separate `init()` calls (traced — free), and treat the static
-list as an outer loop of at most a few compilations.
+For crude hyperparameter search: sweep `init_damping` on a log scale by
+replacing the damping in an `init()` state —
+`dataclasses.replace(solver.init(x0, args), damping=jnp.asarray(d))`, traced
+and recompile-free — and treat the static list as an outer loop of at most a
+few compilations.
+
+When sweeping `p` (or running continuation/homotopy), warm-start each solve
+with the previous `result.x` — traced, recompile-free, and usually collapses
+the step count.
 
 ## Failure Signatures
 

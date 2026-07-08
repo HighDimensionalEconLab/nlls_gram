@@ -40,8 +40,8 @@ class LMHyperparams:
     e.g. grow the inner CG budget as the loss falls — via
     ``dataclasses.replace(ctx.lm_state, hyper=dataclasses.replace(
     ctx.lm_state.hyper, iterative_maxiter=...))``. A field constructed as
-    ``None`` (uncapped ``max_damping``, unlimited ``iterative_maxiter``) is
-    compiled out and stays ``None``. Static configuration (``linear_solver``,
+    ``None`` (uncapped ``max_damping``, backend-default ``iterative_maxiter``)
+    is compiled out and stays ``None``. Static configuration (``linear_solver``,
     ``geodesic_acceleration``, ``cache_jacobian``, ``has_aux``, the metric)
     shapes the compiled program and lives on the solver, not here.
     """
@@ -862,6 +862,7 @@ class UnderdeterminedLevenbergMarquardt:
             problem_changed = problem_changed | _tree_changed(action.x, x)
             x = action.x
         if action.lm_state is not None:
+            previous_hyper = lm_state.hyper
             lm_state = action.lm_state
             if self.cache_jacobian and lm_state.jacobian_valid is None:
                 raise ValueError(
@@ -869,6 +870,24 @@ class UnderdeterminedLevenbergMarquardt:
                     "lm_state without the Jacobian cache; use "
                     "dataclasses.replace(ctx.lm_state, ...) to preserve the "
                     "cache fields"
+                )
+            # Trace-time guard so the hyper contract fails identically with
+            # and without jit (jit would reject the carry mismatch anyway).
+            if previous_hyper is not None and (
+                lm_state.hyper is None
+                or jax.tree_util.tree_structure(previous_hyper)
+                != jax.tree_util.tree_structure(lm_state.hyper)
+                or [
+                    leaf.dtype for leaf in jax.tree_util.tree_leaves(previous_hyper)
+                ]
+                != [leaf.dtype for leaf in jax.tree_util.tree_leaves(lm_state.hyper)]
+            ):
+                raise ValueError(
+                    "the callback action changed the structure or dtypes of "
+                    "lm_state.hyper; reset values with "
+                    "dataclasses.replace(ctx.lm_state.hyper, ...) using arrays "
+                    "of the same dtype — a knob constructed as None cannot be "
+                    "enabled mid-solve"
                 )
         if action.args is not None:
             problem_changed = problem_changed | _tree_changed(action.args, args)

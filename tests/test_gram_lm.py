@@ -1552,6 +1552,60 @@ def test_callback_resets_max_damping_cap():
     assert float(result.lm_state.damping) <= 10.0
 
 
+def test_callback_grows_lsmr_budget_when_loss_small():
+    matrix = jnp.diag(jnp.logspace(0.0, 1.5, 8))
+    target = jnp.linspace(1.0, 2.0, 8)
+
+    def residual(theta, args, p):
+        del args, p
+        return matrix @ theta - target
+
+    def grow_budget(ctx):
+        new_maxiter = jnp.where(
+            ctx.info.loss < 2.0,
+            jnp.asarray(60, dtype=jnp.int32),
+            ctx.lm_state.hyper.iterative_maxiter,
+        )
+        new_hyper = dataclasses.replace(
+            ctx.lm_state.hyper, iterative_maxiter=new_maxiter
+        )
+        return LMSolveAction(
+            lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper)
+        )
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-1, linear_solver="lsmr", iterative_maxiter=1
+    )
+    theta0 = jnp.zeros(8)
+    fixed = solver.solve(theta0, max_steps=60)
+    scheduled = solver.solve(theta0, max_steps=60, callback=grow_budget)
+
+    assert int(scheduled.lm_state.hyper.iterative_maxiter) == 60
+    assert float(scheduled.info.loss) < 1e-2 * float(fixed.info.loss)
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_callback_enabling_none_hyper_knob_raises_clear_error(jit):
+    # max_damping=None is compiled out; flipping it on mid-solve must fail
+    # identically with and without jit.
+    def residual(theta, args, p):
+        return theta - args
+
+    def enable_cap(ctx):
+        new_hyper = dataclasses.replace(
+            ctx.lm_state.hyper, max_damping=jnp.asarray(10.0, dtype=jnp.float32)
+        )
+        return LMSolveAction(
+            lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper)
+        )
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    with pytest.raises(ValueError, match="enabled mid-solve"):
+        solver.solve(
+            jnp.zeros(1), jnp.ones(1), max_steps=3, callback=enable_cap, jit=jit
+        )
+
+
 def test_solve_callback_history_buffer_matches_update_loop():
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)

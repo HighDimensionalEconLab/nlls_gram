@@ -370,9 +370,9 @@ new_hyper = dataclasses.replace(
 return LMSolveAction(lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper))
 ```
 
-Two contracts: knobs constructed as `None` (uncapped `max_damping`, unlimited
-`iterative_maxiter`) are compiled out and stay `None` — a callback cannot turn
-them on; and replacement values must be arrays of the same dtype (use
+Two contracts: knobs constructed as `None` (uncapped `max_damping`,
+backend-default `iterative_maxiter`) are compiled out and stay `None` — a
+callback cannot turn them on; and replacement values must be arrays of the same dtype (use
 `jnp.asarray`/`jnp.where`), since they live in the jitted loop carry. Static
 configuration — `linear_solver`, `geodesic_acceleration`, `cache_jacobian`,
 `has_aux`, the metric — shapes the compiled program and stays on the solver.
