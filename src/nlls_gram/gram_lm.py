@@ -118,7 +118,8 @@ def _tree_changed(new, old):
         return jnp.asarray(True)
     changed = jnp.asarray(False)
     for new_leaf, old_leaf in zip(new_leaves, old_leaves, strict=True):
-        changed = changed | ~jnp.array_equal(new_leaf, old_leaf)
+        # equal_nan: an unchanged NaN sentinel is not a change.
+        changed = changed | ~jnp.array_equal(new_leaf, old_leaf, equal_nan=True)
     return changed
 
 
@@ -778,6 +779,13 @@ class UnderdeterminedLevenbergMarquardt:
             x = action.x
         if action.lm_state is not None:
             lm_state = action.lm_state
+            if self.cache_jacobian and lm_state.jacobian_valid is None:
+                raise ValueError(
+                    "cache_jacobian=True but the callback action returned an "
+                    "lm_state without the Jacobian cache; use "
+                    "dataclasses.replace(ctx.lm_state, ...) to preserve the "
+                    "cache fields"
+                )
         if action.args is not None:
             problem_changed = problem_changed | _tree_changed(action.args, args)
             args = action.args

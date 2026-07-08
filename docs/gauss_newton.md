@@ -195,9 +195,10 @@ identity metric splits the correction evenly, \(s = (1/2, 1/2)\); the metric
 and selects
 
 $$
-s = P J^\top (J P J^\top)^{-1}
-= \frac{1}{1 + 1/4}\begin{bmatrix}1\\[2pt]1/4\end{bmatrix}
-= \begin{bmatrix}0.8\\[2pt]0.2\end{bmatrix}.
+s = -P J^\top (J P J^\top)^{-1} r
+= \frac{-r}{1 + 1/4}\begin{bmatrix}1\\[2pt]1/4\end{bmatrix}
+= \begin{bmatrix}0.8\\[2pt]0.2\end{bmatrix},
+\qquad r = -1.
 $$
 
 With tiny damping, one `update` reproduces both:

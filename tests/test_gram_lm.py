@@ -1419,6 +1419,46 @@ def test_callback_changing_args_defers_stale_convergence(jit):
     assert jnp.allclose(result.x, result.args, atol=1e-2)
 
 
+@pytest.mark.parametrize("jit", [True, False])
+def test_callback_echoing_nan_args_still_converges(jit):
+    # An unchanged NaN sentinel in echoed args is not a change (equal_nan
+    # comparison) and must not defer the tolerance checks.
+    def residual(theta, args, p):
+        del args, p
+        return theta - 1.0
+
+    def callback(ctx):
+        return LMSolveAction(args=ctx.args)
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    result = solver.solve(
+        jnp.zeros(1),
+        jnp.asarray([jnp.nan]),
+        max_steps=100,
+        atol=1e-3,
+        callback=callback,
+        jit=jit,
+    )
+
+    assert int(result.status) == LMStatus.CONVERGED
+    assert jnp.allclose(result.x, 1.0, atol=1e-2)
+
+
+def test_callback_bare_lm_state_with_cache_raises_clear_error():
+    def residual(theta, args, p):
+        del p
+        return theta - args
+
+    def callback(ctx):
+        return LMSolveAction(lm_state=LMState(ctx.lm_state.damping))
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, cache_jacobian=True
+    )
+    with pytest.raises(ValueError, match="Jacobian cache"):
+        solver.solve(jnp.zeros(1), jnp.ones(1), max_steps=3, callback=callback)
+
+
 def test_solve_callback_history_buffer_matches_update_loop():
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
