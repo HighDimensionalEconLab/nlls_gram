@@ -357,8 +357,8 @@ the pre-action problem — and resume after the next update.
 
 ### Resettable Hyperparameters
 
-`init()` and `solve()` populate `lm_state.hyper` with an `LMHyperparams` of
-traced per-step values: `damping_decrease`, `damping_increase`, `max_damping`,
+`solve()` populates `lm_state.hyper` with an `LMHyperparams` of traced
+per-step values: `damping_decrease`, `damping_increase`, `max_damping`,
 `geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`,
 `iterative_maxiter`, and `lsmr_conlim`. Because they ride in the lm_state, a
 callback can reset any of them mid-solve — exactly like a damping reset:
@@ -376,8 +376,13 @@ them on; and replacement values must be arrays of the same dtype (use
 `jnp.asarray`/`jnp.where`), since they live in the jitted loop carry. Static
 configuration — `linear_solver`, `geodesic_acceleration`, `cache_jacobian`,
 `has_aux`, the metric — shapes the compiled program and stays on the solver.
-A hand-built `LMState(damping)` with `hyper=None` falls back to the
-constructor values and compiles to the same program as before.
+`init()` leaves `hyper=None`, which falls back to the constructor values and
+compiles to the same program with no extra per-call buffers — manual
+`update()` loops pay nothing. To schedule hyperparameters in a manual loop,
+opt in with `dataclasses.replace(lm_state, hyper=solver.hyperparams(dtype))`.
+When chaining solves, a warm-started `lm_state` carries the *first* solver's
+hyperparameters; pass `dataclasses.replace(lm_state, hyper=None)` to re-derive
+them from the second solver's constructor.
 
 Under `jit=True`, callbacks must be JAX-traceable and return the same pytree
 structure on every iteration. Use `jnp.where` or `jax.lax.cond` for

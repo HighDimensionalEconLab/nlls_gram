@@ -1459,15 +1459,19 @@ def test_callback_bare_lm_state_with_cache_raises_clear_error():
         solver.solve(jnp.zeros(1), jnp.ones(1), max_steps=3, callback=callback)
 
 
-def test_init_populates_typed_hyperparams():
+def test_hyperparams_typing_and_solve_population():
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
     solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-    lm_state = solver.init({"a": 1.0, "b": 0.0}, (ts, ys))
 
-    assert lm_state.hyper.damping_decrease.dtype == jnp.float32
-    assert lm_state.hyper.iterative_maxiter.dtype == jnp.int32
-    assert lm_state.hyper.max_damping is None
+    # init() stays lean for manual update() loops; solve() populates hyper.
+    assert solver.init({"a": 1.0, "b": 0.0}, (ts, ys)).hyper is None
+    hyper = solver.hyperparams(jnp.float32)
+    assert hyper.damping_decrease.dtype == jnp.float32
+    assert hyper.iterative_maxiter.dtype == jnp.int32
+    assert hyper.max_damping is None
+    result = solver.solve({"a": 1.0, "b": 0.0}, (ts, ys), max_steps=2)
+    assert result.lm_state.hyper.damping_decrease.dtype == jnp.float32
 
 
 def test_bare_lm_state_matches_hyper_lm_state_update():

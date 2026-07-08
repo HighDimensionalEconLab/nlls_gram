@@ -85,8 +85,9 @@ class LMState:
     Jt: jax.Array | None = None
     jacobian_valid: jax.Array | None = None
     aux: Any = None  # arbitrary residual aux pytree
-    # LMHyperparams from init()/solve(); None falls back to the constructor
-    # values (identical compiled code).
+    # LMHyperparams, populated by solve(); None (init()'s default) falls back
+    # to the constructor values with identical compiled code and no extra
+    # per-call buffers in manual update() loops.
     hyper: LMHyperparams | None = None
 
 
@@ -344,16 +345,16 @@ class UnderdeterminedLevenbergMarquardt:
         )
 
     def init(self, x0, args=None, *, p=None):
-        # One residual evaluation types the damping and hyperparameters to
-        # match what update() returns (keeping the jit signature and
-        # solve-loop carry stable) and sizes the Jacobian cache buffers when
-        # cache_jacobian=True.
+        # One residual evaluation types the damping to match what update()
+        # returns (keeping the jit signature and solve-loop carry stable) and
+        # sizes the Jacobian cache buffers when cache_jacobian=True. hyper
+        # stays None so manual update() loops carry no extra buffers; solve()
+        # populates it for its callbacks.
         self._check_residual_args(args, p)
         residual, aux = self._residual_and_aux(x0, args, p)
         damping = jnp.asarray(self.init_damping, dtype=residual.dtype)
-        hyper = self.hyperparams(residual.dtype)
         if not self.cache_jacobian:
-            return LMState(damping, hyper=hyper)
+            return LMState(damping)
         theta, _ = ravel_pytree(x0)
         return LMState(
             damping,
@@ -361,7 +362,6 @@ class UnderdeterminedLevenbergMarquardt:
             jnp.zeros((theta.size, residual.size), dtype=residual.dtype),
             jnp.asarray(False, dtype=jnp.bool_),
             jax.tree.map(jnp.zeros_like, aux),
-            hyper,
         )
 
     def _residual_and_aux(self, x, args, p):
@@ -720,9 +720,12 @@ class UnderdeterminedLevenbergMarquardt:
             if self.cache_jacobian:
                 lm_state = self.init(x0, args, p=p)
             else:
-                lm_state = LMState(
-                    jnp.asarray(self.init_damping), hyper=self.hyperparams()
-                )
+                lm_state = LMState(jnp.asarray(self.init_damping))
+        if lm_state.hyper is None:
+            # Populate here (not in init) so manual update() loops stay lean;
+            # inside the loop the extra scalars are loop-carried, not
+            # re-dispatched per step.
+            lm_state = dataclasses.replace(lm_state, hyper=self.hyperparams())
 
         @jax.custom_jvp
         def solve_with_implicit_p(
