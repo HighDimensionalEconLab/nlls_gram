@@ -525,6 +525,40 @@ losses = result.user_state["loss"][: int(result.steps)]
 - Dtypes flow from `params` and the residual; keep everything in one dtype to
   avoid promotions.
 
+### Jacobian Caching Across Rejected Steps
+
+A rejected LM step leaves the parameters unchanged, so the next update's
+residual and Jacobian are identical — only the damping changed. With
+`cache_jacobian=True` the solver carries `(resid, Jt)` in `LMState` and a
+rejected step's successor skips the residual evaluation and the
+`n_residuals` VJP passes, re-solving only the small damped system (roughly
+2x faster per rejected step; more when the residual is expensive relative to
+the Gram assembly). The flag only affects `linear_solver="cholesky"` — the
+matrix-free solvers never materialize a Jacobian, so it is ignored for them.
+
+```python
+solver = UnderdeterminedLevenbergMarquardt(
+    residual_fn, init_damping=1e-2, cache_jacobian=True
+)
+state = solver.init(params=params, aux=aux)  # params required to size the cache
+```
+
+Caveats:
+
+- The cache is valid only while `params`, `aux`, and `p` are all unchanged.
+  The solver invalidates it automatically when a step is accepted, but it
+  cannot see data changes: if you swap `aux` between updates (minibatching,
+  epoch resampling), either leave the cache off or reset the state — e.g.
+  `dataclasses.replace(state, jacobian_valid=jnp.asarray(False))`, or in a
+  callback return `ctx.initial_state`. A stale cache fails silently, with
+  steps taken against the old Jacobian.
+- `LMState` now carries an `(n_params, n_residuals)` buffer for the whole
+  solve — relevant on GPU memory budgets.
+- Callbacks that rebuild the state must preserve the cache fields
+  (`dataclasses.replace`), not construct a bare `LMState(damping)`.
+- With well-tuned damping factors rejections are rare and the flag buys
+  little; it pays off when the damping schedule is fighting the problem.
+
 ## Migration from 0.x
 
 - `residual_fn(params, batch)` is now `residual_fn(params, aux)` (or with a
@@ -773,9 +807,10 @@ import jax
 jax.config.update("jax_enable_x64", True)
 ```
 
-`init(dtype=None)` uses JAX's default floating dtype; pass an explicit dtype
-only when the problem does not use the default float (e.g. a float32 problem
-with x64 enabled). Even then, `solve` recasts the damping and tolerances to
+`init(dtype=None)` uses JAX's default floating dtype;
+`init(params=..., aux=..., p=...)` evaluates the residual once and infers the
+dtype from it instead. Pass an explicit dtype only when the problem does not
+use the default float (e.g. a float32 problem with x64 enabled). Even then, `solve` recasts the damping and tolerances to
 the residual dtype, so a default `init()` still produces a pure-float32 solve;
 the explicit dtype only matters for keeping a jitted `update` loop's signature
 stable across steps. One known exception: `linear_solver="lsmr"` currently

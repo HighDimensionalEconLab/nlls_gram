@@ -1,3 +1,4 @@
+import dataclasses
 import inspect
 from dataclasses import dataclass
 from typing import Any
@@ -39,6 +40,12 @@ class LMStatus:
 @dataclass(frozen=True)
 class LMState:
     damping: jax.Array
+    # Jacobian cache, populated only when cache_jacobian=True: the residual
+    # and J' at the current params, and whether they are still valid (the
+    # last step was rejected, so params did not move).
+    resid: Any = None
+    Jt: Any = None
+    jacobian_valid: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -135,6 +142,7 @@ class UnderdeterminedLevenbergMarquardt:
         iterative_maxiter=8,
         lsmr_conlim=float("inf"),
         metric=None,
+        cache_jacobian=False,
         geodesic_acceleration=False,
         geodesic_acceptance_ratio=0.75,
     ):
@@ -236,6 +244,11 @@ class UnderdeterminedLevenbergMarquardt:
         self.iterative_maxiter = iterative_maxiter
         self.lsmr_conlim = lsmr_conlim
         self.metric = metric
+        # The cache only pays for the dense cholesky path, where rejected
+        # steps otherwise redo the m VJP passes at an unchanged point; the
+        # matrix-free solvers never materialize J, so there is nothing to
+        # cache and the flag is inert for them (and for qr).
+        self.cache_jacobian = cache_jacobian and linear_solver == "cholesky"
         self._has_custom_metric = has_custom_metric
         self._has_metric_solve = metric.solve is not None
         self.metric_solve = (lambda x: x) if metric.solve is None else metric.solve
@@ -253,15 +266,36 @@ class UnderdeterminedLevenbergMarquardt:
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
 
-    def init(self, dtype=None):
+    def init(self, dtype=None, *, params=None, aux=None, p=None):
         # Use a strongly-typed damping matching the problem dtype so init() and
         # update() produce the same jit signature (a weakly-typed scalar here
         # would force a recompile on the second step). dtype=None defers to JAX's
-        # default float type (float32, or float64 when x64 is enabled); pass an
-        # explicit dtype for problems that do not use the default float.
-        if dtype is None:
+        # default float type (float32, or float64 when x64 is enabled); passing
+        # params (with any aux/p the residual needs) infers the dtype from the
+        # residual instead, and is required when cache_jacobian=True so the
+        # Jacobian cache buffers can be sized.
+        if self.cache_jacobian and params is None:
+            raise ValueError(
+                "cache_jacobian=True requires init(params=...) (with aux/p as "
+                "needed) to size the Jacobian cache"
+            )
+        if params is not None:
+            self._check_residual_args(aux, p)
+            residual = jnp.ravel(self.residual_fn(params, aux, p))
+            if dtype is None:
+                dtype = residual.dtype
+        elif dtype is None:
             dtype = jnp.result_type(float)
-        return LMState(jnp.asarray(self.init_damping, dtype=dtype))
+        damping = jnp.asarray(self.init_damping, dtype=dtype)
+        if not self.cache_jacobian:
+            return LMState(damping)
+        theta, _ = ravel_pytree(params)
+        return LMState(
+            damping,
+            jnp.zeros(residual.shape, dtype=dtype),
+            jnp.zeros((theta.size, residual.size), dtype=dtype),
+            jnp.asarray(False, dtype=jnp.bool_),
+        )
 
     def _initial_info(self, params, state, aux, p):
         # grad_norm is a +inf sentinel (computing it would cost a Jacobian
@@ -293,6 +327,30 @@ class UnderdeterminedLevenbergMarquardt:
 
         if self.linear_solver in ("cg", "lsmr"):
             resid, jvp_fn = jax.linearize(residual_flat, theta)
+        elif self.cache_jacobian:
+            if state.jacobian_valid is None:
+                raise ValueError(
+                    "cache_jacobian=True but the state has no Jacobian cache; "
+                    "create the state with init(params=...)"
+                )
+
+            def compute_resid_and_jt(_):
+                resid, pullback = jax.vjp(residual_flat, theta)
+                residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
+                Jt = jax.vmap(lambda cotangent: pullback(cotangent)[0])(
+                    residual_basis
+                ).T
+                return resid, Jt
+
+            def reuse_resid_and_jt(_):
+                return state.resid, state.Jt
+
+            resid, Jt = jax.lax.cond(
+                state.jacobian_valid,
+                reuse_resid_and_jt,
+                compute_resid_and_jt,
+                operand=None,
+            )
         else:
             resid, pullback = jax.vjp(residual_flat, theta)
         damping = jnp.asarray(state.damping, dtype=resid.dtype)
@@ -360,8 +418,11 @@ class UnderdeterminedLevenbergMarquardt:
                 return self.metric_inv_sqrt(solution.value)
 
         else:
-            residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
-            Jt = jax.vmap(lambda cotangent: pullback(cotangent)[0])(residual_basis).T
+            if not self.cache_jacobian:
+                residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
+                Jt = jax.vmap(lambda cotangent: pullback(cotangent)[0])(
+                    residual_basis
+                ).T
             grad = Jt @ resid
 
             if self.linear_solver == "qr":
@@ -473,9 +534,13 @@ class UnderdeterminedLevenbergMarquardt:
                 new_damping, jnp.asarray(self.max_damping, dtype=resid.dtype)
             )
         loss = jnp.where(improved, loss_candidate, loss_old)
+        if self.cache_jacobian:
+            new_state = LMState(new_damping, resid, Jt, ~improved)
+        else:
+            new_state = LMState(new_damping)
         return (
             unravel(theta_new),
-            LMState(new_damping),
+            new_state,
             LMInfo(
                 loss,
                 loss_old,
@@ -530,7 +595,10 @@ class UnderdeterminedLevenbergMarquardt:
         if state is not None and dtype is not None:
             raise ValueError("dtype is only used when state is None")
         if state is None:
-            state = self.init(dtype)
+            if self.cache_jacobian:
+                state = self.init(dtype, params=params, aux=aux, p=p)
+            else:
+                state = self.init(dtype)
 
         @jax.custom_jvp
         def solve_with_implicit_p(
@@ -701,7 +769,9 @@ class UnderdeterminedLevenbergMarquardt:
         callback,
     ):
         info = self._initial_info(params, state, aux, p)
-        state = LMState(jnp.asarray(state.damping, dtype=info.loss.dtype))
+        state = dataclasses.replace(
+            state, damping=jnp.asarray(state.damping, dtype=info.loss.dtype)
+        )
         initial_state = state
         status = LMStatus.RUNNING
         steps = 0
@@ -785,7 +855,9 @@ def _solve_loop_impl(
     atol = jnp.asarray(atol, dtype=info.loss.dtype)
     gtol = jnp.asarray(gtol, dtype=info.loss.dtype)
     xtol = jnp.asarray(xtol, dtype=info.loss.dtype)
-    state = LMState(jnp.asarray(state.damping, dtype=info.loss.dtype))
+    state = dataclasses.replace(
+        state, damping=jnp.asarray(state.damping, dtype=info.loss.dtype)
+    )
     initial_state = state
     step = jnp.asarray(0, dtype=jnp.int32)
     initial_nonfinite = ~jnp.isfinite(info.loss)

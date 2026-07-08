@@ -1452,3 +1452,85 @@ def test_residual_with_default_args_counts_as_three_arg():
     assert solver.residual_arity == 3
     result = solver.solve(jnp.zeros(1), max_steps=30, atol=1e-6)
     assert int(result.status) == LMStatus.CONVERGED
+
+
+def test_cache_jacobian_single_step_matches_fresh_solver_after_rejection():
+    # After a rejection the cached solver reuses (resid, Jt); its next step
+    # must match a fresh no-cache solver started at the identical (theta,
+    # damping) up to float noise.
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    aux = (x, y)
+    kw = {"init_damping": 1e-8, "damping_decrease": 0.01, "damping_increase": 100.0}
+    cached = UnderdeterminedLevenbergMarquardt(residual_fn, cache_jacobian=True, **kw)
+    plain = UnderdeterminedLevenbergMarquardt(residual_fn, **kw)
+
+    params = {"a": 1.0, "b": 3.0}
+    state = cached.init(params=params, aux=aux)
+    reuse_steps = 0
+    for _ in range(12):
+        params_prev, state_prev = params, state
+        params, state, info = cached.update(params, state, aux)
+        if bool(state_prev.jacobian_valid):
+            reuse_steps += 1
+            ref_params, _, ref_info = plain.update(
+                params_prev, LMState(state_prev.damping), aux
+            )
+            assert bool(ref_info.accepted) == bool(info.accepted)
+            assert jnp.allclose(ref_params["a"], params["a"], rtol=1e-5, atol=1e-6)
+            assert jnp.allclose(ref_params["b"], params["b"], rtol=1e-5, atol=1e-6)
+    assert reuse_steps > 0
+
+
+def test_cache_jacobian_solve_converges_and_matches_plain():
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    cached = UnderdeterminedLevenbergMarquardt(
+        residual_fn, init_damping=1e-2, cache_jacobian=True
+    )
+    plain = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+
+    cached_result = cached.solve({"a": 1.0, "b": 0.0}, (x, y), max_steps=50, atol=1e-6)
+    plain_result = plain.solve({"a": 1.0, "b": 0.0}, (x, y), max_steps=50, atol=1e-6)
+
+    assert int(cached_result.status) == LMStatus.CONVERGED
+    assert int(plain_result.status) == LMStatus.CONVERGED
+    assert jnp.allclose(cached_result.params["a"], 2.0, atol=1e-4)
+    assert jnp.allclose(cached_result.params["b"], -1.0, atol=1e-4)
+
+
+def test_cache_jacobian_requires_sized_state():
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn, cache_jacobian=True)
+    with pytest.raises(ValueError, match="init.params=..."):
+        solver.init()
+    with pytest.raises(ValueError, match="no Jacobian cache"):
+        solver.update(
+            {"a": 1.0, "b": 0.0},
+            LMState(jnp.asarray(1e-3)),
+            (jnp.ones(3), jnp.ones(3)),
+        )
+
+
+def test_cache_jacobian_is_inert_for_non_cholesky_solvers():
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual_fn,
+        linear_solver="cg",
+        cache_jacobian=True,
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+    )
+    assert not solver.cache_jacobian
+    state = solver.init()
+    assert state.jacobian_valid is None
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    _, _, info = solver.update({"a": 1.0, "b": 0.0}, state, (x, y))
+    assert bool(info.accepted)
+
+
+def test_init_with_params_infers_dtype_from_residual():
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    x = jnp.linspace(0.0, 2.0, 20)
+    y = 2.0 * jnp.exp(-1.0 * x)
+    state = solver.init(params={"a": 1.0, "b": 0.0}, aux=(x, y))
+    assert state.damping.dtype == jnp.float32
