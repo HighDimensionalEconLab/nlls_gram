@@ -21,15 +21,17 @@ def _make_large_interpolation_problem(
     n_samples = 1024
     n_centers = 8192
 
-    with jax.default_device(device):
-        x = jnp.linspace(-1.0, 1.0, n_samples)
-        centers = jnp.linspace(-1.2, 1.2, n_centers)
-        scaled_distance = (x[:, None] - centers[None, :]) / 0.08
-        features = jnp.exp(-0.5 * scaled_distance**2) / jnp.sqrt(n_centers)
-        theta_true = jnp.cos(jnp.linspace(0.0, 12.0, n_centers))
-        y = jnp.sin(features @ theta_true)
-        params = 0.05 * jnp.sin(jnp.linspace(0.0, 8.0, n_centers))
-        aux = (features, y)
+    x = jnp.linspace(-1.0, 1.0, n_samples)
+    centers = jnp.linspace(-1.2, 1.2, n_centers)
+    scaled_distance = (x[:, None] - centers[None, :]) / 0.08
+    features = jnp.exp(-0.5 * scaled_distance**2) / jnp.sqrt(n_centers)
+    theta_true = jnp.cos(jnp.linspace(0.0, 12.0, n_centers))
+    y = jnp.sin(features @ theta_true)
+    params = 0.05 * jnp.sin(jnp.linspace(0.0, 8.0, n_centers))
+    # device_put commits the arrays, which pins the jitted step to the target
+    # device; default_device placement alone lets them migrate to the GPU.
+    params = jax.device_put(params, device)
+    aux = jax.device_put((features, y), device)
 
     def residual(theta, aux, p):
         features, y = aux
@@ -55,9 +57,7 @@ def _make_large_interpolation_problem(
         geodesic_acceleration=geodesic_acceleration,
     )
 
-    with jax.default_device(device):
-        state = base_solver.init()
-        state = type(state)(jnp.asarray(state.damping))
+    state = jax.device_put(base_solver.init(), device)
 
     @jax.jit
     def first_step(params, state):
