@@ -556,8 +556,11 @@ Caveats:
   solve — relevant on GPU memory budgets.
 - Callbacks that rebuild the state must preserve the cache fields
   (`dataclasses.replace`), not construct a bare `LMState(damping)`.
-- With well-tuned damping factors rejections are rare and the flag buys
-  little; it pays off when the damping schedule is fighting the problem.
+- When rejections never happen the cache costs essentially nothing at run
+  time (measured at or below noise on CPU and GPU), so for fixed-data
+  problems it is safe to enable unconditionally. It is off by default
+  because `init()` then requires `params`, and because of the stale-cache
+  hazard above for problems whose data changes between steps.
 
 ## Migration from 0.x
 
