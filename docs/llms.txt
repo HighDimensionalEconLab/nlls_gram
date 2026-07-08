@@ -5,6 +5,8 @@
 ## Docs
 
 - [Tuning guide — read first for solver selection and hyperparameter heuristics](https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/)
-- [Main docs — API contracts, solve loop, callbacks, cookbook](https://highdimensionaleconlab.github.io/nlls_gram/)
+- [Main docs — API contracts, math, linear solvers, performance notes](https://highdimensionaleconlab.github.io/nlls_gram/)
+- [Callbacks and cookbook — solve-loop callback contract, resettable hyperparameters, recipes](https://highdimensionaleconlab.github.io/nlls_gram/callbacks/)
+- [Metrics — Metric callback contract, cholesky helper, dense and matrix-free examples](https://highdimensionaleconlab.github.io/nlls_gram/metrics/)
 - [Implicit differentiation — JVP/VJP with respect to p, minimum-norm tangents, aux outputs](https://highdimensionaleconlab.github.io/nlls_gram/implicit_ad/)
 - [Metric Gauss-Newton — minimum-norm math and kernel metric choices](https://highdimensionaleconlab.github.io/nlls_gram/gauss_newton/)

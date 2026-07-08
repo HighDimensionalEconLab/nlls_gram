@@ -78,7 +78,7 @@ exactly then). Three patterns, in order of preference:
    residual shrinks. No scheduling code.
 2. **Grow the CG budget in a callback** when the loss crosses a threshold —
    single solve call, so implicit AD applies; see the
-   [cookbook recipe](index.md#scheduled-inner-solve-accuracy). All of
+   [cookbook recipe](callbacks.md#scheduled-inner-solve-accuracy). All of
    `LMHyperparams` is resettable this way.
 3. **Stage two solvers**: coarse `cg` solve, then a `cholesky` endgame
    warm-started with `result.x` and `result.lm_state`. The implicit

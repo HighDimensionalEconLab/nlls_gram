@@ -43,6 +43,8 @@ extra_javascript:
 
 nav:
   - Home: index.md
+  - Callbacks and Cookbook: callbacks.md
+  - Metrics: metrics.md
   - Implicit Differentiation: implicit_ad.md
   - Tuning Guide: tuning_guide.md
   - Metric Gauss-Newton: gauss_newton.md
