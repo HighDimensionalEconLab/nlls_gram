@@ -75,7 +75,9 @@ e.g. to early-stop on a diagnostic. The solve result additionally carries
 `result.aux`: the aux evaluated at the returned `(result.x, result.args, result.p)`
 with one extra residual evaluation after the loop. This is well-defined for
 every status — the returned `x` is always the last accepted iterate — so it
-holds the final diagnostics whether or not the solve converged. With
+holds the final diagnostics whether or not the solve converged, and it
+participates in the implicit differentiation with respect to `p` (see
+[Aux outputs](#aux-outputs)). With
 `has_aux=False`, both are `None` and nothing is added to the compiled
 program.
 
@@ -755,7 +757,8 @@ implicit rule at the returned solution. `init` is differentiation-inert (its
 outputs are constants whose shapes and dtypes come from one residual
 evaluation), so calling it by hand inside a differentiated function, or
 implicitly via `cache_jacobian=True`, contributes exactly zero to any
-derivative. `result.aux` is likewise a non-differentiated output. One
+derivative. `result.aux` also participates in the implicit rule — see
+[Aux outputs](#aux-outputs) below. One
 construction-time caveat: the solver (including any `Metric` callbacks) is a
 static object — do not build it from traced values.
 
@@ -885,6 +888,82 @@ theta, pullback = jax.vjp(solved_x, jnp.asarray(3.0))
 Here \(J_\theta=[1,2]\), so the identity-metric tangent is
 \(\dot\theta = [1,2]\dot p / 5\), and the VJP maps
 \(\bar\theta\) to \((\bar\theta_0 + 2\bar\theta_1)/5\).
+
+### Aux outputs
+
+With `has_aux=True` the residual returns \((r, a)\); write the aux output map
+as
+
+$$
+a = g(\theta, \text{args}, p),
+\qquad
+a = g(\theta^\star, \text{args}, p)
+\text{ at the returned solution,}
+$$
+
+and define its two Jacobians at the solution (with \(k\) the flattened aux
+dimension):
+
+$$
+G_\theta = \frac{\partial g}{\partial \theta}(\theta^\star, \text{args}, p)
+\in \mathbb R^{k \times n},
+\qquad
+G_p = \frac{\partial g}{\partial p}(\theta^\star, \text{args}, p)
+\in \mathbb R^{k \times \dim p}.
+$$
+
+For a pytree aux/`p`, \(G_\theta \dot\theta\) and \(G_p \dot p\) mean the JAX
+JVP of the aux output with respect to that argument only (the same convention
+as \(J_p \dot p\) above); transposes mean the corresponding VJP.
+
+`p` moves the aux through both paths — directly, and through the solution
+\(\theta^\star(p)\) — and the implicit rule accounts for both. **JVP**: with
+\(\dot\theta\) the minimum-\(M\)-norm implicit tangent above,
+
+$$
+\dot a = G_\theta\,\dot\theta + G_p\,\dot p
+= \bigl(-G_\theta P J_\theta^\top (J_\theta P J_\theta^\top)^{-1} J_p
+  + G_p\bigr)\,\dot p.
+$$
+
+**VJP**: cotangents \(\bar\theta\) on `result.x` and \(\bar a\) on
+`result.aux` combine — the aux cotangent pulls back through
+\(G_\theta^\top\) into the solution cotangent and through \(G_p^\top\)
+directly:
+
+$$
+(J_\theta P J_\theta^\top)\, y
+= J_\theta P\,(\bar\theta + G_\theta^\top \bar a),
+\qquad
+\bar p = -J_p^\top y + G_p^\top \bar a.
+$$
+
+Setting \(\bar a = 0\) recovers the `x`-only VJP above; setting
+\(\bar\theta = 0\) gives the pure aux pullback.
+
+Example — the residual from above with an aux that depends on `p` both ways:
+
+```python
+def residual(theta, args, p):
+    del args
+    r = jnp.array([theta[0] + 2.0 * theta[1] - p])
+    return r, {"m": theta[0] * theta[1] + p**2}
+
+
+solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2, has_aux=True)
+
+
+def solved_aux_m(p):
+    return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).aux["m"]
+
+
+da_dp = jax.grad(solved_aux_m)(jnp.asarray(3.0))
+```
+
+Here \(\theta^\star = (p/5, 2p/5)\), so the aux value is
+\(2p^2/25 + p^2\) and its derivative is \(4p/25 + 2p = 6.48\) at \(p=3\):
+the \(4p/25\) comes through the solution path \(G_\theta\dot\theta\) and the
+\(2p\) through the direct path \(G_p\dot p\).
 
 ## Metric Example
 

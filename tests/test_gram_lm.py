@@ -2024,11 +2024,141 @@ def test_solve_implicit_jvp_works_with_has_aux():
         residual, init_damping=1e-2, has_aux=True
     )
 
-    def solved_x(p):
-        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
+    def solved(p):
+        result = solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6)
+        return result.x, result.aux["level"]
 
-    x, x_dot = jax.jvp(solved_x, (jnp.asarray(3.0),), (jnp.asarray(0.7),))
+    (x, level), (x_dot, level_dot) = jax.jvp(
+        solved, (jnp.asarray(3.0),), (jnp.asarray(0.7),)
+    )
     assert jnp.allclose(x_dot, jnp.array([0.7 / 5.0, 1.4 / 5.0]), atol=1e-6)
+    # aux level = theta*[0] = p/5, so its tangent is p_dot/5.
+    assert jnp.allclose(level_dot, 0.7 / 5.0, atol=1e-6)
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_solve_implicit_jvp_of_aux_wrt_p(jit):
+    # theta* = (p/5, 2p/5), so aux m = theta0*theta1 + p^2 has
+    # dm/dp = theta1/5 + 2*theta0/5 + 2p = 4p/25 + 2p through both the
+    # solution path and the direct p path. The int32 aux leaf must not
+    # break the rule.
+    def residual(theta, args, p):
+        del args
+        aux = {
+            "m": theta[0] * theta[1] + p**2,
+            "count": jnp.asarray(1, dtype=jnp.int32),
+        }
+        return jnp.array([theta[0] + 2.0 * theta[1] - p]), aux
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, has_aux=True
+    )
+
+    def solved_aux_m(p):
+        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6, jit=jit).aux[
+            "m"
+        ]
+
+    p, p_dot = jnp.asarray(3.0), jnp.asarray(0.7)
+    _, m_dot = jax.jvp(solved_aux_m, (p,), (p_dot,))
+    expected = (4.0 * p / 25.0 + 2.0 * p) * p_dot
+    assert jnp.allclose(m_dot, expected, atol=1e-6)
+
+    h = 1e-3
+    fd = (solved_aux_m(p + h) - solved_aux_m(p - h)) / (2.0 * h)
+    assert jnp.allclose(m_dot, fd * p_dot, atol=1e-3)
+
+    # The int32 aux leaf gets a float0 tangent, not a zero float.
+    def solved_aux(q):
+        return solver.solve(jnp.zeros(2), p=q, max_steps=80, atol=1e-6, jit=jit).aux
+
+    _, aux_dot = jax.jvp(solved_aux, (p,), (p_dot,))
+    assert aux_dot["count"].dtype == jax.dtypes.float0
+    assert jnp.allclose(aux_dot["m"], expected, atol=1e-6)
+
+
+def test_solve_implicit_jvp_of_aux_with_pytree_p():
+    # theta* = (s/5, 2s/5) with s = p["scale"]; aux vec = (theta0*s, theta1)
+    # has d/ds = (theta0 + s/5, 2/5) = (2s/5, 2/5). The int32 p leaf takes a
+    # float0 tangent and the int32 aux leaf produces one.
+    def residual(theta, args, p):
+        del args
+        aux = {
+            "vec": jnp.array([theta[0] * p["scale"], theta[1]]),
+            "count": jnp.asarray(1, dtype=jnp.int32),
+        }
+        return jnp.array([theta[0] + 2.0 * theta[1] - p["scale"]]), aux
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, has_aux=True
+    )
+    p = {"scale": jnp.asarray(3.0), "flag": jnp.asarray(2, dtype=jnp.int32)}
+    p_dot = {
+        "scale": jnp.asarray(1.0),
+        "flag": jnp.zeros((), dtype=jax.dtypes.float0),
+    }
+
+    def solved(q):
+        result = solver.solve(jnp.zeros(2), p=q, max_steps=80, atol=1e-6)
+        return result.x, result.aux
+
+    (x, aux), (x_dot, aux_dot) = jax.jvp(solved, (p,), (p_dot,))
+    s = p["scale"]
+    assert jnp.allclose(x_dot, jnp.array([1.0 / 5.0, 2.0 / 5.0]), atol=1e-6)
+    assert jnp.allclose(
+        aux_dot["vec"], jnp.array([2.0 * s / 5.0, 2.0 / 5.0]), atol=1e-5
+    )
+    assert aux_dot["count"].dtype == jax.dtypes.float0
+
+    # VJP: pull back a cotangent on the vector aux leaf; the int32 p leaf
+    # receives a float0 cotangent.
+    def solved_aux_vec(q):
+        return solver.solve(jnp.zeros(2), p=q, max_steps=80, atol=1e-6).aux["vec"]
+
+    _, pullback = jax.vjp(solved_aux_vec, p)
+    vec_bar = jnp.array([1.0, 10.0])
+    (p_bar,) = pullback(vec_bar)
+    assert jnp.allclose(p_bar["scale"], 2.0 * s / 5.0 + 10.0 * 2.0 / 5.0, atol=1e-5)
+    assert p_bar["flag"].dtype == jax.dtypes.float0
+
+
+def test_solve_implicit_vjp_of_aux_wrt_p():
+    def residual(theta, args, p):
+        del args
+        aux = {
+            "m": theta[0] * theta[1] + p**2,
+            "count": jnp.asarray(1, dtype=jnp.int32),
+        }
+        return jnp.array([theta[0] + 2.0 * theta[1] - p]), aux
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, has_aux=True
+    )
+    p = jnp.asarray(3.0)
+    dm_dp = 4.0 * p / 25.0 + 2.0 * p
+
+    def solved_aux_m(q):
+        return solver.solve(jnp.zeros(2), p=q, max_steps=80, atol=1e-6).aux["m"]
+
+    _, pullback = jax.vjp(solved_aux_m, p)
+    m_bar = jnp.asarray(1.3)
+    (p_bar,) = pullback(m_bar)
+    assert jnp.allclose(p_bar, m_bar * dm_dp, atol=1e-6)
+
+    # Joint cotangents on x and aux["m"] pull back additively.
+    def solved_joint(q):
+        result = solver.solve(jnp.zeros(2), p=q, max_steps=80, atol=1e-6)
+        return result.x, result.aux["m"]
+
+    _, joint_pullback = jax.vjp(solved_joint, p)
+    x_bar = jnp.array([3.0, 4.0])
+    (p_bar_joint,) = joint_pullback((x_bar, m_bar))
+    expected_x_pullback = (x_bar[0] + 2.0 * x_bar[1]) / 5.0
+    assert jnp.allclose(p_bar_joint, expected_x_pullback + m_bar * dm_dp, atol=1e-6)
+
+    # grad-under-jit exercises the transposed rule inside an outer trace.
+    jitted_grad = jax.jit(jax.grad(solved_aux_m))(p)
+    assert jnp.allclose(jitted_grad, dm_dp, atol=1e-6)
 
 
 def test_solve_callback_wall_clock_time_limit():

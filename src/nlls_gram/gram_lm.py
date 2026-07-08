@@ -155,7 +155,8 @@ class LMSolveResult:
     p: Any
     user_state: Any
     # With has_aux=True: aux evaluated at the returned (x, args, p) — one extra
-    # residual evaluation, well-defined for every status.
+    # residual evaluation, well-defined for every status. Differentiable with
+    # respect to p through the implicit rule (directly and through x*(p)).
     aux: Any = None
 
 
@@ -758,6 +759,18 @@ class UnderdeterminedLevenbergMarquardt:
                 result.x, result.args, result.p, p_dot
             )
             zero_result = jax.tree.map(_zero_tangent_leaf, result)
+            aux_dot = zero_result.aux
+            if self.has_aux and p is not None:
+                # aux depends on p directly and through the solution x*(p);
+                # linearize the aux map at the returned solution with args
+                # fixed (the same point where the primal result.aux is
+                # evaluated) to account for both paths.
+                def aux_at_solution(x_value, p_value):
+                    return self.residual_fn(x_value, result.args, p_value)[1]
+
+                aux_dot = jax.jvp(
+                    aux_at_solution, (result.x, result.p), (x_dot, p_dot)
+                )[1]
             return (
                 result,
                 LMSolveResult(
@@ -769,7 +782,7 @@ class UnderdeterminedLevenbergMarquardt:
                     zero_result.args,
                     p_dot,
                     zero_result.user_state,
-                    zero_result.aux,
+                    aux_dot,
                 ),
             )
 
