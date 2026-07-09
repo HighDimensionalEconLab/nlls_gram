@@ -25,7 +25,11 @@ from nlls_gram.gram_lm import (
     LMStatus,
     UnderdeterminedLevenbergMarquardt,
 )
-from nlls_gram.metrics import Metric, metric_from_cholesky
+from nlls_gram.metrics import (
+    Metric,
+    metric_from_cholesky,
+    metric_from_tridiagonal_precision,
+)
 
 __all__ = [
     "UnderdeterminedLevenbergMarquardt",
@@ -38,4 +42,5 @@ __all__ = [
     "LMSolveResult",
     "Metric",
     "metric_from_cholesky",
+    "metric_from_tridiagonal_precision",
 ]

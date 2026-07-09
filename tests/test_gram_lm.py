@@ -12,6 +12,7 @@ from nlls_gram import (
     Metric,
     UnderdeterminedLevenbergMarquardt,
     metric_from_cholesky,
+    metric_from_tridiagonal_precision,
 )
 
 
@@ -2231,3 +2232,186 @@ def test_solve_derivative_wrt_x0_is_zero_by_contract():
 
     _, x0_dot = jax.jvp(solved_x, (jnp.zeros(2),), (jnp.ones(2),))
     assert jnp.allclose(x0_dot, jnp.zeros(2))
+
+
+def test_dual_preconditioner_requires_cg():
+    with pytest.raises(ValueError, match="dual_preconditioner"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, dual_preconditioner=lambda v, damping: v
+        )
+    with pytest.raises(ValueError, match="dual_preconditioner"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn,
+            linear_solver="qr",
+            dual_preconditioner=lambda v, damping: v,
+        )
+
+
+def test_cg_preconditioned_step_matches_cholesky_identity_step():
+    # A valid SPD preconditioner changes only the inner Krylov iteration, not
+    # the step the inner solve converges to.
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.0, "b": 0.0}
+    weights = 1.0 + jnp.arange(20, dtype=jnp.float32) / 10.0
+
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+    cg_solver = UnderdeterminedLevenbergMarquardt(
+        residual_fn,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=40,
+        dual_preconditioner=lambda v, damping: v / weights,
+    )
+
+    cholesky_x, cholesky_state, cholesky_info = cholesky_solver.update(
+        x, cholesky_solver.init(x, (ts, ys)), (ts, ys)
+    )
+    cg_x, cg_state, cg_info = cg_solver.update(x, cg_solver.init(x, (ts, ys)), (ts, ys))
+
+    assert bool(cg_info.accepted) == bool(cholesky_info.accepted)
+    assert jnp.allclose(cg_x["a"], cholesky_x["a"], rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(cg_x["b"], cholesky_x["b"], rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(cg_state.damping, cholesky_state.damping)
+    assert jnp.allclose(
+        cg_info.loss,
+        cholesky_info.loss,
+        rtol=REGRESSION_RTOL,
+        atol=REGRESSION_ATOL,
+    )
+
+
+def test_cg_preconditioned_update_jits():
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+    weights = 1.0 + jnp.arange(20, dtype=jnp.float32) / 10.0
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual_fn,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=40,
+        dual_preconditioner=lambda v, damping: v / weights,
+    )
+
+    @jax.jit
+    def train_step(x, lm_state):
+        return solver.update(x, lm_state, (ts, ys))
+
+    x, lm_state, info = train_step(x, solver.init(x, (ts, ys)))
+
+    assert bool(info.accepted)
+    assert jnp.isfinite(info.loss)
+    assert jnp.isfinite(lm_state.damping)
+
+
+def test_cg_preconditioned_geodesic_matches_cholesky():
+    def residual(theta, target, p):
+        return jnp.array([theta[0] ** 2 - target])
+
+    theta0 = jnp.array([1.9])
+    target = 4.0
+
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-6,
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=1.0,
+    )
+    cg_solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-6,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=10,
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=1.0,
+        dual_preconditioner=lambda v, damping: v / (1.0 + damping),
+    )
+
+    cholesky_theta, _, cholesky_info = cholesky_solver.update(
+        theta0, cholesky_solver.init(theta0, target), target
+    )
+    cg_theta, _, cg_info = cg_solver.update(
+        theta0, cg_solver.init(theta0, target), target
+    )
+
+    assert bool(cg_info.accepted)
+    assert bool(cg_info.used_geodesic)
+    assert jnp.allclose(cg_theta, cholesky_theta, rtol=1e-6, atol=1e-6)
+    assert jnp.allclose(
+        cg_info.acceleration_ratio,
+        cholesky_info.acceleration_ratio,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+
+
+def test_cg_dual_preconditioner_enables_ill_conditioned_convergence():
+    # Kernel-collocation miniature: affine residual K x - b with metric M = K,
+    # so the dual operator is K K^{-1} K = K itself -- as ill-conditioned as
+    # the kernel (cond ~ 1e4 here). At a tight inner-iteration budget plain CG
+    # stalls, while the exact preconditioner (a K-solve) recovers
+    # Gauss-Newton-quality steps and converges immediately.
+    n = 40
+    rho = 0.98
+    idx = jnp.arange(n)
+    K = rho ** jnp.abs(idx[:, None] - idx[None, :])
+    L = jnp.linalg.cholesky(K)
+    x_true = jnp.sin(idx / 3.0)
+    b = K @ x_true
+
+    def residual(x):
+        return K @ x - b
+
+    def preconditioner(v, damping):
+        y = jsp_linalg.solve_triangular(L, v, lower=True)
+        return jsp_linalg.solve_triangular(L.T, y, lower=False)
+
+    common = dict(
+        init_damping=1e-6,
+        linear_solver="cg",
+        iterative_maxiter=3,
+        metric=metric_from_cholesky(L),
+    )
+    plain = UnderdeterminedLevenbergMarquardt(residual, **common)
+    preconditioned = UnderdeterminedLevenbergMarquardt(
+        residual, dual_preconditioner=preconditioner, **common
+    )
+    x0 = jnp.zeros(n)
+
+    plain_result = plain.solve(x0, max_steps=20, atol=1e-3)
+    preconditioned_result = preconditioned.solve(x0, max_steps=20, atol=1e-3)
+
+    assert int(preconditioned_result.status) == LMStatus.CONVERGED
+    assert int(plain_result.status) != LMStatus.CONVERGED
+
+
+def test_metric_from_tridiagonal_precision_matches_dense():
+    # M = K with K_ij = rho^|i-j| (Matern-1/2 on a unit grid), whose precision
+    # T = K^{-1} is exactly tridiagonal with closed-form AR(1) entries.
+    n = 15
+    rho = 0.6
+    idx = jnp.arange(n)
+    K = rho ** jnp.abs(idx[:, None] - idx[None, :])
+    scale = 1.0 / (1.0 - rho**2)
+    diag = scale * jnp.concatenate(
+        [jnp.ones(1), (1.0 + rho**2) * jnp.ones(n - 2), jnp.ones(1)]
+    )
+    off_diag = -rho * scale * jnp.ones(n - 1)
+    metric = metric_from_tridiagonal_precision(diag, off_diag)
+
+    x = jax.random.normal(jax.random.PRNGKey(0), (n,))
+    X = jax.random.normal(jax.random.PRNGKey(1), (n, 3))
+    T_dense = jnp.linalg.inv(K)
+
+    assert jnp.allclose(metric.solve(x), T_dense @ x, rtol=1e-4, atol=1e-4)
+    assert jnp.allclose(metric.solve(X), T_dense @ X, rtol=1e-4, atol=1e-4)
+    assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ K @ x), rtol=1e-4, atol=1e-4)
+    S = metric.inv_sqrt(jnp.eye(n))
+    assert jnp.allclose(S @ S.T, T_dense, rtol=1e-3, atol=1e-4)
+    assert jnp.allclose(
+        metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-4
+    )

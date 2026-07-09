@@ -189,6 +189,14 @@ class UnderdeterminedLevenbergMarquardt:
     ``step = -P J' (J P J' + damping I_m)^{-1} r``. Exposes per-step
     ``update``, a jitted ``solve`` loop with callbacks, and implicit
     differentiation of ``solve`` with respect to ``p``.
+
+    With ``linear_solver="cg"``, ``dual_preconditioner(v, damping)`` supplies a
+    jit-traceable, linear, SPD approximation of
+    ``(J P J' + damping I_m)^{-1} v`` used as the CG preconditioner (for the
+    geodesic-acceleration solve as well). It changes only the inner iteration
+    count: every step stays in ``range(P J')``, so the minimum-metric-norm
+    selection for underdetermined residuals is unchanged — the preconditioner
+    may be approximate even though ``metric.solve`` must stay exact.
     """
 
     def __init__(
@@ -204,6 +212,7 @@ class UnderdeterminedLevenbergMarquardt:
         iterative_atol=0.0,
         iterative_maxiter=8,
         lsmr_conlim=float("inf"),
+        dual_preconditioner=None,
         metric=None,
         has_aux=False,
         cache_jacobian=True,
@@ -268,6 +277,8 @@ class UnderdeterminedLevenbergMarquardt:
             )
         if lsmr_conlim <= 0:
             raise ValueError("lsmr_conlim must be positive")
+        if dual_preconditioner is not None and linear_solver != "cg":
+            raise ValueError('dual_preconditioner requires linear_solver="cg"')
         if metric is None:
             metric = Metric()
         has_custom_metric = any(
@@ -308,6 +319,7 @@ class UnderdeterminedLevenbergMarquardt:
         self.iterative_atol = iterative_atol
         self.iterative_maxiter = iterative_maxiter
         self.lsmr_conlim = lsmr_conlim
+        self.dual_preconditioner = dual_preconditioner
         self.metric = metric
         # Only the dense cholesky path materializes J', so the flag is inert
         # for the other solvers.
@@ -484,6 +496,13 @@ class UnderdeterminedLevenbergMarquardt:
             def gram_matvec(cotangent):
                 return jvp_fn(self.metric_solve(JT(cotangent))) + damping * cotangent
 
+            if self.dual_preconditioner is None:
+                cg_preconditioner = None
+            else:
+
+                def cg_preconditioner(cotangent):
+                    return self.dual_preconditioner(cotangent, damping)
+
             def solve_step(rhs):
                 dual_solution, _ = jsp_sparse_linalg.cg(
                     gram_matvec,
@@ -491,6 +510,7 @@ class UnderdeterminedLevenbergMarquardt:
                     tol=cg_tol,
                     atol=cg_atol,
                     maxiter=hyper.iterative_maxiter,
+                    M=cg_preconditioner,
                 )
                 return -self.metric_solve(JT(dual_solution))
 
