@@ -117,9 +117,11 @@ resampling, and per-step history recording; the docs have a cookbook.
 
 `solve(...).x` also supports custom implicit JVP/VJP with respect to `p`;
 the docs give the metric-minimum-norm formula and a minimal `jax.jvp` /
-`jax.vjp` example. The metric matters for underdetermined roots because it
-selects which tangent is the minimum-norm solution. The per-step `update(...)`
-interface does not define the implicit AD rule.
+`jax.vjp` example. With `linear_solver="cg"` the default implicit AD rule is
+matrix-free; pass `implicit_solver="cholesky"` to restore the dense rule. The
+metric matters for underdetermined roots because it selects which tangent is
+the minimum-norm solution. The per-step `update(...)` interface does not
+define the implicit AD rule.
 
 ## Metric Example
 
@@ -151,7 +153,8 @@ Matérn/state-space kernel Grams, `metric_from_diagonal`,
 - `linear_solver="qr"`: dense QR solve of the whitened-step problem (requires
   a full-row-rank Jacobian).
 - `linear_solver="cg"`: matrix-free residual-space CG, with an optional
-  `dual_preconditioner` hook (e.g. `sherman_morrison_preconditioner`).
+  `dual_preconditioner` hook (e.g. `sherman_morrison_preconditioner`); under
+  AD, `implicit_solver="auto"` keeps `solve(...).x` matrix-free.
 - `linear_solver="lsmr"`: matrix-free Lineax LSMR on the damped least-squares
   problem.
 

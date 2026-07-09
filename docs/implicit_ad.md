@@ -106,6 +106,112 @@ metric is supplied only through square-root callbacks, the same inverse metric i
 applied as \(P x = S S^\top x\) using `metric.inv_sqrt` and
 `metric.inv_sqrt_transpose`.
 
+## Dense vs Matrix-Free Implicit Solve
+
+The implicit derivative always uses the same undamped residual-space system:
+
+$$
+(J_\theta P J_\theta^\top)y = J_p\dot p,
+\qquad
+\dot\theta = -P J_\theta^\top y.
+$$
+
+The solver exposes two concrete implicit solvers plus an automatic selector:
+
+- `implicit_solver="cholesky"` materializes \(J_\theta^\top\), assembles
+  \(J_\theta P J_\theta^\top\), and uses a dense Cholesky solve. This is the
+  historical rule and is still the explicit escape hatch.
+- `implicit_solver="cg"` applies \(y \mapsto J_\theta P J_\theta^\top y\)
+  matrix-free using JAX JVP/VJP closures, then solves with CG wrapped in
+  `jax.lax.custom_linear_solve(..., symmetric=True)`. This makes both JVP and
+  VJP of `solve(...).x` matrix-free.
+- `implicit_solver="auto"` chooses the matrix-free CG rule only when
+  `linear_solver="cg"`; otherwise it uses the dense Cholesky rule.
+
+The matrix-free rule has the same mathematical contract as the dense rule:
+\(J_\theta P J_\theta^\top\) must be nonsingular, so \(J_\theta\) must have
+full row rank under the chosen metric. The operator is assumed symmetric
+positive definite; the metric inverse \(P\) must be linear, self-adjoint, and
+positive definite in parameter space, and any `implicit_preconditioner` must be
+linear, self-adjoint, and positive definite for the residual-space operator.
+Rank-deficient implicit systems are intentionally not damped here, because
+damping would change the minimum-\(M\)-norm derivative. The two rules fail
+with different visibility on a singular system: the dense rule and the cg
+rule's run-to-tolerance default both produce non-finite derivatives (loud),
+but a small bounded `implicit_maxiter` returns a finite — and wrong —
+derivative with no diagnostic. Reserve the bounded-budget mode for exact
+preconditioners.
+
+Self-adjointness of \(P\) is all the rule needs from `metric.solve`: the
+final \(P J_\theta^\top y\) application acts on tangent data, and its
+transpose in the VJP is declared to be \(P\) itself
+(a symmetric `jax.lax.custom_linear_solve`, which also batches under
+`jax.vmap`), so `metric.solve` is only ever
+*evaluated*, never transposed. That is what lets an iterative metric solve —
+[`metric_from_shifted_matvec`](utilities.md#unified-shifted-block-metrics),
+or any hand-written CG-based `Metric.solve` — participate in both JVP and
+VJP even though transposing through JAX's CG is unsupported.
+
+Accuracy is controlled separately from the forward iterative solve:
+
+- `implicit_tol=None` uses a dtype-aware default (`1e-6` in float32, `1e-10`
+  in float64), chosen for derivative accuracy rather than forward-step speed.
+  The same attainable-floor bound as any CG applies: the residual stagnates
+  near `machine_eps` times the dual operator's condition number, so at small
+  `eps` (spike weight \(c^2/\varepsilon\)) the float64 default is reachable
+  only with the spike preconditioner below.
+- `implicit_atol=0.0` and `implicit_maxiter=None` are passed to JAX CG.
+  `None` leaves the iteration budget to JAX's CG policy.
+- `implicit_preconditioner(v)` is an optional preconditioner for the undamped
+  implicit dual system. It is deliberately separate from
+  `dual_preconditioner(v, damping)`, because the forward callback is defined
+  for damped systems. To reuse one explicitly, write a zero-damping wrapper,
+  for example
+  `implicit_preconditioner=lambda v: dual_preconditioner(v, jnp.asarray(0.0, v.dtype))`.
+
+Two notes for the
+[unified shifted metric](gauss_newton.md#shifted-metrics-and-the-seminorm-limit)
+\(M = \operatorname{blockdiag}(K, 0) + \varepsilon I\):
+
+- The scalar block injects its rank-\(k\) spike of weight \(c^2/\varepsilon\)
+  into the *undamped* implicit dual operator too — there is no LM damping
+  here to mask it — so at small \(\varepsilon\) the implicit CG needs the
+  same
+  [Sherman–Morrison/Woodbury spike preconditioner](utilities.md#shermanmorrison-dual-preconditioner)
+  as the forward solve (zero-damping wrapper as above).
+- With `metric_from_shifted_matvec` the implicit CG nests an inner metric CG
+  inside every operator application, and the outer solve cannot be more
+  accurate than the inner one: for derivative-critical work set the metric's
+  `tol` at or below `implicit_tol` (the metric's default, the square root of
+  machine epsilon, is looser than the float64 implicit default of `1e-10`).
+
+Example sketch for a large matrix-free residual:
+
+```python
+from nlls_gram import UnderdeterminedLevenbergMarquardt
+
+
+def residual(theta, _, p):
+    # `features(theta)` is evaluated by JVP/VJP closures; no dense Jacobian is
+    # formed by the forward CG solve or the implicit CG derivative.
+    return features(theta) - p
+
+
+def implicit_preconditioner(v):
+    return approximate_undamped_dual_solve(v)
+
+
+solver = UnderdeterminedLevenbergMarquardt(
+    residual,
+    linear_solver="cg",
+    iterative_tol=1e-3,
+    iterative_maxiter=20,
+    implicit_solver="auto",
+    implicit_tol=None,
+    implicit_preconditioner=implicit_preconditioner,
+)
+```
+
 ## VJP
 
 The transpose of the same map gives the VJP. For a cotangent

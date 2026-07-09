@@ -33,6 +33,16 @@ REGRESSION_ATOL = 5e-5
 REGRESSION_RTOL = 1e-5
 
 
+def _solve_2x2(matrix, rhs):
+    determinant = matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0]
+    return jnp.stack(
+        (
+            (matrix[1, 1] * rhs[0] - matrix[0, 1] * rhs[1]) / determinant,
+            (-matrix[1, 0] * rhs[0] + matrix[0, 0] * rhs[1]) / determinant,
+        )
+    )
+
+
 def test_recovers_known_parameters_with_jitted_step():
     a_true, b_true = 2.0, -1.0
     ts = jnp.linspace(0.0, 2.0, 20)
@@ -235,6 +245,48 @@ def test_iterative_options_must_be_valid():
         UnderdeterminedLevenbergMarquardt(
             residual_fn, linear_solver="lsmr", lsmr_conlim=0.0
         )
+
+
+def test_implicit_solver_options_must_be_valid():
+    with pytest.raises(ValueError, match="unknown implicit_solver"):
+        UnderdeterminedLevenbergMarquardt(residual_fn, implicit_solver="lu")
+    with pytest.raises(ValueError, match="implicit_tol must be nonnegative"):
+        UnderdeterminedLevenbergMarquardt(residual_fn, implicit_tol=-1.0)
+    with pytest.raises(ValueError, match="implicit_atol must be nonnegative"):
+        UnderdeterminedLevenbergMarquardt(residual_fn, implicit_atol=-1.0)
+    with pytest.raises(ValueError, match="implicit_maxiter must be positive or None"):
+        UnderdeterminedLevenbergMarquardt(residual_fn, implicit_maxiter=0)
+    with pytest.raises(ValueError, match="implicit_maxiter must be set"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn,
+            implicit_tol=0.0,
+            implicit_atol=0.0,
+            implicit_maxiter=None,
+        )
+    with pytest.raises(ValueError, match="implicit_preconditioner"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, implicit_preconditioner=lambda v: v
+        )
+    with pytest.raises(ValueError, match="implicit_preconditioner"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn,
+            linear_solver="qr",
+            implicit_solver="auto",
+            implicit_preconditioner=lambda v: v,
+        )
+
+    auto_cg = UnderdeterminedLevenbergMarquardt(
+        residual_fn,
+        linear_solver="cg",
+        implicit_preconditioner=lambda v: v,
+    )
+    explicit_cg = UnderdeterminedLevenbergMarquardt(
+        residual_fn,
+        implicit_solver="cg",
+        implicit_preconditioner=lambda v: v,
+    )
+    assert auto_cg.implicit_solver == "auto"
+    assert explicit_cg.implicit_solver == "cg"
 
 
 def test_default_float32_x_keeps_float32_outputs():
@@ -1173,6 +1225,180 @@ def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root(jit):
     assert jnp.allclose(x, expected_x, atol=1e-5)
     assert jnp.allclose(x_dot, expected_x_dot, atol=1e-6)
     assert jnp.allclose(p_cotangent, expected_p_cotangent, atol=1e-6)
+
+
+def test_implicit_cg_jvp_and_vjp_match_cholesky_with_metric():
+    with jax.default_device(jax.devices("cpu")[0]):
+        matrix = jnp.array([[1.0, 2.0, -0.5, 0.3], [0.2, -1.0, 1.5, 2.0]])
+        target_matrix = jnp.array([[1.0, -0.5, 0.7], [0.3, 1.2, -1.0]])
+        L = jnp.array(
+            [
+                [2.0, 0.0, 0.0, 0.0],
+                [0.3, 1.5, 0.0, 0.0],
+                [-0.2, 0.4, 1.2, 0.0],
+                [0.1, -0.1, 0.2, 1.7],
+            ]
+        )
+
+        def residual(theta, _, p):
+            return matrix @ theta - target_matrix @ p
+
+        common = dict(
+            init_damping=1e-2,
+            linear_solver="cg",
+            iterative_tol=1e-7,
+            iterative_maxiter=30,
+            metric=metric_from_cholesky(L),
+            geodesic_acceleration=False,
+        )
+        dense_implicit = UnderdeterminedLevenbergMarquardt(
+            residual, implicit_solver="cholesky", **common
+        )
+        cg_implicit = UnderdeterminedLevenbergMarquardt(
+            residual, implicit_solver="cg", implicit_tol=1e-7, **common
+        )
+        theta0 = jnp.zeros(matrix.shape[1])
+
+        def solved_x(solver, p):
+            return solver.solve(theta0, p=p, max_steps=80, atol=1e-6).x
+
+        p = jnp.array([1.0, -0.5, 0.25])
+        p_dot = jnp.array([0.2, -0.1, 0.3])
+        _, dense_dot = jax.jvp(lambda q: solved_x(dense_implicit, q), (p,), (p_dot,))
+        _, cg_dot = jax.jvp(lambda q: solved_x(cg_implicit, q), (p,), (p_dot,))
+
+        theta_bar = jnp.array([0.4, -0.2, 0.7, 0.1])
+        _, dense_pullback = jax.vjp(lambda q: solved_x(dense_implicit, q), p)
+        _, cg_pullback = jax.vjp(lambda q: solved_x(cg_implicit, q), p)
+        (dense_bar,) = dense_pullback(theta_bar)
+        (cg_bar,) = cg_pullback(theta_bar)
+
+        assert jnp.allclose(cg_dot, dense_dot, rtol=1e-5, atol=1e-5)
+        assert jnp.allclose(cg_bar, dense_bar, rtol=1e-5, atol=1e-5)
+
+
+def test_implicit_cg_sign_and_transpose_match_closed_form():
+    matrix = jnp.array([[1.0, 2.0, -0.5, 0.3], [0.2, -1.0, 1.5, 2.0]])
+    target_matrix = jnp.array([[1.0, -0.5, 0.7], [0.3, 1.2, -1.0]])
+    metric_weights = jnp.array([2.0, 0.5, 1.5, 3.0])
+    metric_inverse = jnp.diag(1.0 / metric_weights)
+
+    def residual(theta, _, p):
+        return matrix @ theta - target_matrix @ p
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=30,
+        implicit_solver="cg",
+        implicit_tol=1e-7,
+        metric=metric_from_diagonal(metric_weights),
+        geodesic_acceleration=False,
+    )
+    theta0 = jnp.zeros(matrix.shape[1])
+
+    def solved_x(p):
+        return solver.solve(theta0, p=p, max_steps=80, atol=1e-6).x
+
+    p = jnp.array([0.7, -1.0, 0.4])
+    p_dot = jnp.array([0.2, -0.1, 0.3])
+    theta_bar = jnp.array([0.4, -0.2, 0.7, 0.1])
+    gram = matrix @ metric_inverse @ matrix.T
+    expected_dot = metric_inverse @ matrix.T @ _solve_2x2(gram, target_matrix @ p_dot)
+    expected_bar = target_matrix.T @ _solve_2x2(
+        gram, matrix @ metric_inverse @ theta_bar
+    )
+
+    _, theta_dot = jax.jvp(solved_x, (p,), (p_dot,))
+    _, pullback = jax.vjp(solved_x, p)
+    (p_bar,) = pullback(theta_bar)
+
+    assert jnp.allclose(theta_dot, expected_dot, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(p_bar, expected_bar, rtol=1e-5, atol=1e-5)
+    assert jnp.allclose(theta_dot @ theta_bar, p_dot @ p_bar, atol=1e-5)
+
+
+def test_implicit_cg_jvp_and_vjp_jit():
+    def residual(theta, _, p):
+        return jnp.array([theta[0] + 2.0 * theta[1] - p])
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+        implicit_solver="auto",
+        implicit_tol=1e-7,
+    )
+
+    def solved_x(p):
+        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
+
+    @jax.jit
+    def jitted_jvp(p, p_dot):
+        return jax.jvp(solved_x, (p,), (p_dot,))[1]
+
+    @jax.jit
+    def jitted_vjp(p, theta_bar):
+        _, pullback = jax.vjp(solved_x, p)
+        return pullback(theta_bar)[0]
+
+    p = jnp.asarray(3.0)
+    assert jnp.allclose(
+        jitted_jvp(p, jnp.asarray(0.7)),
+        jnp.array([0.7 / 5.0, 1.4 / 5.0]),
+        atol=1e-6,
+    )
+    assert jnp.allclose(
+        jitted_vjp(p, jnp.array([3.0, 4.0])),
+        (3.0 + 2.0 * 4.0) / 5.0,
+        atol=1e-6,
+    )
+
+
+def test_implicit_cg_jaxpr_does_not_materialize_dense_jacobian_transpose():
+    n = 257
+    grid = jnp.linspace(0.0, 1.0, n)
+    row0 = jnp.sin(2.0 * jnp.pi * grid) + 1.5
+    row1 = jnp.cos(3.0 * jnp.pi * grid) - 0.25
+    row2 = grid + 0.1
+
+    def residual(theta, _, p):
+        return jnp.stack(
+            (
+                jnp.vdot(row0, theta) - p[0],
+                jnp.vdot(row1, theta) - p[1],
+                jnp.vdot(row2, theta) - p[2],
+            )
+        )
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-6,
+        iterative_maxiter=5,
+        implicit_solver="auto",
+        implicit_tol=1e-6,
+        implicit_maxiter=5,
+        geodesic_acceleration=False,
+    )
+
+    def solved_x(p):
+        return solver.solve(jnp.zeros(n), p=p, max_steps=1, atol=0.0).x
+
+    jaxpr = str(
+        jax.make_jaxpr(lambda p, p_dot: jax.jvp(solved_x, (p,), (p_dot,))[1])(
+            jnp.array([1.0, -0.5, 0.25]),
+            jnp.array([0.2, -0.1, 0.3]),
+        )
+    )
+
+    assert f"f32[{n},3]" not in jaxpr
+    assert f"f32[3,{n}]" not in jaxpr
 
 
 def test_vmap_over_solve_matches_loop_and_implicit_ad():
@@ -2194,6 +2420,61 @@ def test_solve_implicit_jvp_of_aux_with_pytree_p():
     assert p_bar["flag"].dtype == jax.dtypes.float0
 
 
+def test_implicit_cg_works_with_has_aux_and_pytree_x_p():
+    def residual(x, _, p):
+        theta = jnp.array([x["left"], x["right"]["value"]])
+        scale = p["scale"]
+        r = jnp.array([theta[0] + 2.0 * theta[1] - scale])
+        aux = {
+            "m": theta[0] * theta[1] + scale**2,
+            "count": jnp.asarray(1, dtype=jnp.int32),
+        }
+        return r, aux
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+        implicit_solver="auto",
+        implicit_tol=1e-7,
+        has_aux=True,
+    )
+    x0 = {"left": jnp.asarray(0.0), "right": {"value": jnp.asarray(0.0)}}
+    p = {"scale": jnp.asarray(3.0), "flag": jnp.asarray(2, dtype=jnp.int32)}
+    p_dot = {
+        "scale": jnp.asarray(0.7),
+        "flag": jnp.zeros((), dtype=jax.dtypes.float0),
+    }
+
+    def solved(q):
+        result = solver.solve(x0, p=q, max_steps=80, atol=1e-6)
+        return result.x, result.aux
+
+    (x, aux), (x_dot, aux_dot) = jax.jvp(solved, (p,), (p_dot,))
+    expected_m_dot = (4.0 * p["scale"] / 25.0 + 2.0 * p["scale"]) * p_dot["scale"]
+    assert jnp.allclose(x["left"], p["scale"] / 5.0, atol=1e-5)
+    assert jnp.allclose(x["right"]["value"], 2.0 * p["scale"] / 5.0, atol=1e-5)
+    assert aux["count"].dtype == jnp.int32
+    assert jnp.allclose(x_dot["left"], 0.7 / 5.0, atol=1e-6)
+    assert jnp.allclose(x_dot["right"]["value"], 1.4 / 5.0, atol=1e-6)
+    assert jnp.allclose(aux_dot["m"], expected_m_dot, atol=1e-5)
+    assert aux_dot["count"].dtype == jax.dtypes.float0
+
+    def solved_aux_m(q):
+        return solver.solve(x0, p=q, max_steps=80, atol=1e-6).aux["m"]
+
+    _, pullback = jax.vjp(solved_aux_m, p)
+    (p_bar,) = pullback(jnp.asarray(1.3))
+    assert jnp.allclose(
+        p_bar["scale"],
+        jnp.asarray(1.3) * (4.0 * p["scale"] / 25.0 + 2.0 * p["scale"]),
+        atol=1e-5,
+    )
+    assert p_bar["flag"].dtype == jax.dtypes.float0
+
+
 def test_solve_implicit_vjp_of_aux_wrt_p():
     def residual(theta, _, p):
         aux = {
@@ -2344,6 +2625,112 @@ def test_dual_preconditioner_requires_cg():
             linear_solver="lsmr",
             dual_preconditioner=lambda v, damping: v,
         )
+
+
+def test_implicit_cg_exact_preconditioner_matches_closed_form_with_tiny_budget():
+    matrix = jnp.array([[1.0, 0.5, -0.2, 0.1], [0.3, -0.7, 0.4, 1.0]])
+    target_matrix = jnp.array([[1.0, -0.5], [0.25, 0.75]])
+    gram = matrix @ matrix.T
+
+    def residual(theta, _, p):
+        return matrix @ theta - target_matrix @ p
+
+    def exact_implicit_preconditioner(v):
+        return _solve_2x2(gram, v)
+
+    preconditioned = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+        implicit_solver="cg",
+        implicit_tol=0.0,
+        implicit_maxiter=1,
+        implicit_preconditioner=exact_implicit_preconditioner,
+        geodesic_acceleration=False,
+    )
+    theta0 = jnp.zeros(matrix.shape[1])
+
+    def solved_x(solver, p):
+        return solver.solve(theta0, p=p, max_steps=80, atol=1e-6).x
+
+    p = jnp.array([0.2, -0.8])
+    p_dot = jnp.array([0.7, -0.4])
+    _, preconditioned_dot = jax.jvp(
+        lambda q: solved_x(preconditioned, q), (p,), (p_dot,)
+    )
+
+    _, preconditioned_pullback = jax.vjp(lambda q: solved_x(preconditioned, q), p)
+    theta_bar = jnp.array([0.1, -0.2, 0.3, 0.4])
+    (preconditioned_bar,) = preconditioned_pullback(theta_bar)
+    expected_dot = matrix.T @ _solve_2x2(gram, target_matrix @ p_dot)
+    expected_bar = target_matrix.T @ _solve_2x2(gram, matrix @ theta_bar)
+
+    assert jnp.allclose(preconditioned_dot, expected_dot, atol=1e-6)
+    assert jnp.allclose(preconditioned_bar, expected_bar, atol=1e-6)
+
+
+def test_implicit_cg_does_not_reuse_forward_dual_preconditioner_by_default():
+    def residual(theta, _, p):
+        return jnp.array([theta[0] + 2.0 * theta[1] - p])
+
+    # This callback is valid for the damped forward system, but would be
+    # singular if the implicit rule silently called it with zero damping.
+    def dual_preconditioner(v, damping):
+        return v / damping
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+        dual_preconditioner=dual_preconditioner,
+        implicit_solver="auto",
+        implicit_tol=1e-7,
+    )
+
+    def solved_x(p):
+        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
+
+    _, x_dot = jax.jvp(solved_x, (jnp.asarray(3.0),), (jnp.asarray(0.7),))
+
+    assert jnp.all(jnp.isfinite(x_dot))
+    assert jnp.allclose(x_dot, jnp.array([0.7 / 5.0, 1.4 / 5.0]), atol=1e-6)
+
+
+def test_implicit_cg_can_explicitly_reuse_zero_damping_dual_preconditioner():
+    def residual(theta, _, p):
+        return jnp.array([theta[0] + 2.0 * theta[1] - p])
+
+    def dual_preconditioner(v, damping):
+        return v / (5.0 + damping)
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+        dual_preconditioner=dual_preconditioner,
+        implicit_solver="auto",
+        implicit_tol=0.0,
+        implicit_maxiter=1,
+        implicit_preconditioner=lambda v: dual_preconditioner(
+            v, jnp.asarray(0.0, v.dtype)
+        ),
+    )
+
+    def solved_x(p):
+        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
+
+    _, x_dot = jax.jvp(solved_x, (jnp.asarray(3.0),), (jnp.asarray(0.7),))
+    _, pullback = jax.vjp(solved_x, jnp.asarray(3.0))
+    (p_bar,) = pullback(jnp.array([3.0, 4.0]))
+
+    assert jnp.allclose(x_dot, jnp.array([0.7 / 5.0, 1.4 / 5.0]), atol=1e-6)
+    assert jnp.allclose(p_bar, (3.0 + 2.0 * 4.0) / 5.0, atol=1e-6)
 
 
 def test_cg_preconditioned_step_matches_cholesky_identity_step():
@@ -3385,3 +3772,232 @@ def test_cg_with_woodbury_spike_preconditioner_matches_cholesky_step():
     # attainable-residual floor, so the two paths agree only to ~1e-3 and
     # the exact gap varies across BLAS/SIMD variants.
     assert jnp.allclose(x_cg, x_ch, rtol=1e-2, atol=1e-3)
+
+
+def test_implicit_cg_with_shifted_matvec_metric_matches_dense():
+    # End-to-end matrix-free implicit AD: the cg implicit rule applies
+    # metric.solve to tangent-dependent data, and the VJP handles that
+    # through the self-adjoint declaration -- the cotangent pass
+    # re-EVALUATES the shifted-matvec metric's inner CG rather than
+    # transposing it (which JAX cannot do). Pin both derivative modes
+    # against the dense metric + dense implicit rule.
+    n, k, eps = 10, 2, 1e-2
+    t = jnp.arange(n) * 1.0
+    K = dense_matern_gram(t, 1.3, 0.8, 2.5)
+    composite = shifted_composite_metric(
+        metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-8), n, k, eps
+    )
+    M = jnp.block(
+        [
+            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
+            [jnp.zeros((k, n)), eps * jnp.eye(k)],
+        ]
+    )
+    dense = metric_from_cholesky(jnp.linalg.cholesky(M))
+
+    A = jax.random.normal(jax.random.PRNGKey(33), (3, n + k))
+
+    def residual(theta, _, p):
+        return A @ theta - jnp.array([p, 0.5 * p, -p])
+
+    def solved_x(metric, linear_solver, implicit_solver, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            init_damping=1e-2,
+            linear_solver=linear_solver,
+            implicit_solver=implicit_solver,
+            implicit_tol=1e-8,
+            metric=metric,
+            iterative_tol=1e-8,
+            iterative_maxiter=500,
+        )
+        return solver.solve(jnp.zeros(n + k), p=p, max_steps=80, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
+    x_bar = jnp.linspace(-1.0, 1.0, n + k)
+    _, dense_dot = jax.jvp(
+        lambda q: solved_x(dense, "cholesky", "cholesky", q), (p,), (p_dot,)
+    )
+    _, dense_pull = jax.vjp(lambda q: solved_x(dense, "cholesky", "cholesky", q), p)
+
+    # cg implicit rule with the matvec metric, under both forward solvers
+    # (cholesky forward + cg implicit is the forced-"cg" combination).
+    for linear_solver in ("cholesky", "cg"):
+        _, cg_dot = jax.jvp(
+            lambda q, ls=linear_solver: solved_x(composite, ls, "cg", q),
+            (p,),
+            (p_dot,),
+        )
+        _, cg_pull = jax.vjp(
+            lambda q, ls=linear_solver: solved_x(composite, ls, "cg", q), p
+        )
+        assert jnp.allclose(cg_dot, dense_dot, atol=1e-4)
+        assert jnp.allclose(cg_pull(x_bar)[0], dense_pull(x_bar)[0], atol=1e-4)
+
+
+def test_implicit_cg_woodbury_preconditioner_with_shifted_metric():
+    # Under the unified shifted metric, the scalar block injects the rank-k
+    # spike (1/eps) J_beta J_beta' into the UNDAMPED implicit dual operator
+    # too. An exact Woodbury preconditioner (zero-damping wrapper) makes a
+    # one-iteration implicit CG budget reproduce the dense-rule derivative.
+    n, k, eps = 12, 2, 1e-3
+    t = jnp.arange(n) * 1.0
+    K = dense_matern_gram(t, 1.3, 0.8, 1.5)
+    K_shifted = K + eps * jnp.eye(n)
+    metric = shifted_composite_metric(
+        metric_from_cholesky(jnp.linalg.cholesky(K_shifted)), n, k, eps
+    )
+
+    m = 6
+    J_alpha = jax.random.normal(jax.random.PRNGKey(34), (m, n))
+    J_beta = jax.random.normal(jax.random.PRNGKey(35), (m, k))
+    A = jnp.concatenate([J_alpha, J_beta], axis=1)
+
+    def residual(theta, _, p):
+        return A @ theta - p * jnp.linspace(1.0, 2.0, m)
+
+    base = J_alpha @ jnp.linalg.solve(K_shifted, J_alpha.T)
+    base_solve = metric_from_cholesky(jnp.linalg.cholesky(base)).solve
+    spike_preconditioner = woodbury_preconditioner(
+        base_solve, J_beta, (1.0 / eps) * jnp.ones(k)
+    )
+
+    def solved_x(implicit_kwargs, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            init_damping=1e-2,
+            linear_solver="cg",
+            iterative_tol=1e-8,
+            iterative_maxiter=200,
+            metric=metric,
+            geodesic_acceleration=False,
+            **implicit_kwargs,
+        )
+        return solver.solve(jnp.zeros(n + k), p=p, max_steps=80, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(1.0), jnp.asarray(1.0)
+    _, dense_dot = jax.jvp(
+        lambda q: solved_x({"implicit_solver": "cholesky"}, q), (p,), (p_dot,)
+    )
+    _, spike_dot = jax.jvp(
+        lambda q: solved_x(
+            {
+                "implicit_solver": "cg",
+                "implicit_tol": 0.0,
+                "implicit_maxiter": 1,
+                "implicit_preconditioner": lambda v: spike_preconditioner(
+                    v, jnp.asarray(0.0, v.dtype)
+                ),
+            },
+            q,
+        ),
+        (p,),
+        (p_dot,),
+    )
+    assert jnp.allclose(spike_dot, dense_dot, rtol=1e-3, atol=1e-4)
+
+
+def test_implicit_cg_vmap_and_hessian_match_dense():
+    # jax.vmap over differentiated solves and vmap-based second derivatives
+    # (jax.hessian) must compose with the cg implicit rule -- the
+    # self-adjoint metric-inverse declaration is built on
+    # custom_linear_solve, which has a batching rule (linear_call does not).
+    n, k, eps = 8, 2, 1e-2
+    t = jnp.arange(n) * 1.0
+    K = dense_matern_gram(t, 1.3, 0.8, 2.5)
+    composite = shifted_composite_metric(
+        metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-8), n, k, eps
+    )
+    M = jnp.block(
+        [
+            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
+            [jnp.zeros((k, n)), eps * jnp.eye(k)],
+        ]
+    )
+    dense = metric_from_cholesky(jnp.linalg.cholesky(M))
+
+    A = jax.random.normal(jax.random.PRNGKey(36), (3, n + k))
+
+    def residual(theta, _, p):
+        return A @ theta - jnp.array([p, 0.5 * p, -p])
+
+    def solved_x(metric, implicit_solver, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            init_damping=1e-2,
+            linear_solver="cg",
+            implicit_solver=implicit_solver,
+            implicit_tol=1e-8,
+            metric=metric,
+            iterative_tol=1e-8,
+            iterative_maxiter=300,
+        )
+        return solver.solve(jnp.zeros(n + k), p=p, max_steps=60, atol=1e-6).x
+
+    ps = jnp.array([1.0, 2.0, 3.0])
+    one = jnp.asarray(1.0)
+    _, dots_cg = jax.vmap(
+        lambda q: jax.jvp(lambda r: solved_x(composite, "cg", r), (q,), (one,))
+    )(ps)
+    _, dots_dense = jax.vmap(
+        lambda q: jax.jvp(lambda r: solved_x(dense, "cholesky", r), (q,), (one,))
+    )(ps)
+    assert jnp.allclose(dots_cg, dots_dense, atol=1e-4)
+
+    def loss_cg(q):
+        return jnp.sum(solved_x(composite, "cg", q) ** 2)
+
+    def loss_dense(q):
+        return jnp.sum(solved_x(dense, "cholesky", q) ** 2)
+
+    assert jnp.allclose(
+        jax.vmap(jax.grad(loss_cg))(ps), jax.vmap(jax.grad(loss_dense))(ps), atol=1e-3
+    )
+    assert jnp.allclose(
+        jax.hessian(loss_cg)(jnp.asarray(2.0)),
+        jax.hessian(loss_dense)(jnp.asarray(2.0)),
+        rtol=1e-3,
+    )
+
+
+def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
+    # J P J' singular with an inconsistent tangent right-hand side: the
+    # dense rule NaNs through cho_solve, and the cg rule's run-to-tolerance
+    # default diverges to non-finite as well. Only a small bounded
+    # implicit_maxiter (the exact-preconditioner budget mode) returns a
+    # finite -- and wrong -- derivative, which is why that mode is reserved
+    # for exact preconditioners.
+    A = jnp.array(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0, 0.0],
+        ]
+    )
+
+    def residual(theta, _, p):
+        return A @ theta - p
+
+    def x_dot(implicit_solver, implicit_maxiter):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            init_damping=1e-2,
+            linear_solver="cg",
+            implicit_solver=implicit_solver,
+            implicit_tol=1e-8,
+            implicit_maxiter=implicit_maxiter,
+            iterative_tol=1e-8,
+            iterative_maxiter=100,
+            geodesic_acceleration=False,
+        )
+
+        def solved_x(p):
+            return solver.solve(jnp.zeros(5), p=p, max_steps=40, atol=1e-5).x
+
+        p0 = jnp.array([1.0, 2.0, 3.0])
+        p_dot = jnp.array([1.0, 0.0, 0.0])
+        return jax.jvp(solved_x, (p0,), (p_dot,))[1]
+
+    assert not bool(jnp.all(jnp.isfinite(x_dot("cholesky", None))))
+    assert not bool(jnp.all(jnp.isfinite(x_dot("cg", None))))
+    assert bool(jnp.all(jnp.isfinite(x_dot("cg", 1))))

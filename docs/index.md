@@ -165,6 +165,9 @@ u \mapsto J P J^\top u + \lambda u.
 $$
 
 It uses JAX linearization for JVPs/VJPs and `jax.scipy.sparse.linalg.cg`.
+With the default `implicit_solver="auto"`, differentiating `solve(...).x`
+also stays matrix-free for forward CG solves. Pass
+`implicit_solver="cholesky"` to restore the dense implicit AD rule.
 
 An optional `dual_preconditioner(v, damping)` callback is applied as the CG
 preconditioner (for the geodesic-acceleration solve as well). It must be a
@@ -320,7 +323,8 @@ pytree `p`: derivatives of `result.x` (and, with `has_aux=True`, of
 `result.aux`) are defined by the residual equation at the returned solution
 rather than by differentiating through the LM iterations. See
 [Implicit Differentiation](implicit_ad.md) for the math, the role of the
-metric in selecting the minimum-norm tangent, and worked examples.
+metric in selecting the minimum-norm tangent, matrix-free CG implicit solves,
+and worked examples.
 
 ## Geodesic Acceleration
 

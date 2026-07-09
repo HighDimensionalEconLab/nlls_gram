@@ -366,11 +366,17 @@ def metric_from_shifted_matvec(
 
     Because the inner CG is built on ``lax.custom_linear_solve`` with a
     symmetric operator, ``solve`` composes with ``jax.jvp``/``jax.vjp``/
-    ``jax.grad`` — including the solver's implicit-AD rule and
-    differentiating ``update`` through the ``cg`` path — and with values
-    the matvec closes over; ``matvec`` itself only needs to be linear. Raw
-    ``jax.linear_transpose`` of ``solve`` is not supported by JAX's CG (no
-    solver path applies it to ``metric.solve``).
+    ``jax.grad`` — including both implicit-AD rules (dense and
+    ``implicit_solver="cg"``) and differentiating ``update`` through the
+    ``cg`` path — and with values the matvec closes over; ``matvec`` itself
+    only needs to be linear. (Closure-value differentiation holds for
+    direct ``Metric`` use and through ``update``; the LM ``solve()``
+    entry point supports differentiation with respect to ``p`` only — its
+    implicit rule is a ``jax.custom_jvp``, which cannot close over active
+    tracers.) Raw ``jax.linear_transpose`` of ``solve`` is not supported by
+    JAX's CG; the solver never applies it to ``metric.solve`` (the cg
+    implicit rule declares the application self-adjoint instead of
+    transposing it).
     """
 
     if not isinstance(shift, jax.core.Tracer) and float(shift) <= 0.0:
