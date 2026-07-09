@@ -261,6 +261,11 @@ recording.
   every `solve`.
 - `max_steps`, `atol`, `gtol`, and `xtol` are traced values: sweeping them
   does not recompile (concrete numbers, not tracers).
+- `jax.vmap(lambda x0: solver.solve(x0, ...))` works for independent
+  multi-start and per-sample calibration solves. The batched loop runs until
+  every lane has stopped, so `status` and `steps` are per-lane results but
+  runtime is governed by the slowest lane. See
+  [Callbacks and Cookbook](callbacks.md#batched-multi-start).
 - Each `update` costs one residual linearization, one Jacobian
   materialization (`n_residuals` VJP passes in the dense paths), and one
   candidate residual evaluation; geodesic acceleration adds a

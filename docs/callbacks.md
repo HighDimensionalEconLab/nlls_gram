@@ -160,6 +160,41 @@ for step in range(max_steps):
 Reading `float(info.loss)` synchronizes with the device; for maximum
 throughput read diagnostics once per epoch rather than once per step.
 
+### Batched Multi-Start
+
+Use `jax.vmap` to run independent solves over a batch of initial guesses or
+external parameters. The result fields are batched arrays and pytrees, so
+selecting the best converged lane is ordinary JAX indexing:
+
+```python
+def solve_start(x0):
+    return solver.solve(x0, args, max_steps=100, atol=1e-8)
+
+
+results = jax.vmap(solve_start)(x0_batch)
+converged = results.status == LMStatus.CONVERGED
+loss = jnp.where(converged, results.info.loss, jnp.inf)
+best = jnp.argmin(loss)
+x_best = jax.tree.map(lambda leaf: leaf[best], results.x)
+```
+
+To batch per-sample calibration data, map over `p` as well:
+
+```python
+def solve_sample(x0, p):
+    return solver.solve(x0, args, p=p, max_steps=100, atol=1e-8)
+
+
+results = jax.vmap(solve_sample)(x0_batch, p_batch)
+```
+
+JAX batches the internal `while_loop` until every lane has stopped. Lanes that
+finish early keep their result and report their own `steps` and `status`, but
+the compiled call still pays for iterations until the slowest lane stops.
+Callbacks used under `vmap` must be traceable and batch-safe; recipes based on
+`jax.experimental.io_callback`, such as the wall-clock time limit below, are
+host callbacks and should stay outside vmapped solves.
+
 ### Logging
 
 The simplest callback logs and returns `None`, which means "no stop, no

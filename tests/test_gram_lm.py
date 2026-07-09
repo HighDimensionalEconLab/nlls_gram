@@ -1111,6 +1111,39 @@ def test_solve_callback_updates_args_and_user_state():
     assert result.user_state > 0.0
 
 
+def test_vmap_over_solve_callback_stops_per_lane():
+    def residual(theta, _, p):
+        return theta - p["target"]
+
+    def callback(ctx):
+        stop = ctx.step >= ctx.p["stop_after"]
+        return LMSolveAction(stop=stop, status=100 + ctx.p["stop_after"])
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    x0s = jnp.zeros((4, 1))
+    p = {
+        "target": jnp.arange(1.0, 5.0)[:, None],
+        "stop_after": jnp.arange(1, 5, dtype=jnp.int32),
+    }
+
+    def solve_one(x0, p_one):
+        return solver.solve(x0, p=p_one, max_steps=8, atol=0.0, callback=callback)
+
+    batched = jax.vmap(solve_one)(x0s, p)
+    loop = jax.tree.map(
+        lambda *xs: jnp.stack(xs),
+        *[
+            solve_one(x0s[i], jax.tree.map(lambda leaf, i=i: leaf[i], p))
+            for i in range(x0s.shape[0])
+        ],
+    )
+
+    assert jnp.array_equal(batched.steps, p["stop_after"])
+    assert jnp.array_equal(batched.steps, loop.steps)
+    assert jnp.array_equal(batched.status, loop.status)
+    assert jnp.allclose(batched.x, loop.x, atol=1e-6)
+
+
 @pytest.mark.parametrize("jit", [True, False])
 def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root(jit):
     def residual(theta, _, p):
@@ -1135,6 +1168,58 @@ def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root(jit):
     assert jnp.allclose(x, expected_x, atol=1e-5)
     assert jnp.allclose(x_dot, expected_x_dot, atol=1e-6)
     assert jnp.allclose(p_cotangent, expected_p_cotangent, atol=1e-6)
+
+
+def test_vmap_over_solve_matches_loop_and_implicit_ad():
+    matrix = jnp.array([[1.0, 0.5, -0.2, 0.1], [0.3, -0.7, 0.4, 1.0]])
+    gram = matrix @ matrix.T
+    right_inverse = matrix.T @ jnp.linalg.inv(gram)
+
+    def residual(theta, _, p):
+        return matrix @ theta - p
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, geodesic_acceleration=False
+    )
+    ps = jnp.array([[1.0, -0.5], [0.25, 0.75], [-1.2, 0.2], [0.1, -1.4]])
+    x0s = jnp.zeros((ps.shape[0], matrix.shape[1]))
+
+    def solve_one(x0, p):
+        return solver.solve(x0, p=p, max_steps=80, atol=1e-5)
+
+    batched = jax.vmap(solve_one)(x0s, ps)
+    loop = jax.tree.map(
+        lambda *xs: jnp.stack(xs),
+        *[solve_one(x0s[i], ps[i]) for i in range(ps.shape[0])],
+    )
+    expected_x = jax.vmap(lambda p: right_inverse @ p)(ps)
+
+    assert jnp.array_equal(batched.status, loop.status)
+    assert jnp.array_equal(batched.steps, loop.steps)
+    assert jnp.allclose(batched.x, loop.x, atol=1e-6)
+    assert jnp.allclose(batched.x, expected_x, atol=1e-4)
+
+    p_dot = jnp.array([[0.2, -0.1], [0.0, 0.3], [0.7, -0.4], [-0.2, 0.5]])
+
+    def vmapped_x(p_batch):
+        return jax.vmap(lambda p: solve_one(jnp.zeros(matrix.shape[1]), p).x)(p_batch)
+
+    _, x_dot = jax.jvp(vmapped_x, (ps,), (p_dot,))
+    expected_x_dot = jax.vmap(lambda dp: right_inverse @ dp)(p_dot)
+    assert jnp.allclose(x_dot, expected_x_dot, atol=1e-5)
+
+    cotangent = jnp.array(
+        [
+            [0.1, -0.2, 0.3, 0.0],
+            [0.0, 0.4, -0.1, 0.2],
+            [-0.3, 0.2, 0.1, 0.5],
+            [0.7, -0.1, 0.0, -0.4],
+        ]
+    )
+    _, pullback = jax.vjp(vmapped_x, ps)
+    (p_bar,) = pullback(cotangent)
+    expected_p_bar = jax.vmap(lambda c: jnp.linalg.solve(gram, matrix @ c))(cotangent)
+    assert jnp.allclose(p_bar, expected_p_bar, atol=1e-5)
 
 
 @pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
