@@ -69,6 +69,10 @@ def metric_from_tridiagonal_precision(diag, off_diag):
 
     diag = jnp.asarray(diag)
     off_diag = jnp.asarray(off_diag)
+    if diag.ndim != 1 or off_diag.shape != (diag.shape[0] - 1,):
+        raise ValueError(
+            "diag must be 1-D and off_diag must have shape (len(diag) - 1,)"
+        )
     zero = jnp.zeros((1,), dtype=diag.dtype)
     lower = jnp.concatenate([zero, off_diag])
     upper = jnp.concatenate([off_diag, zero])
