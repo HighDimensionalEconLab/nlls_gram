@@ -219,6 +219,95 @@ assert "f32" not in jaxpr, jaxpr
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_quasiseparable_float64_parallel_matches_sequential():
+    # The evidence gating the parallel-apply default (off-CPU + float64):
+    # sequential and associative-scan applies must agree, and the parallel
+    # path must stay finite, on both a well-conditioned grid and a long,
+    # stiff stress grid. Also the tight float64 hyperparameter-gradient
+    # cross-check against a dense metric, with the metric constructed inside
+    # jax.grad and jax.jit(jax.grad(...)).
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import matern_state_space, metric_from_state_space
+
+n = 5000
+sigma, ell = 1.3, 0.8
+x = jax.random.normal(jax.random.PRNGKey(0), (n,))
+X = jax.random.normal(jax.random.PRNGKey(1), (n, 3))
+well = jnp.cumsum(
+    jax.random.uniform(jax.random.PRNGKey(2), (n,), minval=0.6, maxval=1.4)
+)
+stiff = jnp.linspace(0.0, 5.0, n)
+# On the well-conditioned grid the two scan orders agree to machine
+# precision; on the stiff grid (nugget-floored pivots, cond ~1e9) the
+# substitutions are condition-limited to ~cond * eps.
+for (name, t), tol in ((("well", well), 1e-12), (("stiff", stiff), 1e-6)):
+    for nu in (1.5, 2.5):
+        model = matern_state_space(sigma, ell, nu)
+        seq = metric_from_state_space(
+            t, *model, nugget=1e-8 * sigma**2, parallel=False
+        )
+        par = metric_from_state_space(
+            t, *model, nugget=1e-8 * sigma**2, parallel=True
+        )
+        for callback in ("solve", "norm", "inv_sqrt", "inv_sqrt_transpose"):
+            a = getattr(seq, callback)(x)
+            b = getattr(par, callback)(x)
+            assert bool(jnp.all(jnp.isfinite(b))), (name, nu, callback)
+            rel = float(jnp.linalg.norm(a - b) / jnp.linalg.norm(a))
+            assert rel < tol, (name, nu, callback, rel)
+        rel = float(
+            jnp.linalg.norm(seq.solve(X) - par.solve(X)) / jnp.linalg.norm(seq.solve(X))
+        )
+        assert rel < tol, (name, nu, "solve-matrix", rel)
+
+
+def dense_matern_gram(t, sigma, ell, nu):
+    tau = jnp.abs(t[:, None] - t[None, :])
+    ft = jnp.sqrt(2.0 * nu) * tau / ell
+    if nu == 1.5:
+        corr = (1.0 + ft) * jnp.exp(-ft)
+    else:
+        corr = (1.0 + ft + ft**2 / 3.0) * jnp.exp(-ft)
+    return sigma**2 * corr
+
+
+n = 300
+t = jnp.cumsum(jax.random.uniform(jax.random.PRNGKey(3), (n,), minval=0.6, maxval=1.4))
+v = jax.random.normal(jax.random.PRNGKey(4), (n,))
+for nu in (1.5, 2.5):
+
+    def loss_qsm(params, nu=nu):
+        s, l = params
+        model = matern_state_space(s, l, nu)
+        return v @ metric_from_state_space(t, *model, nugget=1e-8).solve(v)
+
+    def loss_dense(params, nu=nu):
+        s, l = params
+        K = dense_matern_gram(t, s, l, nu) + 1e-8 * jnp.eye(n)
+        return v @ jnp.linalg.solve(K, v)
+
+    params = jnp.array([1.3, 0.8])
+    grad_qsm = jax.grad(loss_qsm)(params)
+    grad_jit = jax.jit(jax.grad(loss_qsm))(params)
+    grad_dense = jax.grad(loss_dense)(params)
+    rel = float(jnp.linalg.norm(grad_qsm - grad_dense) / jnp.linalg.norm(grad_dense))
+    assert rel < 1e-9, (nu, rel)
+    rel_jit = float(jnp.linalg.norm(grad_jit - grad_qsm) / jnp.linalg.norm(grad_qsm))
+    assert rel_jit < 1e-12, (nu, rel_jit)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_solve_with_float32_problem_under_x64_keeps_lm_state_dtype_consistent():
     # solve(lm_state=None) must carry the damping in the residual dtype, not
     # the default float, or the while_loop carry mismatches update()'s output

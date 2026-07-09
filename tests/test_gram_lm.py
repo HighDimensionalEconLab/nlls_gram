@@ -12,8 +12,11 @@ from nlls_gram import (
     Metric,
     UnderdeterminedLevenbergMarquardt,
     blockdiag_metric,
+    matern_state_space,
     metric_from_cholesky,
     metric_from_diagonal,
+    metric_from_quasiseparable,
+    metric_from_state_space,
     metric_from_tridiagonal_precision,
     sherman_morrison_preconditioner,
 )
@@ -2743,3 +2746,316 @@ def test_blockdiag_metric_implicit_ad_matches_dense_metric():
     _, block_pullback = jax.vjp(lambda q: solved_x(composite, q), p)
     _, dense_pullback = jax.vjp(lambda q: solved_x(dense, q), p)
     assert jnp.allclose(block_pullback(x_bar)[0], dense_pullback(x_bar)[0], atol=1e-4)
+
+
+def dense_matern_gram(t, sigma, ell, nu):
+    tau = jnp.abs(t[:, None] - t[None, :])
+    ft = jnp.sqrt(2.0 * nu) * tau / ell
+    if nu == 0.5:
+        corr = jnp.exp(-ft)
+    elif nu == 1.5:
+        corr = (1.0 + ft) * jnp.exp(-ft)
+    else:
+        corr = (1.0 + ft + ft**2 / 3.0) * jnp.exp(-ft)
+    return sigma**2 * corr
+
+
+def dense_from_quasiseparable_generators(d, p, q, A):
+    # K[i, j] = p[i] @ A[i-1] ... A[j+1] @ q[j] for i > j, d on the
+    # diagonal, symmetric — the documented generator convention.
+    n, m = p.shape
+
+    def entry(i, j):
+        if i == j:
+            return d[i]
+        lo, hi = min(i, j), max(i, j)
+        Phi = jnp.eye(m, dtype=d.dtype)
+        for k in range(lo + 1, hi):
+            Phi = A[k] @ Phi
+        return p[hi] @ Phi @ q[lo]
+
+    return jnp.array([[entry(i, j) for j in range(n)] for i in range(n)])
+
+
+@pytest.mark.parametrize("nu", [0.5, 1.5, 2.5])
+@pytest.mark.parametrize("parallel", [False, True])
+def test_metric_from_state_space_matern_matches_dense(nu, parallel):
+    # nu=0.5 is included even though metric_from_tridiagonal_precision is the
+    # recommended constructor there — the helper claims support for it.
+    n = 300
+    sigma, ell = 1.3, 0.8
+    nugget = 1e-8 * sigma**2
+    uniform = jnp.arange(n) * 1.0
+    nonuniform = jnp.cumsum(
+        jax.random.uniform(jax.random.PRNGKey(0), (n,), minval=0.6, maxval=1.4)
+    )
+    x = jax.random.normal(jax.random.PRNGKey(1), (n,))
+    X = jax.random.normal(jax.random.PRNGKey(2), (n, 3))
+
+    for t in (uniform, nonuniform):
+        metric = metric_from_state_space(
+            t, *matern_state_space(sigma, ell, nu), nugget=nugget, parallel=parallel
+        )
+        # Pin full matmul precision so the dense float32 references are
+        # comparable to the scan-based callbacks (TF32 on Ampere GPUs).
+        with jax.default_matmul_precision("highest"):
+            K = dense_matern_gram(t, sigma, ell, nu) + nugget * jnp.eye(n)
+            K_inv = jnp.linalg.inv(K)
+
+            assert jnp.allclose(metric.solve(x), K_inv @ x, rtol=1e-4, atol=1e-4)
+            assert jnp.allclose(metric.solve(X), K_inv @ X, rtol=1e-4, atol=1e-4)
+            assert jnp.allclose(
+                metric.norm(x), jnp.sqrt(x @ K @ x), rtol=1e-4, atol=1e-4
+            )
+            S = metric.inv_sqrt(jnp.eye(n))
+            assert jnp.allclose(S @ S.T, K_inv, rtol=1e-3, atol=1e-4)
+            assert jnp.allclose(
+                metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-4
+            )
+            # The implicit-AD fallback literally computes this identity.
+            assert jnp.allclose(
+                metric.solve(X),
+                metric.inv_sqrt(metric.inv_sqrt_transpose(X)),
+                rtol=1e-4,
+                atol=1e-5,
+            )
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_metric_from_quasiseparable_rank1_matches_dense(parallel):
+    # Rank-1 exponential generators reproduce the AR(1) Gram rho^|i-j|.
+    n, rho = 40, 0.7
+    d = jnp.ones(n)
+    p = jnp.full((n, 1), rho)
+    q = jnp.ones((n, 1))
+    A = jnp.full((n, 1, 1), rho)
+    metric = metric_from_quasiseparable(d, p, q, A, parallel=parallel)
+
+    idx = jnp.arange(n)
+    K = rho ** jnp.abs(idx[:, None] - idx[None, :])
+    x = jax.random.normal(jax.random.PRNGKey(3), (n,))
+    X = jax.random.normal(jax.random.PRNGKey(4), (n, 3))
+
+    with jax.default_matmul_precision("highest"):
+        K_inv = jnp.linalg.inv(K)
+        assert jnp.allclose(metric.solve(x), K_inv @ x, rtol=1e-4, atol=1e-4)
+        assert jnp.allclose(metric.solve(X), K_inv @ X, rtol=1e-4, atol=1e-4)
+        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ K @ x), rtol=1e-4, atol=1e-4)
+        S = metric.inv_sqrt(jnp.eye(n))
+        assert jnp.allclose(S @ S.T, K_inv, rtol=1e-3, atol=1e-4)
+        assert jnp.allclose(
+            metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-4
+        )
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_metric_from_quasiseparable_noncommuting_generators_match_dense(parallel):
+    # m=1 generators commute and cannot catch product-order, A[k]-vs-A[k+1],
+    # or transpose mistakes; hand-built noncommuting m=2 transitions can.
+    n, m = 12, 2
+    thetas = jnp.linspace(0.3, 2.4, n)
+    scales = jnp.stack(
+        [0.9 - 0.4 * jnp.linspace(0.0, 1.0, n), 0.5 + 0.3 * jnp.linspace(0.0, 1.0, n)],
+        axis=-1,
+    )
+    cos, sin = jnp.cos(thetas), jnp.sin(thetas)
+    rotations = jnp.stack(
+        [jnp.stack([cos, -sin], axis=-1), jnp.stack([sin, cos], axis=-1)], axis=-2
+    )
+    A = rotations * scales[:, None, :]
+    p = 0.4 * jax.random.normal(jax.random.PRNGKey(5), (n, m))
+    q = 0.4 * jax.random.normal(jax.random.PRNGKey(6), (n, m))
+    d = 5.0 * jnp.ones(n)
+
+    K = dense_from_quasiseparable_generators(d, p, q, A)
+    assert jnp.all(jnp.linalg.eigvalsh(K) > 0)
+    metric = metric_from_quasiseparable(d, p, q, A, parallel=parallel)
+
+    x = jax.random.normal(jax.random.PRNGKey(7), (n,))
+    X = jax.random.normal(jax.random.PRNGKey(8), (n, 3))
+    with jax.default_matmul_precision("highest"):
+        K_inv = jnp.linalg.inv(K)
+        assert jnp.allclose(metric.solve(x), K_inv @ x, rtol=1e-4, atol=1e-5)
+        assert jnp.allclose(metric.solve(X), K_inv @ X, rtol=1e-4, atol=1e-5)
+        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ K @ x), rtol=1e-4, atol=1e-5)
+        S = metric.inv_sqrt(jnp.eye(n))
+        assert jnp.allclose(S @ S.T, K_inv, rtol=1e-3, atol=1e-5)
+        assert jnp.allclose(
+            metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-5
+        )
+
+
+def test_metric_from_state_space_matern_edge_cases():
+    # n=1: the metric is the scalar sigma^2 + nugget.
+    metric = metric_from_state_space(
+        jnp.array([0.5]), *matern_state_space(2.0, 1.0, 1.5)
+    )
+    x = jnp.array([3.0])
+    assert jnp.allclose(metric.solve(x), x / 4.0)
+    assert jnp.allclose(metric.norm(x), 6.0)
+    assert jnp.allclose(metric.inv_sqrt(x), x / 2.0)
+
+    # n=2, nugget=0 on a well-conditioned grid.
+    t2 = jnp.array([0.0, 1.0])
+    metric2 = metric_from_state_space(t2, *matern_state_space(1.3, 0.8, 2.5))
+    K2 = dense_matern_gram(t2, 1.3, 0.8, 2.5)
+    x2 = jnp.array([1.0, -2.0])
+    assert jnp.allclose(metric2.solve(x2), jnp.linalg.solve(K2, x2), rtol=1e-5)
+    assert jnp.allclose(metric2.norm(x2), jnp.sqrt(x2 @ K2 @ x2), rtol=1e-5)
+
+    # nu is static and validated eagerly.
+    with pytest.raises(ValueError, match="nu"):
+        metric_from_state_space(t2, *matern_state_space(1.0, 1.0, 2.0))
+    with pytest.raises(ValueError, match="1-D"):
+        metric_from_state_space(jnp.zeros((2, 2)), *matern_state_space(1.0, 1.0, 1.5))
+
+
+def test_metric_from_quasiseparable_shape_validation():
+    n, m = 4, 2
+    d = jnp.ones(n)
+    p = jnp.ones((n, m))
+    with pytest.raises(ValueError, match="d must"):
+        metric_from_quasiseparable(jnp.ones((n, 1)), p, p, jnp.ones((n, m, m)))
+    with pytest.raises(ValueError, match="p must"):
+        metric_from_quasiseparable(d, jnp.ones(n), p, jnp.ones((n, m, m)))
+    with pytest.raises(ValueError, match="q must"):
+        metric_from_quasiseparable(d, p, jnp.ones((n, m + 1)), jnp.ones((n, m, m)))
+
+
+def test_metric_from_state_space_matern_float32_default_is_stable():
+    # Long, stiff grid (spacing << ell) in float32: the parallel
+    # substitutions propagate rank-1-corrected transitions with no
+    # contraction guarantee, so the dtype-aware default must stay on the
+    # sequential path for float32 setups, on any backend.
+    n = 5000
+    t = jnp.linspace(0.0, 5.0, n, dtype=jnp.float32)
+    metric = metric_from_state_space(t, *matern_state_space(1.0, 1.0, 2.5), nugget=1e-4)
+    assert bool(jnp.all(jnp.isfinite(metric.inv_sqrt(jnp.ones(n, jnp.float32)))))
+    assert bool(jnp.all(jnp.isfinite(metric.solve(jnp.ones(n, jnp.float32)))))
+
+
+def test_metric_from_state_space_matern_hyperparameter_grad_matches_dense():
+    # The metric is constructed INSIDE jax.grad (and jax.jit(jax.grad)) from
+    # traced (sigma, ell) — the downstream sweep pattern — and the gradient
+    # must match the dense-metric gradient.
+    n = 60
+    t = jnp.cumsum(
+        jax.random.uniform(jax.random.PRNGKey(9), (n,), minval=0.6, maxval=1.4)
+    )
+    v = jax.random.normal(jax.random.PRNGKey(10), (n,))
+    nugget = 1e-6
+
+    def loss_qsm(params):
+        sigma, ell = params
+        metric = metric_from_state_space(
+            t, *matern_state_space(sigma, ell, 1.5), nugget=nugget
+        )
+        return v @ metric.solve(v)
+
+    def loss_dense(params):
+        sigma, ell = params
+        K = dense_matern_gram(t, sigma, ell, 1.5) + nugget * jnp.eye(n)
+        return v @ jnp.linalg.solve(K, v)
+
+    params = jnp.array([1.3, 0.8])
+    with jax.default_matmul_precision("highest"):
+        grad_qsm = jax.grad(loss_qsm)(params)
+        grad_jit = jax.jit(jax.grad(loss_qsm))(params)
+        grad_dense = jax.grad(loss_dense)(params)
+    assert jnp.allclose(grad_qsm, grad_dense, rtol=1e-2)
+    assert jnp.allclose(grad_jit, grad_qsm, rtol=1e-4)
+
+
+def test_metric_from_state_space_matern_small_pivot_grad_is_finite():
+    # Nugget-free stiff grid drives the Schur pivots small; the gradient
+    # through the Cholesky square roots must stay finite there (sqrt has an
+    # AD blowup exactly at zero, so the pivots must not underflow — a truly
+    # degenerate nugget-free grid NaNs, as documented).
+    n = 30
+    t = 0.3 * jnp.arange(n)
+
+    def loss(ell):
+        metric = metric_from_state_space(t, *matern_state_space(1.0, ell, 2.5))
+        return jnp.sum(metric.inv_sqrt_transpose(jnp.ones(n)) ** 2)
+
+    grad = jax.grad(loss)(jnp.asarray(1.0))
+    assert bool(jnp.isfinite(grad))
+
+
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr", "lsmr"])
+def test_metric_from_state_space_matern_matches_dense_metric_in_solver(linear_solver):
+    # End-to-end: the O(n) Matern metric drives the actual solver (and its
+    # implicit derivative) to the same solution as the equivalent dense
+    # metric. lsmr exercises inv_sqrt inside a lineax
+    # FunctionLinearOperator.
+    n = 8
+    t = jnp.arange(n) * 1.0
+    sigma, ell, nugget = 1.3, 0.8, 1e-6
+    K = dense_matern_gram(t, sigma, ell, 1.5) + nugget * jnp.eye(n)
+    matern = metric_from_state_space(
+        t, *matern_state_space(sigma, ell, 1.5), nugget=nugget
+    )
+    dense = metric_from_cholesky(jnp.linalg.cholesky(K))
+
+    A = jnp.stack([jnp.ones(n), jnp.arange(n, dtype=jnp.float32)])
+
+    def residual(theta, _, p):
+        return A @ theta - jnp.array([p, 0.5 * p])
+
+    solver_kwargs = {"init_damping": 1e-2, "linear_solver": linear_solver}
+    if linear_solver == "lsmr":
+        solver_kwargs.update({"iterative_tol": 1e-10, "iterative_maxiter": 50})
+
+    def solved_x(metric, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual, metric=metric, **solver_kwargs
+        )
+        return solver.solve(jnp.zeros(n), p=p, max_steps=60, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
+    x_qsm, x_qsm_dot = jax.jvp(lambda s: solved_x(matern, s), (p,), (p_dot,))
+    x_dense, x_dense_dot = jax.jvp(lambda s: solved_x(dense, s), (p,), (p_dot,))
+
+    assert jnp.allclose(A @ x_qsm, jnp.array([p, 0.5 * p]), atol=1e-4)
+    assert jnp.allclose(x_qsm, x_dense, atol=1e-4)
+    assert jnp.allclose(x_qsm_dot, x_dense_dot, atol=1e-4)
+
+    x_bar = jnp.linspace(-1.0, 1.0, n)
+    _, qsm_pullback = jax.vjp(lambda s: solved_x(matern, s), p)
+    _, dense_pullback = jax.vjp(lambda s: solved_x(dense, s), p)
+    assert jnp.allclose(qsm_pullback(x_bar)[0], dense_pullback(x_bar)[0], atol=1e-4)
+
+
+def test_metric_from_state_space_matern_cg_and_preconditioner_smoke():
+    # cg exercises metric.solve under jax.linear_transpose, and the
+    # Sherman-Morrison preconditioner built from metric.solve is the
+    # downstream consumption shape.
+    n = 8
+    t = jnp.arange(n) * 1.0
+    metric = metric_from_state_space(t, *matern_state_space(1.3, 0.8, 1.5), nugget=1e-6)
+
+    A = jnp.stack([jnp.ones(n), jnp.arange(n, dtype=jnp.float32)])
+
+    def residual(theta, _, p):
+        return A @ theta - jnp.array([2.0, 1.0])
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-10,
+        iterative_maxiter=50,
+        metric=metric,
+    )
+    result = solver.solve(jnp.zeros(n), max_steps=60, atol=1e-5)
+    assert int(result.status) == LMStatus.CONVERGED
+    assert jnp.allclose(A @ result.x, jnp.array([2.0, 1.0]), atol=1e-4)
+
+    K = dense_matern_gram(t, 1.3, 0.8, 1.5) + 1e-6 * jnp.eye(n)
+    u, weight = jnp.ones(n), 50.0
+    preconditioner = sherman_morrison_preconditioner(metric.solve, u, weight)
+    B = K + weight * jnp.outer(u, u)
+    v = jax.random.normal(jax.random.PRNGKey(11), (n,))
+    assert jnp.allclose(
+        preconditioner(v, 0.0), jnp.linalg.solve(B, v), rtol=1e-3, atol=1e-3
+    )

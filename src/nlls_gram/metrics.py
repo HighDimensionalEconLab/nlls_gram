@@ -5,6 +5,8 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 
+from nlls_gram import quasiseparable
+
 
 @dataclass(frozen=True)
 class Metric:
@@ -173,6 +175,122 @@ def metric_from_tridiagonal_precision(diag, off_diag, parallel=None):
         inv_sqrt=inv_sqrt,
         inv_sqrt_transpose=inv_sqrt_transpose,
     )
+
+
+def metric_from_quasiseparable(d, p, q, A, nugget=0.0, parallel=None):
+    """Build an O(n) ``Metric`` from a symmetric quasiseparable SPD matrix.
+
+    The metric is ``M = K + nugget * I`` with ``K`` given by rank-``m``
+    quasiseparable generators ``d`` (n,), ``p`` (n, m), ``q`` (n, m), and
+    ``A`` (n, m, m):
+
+    ``K[i, j] = p[i] @ A[i-1] @ ... @ A[j+1] @ q[j]`` for ``i > j``, ``d``
+    on the diagonal, and ``K[j, i] = K[i, j]``. ``A[k]`` is the transition
+    INTO index ``k`` (``A[0]`` never enters the products; the state-space
+    builders set it to the identity). ``nugget`` is an ABSOLUTE variance
+    added to ``d`` before factorization and is part of the metric: all four
+    callbacks act on ``M``, consistently. Every callback costs O(n m^2)
+    through one quasiseparable Cholesky computed at construction;
+    ``solve``, ``inv_sqrt``, and ``inv_sqrt_transpose`` accept vector and
+    matrix inputs (``norm`` is vector-only, as everywhere in ``Metric``).
+
+    ``M`` must be positive definite — not validated, since inputs may be
+    traced; a non-PD or near-singular matrix silently produces NaN through
+    the Cholesky square roots (same convention as
+    ``metric_from_tridiagonal_precision``).
+
+    ``parallel`` picks how the applies run, resolved ONCE at construction
+    (a metric built on one backend keeps that scan choice for its
+    lifetime): ``None`` (the default) uses associative O(log n)-depth scans
+    off-CPU in float64 — where a sequential scan pays a kernel launch per
+    step — and sequential scans otherwise. The
+    parallel substitutions propagate rank-1-corrected transition matrices
+    whose products are not contractive in general, so the float32 default
+    stays sequential; pass ``parallel=True`` to override. The one-time
+    Cholesky setup is always a sequential scan in this release.
+    """
+
+    d = jnp.asarray(d)
+    p = jnp.asarray(p)
+    q = jnp.asarray(q)
+    A = jnp.asarray(A)
+    if d.ndim != 1:
+        raise ValueError("d must be 1-D")
+    n = d.shape[0]
+    if p.ndim != 2 or p.shape[0] != n:
+        raise ValueError("p must have shape (len(d), m)")
+    m = p.shape[1]
+    if q.shape != (n, m) or A.shape != (n, m, m):
+        raise ValueError("q must have shape (n, m) and A shape (n, m, m)")
+    d = d + nugget
+    if parallel is None:
+        parallel = jax.default_backend() != "cpu" and d.dtype == jnp.float64
+    c, w = quasiseparable.cholesky(d, p, q, A)
+
+    def solve(x):
+        # M^{-1} x = L^{-T} L^{-1} x: forward then backward substitution.
+        y = quasiseparable.forward_substitution(c, p, w, A, x.reshape(n, -1), parallel)
+        return quasiseparable.backward_substitution(c, p, w, A, y, parallel).reshape(
+            x.shape
+        )
+
+    def norm(x):
+        # x' M x through one quasiseparable matvec, no solve.
+        y = quasiseparable.matvec(d, p, q, A, x.reshape(n, -1), parallel)
+        return jnp.sqrt(x @ y.reshape(x.shape))
+
+    def inv_sqrt(x):
+        # S = L^{-T} with S S' = M^{-1}.
+        return quasiseparable.backward_substitution(
+            c, p, w, A, x.reshape(n, -1), parallel
+        ).reshape(x.shape)
+
+    def inv_sqrt_transpose(x):
+        return quasiseparable.forward_substitution(
+            c, p, w, A, x.reshape(n, -1), parallel
+        ).reshape(x.shape)
+
+    return Metric(
+        solve=solve,
+        norm=norm,
+        inv_sqrt=inv_sqrt,
+        inv_sqrt_transpose=inv_sqrt_transpose,
+    )
+
+
+def metric_from_state_space(points, h, Pinf, transition, nugget=0.0, parallel=None):
+    """Build an O(n) ``Metric`` for a stationary state-space kernel Gram.
+
+    A stationary Gaussian process has an exact O(n) Gram factorization
+    precisely when it admits a finite-dimensional state-space (linear SDE)
+    representation: an m-dimensional latent Gauss-Markov state observed
+    through a row vector. Given the observation row ``h`` (m,), stationary
+    state covariance ``Pinf`` (m, m), and ``transition(dt)`` mapping gaps
+    (n,) to stacked transition matrices (n, m, m), the metric is
+    ``M = K + nugget * I`` with
+
+    ``K[i, j] = h @ Pinf @ A[i] @ A[i-1] @ ... @ A[j+1] @ h`` for ``i > j``,
+    ``K[i, i] = h @ Pinf @ h``, symmetric, where
+    ``A[k] = transition(points[k] - points[k-1])``. ``transition`` must
+    return the TRANSPOSE of the textbook matrix exponential ``expm(F dt)``
+    of the SDE drift (the tinygp orientation), and ``transition(0)`` must be
+    the identity. The main application is the half-integer Matern family —
+    ``matern_state_space(sigma, ell, nu)`` supplies the exact
+    ``(h, Pinf, transition)`` mapping — but sums of exponentials and other
+    CARMA/celerite-style kernels reduce to the same form.
+
+    ``points`` must be 1-D and sorted STRICTLY increasing — not validated,
+    since it may be traced; unsorted or repeated points silently produce a
+    wrong or NaN metric. ``h``, ``Pinf``, and ``points`` may be traced (e.g.
+    hyperparameter sweeps under ``jax.grad``), in which case the one-time
+    sequential Cholesky setup lands on the hot path; see the tuning guide.
+    The ABSOLUTE ``nugget`` folds into the diagonal before factorization and
+    is part of the metric; ``parallel`` is forwarded to
+    ``metric_from_quasiseparable``.
+    """
+
+    d, p, q, A = quasiseparable.state_space_generators(points, h, Pinf, transition)
+    return metric_from_quasiseparable(d, p, q, A, nugget=nugget, parallel=parallel)
 
 
 def metric_from_diagonal(weights):

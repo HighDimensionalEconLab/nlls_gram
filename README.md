@@ -141,8 +141,9 @@ solver = UnderdeterminedLevenbergMarquardt(
 The `Metric` callbacks act on the flattened parameter vector. The docs give
 the exact callback contract, branch formulas, and validation rules, plus
 structural constructors (`metric_from_tridiagonal_precision`,
-`metric_from_diagonal`, `blockdiag_metric`) so common metrics need no
-callback plumbing.
+`metric_from_state_space` and `metric_from_quasiseparable` for exact O(n)
+Matérn/state-space kernel Grams, `metric_from_diagonal`,
+`blockdiag_metric`) so common metrics need no callback plumbing.
 
 ## Solvers
 

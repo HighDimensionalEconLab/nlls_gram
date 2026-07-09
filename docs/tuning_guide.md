@@ -124,6 +124,7 @@ the step count.
 | every `solve` call recompiles | new solver/callback object per call | construct once at setup scope |
 | float32 problem crashes under x64 with `lsmr` | known Lineax dtype issue | use `cholesky`/`cg`/`qr` |
 | implicit `jax.jvp`/`vjp` wrong or zero | `p` not in the residual signature, or perturbing `args` | move perturbed quantities into `p` |
+| NaN or no progress with a quasiseparable Matérn metric | nugget-free Matérn-3/2/5/2 Gram conditioning wall (cond ~1e21 at n=5000) | add an absolute `nugget` — it folds into the metric exactly |
 
 ## The Metric
 
@@ -133,3 +134,31 @@ For kernel parameterizations use `M = K` (coefficients) or `M = K^{-1}`
 (function values); see the [kernel table](gauss_newton.md#choosing-the-metric-with-kernels).
 If results look right but derivatives look wrong, check the metric before
 anything else.
+
+For Matérn value Grams on sorted 1-D points, pick the constructor by
+structure, not habit:
+
+| kernel / size | use |
+| --- | --- |
+| Matérn-1/2 (any `n`) | `metric_from_tridiagonal_precision` — applies are elementwise shifts |
+| Matérn-3/2, 5/2, `n` below ~256 | `metric_from_cholesky` of the dense Gram — factorization is cheap and exact |
+| Matérn-3/2, 5/2, larger `n` | `metric_from_state_space` with `matern_state_space` — exact O(n) quasiseparable callbacks |
+
+On GPU the scan choice dominates everything (measured on an NVIDIA L40S,
+n=1e5, float32): sequential applies take ~3.1–3.6 **seconds** per
+solve+norm pair — a kernel launch per scan step — while the associative
+(`parallel=True`) applies take ~0.5–0.9 **ms**, a ~3,000–7,000x gap. In
+float64 the `parallel=None` default picks the parallel path off-CPU
+automatically; in float32 it conservatively stays sequential (the parallel
+substitutions have no contraction guarantee), so **on GPU in float32 pass
+`parallel=True` explicitly** after checking finiteness on your grid — on
+the L40S stress grids all four applies stayed finite and matched the
+sequential path to ~1e-7 (well-conditioned) / ~5e-4 (stiff,
+conditioning-amplified). On CPU the sequential default is right: at n=1e5
+the applies cost ~2.5–4.3 ms and even beat the GPU for the sequential
+variant. One caveat: the one-time Cholesky *setup* is a sequential scan —
+~0.9 s at n=1e5 on the L40S versus ~2–3 ms on CPU — so when the metric is
+rebuilt from traced `sigma`/`ell` inside `jax.grad`/`vmap` sweeps at large
+`n` on GPU, setup dominates the step. Reuse a constructed metric across
+solves whenever the hyperparameters are fixed; parallel setup is tracked
+as a follow-up issue.

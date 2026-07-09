@@ -380,7 +380,16 @@ uv run --group benchmark --group gpu pytest \
   benchmarks/test_large_interpolation_benchmark.py --benchmark-only
 ```
 
-On CUDA machines, the optional GPU test is:
+For the quasiseparable state-space (Matérn) metric applies and setup (sequential vs
+parallel vs dense, n up to 1e5):
+
+```bash
+uv run --group benchmark --group gpu pytest \
+  benchmarks/test_quasiseparable_benchmark.py --benchmark-only
+```
+
+On CUDA machines, the optional GPU tests (including the quasiseparable
+metric check) are:
 
 ```bash
 uv run --group gpu pytest tests/test_gpu.py
@@ -402,6 +411,12 @@ narrower and focuses on underdetermined LM with explicit parameter-space metrics
 ::: nlls_gram.metric_from_cholesky
 
 ::: nlls_gram.metric_from_tridiagonal_precision
+
+::: nlls_gram.metric_from_state_space
+
+::: nlls_gram.matern_state_space
+
+::: nlls_gram.metric_from_quasiseparable
 
 ::: nlls_gram.metric_from_diagonal
 

@@ -30,9 +30,12 @@ from nlls_gram.metrics import (
     blockdiag_metric,
     metric_from_cholesky,
     metric_from_diagonal,
+    metric_from_quasiseparable,
+    metric_from_state_space,
     metric_from_tridiagonal_precision,
 )
 from nlls_gram.preconditioners import sherman_morrison_preconditioner
+from nlls_gram.quasiseparable import matern_state_space
 
 __all__ = [
     "UnderdeterminedLevenbergMarquardt",
@@ -45,8 +48,11 @@ __all__ = [
     "LMSolveResult",
     "Metric",
     "blockdiag_metric",
+    "matern_state_space",
     "metric_from_cholesky",
     "metric_from_diagonal",
+    "metric_from_quasiseparable",
+    "metric_from_state_space",
     "metric_from_tridiagonal_precision",
     "sherman_morrison_preconditioner",
 ]
