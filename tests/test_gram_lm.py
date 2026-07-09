@@ -2472,25 +2472,40 @@ def test_blockdiag_metric_matches_dense():
     S = metric.inv_sqrt(jnp.eye(5))
     assert jnp.allclose(S @ S.T, jnp.linalg.inv(M), atol=1e-5)
 
-    # A block's missing callbacks default to identity on that block.
+    # A partially-specified block (here cg-style: solve and norm only) marks
+    # the callbacks it lacks as missing on the composite rather than filling
+    # identity, so the solver's validation still catches e.g. qr without
+    # inv_sqrt — identity fill would break S S' = M^{-1} consistency.
     partial = blockdiag_metric(
         [
-            (Metric(solve=lambda x: x, norm=jnp.linalg.norm), 3),
+            (
+                Metric(
+                    solve=lambda x: x / 4.0, norm=lambda x: 2.0 * jnp.linalg.norm(x)
+                ),
+                3,
+            ),
             (metric_from_diagonal(weights), 2),
         ]
     )
+    assert partial.inv_sqrt is None
+    assert partial.inv_sqrt_transpose is None
     x_partial = jax.random.normal(jax.random.PRNGKey(7), (5,))
     M_partial = jnp.block(
         [
-            [jnp.eye(3), jnp.zeros((3, 2))],
+            [4.0 * jnp.eye(3), jnp.zeros((3, 2))],
             [jnp.zeros((2, 3)), jnp.diag(weights)],
         ]
     )
     assert jnp.allclose(
-        partial.inv_sqrt(x_partial),
-        jnp.linalg.solve(jnp.linalg.cholesky(M_partial).T, x_partial),
-        atol=1e-5,
+        partial.solve(x_partial), jnp.linalg.solve(M_partial, x_partial), atol=1e-6
     )
+    assert jnp.allclose(
+        partial.norm(x_partial), jnp.sqrt(x_partial @ M_partial @ x_partial), atol=1e-5
+    )
+    with pytest.raises(ValueError, match="inv_sqrt"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, linear_solver="qr", metric=partial
+        )
 
 
 def test_sherman_morrison_preconditioner_matches_dense_inverse():
@@ -2540,3 +2555,41 @@ def test_blockdiag_metric_identity_block_defaults():
 
     with pytest.raises(ValueError, match="at least one"):
         blockdiag_metric([])
+
+
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
+def test_structural_metrics_match_dense_metric_in_solver(linear_solver):
+    # End-to-end: the O(n) tridiagonal metric drives the actual solver (and
+    # its implicit derivative) to the same solution as the equivalent dense
+    # metric — the constructors compose with every callback the solver uses.
+    n = 8
+    rho = 0.6
+    idx = jnp.arange(n)
+    K = rho ** jnp.abs(idx[:, None] - idx[None, :])
+    scale = 1.0 / (1.0 - rho**2)
+    diag = scale * jnp.concatenate(
+        [jnp.ones(1), (1.0 + rho**2) * jnp.ones(n - 2), jnp.ones(1)]
+    )
+    off_diag = -rho * scale * jnp.ones(n - 1)
+    tridiagonal = metric_from_tridiagonal_precision(diag, off_diag)
+    dense = metric_from_cholesky(jnp.linalg.cholesky(K))
+
+    # Underdetermined: 2 residuals, n parameters, external p for implicit AD.
+    A = jnp.stack([jnp.ones(n), idx.astype(jnp.float32)])
+
+    def residual(theta, _, p):
+        return A @ theta - jnp.array([p, 0.5 * p])
+
+    def solved_x(metric, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual, init_damping=1e-2, linear_solver=linear_solver, metric=metric
+        )
+        return solver.solve(jnp.zeros(n), p=p, max_steps=60, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
+    x_tri, x_tri_dot = jax.jvp(lambda q: solved_x(tridiagonal, q), (p,), (p_dot,))
+    x_dense, x_dense_dot = jax.jvp(lambda q: solved_x(dense, q), (p,), (p_dot,))
+
+    assert jnp.allclose(A @ x_tri, jnp.array([p, 0.5 * p]), atol=1e-4)
+    assert jnp.allclose(x_tri, x_dense, atol=1e-4)
+    assert jnp.allclose(x_tri_dot, x_dense_dot, atol=1e-4)

@@ -169,8 +169,10 @@ It uses JAX linearization for JVPs/VJPs and `jax.scipy.sparse.linalg.cg`.
 An optional `dual_preconditioner(v, damping)` callback is applied as the CG
 preconditioner (for the geodesic-acceleration solve as well). It must be a
 jit-traceable, linear, SPD approximation of
-\((J P J^\top + \lambda I)^{-1} v\); it changes only the inner iteration
-count, never the converged root, so approximations are safe — see
+\((J P J^\top + \lambda I)^{-1} v\). It never changes the subproblem being
+solved: at inner convergence the step is identical, and a budget-truncated
+step still lies in \(\operatorname{range}(P J^\top)\), preserving the
+minimum-metric-norm structure — so approximations are safe. See
 [Utilities](utilities.md) for a structural rank-1 constructor. Like `metric`,
 it is static configuration: it cannot be swapped mid-`solve` by a callback.
 

@@ -208,9 +208,15 @@ def blockdiag_metric(blocks):
     ``blocks`` is a sequence of ``(metric, size)`` pairs in the order the
     flattened parameter vector is laid out. ``solve``, ``inv_sqrt``, and
     ``inv_sqrt_transpose`` slice on the leading axis (vector and matrix
-    inputs both work); ``norm`` combines the block norms in quadrature. A
-    callback left ``None`` by a block defaults to the identity metric on that
-    block, matching the bare ``Metric()`` convention.
+    inputs both work); ``norm`` combines the block norms in quadrature.
+
+    A fully-default ``Metric()`` block means the identity metric on that
+    block, and its callbacks are filled in accordingly. A block that defines
+    some callbacks but leaves others ``None`` is treated as missing those
+    callbacks: the composite field is ``None``, so the solver's
+    construction-time validation applies exactly as it would to that block
+    alone. Filling identity there instead would silently break the
+    ``S S' = M^{-1}`` consistency between callbacks.
     """
 
     if not blocks:
@@ -219,6 +225,14 @@ def blockdiag_metric(blocks):
     offsets = [0]
     for _, size in blocks:
         offsets.append(offsets[-1] + size)
+
+    identity_block = [
+        metric.solve is None
+        and metric.norm is None
+        and metric.inv_sqrt is None
+        and metric.inv_sqrt_transpose is None
+        for metric in metrics
+    ]
 
     def split(x):
         return [
@@ -229,6 +243,11 @@ def blockdiag_metric(blocks):
         return x
 
     def blockwise(callbacks):
+        if any(
+            callback is None and not is_identity
+            for callback, is_identity in zip(callbacks, identity_block, strict=True)
+        ):
+            return None
         filled = [identity if callback is None else callback for callback in callbacks]
 
         def apply(x):
@@ -241,21 +260,30 @@ def blockdiag_metric(blocks):
 
         return apply
 
-    norms = [
-        jnp.linalg.norm if metric.norm is None else metric.norm for metric in metrics
-    ]
+    def make_norm(callbacks):
+        if any(
+            callback is None and not is_identity
+            for callback, is_identity in zip(callbacks, identity_block, strict=True)
+        ):
+            return None
+        filled = [
+            jnp.linalg.norm if callback is None else callback for callback in callbacks
+        ]
 
-    def norm(x):
-        parts = split(x)
-        return jnp.sqrt(
-            sum(
-                callback(part) ** 2 for callback, part in zip(norms, parts, strict=True)
+        def norm(x):
+            parts = split(x)
+            return jnp.sqrt(
+                sum(
+                    callback(part) ** 2
+                    for callback, part in zip(filled, parts, strict=True)
+                )
             )
-        )
+
+        return norm
 
     return Metric(
         solve=blockwise([metric.solve for metric in metrics]),
-        norm=norm,
+        norm=make_norm([metric.norm for metric in metrics]),
         inv_sqrt=blockwise([metric.inv_sqrt for metric in metrics]),
         inv_sqrt_transpose=blockwise([metric.inv_sqrt_transpose for metric in metrics]),
     )

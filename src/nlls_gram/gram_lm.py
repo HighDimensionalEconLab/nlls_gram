@@ -193,10 +193,11 @@ class UnderdeterminedLevenbergMarquardt:
     With ``linear_solver="cg"``, ``dual_preconditioner(v, damping)`` supplies a
     jit-traceable, linear, SPD approximation of
     ``(J P J' + damping I_m)^{-1} v`` used as the CG preconditioner (for the
-    geodesic-acceleration solve as well). It changes only the inner iteration
-    count: every step stays in ``range(P J')``, so the minimum-metric-norm
-    selection for underdetermined residuals is unchanged — the preconditioner
-    may be approximate even though ``metric.solve`` must stay exact.
+    geodesic-acceleration solve as well). It never changes the subproblem: at
+    inner convergence the step is identical, and a budget-truncated step still
+    lies in ``range(P J')``, so the minimum-metric-norm selection for
+    underdetermined residuals is unchanged — the preconditioner may be
+    approximate even though ``metric.solve`` must stay exact.
     """
 
     def __init__(

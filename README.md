@@ -139,14 +139,18 @@ solver = UnderdeterminedLevenbergMarquardt(
 ```
 
 The `Metric` callbacks act on the flattened parameter vector. The docs give
-the exact callback contract, branch formulas, and validation rules.
+the exact callback contract, branch formulas, and validation rules, plus
+structural constructors (`metric_from_tridiagonal_precision`,
+`metric_from_diagonal`, `blockdiag_metric`) so common metrics need no
+callback plumbing.
 
 ## Solvers
 
 - `linear_solver="cholesky"`: dense residual-space Gram solve, the default.
 - `linear_solver="qr"`: dense QR solve of the whitened-step problem (requires
   a full-row-rank Jacobian).
-- `linear_solver="cg"`: matrix-free residual-space CG.
+- `linear_solver="cg"`: matrix-free residual-space CG, with an optional
+  `dual_preconditioner` hook (e.g. `sherman_morrison_preconditioner`).
 - `linear_solver="lsmr"`: matrix-free Lineax LSMR on the damped least-squares
   problem.
 

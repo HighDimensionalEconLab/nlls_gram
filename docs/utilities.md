@@ -54,20 +54,25 @@ metric = blockdiag_metric(
 
 `solve`, `inv_sqrt`, and `inv_sqrt_transpose` slice on the leading axis, so
 vector and matrix inputs both work; `norm` combines the block norms in
-quadrature. A callback left `None` by any block is `None` on the composite.
+quadrature. A fully-default `Metric()` block means the identity metric on
+that block. A block that defines some callbacks but leaves others `None`
+propagates the missing callbacks as `None` on the composite, so the solver's
+construction-time validation applies exactly as it would to that block
+alone.
 
 ## Sherman–Morrison Dual Preconditioner
 
 With `linear_solver="cg"`, the `dual_preconditioner(v, damping)` argument
 supplies an approximation of \((J M^{-1} J^\top + \lambda I)^{-1} v\) on
-residual-space vectors. It changes only the inner iteration count: steps stay
-in \(\operatorname{range}(M^{-1}J^\top)\), so the minimum-metric-norm
-selection for underdetermined residuals is unchanged, and an approximate
-preconditioner is safe even though `metric.solve` must stay exact.
+residual-space vectors. It never changes the subproblem being solved: at
+inner convergence the step is identical, and a budget-truncated step still
+lies in \(\operatorname{range}(M^{-1}J^\top)\), so the minimum-metric-norm
+selection for underdetermined residuals is unchanged and an approximate
+preconditioner is safe — even though `metric.solve` must stay exact.
 
 A metric weight \(m\) on a scalar parameter injects an exactly known rank-1
-spike into the dual operator. For the kernel-collocation family, a residual
-row \(-c\,u\) on that parameter contributes \((c^2/m)\,uu^\top\), and
+spike into the dual operator. For the kernel-collocation family, a Jacobian
+column \(-c\,u\) for that parameter contributes \((c^2/m)\,uu^\top\), and
 
 ```python
 from nlls_gram import sherman_morrison_preconditioner
