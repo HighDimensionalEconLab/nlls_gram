@@ -418,6 +418,28 @@ for tol in (1e-4, 1e-12):
     derivative_errors[tol] = float(jnp.linalg.norm(dot_matvec - dot_dense))
 assert derivative_errors[1e-12] < derivative_errors[1e-4], derivative_errors
 assert derivative_errors[1e-12] < 1e-8, derivative_errors
+
+# The matrix-free cg implicit rule (metric tol at or below implicit_tol, per
+# the nested-tolerance guidance) reproduces the dense-rule derivative in
+# both directions.
+def solved_x_cg_implicit(p_value):
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-6,
+        metric=matvec_composite(1e-12),
+        geodesic_acceleration=False,
+        implicit_solver="cg",
+        implicit_tol=1e-12,
+    )
+    return solver.solve(jnp.zeros(n + k), p=p_value, max_steps=200, atol=1e-12).x
+
+_, dot_cg_implicit = jax.jvp(solved_x_cg_implicit, (p,), (p_dot,))
+assert float(jnp.linalg.norm(dot_cg_implicit - dot_dense)) < 1e-8
+
+x_bar = jnp.linspace(-1.0, 1.0, n + k)
+_, pull_dense = jax.vjp(lambda q: solved_x(dense_composite(eps), q), p)
+_, pull_cg_implicit = jax.vjp(solved_x_cg_implicit, p)
+assert float(jnp.abs(pull_cg_implicit(x_bar)[0] - pull_dense(x_bar)[0])) < 1e-8
 """
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],

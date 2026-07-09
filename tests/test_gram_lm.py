@@ -3772,3 +3772,125 @@ def test_cg_with_woodbury_spike_preconditioner_matches_cholesky_step():
     # attainable-residual floor, so the two paths agree only to ~1e-3 and
     # the exact gap varies across BLAS/SIMD variants.
     assert jnp.allclose(x_cg, x_ch, rtol=1e-2, atol=1e-3)
+
+
+def test_implicit_cg_with_shifted_matvec_metric_matches_dense():
+    # End-to-end matrix-free implicit AD: the cg implicit rule applies
+    # metric.solve to tangent-dependent data, so the shifted-matvec metric's
+    # inner custom_linear_solve is transposed (via its symmetric solve rule)
+    # inside the VJP -- nested custom_linear_solve, both directions. Pin
+    # both derivative modes against the dense metric + dense implicit rule.
+    n, k, eps = 10, 2, 1e-2
+    t = jnp.arange(n) * 1.0
+    K = dense_matern_gram(t, 1.3, 0.8, 2.5)
+    composite = shifted_composite_metric(
+        metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-8), n, k, eps
+    )
+    M = jnp.block(
+        [
+            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
+            [jnp.zeros((k, n)), eps * jnp.eye(k)],
+        ]
+    )
+    dense = metric_from_cholesky(jnp.linalg.cholesky(M))
+
+    A = jax.random.normal(jax.random.PRNGKey(33), (3, n + k))
+
+    def residual(theta, _, p):
+        return A @ theta - jnp.array([p, 0.5 * p, -p])
+
+    def solved_x(metric, linear_solver, implicit_solver, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            init_damping=1e-2,
+            linear_solver=linear_solver,
+            implicit_solver=implicit_solver,
+            implicit_tol=1e-8,
+            metric=metric,
+            iterative_tol=1e-8,
+            iterative_maxiter=500,
+        )
+        return solver.solve(jnp.zeros(n + k), p=p, max_steps=80, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
+    x_bar = jnp.linspace(-1.0, 1.0, n + k)
+    _, dense_dot = jax.jvp(
+        lambda q: solved_x(dense, "cholesky", "cholesky", q), (p,), (p_dot,)
+    )
+    _, dense_pull = jax.vjp(lambda q: solved_x(dense, "cholesky", "cholesky", q), p)
+
+    # cg implicit rule with the matvec metric, under both forward solvers
+    # (cholesky forward + cg implicit is the forced-"cg" combination).
+    for linear_solver in ("cholesky", "cg"):
+        _, cg_dot = jax.jvp(
+            lambda q, ls=linear_solver: solved_x(composite, ls, "cg", q),
+            (p,),
+            (p_dot,),
+        )
+        _, cg_pull = jax.vjp(
+            lambda q, ls=linear_solver: solved_x(composite, ls, "cg", q), p
+        )
+        assert jnp.allclose(cg_dot, dense_dot, atol=1e-4)
+        assert jnp.allclose(cg_pull(x_bar)[0], dense_pull(x_bar)[0], atol=1e-4)
+
+
+def test_implicit_cg_woodbury_preconditioner_with_shifted_metric():
+    # Under the unified shifted metric, the scalar block injects the rank-k
+    # spike (1/eps) J_beta J_beta' into the UNDAMPED implicit dual operator
+    # too. An exact Woodbury preconditioner (zero-damping wrapper) makes a
+    # one-iteration implicit CG budget reproduce the dense-rule derivative.
+    n, k, eps = 12, 2, 1e-3
+    t = jnp.arange(n) * 1.0
+    K = dense_matern_gram(t, 1.3, 0.8, 1.5)
+    K_shifted = K + eps * jnp.eye(n)
+    metric = shifted_composite_metric(
+        metric_from_cholesky(jnp.linalg.cholesky(K_shifted)), n, k, eps
+    )
+
+    m = 6
+    J_alpha = jax.random.normal(jax.random.PRNGKey(34), (m, n))
+    J_beta = jax.random.normal(jax.random.PRNGKey(35), (m, k))
+    A = jnp.concatenate([J_alpha, J_beta], axis=1)
+
+    def residual(theta, _, p):
+        return A @ theta - p * jnp.linspace(1.0, 2.0, m)
+
+    base = J_alpha @ jnp.linalg.solve(K_shifted, J_alpha.T)
+    base_solve = metric_from_cholesky(jnp.linalg.cholesky(base)).solve
+    spike_preconditioner = woodbury_preconditioner(
+        base_solve, J_beta, (1.0 / eps) * jnp.ones(k)
+    )
+
+    def solved_x(implicit_kwargs, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            init_damping=1e-2,
+            linear_solver="cg",
+            iterative_tol=1e-8,
+            iterative_maxiter=200,
+            metric=metric,
+            geodesic_acceleration=False,
+            **implicit_kwargs,
+        )
+        return solver.solve(jnp.zeros(n + k), p=p, max_steps=80, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(1.0), jnp.asarray(1.0)
+    _, dense_dot = jax.jvp(
+        lambda q: solved_x({"implicit_solver": "cholesky"}, q), (p,), (p_dot,)
+    )
+    _, spike_dot = jax.jvp(
+        lambda q: solved_x(
+            {
+                "implicit_solver": "cg",
+                "implicit_tol": 0.0,
+                "implicit_maxiter": 1,
+                "implicit_preconditioner": lambda v: spike_preconditioner(
+                    v, jnp.asarray(0.0, v.dtype)
+                ),
+            },
+            q,
+        ),
+        (p,),
+        (p_dot,),
+    )
+    assert jnp.allclose(spike_dot, dense_dot, rtol=1e-3, atol=1e-4)

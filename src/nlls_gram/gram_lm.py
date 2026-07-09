@@ -939,7 +939,6 @@ class UnderdeterminedLevenbergMarquardt:
         def residual_from_p(p_value):
             return self._residual_and_aux(x, args, p_value)[0]
 
-        residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
         cg_tol = self._implicit_cg_tol(residual.dtype)
         cg_atol = jnp.asarray(self.implicit_atol, dtype=residual.dtype)
 
@@ -961,13 +960,26 @@ class UnderdeterminedLevenbergMarquardt:
             )
             return solution
 
+        residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
         dual_solution = jax.lax.custom_linear_solve(
             gram_matvec,
             residual_p_dot,
             solve,
             symmetric=True,
         )
-        theta_dot = -self._metric_inverse(JT(dual_solution))
+
+        # The final metric inverse acts on tangent data, so VJP transposes
+        # it. An iterative metric solve (e.g. metric_from_shifted_matvec)
+        # is not transposable by JAX -- its CG captures tol*|b| inside the
+        # linear solve's parameters -- but P is self-adjoint by contract,
+        # so linear_call declares the application as its own transpose and
+        # the cotangent pass just EVALUATES metric.solve.
+        def metric_inverse_apply(_, v):
+            return self._metric_inverse(v)
+
+        theta_dot = -jax.custom_derivatives.linear_call(
+            metric_inverse_apply, metric_inverse_apply, (), JT(dual_solution)
+        )
         return unravel(theta_dot)
 
     def _implicit_cg_tol(self, dtype):

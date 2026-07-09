@@ -137,6 +137,15 @@ linear, self-adjoint, and positive definite for the residual-space operator.
 Rank-deficient implicit systems are intentionally not damped here, because
 damping would change the minimum-\(M\)-norm derivative.
 
+Self-adjointness of \(P\) is all the rule needs from `metric.solve`: the
+final \(P J_\theta^\top y\) application acts on tangent data, and its
+transpose in the VJP is declared to be \(P\) itself
+(`jax.custom_derivatives.linear_call`), so `metric.solve` is only ever
+*evaluated*, never transposed. That is what lets an iterative metric solve —
+[`metric_from_shifted_matvec`](utilities.md#unified-shifted-block-metrics),
+or any hand-written CG-based `Metric.solve` — participate in both JVP and
+VJP even though transposing through JAX's CG is unsupported.
+
 Accuracy is controlled separately from the forward iterative solve:
 
 - `implicit_tol=None` uses a dtype-aware default (`1e-6` in float32, `1e-10`
@@ -149,6 +158,22 @@ Accuracy is controlled separately from the forward iterative solve:
   for damped systems. To reuse one explicitly, write a zero-damping wrapper,
   for example
   `implicit_preconditioner=lambda v: dual_preconditioner(v, jnp.asarray(0.0, v.dtype))`.
+
+Two notes for the
+[unified shifted metric](gauss_newton.md#shifted-metrics-and-the-seminorm-limit)
+\(M = \operatorname{blockdiag}(K, 0) + \varepsilon I\):
+
+- The scalar block injects its rank-\(k\) spike of weight \(c^2/\varepsilon\)
+  into the *undamped* implicit dual operator too — there is no LM damping
+  here to mask it — so at small \(\varepsilon\) the implicit CG needs the
+  same
+  [Sherman–Morrison/Woodbury spike preconditioner](utilities.md#shermanmorrison-dual-preconditioner)
+  as the forward solve (zero-damping wrapper as above).
+- With `metric_from_shifted_matvec` the implicit CG nests an inner metric CG
+  inside every operator application, and the outer solve cannot be more
+  accurate than the inner one: for derivative-critical work set the metric's
+  `tol` at or below `implicit_tol` (the metric's default, the square root of
+  machine epsilon, is looser than the float64 implicit default of `1e-10`).
 
 Example sketch for a large matrix-free residual:
 
