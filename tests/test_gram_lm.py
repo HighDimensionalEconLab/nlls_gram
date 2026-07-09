@@ -2527,6 +2527,23 @@ def test_sherman_morrison_preconditioner_matches_dense_inverse():
     )
 
 
+def test_metric_from_tridiagonal_precision_float32_default_is_stable():
+    # Long, stiff AR(1) grid (rho near 1) in float32: the parallel Mobius
+    # scan's projective cancellation goes non-finite here, the sequential
+    # recurrence does not. The dtype-aware default must never pick the
+    # unstable path for float32 setups, on any backend.
+    n, rho = 5000, 0.9999
+    scale = 1.0 / (1.0 - rho**2)
+    diag = (
+        scale
+        * jnp.concatenate([jnp.ones(1), (1.0 + rho**2) * jnp.ones(n - 2), jnp.ones(1)])
+    ).astype(jnp.float32)
+    off_diag = (-rho * scale * jnp.ones(n - 1)).astype(jnp.float32)
+
+    metric = metric_from_tridiagonal_precision(diag, off_diag)
+    assert bool(jnp.all(jnp.isfinite(metric.inv_sqrt(jnp.ones(n, jnp.float32)))))
+
+
 def test_metric_from_tridiagonal_precision_single_point():
     metric = metric_from_tridiagonal_precision(jnp.array([4.0]), jnp.zeros(0))
     x = jnp.array([3.0])

@@ -69,9 +69,14 @@ def metric_from_tridiagonal_precision(diag, off_diag, parallel=None):
     O(n) and nothing is factored densely.
 
     ``parallel`` picks how the one-time bidiagonal Cholesky setup runs:
-    ``None`` (default) uses an associative O(log n)-depth scan off-CPU, where
-    a sequential scan pays a kernel launch per step, and the sequential scan
-    on CPU, where it is faster.
+    ``None`` (default) uses an associative O(log n)-depth scan off-CPU in
+    float64 — where a sequential scan pays a kernel launch per step — and
+    the sequential scan otherwise. In float32 the default stays sequential
+    even off-CPU: the parallel scan evaluates the pivot recurrence through
+    projective 2x2 products whose cancellation can go non-finite on long,
+    stiff grids (e.g. near-unit-correlation AR(1)), while the sequential
+    recurrence is stable there. Pass ``parallel=True`` to override only when
+    the setup is float64 or the grid is short and well-conditioned.
     """
 
     diag = jnp.asarray(diag)
@@ -81,7 +86,7 @@ def metric_from_tridiagonal_precision(diag, off_diag, parallel=None):
             "diag must be 1-D and off_diag must have shape (len(diag) - 1,)"
         )
     if parallel is None:
-        parallel = jax.default_backend() != "cpu"
+        parallel = jax.default_backend() != "cpu" and diag.dtype == jnp.float64
     zero = jnp.zeros((1,), dtype=diag.dtype)
     lower = jnp.concatenate([zero, off_diag])
     upper = jnp.concatenate([off_diag, zero])

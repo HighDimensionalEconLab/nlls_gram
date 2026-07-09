@@ -29,8 +29,12 @@ metric = metric_from_tridiagonal_precision(diag, off_diag)
 ```
 
 `parallel=None` (the default) runs the one-time bidiagonal Cholesky setup as
-an associative \(O(\log n)\)-depth scan off-CPU — where a sequential scan
-pays a kernel launch per step — and as the (faster) sequential scan on CPU.
+an associative \(O(\log n)\)-depth scan off-CPU in float64 — where a
+sequential scan pays a kernel launch per step — and as the sequential scan
+otherwise. In float32 the default stays sequential even off-CPU: the
+parallel scan's projective \(2\times 2\) products can cancel to non-finite
+values on long, stiff grids (near-unit-correlation AR(1)), while the
+sequential recurrence is stable there.
 
 ## Diagonal and Block-Diagonal Metrics
 
