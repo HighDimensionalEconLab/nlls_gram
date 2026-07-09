@@ -2405,13 +2405,18 @@ def test_metric_from_tridiagonal_precision_matches_dense():
 
     x = jax.random.normal(jax.random.PRNGKey(0), (n,))
     X = jax.random.normal(jax.random.PRNGKey(1), (n, 3))
-    T_dense = jnp.linalg.inv(K)
 
-    assert jnp.allclose(metric.solve(x), T_dense @ x, rtol=1e-4, atol=1e-4)
-    assert jnp.allclose(metric.solve(X), T_dense @ X, rtol=1e-4, atol=1e-4)
-    assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ K @ x), rtol=1e-4, atol=1e-4)
-    S = metric.inv_sqrt(jnp.eye(n))
-    assert jnp.allclose(S @ S.T, T_dense, rtol=1e-3, atol=1e-4)
-    assert jnp.allclose(
-        metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-4
-    )
+    # The dense float32 references go through matmuls that Ampere GPUs run in
+    # TF32 (~1e-3 precision) by default, while the tridiagonal callbacks are
+    # elementwise-exact; pin full precision so the references are comparable.
+    with jax.default_matmul_precision("highest"):
+        T_dense = jnp.linalg.inv(K)
+
+        assert jnp.allclose(metric.solve(x), T_dense @ x, rtol=1e-4, atol=1e-4)
+        assert jnp.allclose(metric.solve(X), T_dense @ X, rtol=1e-4, atol=1e-4)
+        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ K @ x), rtol=1e-4, atol=1e-4)
+        S = metric.inv_sqrt(jnp.eye(n))
+        assert jnp.allclose(S @ S.T, T_dense, rtol=1e-3, atol=1e-4)
+        assert jnp.allclose(
+            metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-4
+        )
