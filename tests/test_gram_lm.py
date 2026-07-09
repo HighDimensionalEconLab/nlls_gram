@@ -2248,6 +2248,12 @@ def test_dual_preconditioner_requires_cg():
             linear_solver="qr",
             dual_preconditioner=lambda v, damping: v,
         )
+    with pytest.raises(ValueError, match="dual_preconditioner"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn,
+            linear_solver="lsmr",
+            dual_preconditioner=lambda v, damping: v,
+        )
 
 
 def test_cg_preconditioned_step_matches_cholesky_identity_step():
@@ -2466,17 +2472,25 @@ def test_blockdiag_metric_matches_dense():
     S = metric.inv_sqrt(jnp.eye(5))
     assert jnp.allclose(S @ S.T, jnp.linalg.inv(M), atol=1e-5)
 
-    # A block without inv_sqrt makes the composite inv_sqrt None but leaves
-    # solve/norm intact.
+    # A block's missing callbacks default to identity on that block.
     partial = blockdiag_metric(
         [
             (Metric(solve=lambda x: x, norm=jnp.linalg.norm), 3),
             (metric_from_diagonal(weights), 2),
         ]
     )
-    assert partial.inv_sqrt is None
-    assert partial.solve is not None
-    assert partial.norm is not None
+    x_partial = jax.random.normal(jax.random.PRNGKey(7), (5,))
+    M_partial = jnp.block(
+        [
+            [jnp.eye(3), jnp.zeros((3, 2))],
+            [jnp.zeros((2, 3)), jnp.diag(weights)],
+        ]
+    )
+    assert jnp.allclose(
+        partial.inv_sqrt(x_partial),
+        jnp.linalg.solve(jnp.linalg.cholesky(M_partial).T, x_partial),
+        atol=1e-5,
+    )
 
 
 def test_sherman_morrison_preconditioner_matches_dense_inverse():
@@ -2496,3 +2510,33 @@ def test_sherman_morrison_preconditioner_matches_dense_inverse():
     assert jnp.allclose(
         preconditioner(v, 0.0), jnp.linalg.solve(P, v), rtol=1e-3, atol=1e-3
     )
+
+
+def test_metric_from_tridiagonal_precision_single_point():
+    metric = metric_from_tridiagonal_precision(jnp.array([4.0]), jnp.zeros(0))
+    x = jnp.array([3.0])
+
+    assert jnp.allclose(metric.solve(x), 4.0 * x)
+    assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ x / 4.0))
+    assert jnp.allclose(metric.inv_sqrt(x), 2.0 * x)
+
+
+def test_blockdiag_metric_identity_block_defaults():
+    # A bare Metric() block means identity on that block -- the other block's
+    # weighting must survive.
+    weights = jnp.array([4.0, 0.25])
+    metric = blockdiag_metric([(Metric(), 3), (metric_from_diagonal(weights), 2)])
+    M = jnp.block(
+        [
+            [jnp.eye(3), jnp.zeros((3, 2))],
+            [jnp.zeros((2, 3)), jnp.diag(weights)],
+        ]
+    )
+    x = jax.random.normal(jax.random.PRNGKey(9), (5,))
+
+    assert metric.solve is not None
+    assert jnp.allclose(metric.solve(x), jnp.linalg.solve(M, x), atol=1e-6)
+    assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ M @ x), atol=1e-6)
+
+    with pytest.raises(ValueError, match="at least one"):
+        blockdiag_metric([])

@@ -87,9 +87,10 @@ exactly then). Three patterns, in order of preference:
 Before scheduling accuracy, check whether a structural `dual_preconditioner`
 removes the problem: when the dual operator's conditioning grows with problem
 size (metric solves inject \(M^{-1}\) into it), a spectrally equivalent
-preconditioner pins the required budget at a small constant — flat
-`iterative_maxiter` around 2–20 — where the unpreconditioned budget grows with
-refinement. See [Utilities](utilities.md#shermanmorrison-dual-preconditioner).
+preconditioner can pin the required budget at a small constant (in a
+kernel-collocation case study, a flat `iterative_maxiter` of 2–20 across two
+orders of magnitude in problem size) where the unpreconditioned budget grows
+with refinement. See [Utilities](utilities.md#shermanmorrison-dual-preconditioner).
 
 ## What Is Free to Sweep
 

@@ -171,7 +171,8 @@ preconditioner (for the geodesic-acceleration solve as well). It must be a
 jit-traceable, linear, SPD approximation of
 \((J P J^\top + \lambda I)^{-1} v\); it changes only the inner iteration
 count, never the converged root, so approximations are safe — see
-[Utilities](utilities.md) for a structural rank-1 constructor.
+[Utilities](utilities.md) for a structural rank-1 constructor. Like `metric`,
+it is static configuration: it cannot be swapped mid-`solve` by a callback.
 
 ### QR
 

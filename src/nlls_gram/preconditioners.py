@@ -7,8 +7,6 @@ preconditioner only changes the inner CG iteration count, so approximations
 are safe.
 """
 
-from __future__ import annotations
-
 
 def sherman_morrison_preconditioner(solve, u, weight):
     """Preconditioner for ``P = A + weight * u u'`` from a solve with ``A``.

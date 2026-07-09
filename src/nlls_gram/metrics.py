@@ -61,7 +61,9 @@ def metric_from_tridiagonal_precision(diag, off_diag, parallel=None):
     """Build an O(n) ``Metric`` from a symmetric tridiagonal precision matrix.
 
     ``diag`` (length n) and ``off_diag`` (length n-1) give the main and
-    off-diagonal of ``T = M^{-1}``, which must be positive definite. Suited to
+    off-diagonal of ``T = M^{-1}``, which must be positive definite (not
+    validated, since inputs may be traced; non-PD input silently produces a
+    non-metric). Suited to
     Markov kernels, where the Gram inverse is exactly tridiagonal (e.g.
     Matern-1/2 / Ornstein-Uhlenbeck on sorted points): every callback costs
     O(n) and nothing is factored densely.
@@ -171,7 +173,8 @@ def metric_from_tridiagonal_precision(diag, off_diag, parallel=None):
 def metric_from_diagonal(weights):
     """Build a ``Metric`` for the diagonal metric ``M = diag(weights)``.
 
-    ``weights`` (length n) must be positive. Every callback is elementwise.
+    ``weights`` (length n) must be positive -- not validated, since inputs
+    may be traced. Every callback is elementwise.
     """
 
     weights = jnp.asarray(weights)
@@ -206,9 +209,12 @@ def blockdiag_metric(blocks):
     flattened parameter vector is laid out. ``solve``, ``inv_sqrt``, and
     ``inv_sqrt_transpose`` slice on the leading axis (vector and matrix
     inputs both work); ``norm`` combines the block norms in quadrature. A
-    callback left ``None`` by any block is ``None`` on the composite.
+    callback left ``None`` by a block defaults to the identity metric on that
+    block, matching the bare ``Metric()`` convention.
     """
 
+    if not blocks:
+        raise ValueError("blocks must contain at least one (metric, size) pair")
     metrics = [metric for metric, _ in blocks]
     offsets = [0]
     for _, size in blocks:
@@ -219,33 +225,33 @@ def blockdiag_metric(blocks):
             x[start:stop] for start, stop in zip(offsets[:-1], offsets[1:], strict=True)
         ]
 
+    def identity(x):
+        return x
+
     def blockwise(callbacks):
-        if any(callback is None for callback in callbacks):
-            return None
+        filled = [identity if callback is None else callback for callback in callbacks]
 
         def apply(x):
             return jnp.concatenate(
                 [
                     callback(part)
-                    for callback, part in zip(callbacks, split(x), strict=True)
+                    for callback, part in zip(filled, split(x), strict=True)
                 ]
             )
 
         return apply
 
-    norms = [metric.norm for metric in metrics]
-    if any(callback is None for callback in norms):
-        norm = None
-    else:
+    norms = [
+        jnp.linalg.norm if metric.norm is None else metric.norm for metric in metrics
+    ]
 
-        def norm(x):
-            parts = split(x)
-            return jnp.sqrt(
-                sum(
-                    callback(part) ** 2
-                    for callback, part in zip(norms, parts, strict=True)
-                )
+    def norm(x):
+        parts = split(x)
+        return jnp.sqrt(
+            sum(
+                callback(part) ** 2 for callback, part in zip(norms, parts, strict=True)
             )
+        )
 
     return Metric(
         solve=blockwise([metric.solve for metric in metrics]),

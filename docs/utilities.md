@@ -79,8 +79,8 @@ dual_preconditioner = sherman_morrison_preconditioner(
 
 builds \(P^{-1}\) for \(P = K + (c^2/m_0)\,\mathbf{1}\mathbf{1}^\top\) from
 one kernel solve plus a rank-1 correction. Such structural preconditioners
-can be spectrally equivalent to the dual operator uniformly in \(n\), pinning
-the inner CG budget at a constant where the unpreconditioned budget grows
+can be spectrally equivalent to the dual operator uniformly in \(n\),
+keeping the inner CG budget constant where the unpreconditioned budget grows
 with refinement — see the [Tuning Guide](tuning_guide.md).
 
 ## API
