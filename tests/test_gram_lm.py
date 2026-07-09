@@ -2389,7 +2389,8 @@ def test_cg_dual_preconditioner_enables_ill_conditioned_convergence():
     assert int(plain_result.status) != LMStatus.CONVERGED
 
 
-def test_metric_from_tridiagonal_precision_matches_dense():
+@pytest.mark.parametrize("parallel", [False, True])
+def test_metric_from_tridiagonal_precision_matches_dense(parallel):
     # M = K with K_ij = rho^|i-j| (Matern-1/2 on a unit grid), whose precision
     # T = K^{-1} is exactly tridiagonal with closed-form AR(1) entries.
     n = 15
@@ -2401,7 +2402,7 @@ def test_metric_from_tridiagonal_precision_matches_dense():
         [jnp.ones(1), (1.0 + rho**2) * jnp.ones(n - 2), jnp.ones(1)]
     )
     off_diag = -rho * scale * jnp.ones(n - 1)
-    metric = metric_from_tridiagonal_precision(diag, off_diag)
+    metric = metric_from_tridiagonal_precision(diag, off_diag, parallel=parallel)
 
     x = jax.random.normal(jax.random.PRNGKey(0), (n,))
     X = jax.random.normal(jax.random.PRNGKey(1), (n, 3))

@@ -57,7 +57,7 @@ def metric_from_cholesky(L):
     )
 
 
-def metric_from_tridiagonal_precision(diag, off_diag):
+def metric_from_tridiagonal_precision(diag, off_diag, parallel=None):
     """Build an O(n) ``Metric`` from a symmetric tridiagonal precision matrix.
 
     ``diag`` (length n) and ``off_diag`` (length n-1) give the main and
@@ -65,6 +65,11 @@ def metric_from_tridiagonal_precision(diag, off_diag):
     Markov kernels, where the Gram inverse is exactly tridiagonal (e.g.
     Matern-1/2 / Ornstein-Uhlenbeck on sorted points): every callback costs
     O(n) and nothing is factored densely.
+
+    ``parallel`` picks how the one-time bidiagonal Cholesky setup runs:
+    ``None`` (default) uses an associative O(log n)-depth scan off-CPU, where
+    a sequential scan pays a kernel launch per step, and the sequential scan
+    on CPU, where it is faster.
     """
 
     diag = jnp.asarray(diag)
@@ -73,21 +78,58 @@ def metric_from_tridiagonal_precision(diag, off_diag):
         raise ValueError(
             "diag must be 1-D and off_diag must have shape (len(diag) - 1,)"
         )
+    if parallel is None:
+        parallel = jax.default_backend() != "cpu"
     zero = jnp.zeros((1,), dtype=diag.dtype)
     lower = jnp.concatenate([zero, off_diag])
     upper = jnp.concatenate([off_diag, zero])
 
     # Bidiagonal Cholesky T = C C': c_off[i] = off[i] / c_d[i],
-    # c_d[i+1] = sqrt(diag[i+1] - c_off[i]^2).
-    def chol_step(c_d_prev, inputs):
-        off_i, diag_next = inputs
-        c_off_i = off_i / c_d_prev
-        c_d_i = jnp.sqrt(diag_next - c_off_i**2)
-        return c_d_i, (c_off_i, c_d_i)
+    # c_d[i+1] = sqrt(diag[i+1] - c_off[i]^2), i.e. the pivot recurrence
+    # delta_{i+1} = diag_{i+1} - off_i^2 / delta_i with delta = c_d^2.
+    if off_diag.shape[0] == 0:
+        c_d = jnp.sqrt(diag)
+        c_off = off_diag
+    elif parallel:
+        # The pivot recurrence is a Mobius map delta -> (a delta + b)/delta,
+        # so cumulative 2x2 matrix products compose it associatively; the
+        # per-element normalization leaves the projective action unchanged
+        # while keeping the entries O(1).
+        mobius = jnp.stack(
+            [
+                jnp.stack([diag[1:], -(off_diag**2)], axis=-1),
+                jnp.stack(
+                    [jnp.ones_like(off_diag), jnp.zeros_like(off_diag)], axis=-1
+                ),
+            ],
+            axis=-2,
+        )
 
-    c_d_0 = jnp.sqrt(diag[0])
-    _, (c_off, c_d_rest) = jax.lax.scan(chol_step, c_d_0, (off_diag, diag[1:]))
-    c_d = jnp.concatenate([c_d_0[None], c_d_rest])
+        def combine(earlier, later):
+            product = later @ earlier
+            scale = jnp.max(jnp.abs(product), axis=(-2, -1), keepdims=True)
+            return product / scale
+
+        cumulative = jax.lax.associative_scan(combine, mobius)
+        delta_rest = (
+            cumulative[:, 0, 0] * diag[0] + cumulative[:, 0, 1]
+        ) / (cumulative[:, 1, 0] * diag[0] + cumulative[:, 1, 1])
+        delta = jnp.concatenate([diag[:1], delta_rest])
+        c_d = jnp.sqrt(delta)
+        c_off = off_diag / c_d[:-1]
+    else:
+
+        def chol_step(c_d_prev, inputs):
+            off_i, diag_next = inputs
+            c_off_i = off_i / c_d_prev
+            c_d_i = jnp.sqrt(diag_next - c_off_i**2)
+            return c_d_i, (c_off_i, c_d_i)
+
+        c_d_0 = jnp.sqrt(diag[0])
+        _, (c_off, c_d_rest) = jax.lax.scan(
+            chol_step, c_d_0, (off_diag, diag[1:])
+        )
+        c_d = jnp.concatenate([c_d_0[None], c_d_rest])
 
     def expand(v, x):
         return v.reshape(v.shape + (1,) * (x.ndim - 1))
