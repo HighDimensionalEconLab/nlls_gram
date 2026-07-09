@@ -3776,10 +3776,11 @@ def test_cg_with_woodbury_spike_preconditioner_matches_cholesky_step():
 
 def test_implicit_cg_with_shifted_matvec_metric_matches_dense():
     # End-to-end matrix-free implicit AD: the cg implicit rule applies
-    # metric.solve to tangent-dependent data, so the shifted-matvec metric's
-    # inner custom_linear_solve is transposed (via its symmetric solve rule)
-    # inside the VJP -- nested custom_linear_solve, both directions. Pin
-    # both derivative modes against the dense metric + dense implicit rule.
+    # metric.solve to tangent-dependent data, and the VJP handles that
+    # through the self-adjoint declaration -- the cotangent pass
+    # re-EVALUATES the shifted-matvec metric's inner CG rather than
+    # transposing it (which JAX cannot do). Pin both derivative modes
+    # against the dense metric + dense implicit rule.
     n, k, eps = 10, 2, 1e-2
     t = jnp.arange(n) * 1.0
     K = dense_matern_gram(t, 1.3, 0.8, 2.5)
