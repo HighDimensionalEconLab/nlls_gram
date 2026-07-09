@@ -63,7 +63,10 @@ L = jnp.linalg.cholesky(metric_matrix)
 metric = metric_from_cholesky(L)
 ```
 
-The helper returns a `Metric` with all four callbacks filled in.
+The helper returns a `Metric` with all four callbacks filled in. Further
+constructors — tridiagonal-precision, diagonal, and block-diagonal metrics,
+plus a Sherman–Morrison dual preconditioner — are collected in
+[Utilities](utilities.md).
 
 ## Metric Example
 

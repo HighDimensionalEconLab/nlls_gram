@@ -166,6 +166,13 @@ $$
 
 It uses JAX linearization for JVPs/VJPs and `jax.scipy.sparse.linalg.cg`.
 
+An optional `dual_preconditioner(v, damping)` callback is applied as the CG
+preconditioner (for the geodesic-acceleration solve as well). It must be a
+jit-traceable, linear, SPD approximation of
+\((J P J^\top + \lambda I)^{-1} v\); it changes only the inner iteration
+count, never the converged root, so approximations are safe — see
+[Utilities](utilities.md) for a structural rank-1 constructor.
+
 ### QR
 
 `linear_solver="qr"` uses the square-root metric form. With \(s = Sz\), solve
@@ -384,6 +391,14 @@ narrower and focuses on underdetermined LM with explicit parameter-space metrics
 ::: nlls_gram.Metric
 
 ::: nlls_gram.metric_from_cholesky
+
+::: nlls_gram.metric_from_tridiagonal_precision
+
+::: nlls_gram.metric_from_diagonal
+
+::: nlls_gram.blockdiag_metric
+
+::: nlls_gram.sherman_morrison_preconditioner
 
 ::: nlls_gram.LMState
 

@@ -98,9 +98,7 @@ def metric_from_tridiagonal_precision(diag, off_diag, parallel=None):
         mobius = jnp.stack(
             [
                 jnp.stack([diag[1:], -(off_diag**2)], axis=-1),
-                jnp.stack(
-                    [jnp.ones_like(off_diag), jnp.zeros_like(off_diag)], axis=-1
-                ),
+                jnp.stack([jnp.ones_like(off_diag), jnp.zeros_like(off_diag)], axis=-1),
             ],
             axis=-2,
         )
@@ -111,9 +109,9 @@ def metric_from_tridiagonal_precision(diag, off_diag, parallel=None):
             return product / scale
 
         cumulative = jax.lax.associative_scan(combine, mobius)
-        delta_rest = (
-            cumulative[:, 0, 0] * diag[0] + cumulative[:, 0, 1]
-        ) / (cumulative[:, 1, 0] * diag[0] + cumulative[:, 1, 1])
+        delta_rest = (cumulative[:, 0, 0] * diag[0] + cumulative[:, 0, 1]) / (
+            cumulative[:, 1, 0] * diag[0] + cumulative[:, 1, 1]
+        )
         delta = jnp.concatenate([diag[:1], delta_rest])
         c_d = jnp.sqrt(delta)
         c_off = off_diag / c_d[:-1]
@@ -126,9 +124,7 @@ def metric_from_tridiagonal_precision(diag, off_diag, parallel=None):
             return c_d_i, (c_off_i, c_d_i)
 
         c_d_0 = jnp.sqrt(diag[0])
-        _, (c_off, c_d_rest) = jax.lax.scan(
-            chol_step, c_d_0, (off_diag, diag[1:])
-        )
+        _, (c_off, c_d_rest) = jax.lax.scan(chol_step, c_d_0, (off_diag, diag[1:]))
         c_d = jnp.concatenate([c_d_0[None], c_d_rest])
 
     def expand(v, x):
@@ -169,4 +165,91 @@ def metric_from_tridiagonal_precision(diag, off_diag, parallel=None):
         norm=norm,
         inv_sqrt=inv_sqrt,
         inv_sqrt_transpose=inv_sqrt_transpose,
+    )
+
+
+def metric_from_diagonal(weights):
+    """Build a ``Metric`` for the diagonal metric ``M = diag(weights)``.
+
+    ``weights`` (length n) must be positive. Every callback is elementwise.
+    """
+
+    weights = jnp.asarray(weights)
+    if weights.ndim != 1:
+        raise ValueError("weights must be 1-D")
+    sqrt_weights = jnp.sqrt(weights)
+
+    def expand(v, x):
+        return v.reshape(v.shape + (1,) * (x.ndim - 1))
+
+    def solve(x):
+        return x / expand(weights, x)
+
+    def norm(x):
+        return jnp.sqrt(x @ (weights * x))
+
+    def inv_sqrt(x):
+        return x / expand(sqrt_weights, x)
+
+    return Metric(
+        solve=solve,
+        norm=norm,
+        inv_sqrt=inv_sqrt,
+        inv_sqrt_transpose=inv_sqrt,
+    )
+
+
+def blockdiag_metric(blocks):
+    """Compose per-block ``Metric``s into one block-diagonal ``Metric``.
+
+    ``blocks`` is a sequence of ``(metric, size)`` pairs in the order the
+    flattened parameter vector is laid out. ``solve``, ``inv_sqrt``, and
+    ``inv_sqrt_transpose`` slice on the leading axis (vector and matrix
+    inputs both work); ``norm`` combines the block norms in quadrature. A
+    callback left ``None`` by any block is ``None`` on the composite.
+    """
+
+    metrics = [metric for metric, _ in blocks]
+    offsets = [0]
+    for _, size in blocks:
+        offsets.append(offsets[-1] + size)
+
+    def split(x):
+        return [
+            x[start:stop] for start, stop in zip(offsets[:-1], offsets[1:], strict=True)
+        ]
+
+    def blockwise(callbacks):
+        if any(callback is None for callback in callbacks):
+            return None
+
+        def apply(x):
+            return jnp.concatenate(
+                [
+                    callback(part)
+                    for callback, part in zip(callbacks, split(x), strict=True)
+                ]
+            )
+
+        return apply
+
+    norms = [metric.norm for metric in metrics]
+    if any(callback is None for callback in norms):
+        norm = None
+    else:
+
+        def norm(x):
+            parts = split(x)
+            return jnp.sqrt(
+                sum(
+                    callback(part) ** 2
+                    for callback, part in zip(norms, parts, strict=True)
+                )
+            )
+
+    return Metric(
+        solve=blockwise([metric.solve for metric in metrics]),
+        norm=norm,
+        inv_sqrt=blockwise([metric.inv_sqrt for metric in metrics]),
+        inv_sqrt_transpose=blockwise([metric.inv_sqrt_transpose for metric in metrics]),
     )

@@ -84,6 +84,13 @@ exactly then). Three patterns, in order of preference:
    warm-started with `result.x` and `result.lm_state`. The implicit
    derivative is unaffected (it is defined at the returned solution only).
 
+Before scheduling accuracy, check whether a structural `dual_preconditioner`
+removes the problem: when the dual operator's conditioning grows with problem
+size (metric solves inject \(M^{-1}\) into it), a spectrally equivalent
+preconditioner pins the required budget at a small constant — flat
+`iterative_maxiter` around 2–20 — where the unpreconditioned budget grows with
+refinement. See [Utilities](utilities.md#shermanmorrison-dual-preconditioner).
+
 ## What Is Free to Sweep
 
 - **Free (traced, no recompile):** `max_steps`, `atol`/`gtol`/`xtol`, the

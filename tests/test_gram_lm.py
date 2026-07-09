@@ -11,8 +11,11 @@ from nlls_gram import (
     LMStatus,
     Metric,
     UnderdeterminedLevenbergMarquardt,
+    blockdiag_metric,
     metric_from_cholesky,
+    metric_from_diagonal,
     metric_from_tridiagonal_precision,
+    sherman_morrison_preconditioner,
 )
 
 
@@ -2421,3 +2424,75 @@ def test_metric_from_tridiagonal_precision_matches_dense(parallel):
         assert jnp.allclose(
             metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-4
         )
+
+
+def test_metric_from_diagonal_matches_dense():
+    weights = jnp.array([2.0, 0.5, 4.0, 1.5])
+    metric = metric_from_diagonal(weights)
+    M = jnp.diag(weights)
+    x = jax.random.normal(jax.random.PRNGKey(2), (4,))
+    X = jax.random.normal(jax.random.PRNGKey(3), (4, 3))
+
+    assert jnp.allclose(metric.solve(x), jnp.linalg.solve(M, x))
+    assert jnp.allclose(metric.solve(X), jnp.linalg.solve(M, X))
+    assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ M @ x))
+    S = metric.inv_sqrt(jnp.eye(4))
+    assert jnp.allclose(S @ S.T, jnp.linalg.inv(M))
+    assert jnp.allclose(metric.inv_sqrt_transpose(jnp.eye(4)), S.T)
+
+
+def test_blockdiag_metric_matches_dense():
+    # A dense 3x3 block composed with a diagonal 2-block.
+    A = jnp.array([[2.0, 0.5, 0.0], [0.5, 3.0, 0.2], [0.0, 0.2, 1.5]])
+    weights = jnp.array([4.0, 0.25])
+    metric = blockdiag_metric(
+        [
+            (metric_from_cholesky(jnp.linalg.cholesky(A)), 3),
+            (metric_from_diagonal(weights), 2),
+        ]
+    )
+    M = jnp.block(
+        [
+            [A, jnp.zeros((3, 2))],
+            [jnp.zeros((2, 3)), jnp.diag(weights)],
+        ]
+    )
+    x = jax.random.normal(jax.random.PRNGKey(4), (5,))
+    X = jax.random.normal(jax.random.PRNGKey(5), (5, 3))
+
+    assert jnp.allclose(metric.solve(x), jnp.linalg.solve(M, x), atol=1e-5)
+    assert jnp.allclose(metric.solve(X), jnp.linalg.solve(M, X), atol=1e-5)
+    assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ M @ x), atol=1e-5)
+    S = metric.inv_sqrt(jnp.eye(5))
+    assert jnp.allclose(S @ S.T, jnp.linalg.inv(M), atol=1e-5)
+
+    # A block without inv_sqrt makes the composite inv_sqrt None but leaves
+    # solve/norm intact.
+    partial = blockdiag_metric(
+        [
+            (Metric(solve=lambda x: x, norm=jnp.linalg.norm), 3),
+            (metric_from_diagonal(weights), 2),
+        ]
+    )
+    assert partial.inv_sqrt is None
+    assert partial.solve is not None
+    assert partial.norm is not None
+
+
+def test_sherman_morrison_preconditioner_matches_dense_inverse():
+    n = 12
+    idx = jnp.arange(n)
+    A = 0.6 ** jnp.abs(idx[:, None] - idx[None, :])
+    L = jnp.linalg.cholesky(A)
+    u = jnp.ones(n)
+    weight = 50.0
+
+    preconditioner = sherman_morrison_preconditioner(
+        metric_from_cholesky(L).solve, u, weight
+    )
+    P = A + weight * jnp.outer(u, u)
+    v = jax.random.normal(jax.random.PRNGKey(6), (n,))
+
+    assert jnp.allclose(
+        preconditioner(v, 0.0), jnp.linalg.solve(P, v), rtol=1e-3, atol=1e-3
+    )
