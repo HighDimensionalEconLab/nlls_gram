@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
+import jax.scipy.sparse.linalg as jsp_sparse_linalg
 
 from nlls_gram import quasiseparable
 
@@ -323,6 +324,86 @@ def metric_from_diagonal(weights):
         inv_sqrt=inv_sqrt,
         inv_sqrt_transpose=inv_sqrt,
     )
+
+
+def metric_from_shifted_matvec(
+    matvec, shift, *, tol=None, atol=0.0, maxiter=None, preconditioner=None
+):
+    """Build a matrix-free ``Metric`` for ``M = A + shift * I`` from a matvec.
+
+    ``matvec(x)`` applies a symmetric positive-semidefinite ``A`` and must
+    accept both ``(n,)`` vectors and ``(n, k)`` matrices on the leading axis
+    (the same shape contract ``Metric.solve`` itself carries). ``shift``
+    must be POSITIVE -- it is the spectral floor that makes an iterative
+    metric solve viable at all: ``cond(A + shift I) <= (lambda_max + shift)
+    / shift`` regardless of how singular ``A`` is, and ``solve`` costs
+    ``~sqrt(lambda_max / shift) * log(1/tol)`` matvecs. A concrete
+    ``shift <= 0`` raises; a traced ``shift`` is not validated and must be
+    positive. Only ``solve`` and ``norm`` are provided (there is no
+    matrix-free square root), so the solver accepts this metric for the
+    ``cholesky`` and ``cg`` paths and rejects ``qr``/``lsmr`` at
+    construction.
+
+    ``solve`` runs ``jax.scipy.sparse.linalg.cg`` on the shifted matvec, so
+    it meets the library's exactness contract only in the tight-``tol``
+    limit. Unlike ``dual_preconditioner`` error -- which never moves the
+    converged root -- this solve's residual error perturbs the selected
+    step, the converged solution, and the implicit derivatives at order
+    ``tol``; the implicit derivative in particular is computed outside the
+    accept/reject loop with no safeguard. ``tol`` is therefore an accuracy
+    knob for the ANSWER, not a solver schedule. The default (``None`` ->
+    the square root of the input dtype's machine epsilon, ~1.5e-8 in
+    float64) keeps that perturbation at the level of typical outer
+    tolerances; CG's attainable residual stagnates near
+    ``machine_eps * (lambda_max + shift) / shift``, which bounds how far
+    ``tol`` can usefully be tightened (~1e-10 is reachable in float64 only
+    when that condition number is ~1e4 or better). ``maxiter=None`` runs to
+    tolerance -- a truncated CG is not a linear function of its right-hand
+    side, which breaks the linear-operator assumptions of the ``cg``
+    linear_solver, so do not cap it as a cost control. ``preconditioner``
+    is forwarded to the inner CG (its ``M`` argument). A matrix right-hand
+    side is solved as one stacked CG call (same spectrum, batched matvecs).
+
+    Because the inner CG is built on ``lax.custom_linear_solve`` with a
+    symmetric operator, ``solve`` composes with ``jax.jvp``/``jax.vjp``/
+    ``jax.grad`` — including the solver's implicit-AD rule and
+    differentiating ``update`` through the ``cg`` path — and with values
+    the matvec closes over; ``matvec`` itself only needs to be linear. Raw
+    ``jax.linear_transpose`` of ``solve`` is not supported by JAX's CG (no
+    solver path applies it to ``metric.solve``).
+    """
+
+    if not isinstance(shift, jax.core.Tracer) and float(shift) <= 0.0:
+        raise ValueError("shift must be positive (it is the spectral floor)")
+    if tol is not None and tol < 0:
+        raise ValueError("tol must be nonnegative")
+    if atol < 0:
+        raise ValueError("atol must be nonnegative")
+    if maxiter is not None and maxiter <= 0:
+        raise ValueError("maxiter must be positive or None")
+
+    def shifted_matvec(x):
+        return matvec(x) + shift * x
+
+    def solve(x):
+        if tol is None:
+            solve_tol = float(jnp.finfo(jnp.result_type(x)).eps) ** 0.5
+        else:
+            solve_tol = tol
+        solution, _ = jsp_sparse_linalg.cg(
+            shifted_matvec,
+            x,
+            tol=solve_tol,
+            atol=atol,
+            maxiter=maxiter,
+            M=preconditioner,
+        )
+        return solution
+
+    def norm(x):
+        return jnp.sqrt(x @ shifted_matvec(x))
+
+    return Metric(solve=solve, norm=norm)
 
 
 def blockdiag_metric(blocks):

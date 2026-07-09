@@ -308,6 +308,126 @@ for nu in (1.5, 2.5):
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_shifted_metric_eps_limit_matches_kkt():
+    # The unified shifted metric M = blockdiag(K, 0) + eps I: as eps -> 0
+    # the minimum-M-norm interpolant converges at rate O(eps) to the
+    # bordered-KKT solution of min alpha' K alpha s.t. J theta = b with
+    # beta free -- under the uniqueness conditions (K PD, J full row rank,
+    # J_beta full column rank) that make that solution unique. Also: the
+    # matrix-free composite matches the dense composite, and the implicit
+    # derivative error shrinks with the inner CG tolerance.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import (
+    UnderdeterminedLevenbergMarquardt,
+    blockdiag_metric,
+    metric_from_cholesky,
+    metric_from_diagonal,
+    metric_from_shifted_matvec,
+)
+
+n, k, m = 12, 2, 4
+t = jnp.arange(n) * 1.0
+ft = jnp.sqrt(3.0) * jnp.abs(t[:, None] - t[None, :]) / 0.8
+K = 1.3**2 * (1.0 + ft) * jnp.exp(-ft) + 1e-8 * jnp.eye(n)  # PD
+J_alpha = jax.random.normal(jax.random.PRNGKey(0), (m, n))
+J_beta = jax.random.normal(jax.random.PRNGKey(1), (m, k))  # full column rank
+J = jnp.concatenate([J_alpha, J_beta], axis=1)
+b = jax.random.normal(jax.random.PRNGKey(2), (m,))
+
+# Bordered KKT: [[2K, 0, J_a'], [0, 0, J_b'], [J_a, J_b, 0]] [a, B, -y] = [0,0,b]
+kkt = jnp.block(
+    [
+        [2.0 * K, jnp.zeros((n, k)), J_alpha.T],
+        [jnp.zeros((k, n)), jnp.zeros((k, k)), J_beta.T],
+        [J_alpha, J_beta, jnp.zeros((m, m))],
+    ]
+)
+kkt_solution = jnp.linalg.solve(kkt, jnp.concatenate([jnp.zeros(n + k), b]))
+theta_kkt = kkt_solution[: n + k]
+assert jnp.allclose(J @ theta_kkt, b, atol=1e-9)
+
+
+def residual(theta, _, p):
+    return J @ theta - p * b
+
+
+def dense_composite(eps):
+    return blockdiag_metric(
+        [
+            (metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n))), n),
+            (metric_from_diagonal(eps * jnp.ones(k)), k),
+        ]
+    )
+
+
+def solved_x(metric, p):
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-6, metric=metric, geodesic_acceleration=False
+    )
+    return solver.solve(jnp.zeros(n + k), p=p, max_steps=200, atol=1e-12).x
+
+
+errors = {}
+for eps in (1e-3, 1e-5, 1e-7):
+    theta_eps = solved_x(dense_composite(eps), jnp.asarray(1.0))
+    assert jnp.allclose(J @ theta_eps, b, atol=1e-8), eps
+    errors[eps] = float(jnp.linalg.norm(theta_eps - theta_kkt))
+
+# Convergence to the KKT solution, at first order in eps.
+assert errors[1e-7] < 1e-5, errors
+rate = errors[1e-3] / errors[1e-5]
+assert 30.0 < rate < 300.0, (errors, rate)
+
+# The matrix-free composite matches the dense composite at eps = 1e-5.
+eps = 1e-5
+matvec_metric = blockdiag_metric(
+    [
+        (metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-12), n),
+        (metric_from_diagonal(eps * jnp.ones(k)), k),
+    ]
+)
+theta_matvec = solved_x(matvec_metric, jnp.asarray(1.0))
+theta_dense = solved_x(dense_composite(eps), jnp.asarray(1.0))
+rel = float(jnp.linalg.norm(theta_matvec - theta_dense) / jnp.linalg.norm(theta_dense))
+assert rel < 1e-9, rel
+
+# Implicit-derivative error shrinks with the inner CG tolerance: the final
+# metric solve has no accept/reject safeguard, so tol directly sets it.
+p, p_dot = jnp.asarray(1.0), jnp.asarray(1.0)
+_, dot_dense = jax.jvp(lambda q: solved_x(dense_composite(eps), q), (p,), (p_dot,))
+
+
+def matvec_composite(tol):
+    return blockdiag_metric(
+        [
+            (metric_from_shifted_matvec(lambda x: K @ x, eps, tol=tol), n),
+            (metric_from_diagonal(eps * jnp.ones(k)), k),
+        ]
+    )
+
+
+derivative_errors = {}
+for tol in (1e-4, 1e-12):
+    _, dot_matvec = jax.jvp(
+        lambda q: solved_x(matvec_composite(tol), q), (p,), (p_dot,)
+    )
+    derivative_errors[tol] = float(jnp.linalg.norm(dot_matvec - dot_dense))
+assert derivative_errors[1e-12] < derivative_errors[1e-4], derivative_errors
+assert derivative_errors[1e-12] < 1e-8, derivative_errors
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_solve_with_float32_problem_under_x64_keeps_lm_state_dtype_consistent():
     # solve(lm_state=None) must carry the damping in the residual dtype, not
     # the default float, or the while_loop carry mismatches update()'s output

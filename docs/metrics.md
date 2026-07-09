@@ -93,32 +93,24 @@ solver = UnderdeterminedLevenbergMarquardt(
 
 ## Matrix-Free Metric Example
 
-For CG, the metric only needs a solve callback. This can wrap an iterative solve
-or any JAX-linear operation implementing \(M^{-1}x\), without materializing a
-dense inverse:
+For CG, the metric only needs `solve` (and `norm` for geodesic
+acceleration). `metric_from_shifted_matvec` builds \(M = A + \varepsilon I\)
+from a matvec alone, running an inner CG to a tight, dtype-aware tolerance:
 
 ```python
-import jax.scipy.sparse.linalg as jsp_sparse_linalg
-
-from nlls_gram import Metric, UnderdeterminedLevenbergMarquardt
-
-
-def metric_matvec(x):
-    return kernel_matvec(x) + ridge * x
-
-
-def metric_solve(x):
-    solution, _ = jsp_sparse_linalg.cg(metric_matvec, x, maxiter=32)
-    return solution
-
+from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_shifted_matvec
 
 solver = UnderdeterminedLevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
     linear_solver="cg",
-    metric=Metric(solve=metric_solve),
+    metric=metric_from_shifted_matvec(kernel_matvec, eps),
 )
 ```
 
 This changes the LM damping metric. It is not a preconditioner for the inner CG
-iteration; it changes the step being solved for.
+iteration; it changes the step being solved for — which is why the inner
+solve must run to convergence (a truncated CG is not even a linear function
+of its input; never cap `maxiter` as a cost control). See
+[Utilities](utilities.md#unified-shifted-block-metrics) for the shift's
+role and the exactness caveat.

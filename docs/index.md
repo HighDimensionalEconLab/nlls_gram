@@ -418,11 +418,15 @@ narrower and focuses on underdetermined LM with explicit parameter-space metrics
 
 ::: nlls_gram.metric_from_quasiseparable
 
+::: nlls_gram.metric_from_shifted_matvec
+
 ::: nlls_gram.metric_from_diagonal
 
 ::: nlls_gram.blockdiag_metric
 
 ::: nlls_gram.sherman_morrison_preconditioner
+
+::: nlls_gram.woodbury_preconditioner
 
 ::: nlls_gram.LMState
 

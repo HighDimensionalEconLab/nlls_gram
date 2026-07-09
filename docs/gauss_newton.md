@@ -186,6 +186,63 @@ The same choice governs [implicit differentiation](implicit_ad.md):
 in underdetermined problems the metric is part of the definition of the
 derivative, selecting the minimum-\(M\)-norm solution tangent.
 
+## Shifted Metrics and the Seminorm Limit
+
+Kernel models often carry a few extra scalar parameters \(\beta\) (level
+constants, initial values) alongside the coefficients \(\alpha\), and the
+natural objective is the RKHS *seminorm* \(\alpha^\top K \alpha\) with
+\(\beta\) free — which is not a metric (\(M \succ 0\) fails on the
+\(\beta\) block, and \(K\) itself is numerically singular on fine grids).
+The **unified shifted metric**
+
+$$
+M_\varepsilon
+= \begin{bmatrix} K & 0 \\ 0 & 0 \end{bmatrix} + \varepsilon I
+= \begin{bmatrix} K + \varepsilon I_n & 0 \\ 0 & \varepsilon I_k \end{bmatrix}
+$$
+
+completes it with a single spectral floor: the eigenvalues are
+\(\{\lambda_i(K) + \varepsilon\} \cup \{\varepsilon\}\), so
+\(\|M_\varepsilon^{-1}\|_2 = 1/\varepsilon\) exactly — uniformly in \(n\)
+and in how singular \(K\) is. The metric norm it minimizes is
+
+$$
+\|s\|_{M_\varepsilon}^2
+= \alpha^\top K \alpha + \varepsilon \|s\|_2^2 ,
+$$
+
+the seminorm plus a flat Tikhonov ridge on the whole parameter vector.
+
+**The \(\varepsilon \to 0\) limit.** When \(K \succ 0\), \(J\) has full row
+rank, and the \(\beta\)-columns \(J_\beta\) have full column rank, the
+seminorm-constrained problem \(\min_\theta \alpha^\top K \alpha\) s.t.
+\(J\theta = b\) has a unique solution — the bordered KKT system
+
+$$
+\begin{bmatrix} 2K & 0 & J_\alpha^\top \\ 0 & 0 & J_\beta^\top \\
+J_\alpha & J_\beta & 0 \end{bmatrix}
+\begin{bmatrix} \alpha \\ \beta \\ -y \end{bmatrix}
+= \begin{bmatrix} 0 \\ 0 \\ b \end{bmatrix}
+$$
+
+— and the minimum-\(M_\varepsilon\)-norm solution (and its implicit
+derivative) converges to it at rate \(O(\varepsilon)\). For **singular**
+\(K\) the limit is *lexicographic*: the minimum-Euclidean-norm element
+among the seminorm minimizers (the Tikhonov tie-break), not a distinguished
+"\(\beta\)-free" solution. (With \(K = 0\) and one constraint
+\(\alpha + \beta = 1\), every feasible pair has zero seminorm;
+\(M_\varepsilon\) selects \(\alpha = \beta = 1/2\).) State uniqueness
+assumptions before claiming the \(O(\varepsilon)\) perturbation.
+
+Compared to the two-knob block form \(\operatorname{blockdiag}(K +
+\delta I, m_0 I_k)\), one \(\varepsilon\) is one dial: smaller
+\(\varepsilon\) means less selection bias but a harder metric solve
+(\(\kappa(K + \varepsilon I) = (\lambda_{\max} + \varepsilon)/\varepsilon\))
+and a larger scalar-block spike \((c^2/\varepsilon)\,uu^\top\) in the dual
+operator — see the [Tuning Guide](tuning_guide.md#the-metric) and
+[Utilities](utilities.md#unified-shifted-block-metrics) for construction
+and preconditioning.
+
 ## Worked Example
 
 For the one-row residual \(r(\theta) = \theta_1 + \theta_2 - 1\) at

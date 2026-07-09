@@ -16,9 +16,11 @@ from nlls_gram import (
     metric_from_cholesky,
     metric_from_diagonal,
     metric_from_quasiseparable,
+    metric_from_shifted_matvec,
     metric_from_state_space,
     metric_from_tridiagonal_precision,
     sherman_morrison_preconditioner,
+    woodbury_preconditioner,
 )
 
 
@@ -3059,3 +3061,323 @@ def test_metric_from_state_space_matern_cg_and_preconditioner_smoke():
     assert jnp.allclose(
         preconditioner(v, 0.0), jnp.linalg.solve(B, v), rtol=1e-3, atol=1e-3
     )
+
+
+def shifted_composite_metric(kernel_block, n, k, eps):
+    return blockdiag_metric(
+        [(kernel_block, n), (metric_from_diagonal(eps * jnp.ones(k)), k)]
+    )
+
+
+def test_metric_from_shifted_matvec_matches_dense_metric():
+    n, shift = 30, 0.5
+    t = jnp.arange(n) * 1.0
+    K = dense_matern_gram(t, 1.3, 0.8, 2.5)
+    metric = metric_from_shifted_matvec(lambda x: K @ x, shift, tol=1e-6)
+    x = jax.random.normal(jax.random.PRNGKey(20), (n,))
+    X = jax.random.normal(jax.random.PRNGKey(21), (n, 3))
+
+    with jax.default_matmul_precision("highest"):
+        K_shifted = K + shift * jnp.eye(n)
+        assert jnp.allclose(
+            metric.solve(x), jnp.linalg.solve(K_shifted, x), rtol=1e-4, atol=1e-4
+        )
+        assert jnp.allclose(
+            metric.solve(X), jnp.linalg.solve(K_shifted, X), rtol=1e-4, atol=1e-4
+        )
+        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ K_shifted @ x), rtol=1e-4)
+        # The default tolerance (sqrt of machine eps) also solves correctly,
+        # just less tightly.
+        default_metric = metric_from_shifted_matvec(lambda v: K @ v, shift)
+        assert jnp.allclose(
+            default_metric.solve(x), jnp.linalg.solve(K_shifted, x), rtol=1e-2
+        )
+    assert metric.inv_sqrt is None
+    assert metric.inv_sqrt_transpose is None
+
+
+def test_metric_from_shifted_matvec_solves_ill_conditioned_kernel():
+    # Nugget-free fine-grid Matern-5/2 Gram: numerically singular K, but the
+    # shift floors the spectrum so the iterative solve still matches the
+    # dense shifted factorization -- the floor is the point.
+    n, shift = 120, 1e-2
+    t = 0.05 * jnp.arange(n)
+    K = dense_matern_gram(t, 1.0, 0.8, 2.5)
+    metric = metric_from_shifted_matvec(lambda x: K @ x, shift, tol=1e-6)
+    x = jax.random.normal(jax.random.PRNGKey(22), (n,))
+
+    with jax.default_matmul_precision("highest"):
+        expected = jnp.linalg.solve(K + shift * jnp.eye(n), x)
+        assert jnp.allclose(metric.solve(x), expected, rtol=1e-2, atol=1e-3)
+
+
+def test_metric_from_shifted_matvec_validation_and_solver_requirements():
+    for bad_shift in (0.0, -1.0):
+        with pytest.raises(ValueError, match="shift"):
+            metric_from_shifted_matvec(lambda x: x, bad_shift)
+    with pytest.raises(ValueError, match="tol"):
+        metric_from_shifted_matvec(lambda x: x, 1.0, tol=-1.0)
+    with pytest.raises(ValueError, match="atol"):
+        metric_from_shifted_matvec(lambda x: x, 1.0, atol=-1.0)
+    with pytest.raises(ValueError, match="maxiter"):
+        metric_from_shifted_matvec(lambda x: x, 1.0, maxiter=0)
+
+    metric = metric_from_shifted_matvec(lambda x: 2.0 * x, 1.0)
+    for linear_solver in ("qr", "lsmr"):
+        with pytest.raises(ValueError, match="inv_sqrt"):
+            UnderdeterminedLevenbergMarquardt(
+                residual_fn, linear_solver=linear_solver, metric=metric
+            )
+    for linear_solver in ("cholesky", "cg"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, linear_solver=linear_solver, metric=metric
+        )
+    # norm is provided, so geodesic acceleration accepts this metric.
+    UnderdeterminedLevenbergMarquardt(
+        residual_fn, metric=metric, geodesic_acceleration=True
+    )
+
+
+@pytest.mark.parametrize("kernel_block", ["dense", "state_space", "matvec"])
+def test_shifted_blockdiag_metric_matches_dense_metric(kernel_block):
+    # The three representations of blockdiag(K, 0) + eps I are
+    # interchangeable and match the dense factorization of the full M.
+    n, k, eps = 24, 2, 1e-2
+    t = jnp.arange(n) * 1.0
+    sigma, ell = 1.3, 0.8
+    K = dense_matern_gram(t, sigma, ell, 2.5)
+    if kernel_block == "dense":
+        block = metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n)))
+    elif kernel_block == "state_space":
+        block = metric_from_state_space(
+            t, *matern_state_space(sigma, ell, 2.5), nugget=eps
+        )
+    else:
+        block = metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-6)
+    metric = shifted_composite_metric(block, n, k, eps)
+
+    M = jnp.block(
+        [
+            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
+            [jnp.zeros((k, n)), eps * jnp.eye(k)],
+        ]
+    )
+    x = jax.random.normal(jax.random.PRNGKey(23), (n + k,))
+    X = jax.random.normal(jax.random.PRNGKey(24), (n + k, 3))
+    with jax.default_matmul_precision("highest"):
+        assert jnp.allclose(
+            metric.solve(x), jnp.linalg.solve(M, x), rtol=1e-3, atol=1e-4
+        )
+        assert jnp.allclose(
+            metric.solve(X), jnp.linalg.solve(M, X), rtol=1e-3, atol=1e-4
+        )
+        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ M @ x), rtol=1e-4)
+        if kernel_block == "matvec":
+            assert metric.inv_sqrt is None
+            assert metric.inv_sqrt_transpose is None
+        else:
+            S = metric.inv_sqrt(jnp.eye(n + k))
+            assert jnp.allclose(S @ S.T, jnp.linalg.inv(M), rtol=1e-3, atol=1e-4)
+
+
+SHIFTED_STEP_CASES = [
+    ("dense", "cholesky"),
+    ("dense", "qr"),
+    ("dense", "cg"),
+    ("dense", "lsmr"),
+    ("state_space", "cholesky"),
+    ("state_space", "qr"),
+    ("state_space", "cg"),
+    ("state_space", "lsmr"),
+    ("matvec", "cholesky"),
+    ("matvec", "cg"),
+]
+
+
+@pytest.mark.parametrize("kernel_block,linear_solver", SHIFTED_STEP_CASES)
+def test_shifted_metric_step_matches_closed_form_across_solvers(
+    kernel_block, linear_solver
+):
+    n, k, eps = 12, 2, 1e-2
+    t = jnp.arange(n) * 1.0
+    sigma, ell = 1.3, 0.8
+    K = dense_matern_gram(t, sigma, ell, 2.5)
+    if kernel_block == "dense":
+        block = metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n)))
+    elif kernel_block == "state_space":
+        block = metric_from_state_space(
+            t, *matern_state_space(sigma, ell, 2.5), nugget=eps
+        )
+    else:
+        block = metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-8)
+    metric = shifted_composite_metric(block, n, k, eps)
+    M = jnp.block(
+        [
+            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
+            [jnp.zeros((k, n)), eps * jnp.eye(k)],
+        ]
+    )
+
+    A = jax.random.normal(jax.random.PRNGKey(25), (3, n + k))
+    b = jnp.array([1.0, -0.5, 2.0])
+
+    def residual(theta, _, p):
+        return A @ theta - b
+
+    damping = 1e-2
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=damping,
+        linear_solver=linear_solver,
+        geodesic_acceleration=False,
+        metric=metric,
+        iterative_tol=1e-8,
+        iterative_maxiter=500,
+    )
+    x0 = jnp.zeros(n + k)
+    x1, _, info = solver.update(x0, solver.init(x0, None))
+    assert bool(info.accepted)
+
+    with jax.default_matmul_precision("highest"):
+        step = jnp.linalg.solve(A.T @ A + damping * M, A.T @ b)
+    assert jnp.allclose(x1, step, rtol=1e-3, atol=1e-4)
+
+
+def test_shifted_metric_implicit_jvp_and_vjp_match_dense():
+    # The matvec composite drives solve() and its implicit JVP/VJP to the
+    # same answers as the dense factorization of the full M -- exercising
+    # the inner CG on the (n, m) Jt inside the implicit rule and its
+    # differentiation.
+    n, k, eps = 10, 2, 1e-2
+    t = jnp.arange(n) * 1.0
+    K = dense_matern_gram(t, 1.3, 0.8, 2.5)
+    composite = shifted_composite_metric(
+        metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-8), n, k, eps
+    )
+    M = jnp.block(
+        [
+            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
+            [jnp.zeros((k, n)), eps * jnp.eye(k)],
+        ]
+    )
+    dense = metric_from_cholesky(jnp.linalg.cholesky(M))
+
+    A = jax.random.normal(jax.random.PRNGKey(26), (3, n + k))
+
+    def residual(theta, _, p):
+        return A @ theta - jnp.array([p, 0.5 * p, -p])
+
+    def solved_x(metric, linear_solver, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            init_damping=1e-2,
+            linear_solver=linear_solver,
+            metric=metric,
+            iterative_tol=1e-8,
+            iterative_maxiter=500,
+        )
+        return solver.solve(jnp.zeros(n + k), p=p, max_steps=80, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
+    x_dense, x_dense_dot = jax.jvp(
+        lambda q: solved_x(dense, "cholesky", q), (p,), (p_dot,)
+    )
+    for linear_solver in ("cholesky", "cg"):
+        x_m, x_m_dot = jax.jvp(
+            lambda q, ls=linear_solver: solved_x(composite, ls, q), (p,), (p_dot,)
+        )
+        assert jnp.allclose(x_m, x_dense, atol=1e-4)
+        assert jnp.allclose(x_m_dot, x_dense_dot, atol=1e-4)
+
+        x_bar = jnp.linspace(-1.0, 1.0, n + k)
+        _, pull_m = jax.vjp(lambda q, ls=linear_solver: solved_x(composite, ls, q), p)
+        _, pull_d = jax.vjp(lambda q: solved_x(dense, "cholesky", q), p)
+        assert jnp.allclose(pull_m(x_bar)[0], pull_d(x_bar)[0], atol=1e-4)
+
+
+def test_metric_from_shifted_matvec_preconditioner_passthrough():
+    # An exact inverse as the inner preconditioner must give the same solve
+    # (pins the M= plumbing into the inner CG).
+    n, shift = 20, 0.5
+    t = jnp.arange(n) * 1.0
+    K = dense_matern_gram(t, 1.3, 0.8, 1.5)
+    K_shifted_inv = jnp.linalg.inv(K + shift * jnp.eye(n))
+    plain = metric_from_shifted_matvec(lambda x: K @ x, shift, tol=1e-6)
+    preconditioned = metric_from_shifted_matvec(
+        lambda x: K @ x, shift, tol=1e-6, preconditioner=lambda v: K_shifted_inv @ v
+    )
+    x = jax.random.normal(jax.random.PRNGKey(27), (n,))
+    assert jnp.allclose(preconditioned.solve(x), plain.solve(x), rtol=1e-4, atol=1e-5)
+
+
+def test_woodbury_preconditioner_matches_dense_inverse():
+    n, k = 12, 2
+    idx = jnp.arange(n)
+    A = 0.6 ** jnp.abs(idx[:, None] - idx[None, :])
+    solve = metric_from_cholesky(jnp.linalg.cholesky(A)).solve
+    U = jax.random.normal(jax.random.PRNGKey(28), (n, k))
+    weights = jnp.array([50.0, 20.0])
+
+    preconditioner = woodbury_preconditioner(solve, U, weights)
+    B = A + U @ jnp.diag(weights) @ U.T
+    v = jax.random.normal(jax.random.PRNGKey(29), (n,))
+    assert jnp.allclose(
+        preconditioner(v, 0.0), jnp.linalg.solve(B, v), rtol=1e-3, atol=1e-3
+    )
+
+    # k=1 reduces exactly to Sherman-Morrison.
+    rank1 = woodbury_preconditioner(solve, U[:, :1], weights[:1])
+    sherman = sherman_morrison_preconditioner(solve, U[:, 0], weights[0])
+    assert jnp.allclose(rank1(v, 0.0), sherman(v, 0.0), rtol=1e-5, atol=1e-6)
+
+    with pytest.raises(ValueError, match="U must"):
+        woodbury_preconditioner(solve, U[:, 0], weights)
+
+
+def test_cg_with_woodbury_spike_preconditioner_matches_cholesky_step():
+    # Unified-eps metric: the scalar block injects the exactly known rank-k
+    # spike (1/eps) J_beta J_beta' into the dual operator; preconditioning
+    # the cg linear_solver with its Woodbury inverse never changes the
+    # subproblem, so the step matches cholesky.
+    n, k, eps = 16, 2, 1e-3
+    t = jnp.arange(n) * 1.0
+    K = dense_matern_gram(t, 1.3, 0.8, 1.5)
+    K_shifted = K + eps * jnp.eye(n)
+    metric = shifted_composite_metric(
+        metric_from_cholesky(jnp.linalg.cholesky(K_shifted)), n, k, eps
+    )
+
+    m = 8
+    J_alpha = jax.random.normal(jax.random.PRNGKey(30), (m, n))
+    J_beta = jax.random.normal(jax.random.PRNGKey(31), (m, k))
+    A = jnp.concatenate([J_alpha, J_beta], axis=1)
+    b = jax.random.normal(jax.random.PRNGKey(32), (m,))
+
+    def residual(theta, _, p):
+        return A @ theta - b
+
+    # Base = the kernel part of the dual operator, spike = the scalar block.
+    base = J_alpha @ jnp.linalg.solve(K_shifted, J_alpha.T)
+    base_solve = metric_from_cholesky(jnp.linalg.cholesky(base)).solve
+    dual_preconditioner = woodbury_preconditioner(
+        base_solve, J_beta, (1.0 / eps) * jnp.ones(k)
+    )
+
+    common = dict(init_damping=1e-2, geodesic_acceleration=False, metric=metric)
+    cg_solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        linear_solver="cg",
+        iterative_tol=1e-8,
+        iterative_maxiter=200,
+        dual_preconditioner=dual_preconditioner,
+        **common,
+    )
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(
+        residual, linear_solver="cholesky", **common
+    )
+
+    x0 = jnp.zeros(n + k)
+    x_cg, _, info_cg = cg_solver.update(x0, cg_solver.init(x0, None))
+    x_ch, _, info_ch = cholesky_solver.update(x0, cholesky_solver.init(x0, None))
+    assert bool(info_cg.accepted) and bool(info_ch.accepted)
+    assert jnp.allclose(x_cg, x_ch, rtol=1e-3, atol=1e-4)

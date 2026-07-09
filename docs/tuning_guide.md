@@ -135,6 +135,29 @@ For kernel parameterizations use `M = K` (coefficients) or `M = K^{-1}`
 If results look right but derivatives look wrong, check the metric before
 anything else.
 
+For kernel blocks plus free scalar parameters, the unified shifted metric
+`blockdiag(K, 0) + eps*I` (see
+[Utilities](utilities.md#unified-shifted-block-metrics)) replaces the
+two-knob `blockdiag(K + jitter*I, m_0*I)` form with one dial. Choosing
+`eps`: the selected solution and its implicit derivative are biased O(eps)
+away from the pure seminorm limit, while the metric inverse is bounded by
+1/eps and the scalar-block dual spike carries weight c²/eps — so smaller
+`eps` buys selection accuracy at the price of a harder dual solve (use the
+Sherman-Morrison/Woodbury spike preconditioner — measured 3.7-4.8x per cg
+step at n=1e3-1e4 with a matrix-free kernel block) and, for the
+matrix-free representation, a harder inner solve. In practice the inner CG cost is
+dominated by the smooth-kernel spectrum, not the worst-case bound: the
+shift clusters the spectral tail, and measured float64 iteration counts
+(~32 at n=1000 for Matérn-5/2) are flat in `eps` from 1e-2 to 1e-8. Two
+budget notes for `linear_solver="cg"` with a matrix-free metric: total
+kernel matvecs = outer CG iterations x inner CG iterations, so the inner
+tolerance is the dominant cost knob; and large LM damping hides metric
+conditioning (the dual operator is G + lambda*I), so problems can look
+easy early and harden near convergence. In float32 the inner CG's
+attainable residual (~machine_eps x cond) can sit ABOVE the default
+tolerance for small `eps` — the solve then silently burns its full
+iteration budget; use float64 or a larger `eps`.
+
 For Matérn value Grams on sorted 1-D points, pick the constructor by
 structure, not habit:
 

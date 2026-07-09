@@ -12,9 +12,11 @@ callables or `Metric` objects; nothing is required — the solver only sees the
 | `metric_from_tridiagonal_precision(diag, off_diag)` | `Metric` from a tridiagonal \(T = M^{-1}\) | \(O(n)\) |
 | `metric_from_state_space(points, h, Pinf, transition)` | `Metric` for a stationary state-space kernel Gram \(M = K + \eta I\) (Matérn via `matern_state_space`) | \(O(n m^2)\) |
 | `metric_from_quasiseparable(d, p, q, A)` | `Metric` from quasiseparable generators | \(O(n m^2)\) |
+| `metric_from_shifted_matvec(matvec, shift)` | matrix-free `Metric` for \(M = A + \varepsilon I\) via inner CG | \(O(\text{iters} \times \text{matvec})\) |
 | `metric_from_diagonal(weights)` | `Metric` from \(M = \operatorname{diag}(w)\) | \(O(n)\) |
 | `blockdiag_metric(blocks)` | `Metric` over concatenated parameter blocks | sum of blocks |
 | `sherman_morrison_preconditioner(solve, u, weight)` | `dual_preconditioner` for \(B = A + w\,uu^\top\) | one `solve` |
+| `woodbury_preconditioner(solve, U, weights)` | `dual_preconditioner` for \(B = A + U\operatorname{diag}(w)U^\top\) | one `solve` + \(k \times k\) |
 
 ## Tridiagonal Precision Metric
 
@@ -118,6 +120,55 @@ metrics reused across solves, but on the hot path when the metric is
 rebuilt from traced \(\sigma, \ell\) inside `jax.grad`/`vmap` sweeps; see
 the [Tuning Guide](tuning_guide.md).
 
+## Unified Shifted Block Metrics
+
+For a kernel-coefficient block \(\alpha\) plus scalar parameters \(\beta\),
+the unified shifted metric \(M = \operatorname{blockdiag}(K, 0) +
+\varepsilon I = \operatorname{blockdiag}(K + \varepsilon I_n,
+\varepsilon I_k)\) completes the RKHS seminorm \(\alpha^\top K \alpha\)
+with a single spectral floor — the theory (spectrum, the
+\(\varepsilon \to 0\) seminorm limit and its uniqueness conditions) is in
+[Metric Gauss-Newton](gauss_newton.md#shifted-metrics-and-the-seminorm-limit).
+It composes from existing constructors; the kernel block has three
+interchangeable representations:
+
+```python
+scalar_block = metric_from_diagonal(eps * jnp.ones(k))
+metric = blockdiag_metric([(kernel_block, n), (scalar_block, k)])
+# kernel_block, by representation of K:
+#   metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n)))   # dense
+#   metric_from_state_space(t, *matern_state_space(sigma, ell, nu), nugget=eps)
+#   metric_from_shifted_matvec(kernel_matvec, eps)      # matvec only; cholesky/cg
+```
+
+One structural note: the Matérn-1/2 tridiagonal shortcut does not survive
+the shift — `metric_from_tridiagonal_precision` parameterizes
+\(T = M^{-1}\), and \((K + \varepsilon I)^{-1}\) is **not** tridiagonal —
+so a shifted OU metric goes through
+`metric_from_state_space(..., nu=0.5, nugget=eps)` instead.
+
+`metric_from_shifted_matvec(matvec, shift, *, tol=None, atol=0.0,
+maxiter=None, preconditioner=None)` needs only a matvec of a symmetric PSD
+\(A\), accepting `(n,)` and `(n, k)` leading-axis inputs (the same shape
+contract `Metric.solve` carries). The positive `shift` is what makes an
+iterative metric solve viable: \(\kappa(A + \varepsilon I) \le
+(\lambda_{\max} + \varepsilon)/\varepsilon\) regardless of how singular
+\(A\) is — and in practice far better, since the shift *clusters* the
+spectral tail at \(\approx \varepsilon\) and CG resolves a cluster in
+about one iteration (measured: ~32 float64 iterations for a Matérn-5/2
+Gram at n=1000, independent of \(\varepsilon\) from 1e-2 to 1e-8). It
+provides `solve` and `norm` only (no matrix-free square root), so it works
+with the `cholesky` and `cg` linear solvers and is rejected for
+`qr`/`lsmr` at construction. This is the one constructor that meets the
+`metric.solve` exactness contract in a limit rather than identically: its
+inner CG tolerance is part of the answer, not of the schedule — the
+residual error perturbs the selected solution and the implicit derivatives
+at order `tol`, and the implicit derivative has no accept/reject
+safeguard. The default tolerance (square root of the dtype's machine
+epsilon) matches typical outer tolerances; never cap `maxiter` as a cost
+control (a truncated CG is not a linear map, which breaks the `cg`
+linear_solver's operator assumptions).
+
 ## Diagonal and Block-Diagonal Metrics
 
 Models with a kernel block plus a few scalar parameters can compose
@@ -170,7 +221,14 @@ dual_preconditioner = sherman_morrison_preconditioner(
 
 builds \(B^{-1}\) for \(B = K + (c^2/m_0)\,\mathbf{1}\mathbf{1}^\top\) from
 one kernel solve plus a rank-1 correction (\(B\), not \(P\): the docs reserve
-\(P\) for \(M^{-1}\)). Such structural preconditioners
+\(P\) for \(M^{-1}\)). Under the unified shifted metric the scalar-block
+weight is \(\varepsilon\), so the spike weight is \(c^2/\varepsilon\) — it
+grows as \(\varepsilon\) shrinks, making the preconditioner more
+load-bearing, not less. For \(k\) scalar parameters at once,
+`woodbury_preconditioner(solve, U, weights)` is the rank-\(k\)
+generalization (\(B = A + U\operatorname{diag}(w)U^\top\), one matrix
+solve plus a \(k \times k\) Cholesky, reducing exactly to Sherman-Morrison
+at \(k = 1\)). Such structural preconditioners
 can be spectrally equivalent to the dual operator uniformly in \(n\),
 keeping the inner CG budget constant where the unpreconditioned budget grows
 with refinement — see the [Tuning Guide](tuning_guide.md).
@@ -185,8 +243,12 @@ with refinement — see the [Tuning Guide](tuning_guide.md).
 
 ::: nlls_gram.metric_from_quasiseparable
 
+::: nlls_gram.metric_from_shifted_matvec
+
 ::: nlls_gram.metric_from_diagonal
 
 ::: nlls_gram.blockdiag_metric
 
 ::: nlls_gram.sherman_morrison_preconditioner
+
+::: nlls_gram.woodbury_preconditioner
