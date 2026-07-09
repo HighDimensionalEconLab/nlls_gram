@@ -12,7 +12,7 @@ callables or `Metric` objects; nothing is required — the solver only sees the
 | `metric_from_tridiagonal_precision(diag, off_diag)` | `Metric` from a tridiagonal \(T = M^{-1}\) | \(O(n)\) |
 | `metric_from_diagonal(weights)` | `Metric` from \(M = \operatorname{diag}(w)\) | \(O(n)\) |
 | `blockdiag_metric(blocks)` | `Metric` over concatenated parameter blocks | sum of blocks |
-| `sherman_morrison_preconditioner(solve, u, weight)` | `dual_preconditioner` for \(P = A + w\,uu^\top\) | one `solve` |
+| `sherman_morrison_preconditioner(solve, u, weight)` | `dual_preconditioner` for \(B = A + w\,uu^\top\) | one `solve` |
 
 ## Tridiagonal Precision Metric
 
@@ -82,8 +82,9 @@ dual_preconditioner = sherman_morrison_preconditioner(
 )
 ```
 
-builds \(P^{-1}\) for \(P = K + (c^2/m_0)\,\mathbf{1}\mathbf{1}^\top\) from
-one kernel solve plus a rank-1 correction. Such structural preconditioners
+builds \(B^{-1}\) for \(B = K + (c^2/m_0)\,\mathbf{1}\mathbf{1}^\top\) from
+one kernel solve plus a rank-1 correction (\(B\), not \(P\): the docs reserve
+\(P\) for \(M^{-1}\)). Such structural preconditioners
 can be spectrally equivalent to the dual operator uniformly in \(n\),
 keeping the inner CG budget constant where the unpreconditioned budget grows
 with refinement — see the [Tuning Guide](tuning_guide.md).

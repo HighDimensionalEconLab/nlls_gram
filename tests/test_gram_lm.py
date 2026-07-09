@@ -2593,3 +2593,51 @@ def test_structural_metrics_match_dense_metric_in_solver(linear_solver):
     assert jnp.allclose(A @ x_tri, jnp.array([p, 0.5 * p]), atol=1e-4)
     assert jnp.allclose(x_tri, x_dense, atol=1e-4)
     assert jnp.allclose(x_tri_dot, x_dense_dot, atol=1e-4)
+
+    x_bar = jnp.linspace(-1.0, 1.0, n)
+    _, tri_pullback = jax.vjp(lambda q: solved_x(tridiagonal, q), p)
+    _, dense_pullback = jax.vjp(lambda q: solved_x(dense, q), p)
+    assert jnp.allclose(tri_pullback(x_bar)[0], dense_pullback(x_bar)[0], atol=1e-4)
+
+
+def test_blockdiag_metric_implicit_ad_matches_dense_metric():
+    # A blockdiag composite (dense kernel block + diagonal scalar block)
+    # drives solve() and its implicit JVP/VJP to the same answers as the
+    # equivalent single dense metric.
+    idx = jnp.arange(3)
+    K = 0.6 ** jnp.abs(idx[:, None] - idx[None, :])
+    weights = jnp.array([4.0, 0.25])
+    composite = blockdiag_metric(
+        [
+            (metric_from_cholesky(jnp.linalg.cholesky(K)), 3),
+            (metric_from_diagonal(weights), 2),
+        ]
+    )
+    M = jnp.block(
+        [
+            [K, jnp.zeros((3, 2))],
+            [jnp.zeros((2, 3)), jnp.diag(weights)],
+        ]
+    )
+    dense = metric_from_cholesky(jnp.linalg.cholesky(M))
+    A = jnp.stack([jnp.ones(5), jnp.arange(5, dtype=jnp.float32)])
+
+    def residual(theta, _, p):
+        return A @ theta - jnp.array([p, 0.5 * p])
+
+    def solved_x(metric, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual, init_damping=1e-2, metric=metric
+        )
+        return solver.solve(jnp.zeros(5), p=p, max_steps=60, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
+    x_block, x_block_dot = jax.jvp(lambda q: solved_x(composite, q), (p,), (p_dot,))
+    x_dense, x_dense_dot = jax.jvp(lambda q: solved_x(dense, q), (p,), (p_dot,))
+    assert jnp.allclose(x_block, x_dense, atol=1e-4)
+    assert jnp.allclose(x_block_dot, x_dense_dot, atol=1e-4)
+
+    x_bar = jnp.linspace(-1.0, 1.0, 5)
+    _, block_pullback = jax.vjp(lambda q: solved_x(composite, q), p)
+    _, dense_pullback = jax.vjp(lambda q: solved_x(dense, q), p)
+    assert jnp.allclose(block_pullback(x_bar)[0], dense_pullback(x_bar)[0], atol=1e-4)

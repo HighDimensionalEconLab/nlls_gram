@@ -3,15 +3,15 @@
 A ``dual_preconditioner(v, damping)`` callback supplies an approximation of
 ``(J M^{-1} J' + damping I)^{-1} v`` on residual-space vectors. Unlike
 ``metric.solve`` -- which defines the converged root and must stay exact -- a
-preconditioner only changes the inner CG iteration count, so approximations
+preconditioner never changes the subproblem being solved, so approximations
 are safe.
 """
 
 
 def sherman_morrison_preconditioner(solve, u, weight):
-    """Preconditioner for ``P = A + weight * u u'`` from a solve with ``A``.
+    """Preconditioner for ``B = A + weight * u u'`` from a solve with ``A``.
 
-    Applies ``P^{-1} v = y - A^{-1}u (u' y) / (1/weight + u' A^{-1} u)`` with
+    Applies ``B^{-1} v = y - A^{-1}u (u' y) / (1/weight + u' A^{-1} u)`` with
     ``y = A^{-1} v`` by the Sherman-Morrison identity; ``A^{-1} u`` and the
     scalar denominator are precomputed. This is the natural shape for
     kernel-collocation dual operators, where a metric weight ``m`` on a scalar

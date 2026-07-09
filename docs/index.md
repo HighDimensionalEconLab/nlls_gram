@@ -174,7 +174,8 @@ solved: at inner convergence the step is identical, and a budget-truncated
 step still lies in \(\operatorname{range}(P J^\top)\), preserving the
 minimum-metric-norm structure — so approximations are safe. See
 [Utilities](utilities.md) for a structural rank-1 constructor. Like `metric`,
-it is static configuration: it cannot be swapped mid-`solve` by a callback.
+it is static configuration: it is not carried in `LMState` and no callback
+action can replace it — construct a new solver to change it.
 
 ### QR
 
