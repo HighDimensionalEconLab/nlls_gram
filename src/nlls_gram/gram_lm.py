@@ -972,13 +972,18 @@ class UnderdeterminedLevenbergMarquardt:
         # it. An iterative metric solve (e.g. metric_from_shifted_matvec)
         # is not transposable by JAX -- its CG captures tol*|b| inside the
         # linear solve's parameters -- but P is self-adjoint by contract,
-        # so linear_call declares the application as its own transpose and
-        # the cotangent pass just EVALUATES metric.solve.
-        def metric_inverse_apply(_, v):
-            return self._metric_inverse(v)
-
-        theta_dot = -jax.custom_derivatives.linear_call(
-            metric_inverse_apply, metric_inverse_apply, (), JT(dual_solution)
+        # so declare the application as its own transpose: every rule of
+        # this custom_linear_solve routes through `solve` (the identity
+        # matvec contributes nothing), and with symmetric=True the
+        # cotangent pass just EVALUATES metric.solve. custom_linear_solve
+        # is used rather than jax.custom_derivatives.linear_call because
+        # linear_call has no batching rule, which would break jax.vmap
+        # (and vmap-based second derivatives) over differentiated solves.
+        theta_dot = -jax.lax.custom_linear_solve(
+            lambda v: v,
+            JT(dual_solution),
+            lambda _, rhs: self._metric_inverse(rhs),
+            symmetric=True,
         )
         return unravel(theta_dot)
 

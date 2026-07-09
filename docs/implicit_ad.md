@@ -135,12 +135,18 @@ positive definite; the metric inverse \(P\) must be linear, self-adjoint, and
 positive definite in parameter space, and any `implicit_preconditioner` must be
 linear, self-adjoint, and positive definite for the residual-space operator.
 Rank-deficient implicit systems are intentionally not damped here, because
-damping would change the minimum-\(M\)-norm derivative.
+damping would change the minimum-\(M\)-norm derivative. The two rules fail
+with different visibility on a singular system: the dense rule and the cg
+rule's run-to-tolerance default both produce non-finite derivatives (loud),
+but a small bounded `implicit_maxiter` returns a finite — and wrong —
+derivative with no diagnostic. Reserve the bounded-budget mode for exact
+preconditioners.
 
 Self-adjointness of \(P\) is all the rule needs from `metric.solve`: the
 final \(P J_\theta^\top y\) application acts on tangent data, and its
 transpose in the VJP is declared to be \(P\) itself
-(`jax.custom_derivatives.linear_call`), so `metric.solve` is only ever
+(a symmetric `jax.lax.custom_linear_solve`, which also batches under
+`jax.vmap`), so `metric.solve` is only ever
 *evaluated*, never transposed. That is what lets an iterative metric solve —
 [`metric_from_shifted_matvec`](utilities.md#unified-shifted-block-metrics),
 or any hand-written CG-based `Metric.solve` — participate in both JVP and
@@ -150,6 +156,10 @@ Accuracy is controlled separately from the forward iterative solve:
 
 - `implicit_tol=None` uses a dtype-aware default (`1e-6` in float32, `1e-10`
   in float64), chosen for derivative accuracy rather than forward-step speed.
+  The same attainable-floor bound as any CG applies: the residual stagnates
+  near `machine_eps` times the dual operator's condition number, so at small
+  `eps` (spike weight \(c^2/\varepsilon\)) the float64 default is reachable
+  only with the spike preconditioner below.
 - `implicit_atol=0.0` and `implicit_maxiter=None` are passed to JAX CG.
   `None` leaves the iteration budget to JAX's CG policy.
 - `implicit_preconditioner(v)` is an optional preconditioner for the undamped

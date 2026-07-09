@@ -3894,3 +3894,109 @@ def test_implicit_cg_woodbury_preconditioner_with_shifted_metric():
         (p_dot,),
     )
     assert jnp.allclose(spike_dot, dense_dot, rtol=1e-3, atol=1e-4)
+
+
+def test_implicit_cg_vmap_and_hessian_match_dense():
+    # jax.vmap over differentiated solves and vmap-based second derivatives
+    # (jax.hessian) must compose with the cg implicit rule -- the
+    # self-adjoint metric-inverse declaration is built on
+    # custom_linear_solve, which has a batching rule (linear_call does not).
+    n, k, eps = 8, 2, 1e-2
+    t = jnp.arange(n) * 1.0
+    K = dense_matern_gram(t, 1.3, 0.8, 2.5)
+    composite = shifted_composite_metric(
+        metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-8), n, k, eps
+    )
+    M = jnp.block(
+        [
+            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
+            [jnp.zeros((k, n)), eps * jnp.eye(k)],
+        ]
+    )
+    dense = metric_from_cholesky(jnp.linalg.cholesky(M))
+
+    A = jax.random.normal(jax.random.PRNGKey(36), (3, n + k))
+
+    def residual(theta, _, p):
+        return A @ theta - jnp.array([p, 0.5 * p, -p])
+
+    def solved_x(metric, implicit_solver, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            init_damping=1e-2,
+            linear_solver="cg",
+            implicit_solver=implicit_solver,
+            implicit_tol=1e-8,
+            metric=metric,
+            iterative_tol=1e-8,
+            iterative_maxiter=300,
+        )
+        return solver.solve(jnp.zeros(n + k), p=p, max_steps=60, atol=1e-6).x
+
+    ps = jnp.array([1.0, 2.0, 3.0])
+    one = jnp.asarray(1.0)
+    _, dots_cg = jax.vmap(
+        lambda q: jax.jvp(lambda r: solved_x(composite, "cg", r), (q,), (one,))
+    )(ps)
+    _, dots_dense = jax.vmap(
+        lambda q: jax.jvp(lambda r: solved_x(dense, "cholesky", r), (q,), (one,))
+    )(ps)
+    assert jnp.allclose(dots_cg, dots_dense, atol=1e-4)
+
+    def loss_cg(q):
+        return jnp.sum(solved_x(composite, "cg", q) ** 2)
+
+    def loss_dense(q):
+        return jnp.sum(solved_x(dense, "cholesky", q) ** 2)
+
+    assert jnp.allclose(
+        jax.vmap(jax.grad(loss_cg))(ps), jax.vmap(jax.grad(loss_dense))(ps), atol=1e-3
+    )
+    assert jnp.allclose(
+        jax.hessian(loss_cg)(jnp.asarray(2.0)),
+        jax.hessian(loss_dense)(jnp.asarray(2.0)),
+        rtol=1e-3,
+    )
+
+
+def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
+    # J P J' singular with an inconsistent tangent right-hand side: the
+    # dense rule NaNs through cho_solve, and the cg rule's run-to-tolerance
+    # default diverges to non-finite as well. Only a small bounded
+    # implicit_maxiter (the exact-preconditioner budget mode) returns a
+    # finite -- and wrong -- derivative, which is why that mode is reserved
+    # for exact preconditioners.
+    A = jnp.array(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0, 0.0, 0.0],
+        ]
+    )
+
+    def residual(theta, _, p):
+        return A @ theta - p
+
+    def x_dot(implicit_solver, implicit_maxiter):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            init_damping=1e-2,
+            linear_solver="cg",
+            implicit_solver=implicit_solver,
+            implicit_tol=1e-8,
+            implicit_maxiter=implicit_maxiter,
+            iterative_tol=1e-8,
+            iterative_maxiter=100,
+            geodesic_acceleration=False,
+        )
+
+        def solved_x(p):
+            return solver.solve(jnp.zeros(5), p=p, max_steps=40, atol=1e-5).x
+
+        p0 = jnp.array([1.0, 2.0, 3.0])
+        p_dot = jnp.array([1.0, 0.0, 0.0])
+        return jax.jvp(solved_x, (p0,), (p_dot,))[1]
+
+    assert not bool(jnp.all(jnp.isfinite(x_dot("cholesky", None))))
+    assert not bool(jnp.all(jnp.isfinite(x_dot("cg", None))))
+    assert bool(jnp.all(jnp.isfinite(x_dot("cg", 1))))
