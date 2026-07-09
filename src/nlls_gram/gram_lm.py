@@ -198,6 +198,13 @@ class UnderdeterminedLevenbergMarquardt:
     lies in ``range(P J')``, so the minimum-metric-norm selection for
     underdetermined residuals is unchanged — the preconditioner may be
     approximate even though ``metric.solve`` must stay exact.
+
+    ``solve(...).x`` has a custom implicit AD rule with respect to ``p``. By
+    default, ``implicit_solver="auto"`` uses a fully matrix-free CG implicit
+    solve when the forward solver is ``linear_solver="cg"``, and otherwise uses
+    the legacy dense Cholesky solve. Pass ``implicit_solver="cholesky"`` to
+    force the dense implicit rule, or ``implicit_solver="cg"`` to force the
+    matrix-free rule.
     """
 
     def __init__(
@@ -214,6 +221,11 @@ class UnderdeterminedLevenbergMarquardt:
         iterative_maxiter=8,
         lsmr_conlim=float("inf"),
         dual_preconditioner=None,
+        implicit_solver="auto",
+        implicit_tol=None,
+        implicit_atol=0.0,
+        implicit_maxiter=None,
+        implicit_preconditioner=None,
         metric=None,
         has_aux=False,
         cache_jacobian=True,
@@ -280,6 +292,29 @@ class UnderdeterminedLevenbergMarquardt:
             raise ValueError("lsmr_conlim must be positive")
         if dual_preconditioner is not None and linear_solver != "cg":
             raise ValueError('dual_preconditioner requires linear_solver="cg"')
+        if implicit_solver not in ("auto", "cholesky", "cg"):
+            raise ValueError(f"unknown implicit_solver: {implicit_solver}")
+        if implicit_tol is not None and implicit_tol < 0:
+            raise ValueError("implicit_tol must be nonnegative or None")
+        if implicit_atol < 0:
+            raise ValueError("implicit_atol must be nonnegative")
+        if implicit_maxiter is not None and implicit_maxiter <= 0:
+            raise ValueError("implicit_maxiter must be positive or None")
+        if implicit_tol == 0 and implicit_atol == 0 and implicit_maxiter is None:
+            raise ValueError(
+                "implicit_maxiter must be set when both implicit tolerances are zero"
+            )
+        resolved_implicit_solver = (
+            "cg"
+            if implicit_solver == "cg"
+            or (implicit_solver == "auto" and linear_solver == "cg")
+            else "cholesky"
+        )
+        if implicit_preconditioner is not None and resolved_implicit_solver != "cg":
+            raise ValueError(
+                'implicit_preconditioner requires implicit_solver="cg" '
+                'or implicit_solver="auto" with linear_solver="cg"'
+            )
         if metric is None:
             metric = Metric()
         has_custom_metric = any(
@@ -321,6 +356,12 @@ class UnderdeterminedLevenbergMarquardt:
         self.iterative_maxiter = iterative_maxiter
         self.lsmr_conlim = lsmr_conlim
         self.dual_preconditioner = dual_preconditioner
+        self.implicit_solver = implicit_solver
+        self.implicit_tol = implicit_tol
+        self.implicit_atol = implicit_atol
+        self.implicit_maxiter = implicit_maxiter
+        self.implicit_preconditioner = implicit_preconditioner
+        self._resolved_implicit_solver = resolved_implicit_solver
         self.metric = metric
         # Only the dense cholesky path materializes J', so the flag is inert
         # for the other solvers.
@@ -855,7 +896,11 @@ class UnderdeterminedLevenbergMarquardt:
     def _implicit_x_tangent_from_p(self, x, args, p, p_dot):
         if p is None:
             return jax.tree.map(_zero_tangent_leaf, x)
+        if self._resolved_implicit_solver == "cg":
+            return self._implicit_x_tangent_from_p_cg(x, args, p, p_dot)
+        return self._implicit_x_tangent_from_p_cholesky(x, args, p, p_dot)
 
+    def _implicit_x_tangent_from_p_cholesky(self, x, args, p, p_dot):
         theta, unravel = ravel_pytree(x)
 
         def residual_from_theta(theta_value):
@@ -875,6 +920,61 @@ class UnderdeterminedLevenbergMarquardt:
         factor = jsp_linalg.cho_factor(gram)
         theta_dot = -gram_step_left @ jsp_linalg.cho_solve(factor, residual_p_dot)
         return unravel(theta_dot)
+
+    def _implicit_x_tangent_from_p_cg(self, x, args, p, p_dot):
+        theta, unravel = ravel_pytree(x)
+
+        def residual_from_theta(theta_value):
+            return self._residual_and_aux(unravel(theta_value), args, p)[0]
+
+        residual, theta_jvp = jax.linearize(residual_from_theta, theta)
+        theta_transpose = jax.linear_transpose(theta_jvp, theta)
+
+        def JT(cotangent):
+            return theta_transpose(cotangent)[0]
+
+        def gram_matvec(cotangent):
+            return theta_jvp(self._metric_inverse(JT(cotangent)))
+
+        def residual_from_p(p_value):
+            return self._residual_and_aux(x, args, p_value)[0]
+
+        residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
+        cg_tol = self._implicit_cg_tol(residual.dtype)
+        cg_atol = jnp.asarray(self.implicit_atol, dtype=residual.dtype)
+
+        if self.implicit_preconditioner is None:
+            cg_preconditioner = None
+        else:
+
+            def cg_preconditioner(cotangent):
+                return self.implicit_preconditioner(cotangent)
+
+        def solve(matvec, rhs):
+            solution, _ = jsp_sparse_linalg.cg(
+                matvec,
+                rhs,
+                tol=cg_tol,
+                atol=cg_atol,
+                maxiter=self.implicit_maxiter,
+                M=cg_preconditioner,
+            )
+            return solution
+
+        dual_solution = jax.lax.custom_linear_solve(
+            gram_matvec,
+            residual_p_dot,
+            solve,
+            symmetric=True,
+        )
+        theta_dot = -self._metric_inverse(JT(dual_solution))
+        return unravel(theta_dot)
+
+    def _implicit_cg_tol(self, dtype):
+        if self.implicit_tol is not None:
+            return jnp.asarray(self.implicit_tol, dtype=dtype)
+        default_tol = 1e-10 if jnp.finfo(dtype).bits > 32 else 1e-6
+        return jnp.asarray(default_tol, dtype=dtype)
 
     def _metric_inverse(self, x):
         if self._has_metric_solve:

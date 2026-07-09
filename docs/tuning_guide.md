@@ -46,7 +46,9 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   reach for it only when that is the binding constraint.
 - `cg` returns an *approximate* step under its iteration budget. That is
   usually fine — LM's accept/reject absorbs inexactness — but see the
-  scheduling pattern below.
+  scheduling pattern below. With the default `implicit_solver="auto"`,
+  differentiating a forward CG `solve(...).x` also uses matrix-free CG instead
+  of materializing \(J^\top\).
 - `cholesky`/`cg` square the condition number (they factor `J P J'`). If the
   Gram system is ill-conditioned or implicit derivatives must be accurate,
   **enable `jax_enable_x64` first** — it fixes more numerical trouble than
@@ -84,6 +86,14 @@ exactly then). Three patterns, in order of preference:
    warm-started with `result.x` and `result.lm_state`. The implicit
    derivative is unaffected (it is defined at the returned solution only).
 
+Forward iterative tolerances and implicit AD tolerances are separate. The
+implicit CG rule uses `implicit_tol=None` by default, which means `1e-6` in
+float32 and `1e-10` in float64; these defaults target derivative accuracy, not
+cheap forward steps. Use `implicit_solver="cholesky"` when you want the old
+dense implicit rule, or tune `implicit_tol`, `implicit_atol`,
+`implicit_maxiter`, and `implicit_preconditioner(v)` for a matrix-free
+derivative.
+
 Before scheduling accuracy, check whether a structural `dual_preconditioner`
 removes the problem: when the dual operator's conditioning grows with problem
 size (metric solves inject \(M^{-1}\) into it), a spectrally equivalent
@@ -98,8 +108,10 @@ with refinement. See [Utilities](utilities.md#shermanmorrison-dual-preconditione
   array-valued `LMHyperparams` fields (same dtype; a knob compiled out as
   `None` cannot be switched on), and the *values* of `x0`/`args`/`p`.
 - **Recompiles per value (static):** `linear_solver`,
+  `implicit_solver`, the `implicit_*` accuracy knobs,
   `geodesic_acceleration`, `cache_jacobian`, `has_aux`, the `Metric`
-  callbacks, the callback function identity, and the solver instance itself.
+  callbacks, `implicit_preconditioner`, the callback function identity, and
+  the solver instance itself.
   Construct solvers once at setup scope; an inline `lambda` callback at the
   call site recompiles every solve.
 
