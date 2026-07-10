@@ -59,7 +59,18 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   dual answer to ~1e-6 on a 1e-7-spike metric where plain float32 is ~5%
   wrong. Enabling `jax_enable_x64` globally remains the full fix when the
   model itself needs it (and is still required — it is what makes float64
-  arrays available; explicitly float32 data stays float32).
+  arrays available; explicitly float32 data stays float32). Choosing
+  between the grades: the flag's win is proportional to how much of the
+  step is model evaluation (residual + the m VJP Jacobian passes, which
+  stay float32) versus dual algebra (the promoted n·m² assembly); when the
+  dual algebra IS the step — trivial residuals, dense-metric-dominated
+  updates — the flag costs about the same wall time as full x64 and its
+  remaining win is halved model memory and the unchanged float32 contract.
+  One cost surprise to know about: with an iterative metric
+  (`metric_from_shifted_matvec`) the flag runs the metric's inner CG in
+  float64 at the tighter float64 default tolerance. The flag does not touch
+  the CG solver paths — there the remedies remain preconditioning and,
+  when the attainable-residual floor binds, full x64.
 
 ## Damping
 
