@@ -8,6 +8,6 @@
 - [Main docs — API contracts, math, linear solvers, performance notes](https://highdimensionaleconlab.github.io/nlls_gram/)
 - [Callbacks and cookbook — solve-loop callback contract, resettable hyperparameters, recipes](https://highdimensionaleconlab.github.io/nlls_gram/callbacks/)
 - [Metrics — Metric callback contract, cholesky helper, dense and matrix-free examples](https://highdimensionaleconlab.github.io/nlls_gram/metrics/)
-- [Utilities — tridiagonal/state-space-Matérn/shifted-matvec/diagonal/block-diagonal metric constructors, Sherman-Morrison and Woodbury dual preconditioners](https://highdimensionaleconlab.github.io/nlls_gram/utilities/)
+- [Utilities — tridiagonal/state-space-Matérn/shifted-matvec/diagonal/block-diagonal metric constructors; Sherman-Morrison, Woodbury, identity, and randomized Nyström (FTU) preconditioners for the required CG dual/implicit hooks](https://highdimensionaleconlab.github.io/nlls_gram/utilities/)
 - [Implicit differentiation — JVP/VJP with respect to p, minimum-norm tangents, aux outputs](https://highdimensionaleconlab.github.io/nlls_gram/implicit_ad/)
 - [Metric Gauss-Newton — minimum-norm math and kernel metric choices](https://highdimensionaleconlab.github.io/nlls_gram/gauss_newton/)

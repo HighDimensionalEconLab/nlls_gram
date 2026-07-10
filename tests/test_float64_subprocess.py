@@ -10,7 +10,11 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from flax import nnx
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt, identity_preconditioner
+from nlls_gram import (
+    UnderdeterminedLevenbergMarquardt,
+    identity_preconditioner,
+    nystrom_preconditioner,
+)
 
 
 def assert_float64_tree(tree):
@@ -153,6 +157,62 @@ assert info.damping_factor.dtype == jnp.float64
 assert info.acceleration_ratio.dtype == jnp.float64
 assert info.grad_norm.dtype == jnp.float64
 assert info.step_norm.dtype == jnp.float64
+jaxpr = str(
+    jax.make_jaxpr(lambda p, s: solver.update(p, s, (matrix, target)))(theta, lm_state)
+)
+assert "f32" not in jaxpr, jaxpr
+
+
+# Nystrom build + apply traced end to end: the sketch, Cholesky, and SVD must
+# all stay float64.
+n_dual = 6
+G_psd = jax.random.normal(jax.random.PRNGKey(0), (n_dual, n_dual), dtype=jnp.float64)
+A_psd = G_psd @ G_psd.T + jnp.eye(n_dual)
+
+
+def build_and_apply(A, v):
+    preconditioner = nystrom_preconditioner(
+        lambda X: A @ X, n_dual, n_dual, jax.random.PRNGKey(1)
+    )
+    return preconditioner(v, jnp.asarray(1e-3, v.dtype))
+
+
+v_dual = jnp.ones(n_dual, dtype=jnp.float64)
+assert build_and_apply(A_psd, v_dual).dtype == jnp.float64
+jaxpr = str(jax.make_jaxpr(build_and_apply)(A_psd, v_dual))
+assert "f32" not in jaxpr, jaxpr
+
+# An explicit float32 dtype stays float32 even with x64 enabled.
+pre32 = nystrom_preconditioner(
+    lambda X: A_psd.astype(jnp.float32) @ X,
+    n_dual,
+    3,
+    jax.random.PRNGKey(2),
+    dtype=jnp.float32,
+)
+assert pre32(jnp.ones(n_dual, jnp.float32), jnp.float32(0.5)).dtype == jnp.float32
+
+# A cg solver whose dual preconditioner is a (float64) Nystrom sketch of
+# J J' keeps the whole update float64.
+solver = UnderdeterminedLevenbergMarquardt(
+    linear_residual,
+    init_damping=1e-2,
+    linear_solver="cg",
+    iterative_tol=1e-10,
+    iterative_maxiter=20,
+    dual_preconditioner=nystrom_preconditioner(
+        lambda V: matrix @ (matrix.T @ V),
+        matrix.shape[0],
+        matrix.shape[0],
+        jax.random.PRNGKey(3),
+    ),
+    implicit_preconditioner=identity_preconditioner(),
+)
+lm_state = solver.init(theta, (matrix, target))
+theta_nystrom, lm_state, info = solver.update(theta, lm_state, (matrix, target))
+
+assert theta_nystrom.dtype == jnp.float64
+assert info.loss.dtype == jnp.float64
 jaxpr = str(
     jax.make_jaxpr(lambda p, s: solver.update(p, s, (matrix, target)))(theta, lm_state)
 )

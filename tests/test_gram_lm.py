@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 import pytest
+from jax.flatten_util import ravel_pytree
 
 from nlls_gram import (
     LMSolveAction,
@@ -20,6 +21,7 @@ from nlls_gram import (
     metric_from_shifted_matvec,
     metric_from_state_space,
     metric_from_tridiagonal_precision,
+    nystrom_preconditioner,
     sherman_morrison_preconditioner,
     woodbury_preconditioner,
 )
@@ -3739,6 +3741,218 @@ def test_cg_with_woodbury_spike_preconditioner_matches_cholesky_step():
     # attainable-residual floor, so the two paths agree only to ~1e-3 and
     # the exact gap varies across BLAS/SIMD variants.
     assert jnp.allclose(x_cg, x_ch, rtol=1e-2, atol=1e-3)
+
+
+def test_nystrom_preconditioner_full_rank_matches_dense_solve():
+    n = 12
+    G = jax.random.normal(jax.random.PRNGKey(37), (n, n))
+    A = G @ G.T + 0.5 * jnp.eye(n)
+    preconditioner = nystrom_preconditioner(
+        lambda X: A @ X, n, n, jax.random.PRNGKey(38)
+    )
+    v = jax.random.normal(jax.random.PRNGKey(39), (n,))
+
+    # rank = n makes the Nystrom approximation exact, so the apply is the
+    # exact damped inverse; damping=0 is valid because A is positive definite.
+    for damping in (0.0, 0.5):
+        expected = jnp.linalg.solve(A + damping * jnp.eye(n), v)
+        assert jnp.allclose(preconditioner(v, damping), expected, rtol=1e-3, atol=1e-4)
+
+
+def test_nystrom_preconditioner_exact_for_low_rank_operator():
+    # A rank-r PSD operator sketched at rank >= r is recovered exactly, so
+    # the apply matches the dense damped inverse.
+    n, r = 14, 4
+    W = jax.random.normal(jax.random.PRNGKey(40), (n, r))
+    A = W @ W.T
+    preconditioner = nystrom_preconditioner(
+        lambda X: A @ X, n, 6, jax.random.PRNGKey(41)
+    )
+    v = jax.random.normal(jax.random.PRNGKey(42), (n,))
+    damping = 0.3
+
+    expected = jnp.linalg.solve(A + damping * jnp.eye(n), v)
+    assert jnp.allclose(preconditioner(v, damping), expected, rtol=1e-3, atol=1e-4)
+
+
+def test_nystrom_preconditioner_matches_ftu_formula():
+    # Replicate the construction with the same key and assemble the FTU
+    # apply densely: the unresolved complement must be balanced at
+    # rho + damping (rho the smallest retained eigenvalue), not at the
+    # bare damping.
+    n, rank = 16, 6
+    G = jax.random.normal(jax.random.PRNGKey(43), (n, n))
+    A = G @ G.T / n + jnp.eye(n)
+    key = jax.random.PRNGKey(44)
+    preconditioner = nystrom_preconditioner(lambda X: A @ X, n, rank, key)
+
+    Omega = jnp.linalg.qr(jax.random.normal(key, (n, rank)))[0]
+    Y = A @ Omega
+    nu = jnp.maximum(
+        jnp.finfo(Y.dtype).eps * jnp.linalg.norm(Y), jnp.finfo(Y.dtype).tiny
+    )
+    Y_nu = Y + nu * Omega
+    core = Omega.T @ Y_nu
+    L = jnp.linalg.cholesky(0.5 * (core + core.T))
+    B = jsp_linalg.solve_triangular(L, Y_nu.T, lower=True).T
+    U, sigma, _ = jnp.linalg.svd(B, full_matrices=False)
+    lam = jnp.maximum(sigma**2 - nu, 0.0)
+    rho = lam[-1]
+    damping = 0.25
+    v = jax.random.normal(jax.random.PRNGKey(45), (n,))
+
+    ftu = U @ ((U.T @ v) / (lam + damping)) + (v - U @ (U.T @ v)) / (rho + damping)
+    assert jnp.allclose(preconditioner(v, damping), ftu, rtol=1e-5, atol=1e-6)
+    # rho sits strictly inside the spectrum here (A is positive definite),
+    # so the FTU complement genuinely differs from a sketch-and-solve
+    # inverse that would divide the complement by the bare damping.
+    assert float(rho) > damping
+    naive = U @ ((U.T @ v) / (lam + damping)) + (v - U @ (U.T @ v)) / damping
+    assert not jnp.allclose(preconditioner(v, damping), naive, rtol=1e-3)
+
+
+def test_nystrom_preconditioner_symmetry_definiteness_and_key_determinism():
+    n, rank = 10, 4
+    G = jax.random.normal(jax.random.PRNGKey(46), (n, n))
+    A = G @ G.T / n + 0.5 * jnp.eye(n)
+    key = jax.random.PRNGKey(47)
+    preconditioner = nystrom_preconditioner(lambda X: A @ X, n, rank, key)
+    x = jax.random.normal(jax.random.PRNGKey(48), (n,))
+    y = jax.random.normal(jax.random.PRNGKey(49), (n,))
+    damping = 0.1
+
+    assert jnp.allclose(
+        x @ preconditioner(y, damping),
+        y @ preconditioner(x, damping),
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    assert float(x @ preconditioner(x, damping)) > 0.0
+    same = nystrom_preconditioner(lambda X: A @ X, n, rank, key)
+    assert jnp.allclose(preconditioner(x, damping), same(x, damping))
+    different = nystrom_preconditioner(lambda X: A @ X, n, rank, jax.random.PRNGKey(50))
+    assert not jnp.allclose(preconditioner(x, damping), different(x, damping))
+
+
+def test_nystrom_preconditioner_validation_and_zero_operator():
+    def matvec(X):
+        return X
+
+    key = jax.random.PRNGKey(51)
+    with pytest.raises(ValueError, match="rank must"):
+        nystrom_preconditioner(matvec, 4, 0, key)
+    with pytest.raises(ValueError, match="rank must"):
+        nystrom_preconditioner(matvec, 4, 5, key)
+    with pytest.raises(ValueError, match="rank must"):
+        nystrom_preconditioner(matvec, 4, 2.0, key)
+    with pytest.raises(ValueError, match="n must"):
+        nystrom_preconditioner(matvec, 0, 1, key)
+
+    # The tiny floor on the stabilization shift keeps a zero operator's
+    # build and apply finite.
+    zero = nystrom_preconditioner(lambda X: 0.0 * X, 4, 2, key)
+    assert bool(jnp.all(jnp.isfinite(zero(jnp.ones(4), 1.0))))
+
+
+def test_cg_nystrom_preconditioner_enables_ill_conditioned_convergence():
+    # Identity-metric mirror of the kernel-preconditioner test above: the
+    # residual K x - b makes the dual operator K^2 + damping I,
+    # ill-conditioned like cond(K)^2. At a tight inner budget
+    # identity-preconditioned CG stalls; the Nystrom preconditioner built
+    # from the K^2 matvec recovers Gauss-Newton-quality steps and converges.
+    n = 40
+    rho = 0.9
+    idx = jnp.arange(n)
+    K = rho ** jnp.abs(idx[:, None] - idx[None, :])
+    x_true = jnp.sin(idx / 3.0)
+    b = K @ x_true
+
+    def residual(x):
+        return K @ x - b
+
+    nystrom = nystrom_preconditioner(
+        lambda V: K @ (K @ V), n, n, jax.random.PRNGKey(52)
+    )
+    common = dict(
+        init_damping=1e-6,
+        linear_solver="cg",
+        iterative_maxiter=3,
+        implicit_preconditioner=identity_preconditioner(),
+    )
+    plain = UnderdeterminedLevenbergMarquardt(
+        residual, dual_preconditioner=identity_preconditioner(), **common
+    )
+    preconditioned = UnderdeterminedLevenbergMarquardt(
+        residual, dual_preconditioner=nystrom, **common
+    )
+    x0 = jnp.zeros(n)
+
+    plain_result = plain.solve(x0, max_steps=20, atol=1e-3)
+    preconditioned_result = preconditioned.solve(x0, max_steps=20, atol=1e-3)
+
+    assert int(preconditioned_result.status) == LMStatus.CONVERGED
+    assert int(plain_result.status) != LMStatus.CONVERGED
+
+
+def test_cg_nystrom_mlp_ntk_example():
+    # Copyable example: pure-jax MLP least squares under the identity
+    # metric (n_params >> m collocation residuals), with the CG dual
+    # preconditioner built by sketching the m x m empirical NTK Gram J J'
+    # at the initial parameters via jax.linearize / jax.linear_transpose.
+    m, width = 10, 16
+    ts = jnp.linspace(-1.0, 1.0, m)
+    targets = jnp.sin(jnp.pi * ts)
+
+    keys = jax.random.split(jax.random.PRNGKey(53), 3)
+    x0 = {
+        "w1": jax.random.normal(keys[0], (1, width)),
+        "b1": jnp.zeros(width),
+        "w2": jax.random.normal(keys[1], (width, width)) / jnp.sqrt(width),
+        "b2": jnp.zeros(width),
+        "w3": jax.random.normal(keys[2], (width, 1)) / jnp.sqrt(width),
+        "b3": jnp.zeros(1),
+    }
+
+    def mlp(params, t):
+        h = jnp.tanh(t[:, None] @ params["w1"] + params["b1"])
+        h = jnp.tanh(h @ params["w2"] + params["b2"])
+        return (h @ params["w3"] + params["b3"]).ravel()
+
+    def residual(params):
+        return mlp(params, ts) - targets
+
+    theta0, unravel = ravel_pytree(x0)
+    _, jvp_fn = jax.linearize(lambda th: residual(unravel(th)), theta0)
+    transpose_fn = jax.linear_transpose(jvp_fn, theta0)
+
+    def ntk_matvec(V):
+        # V is (m, k); apply J (J' v) column by column, frozen at x0.
+        return jax.vmap(
+            lambda col: jvp_fn(transpose_fn(col)[0]), in_axes=1, out_axes=1
+        )(V)
+
+    cg_solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-6,
+        iterative_maxiter=20,
+        dual_preconditioner=nystrom_preconditioner(
+            ntk_matvec, m, m, jax.random.PRNGKey(54)
+        ),
+        implicit_preconditioner=identity_preconditioner(),
+    )
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+
+    cg_result = cg_solver.solve(x0, max_steps=100, atol=1e-3)
+    cholesky_result = cholesky_solver.solve(x0, max_steps=100, atol=1e-3)
+
+    assert int(cg_result.status) == LMStatus.CONVERGED
+    assert int(cholesky_result.status) == LMStatus.CONVERGED
+    # Compare model outputs, not raw parameters: an underdetermined network
+    # has many interpolating parameter roots.
+    assert jnp.allclose(mlp(cg_result.x, ts), targets, atol=2e-3)
+    assert jnp.allclose(mlp(cg_result.x, ts), mlp(cholesky_result.x, ts), atol=2e-3)
 
 
 def test_implicit_cg_with_shifted_matvec_metric_matches_dense():

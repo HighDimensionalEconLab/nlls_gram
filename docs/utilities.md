@@ -20,6 +20,7 @@ explicit opt-out.
 | `sherman_morrison_preconditioner(solve, u, weight)` | `dual_preconditioner` for \(B = A + w\,uu^\top\) | one `solve` |
 | `woodbury_preconditioner(solve, U, weights)` | `dual_preconditioner` for \(B = A + U\operatorname{diag}(w)U^\top\) | one `solve` + \(k \times k\) |
 | `identity_preconditioner()` | the explicit "no preconditioner" choice (both hook signatures) | free |
+| `nystrom_preconditioner(matvec, n, rank, key)` | randomized Nyström `dual_preconditioner` for a PSD operator (FTU) | two \((n, \text{rank})\) GEMVs |
 
 ## Tridiagonal Precision Metric
 
@@ -261,6 +262,80 @@ The returned callable accepts both hook signatures —
 `dual_preconditioner(v, damping)` and `implicit_preconditioner(v)` — so one
 helper serves both arguments.
 
+## Nyström Preconditioner for Neural-Network Least Squares
+
+When no structural preconditioner is available — typically neural-network
+least squares under the identity metric, where the dual operator is the
+\(m \times m\) empirical NTK Gram \(JJ^\top\) with fast spectral decay —
+`nystrom_preconditioner(matvec, n, rank, key)` builds the randomized Nyström
+preconditioner of
+[Frangella, Tropp, and Udell](https://arxiv.org/abs/2110.02820): sketch the
+PSD operator with a thin-QR'd Gaussian test matrix (`rank` operator
+applications plus one \(O(n\,\text{rank}^2)\) factorization, once at
+construction), recover the rank-`rank` approximation
+\(\hat A = U\Lambda U^\top\), and apply
+
+$$
+v \mapsto U\frac{U^\top v}{\Lambda + \lambda}
++ \frac{v - UU^\top v}{\rho + \lambda},
+$$
+
+with \(\rho\) the smallest retained eigenvalue and \(\lambda\) the **live**
+LM damping — this is the one shipped helper that uses the `damping`
+argument, so a single construction serves every damping value. The
+unresolved complement is balanced at \(\rho + \lambda\) rather than
+\(\lambda\); that balance carries the FTU condition-number guarantee for
+fast-decaying spectra. `matvec` must apply a symmetric PSD operator and
+accept `(n, k)` matrices (the `Metric.solve` shape contract). Like every
+preconditioner it is frozen at construction, so for a nonlinear residual it
+approximates the dual at the linearization point it was built from —
+staleness across LM steps is safe (preconditioner error never moves the
+converged root), and refresh cadence is a tuning knob.
+
+The NTK matvec assembles matrix-free from the residual at the initial
+parameters via `jax.linearize` and `jax.linear_transpose` (this mirrors the
+`test_cg_nystrom_mlp_ntk_example` test, which doubles as the runnable
+example):
+
+```python
+import jax
+import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
+
+from nlls_gram import (
+    UnderdeterminedLevenbergMarquardt,
+    identity_preconditioner,
+    nystrom_preconditioner,
+)
+
+# residual: m collocation residuals of a pure-jax MLP, n_params >> m
+theta0, unravel = ravel_pytree(x0)
+_, jvp_fn = jax.linearize(lambda th: residual(unravel(th)), theta0)
+transpose_fn = jax.linear_transpose(jvp_fn, theta0)
+
+
+def ntk_matvec(V):  # (m, k) -> J (J' V), frozen at x0
+    return jax.vmap(
+        lambda col: jvp_fn(transpose_fn(col)[0]), in_axes=1, out_axes=1
+    )(V)
+
+
+solver = UnderdeterminedLevenbergMarquardt(
+    residual,
+    linear_solver="cg",
+    iterative_tol=1e-6,
+    iterative_maxiter=20,
+    dual_preconditioner=nystrom_preconditioner(
+        ntk_matvec, m, rank, jax.random.PRNGKey(0)
+    ),
+    implicit_preconditioner=identity_preconditioner(),
+)
+```
+
+Called through the single-argument `implicit_preconditioner(v)` signature
+the helper applies the undamped inverse, which is valid only when the
+retained spectrum is strictly positive.
+
 ## API
 
 ::: nlls_gram.metric_from_tridiagonal_precision
@@ -282,3 +357,5 @@ helper serves both arguments.
 ::: nlls_gram.woodbury_preconditioner
 
 ::: nlls_gram.identity_preconditioner
+
+::: nlls_gram.nystrom_preconditioner

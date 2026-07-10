@@ -100,6 +100,13 @@ preconditioner can pin the required budget at a small constant (in a
 kernel-collocation case study, a flat `iterative_maxiter` of 2–20 across two
 orders of magnitude in problem size) where the unpreconditioned budget grows
 with refinement. See [Utilities](utilities.md#shermanmorrison-dual-preconditioner).
+When no structural preconditioner is available — identity-metric
+neural-network duals (empirical NTK Grams) are the canonical case — reach
+for the randomized
+[`nystrom_preconditioner`](utilities.md#nystrom-preconditioner-for-neural-network-least-squares):
+its sketch-and-shift construction targets exactly the fast-decaying spectra
+those duals show, and it reads the live damping, so one construction serves
+the whole solve.
 
 ## What Is Free to Sweep
 

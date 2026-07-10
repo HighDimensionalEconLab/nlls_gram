@@ -7,6 +7,7 @@ preconditioner never changes the subproblem being solved, so approximations
 are safe.
 """
 
+import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 
@@ -81,3 +82,77 @@ def woodbury_preconditioner(solve, U, weights):
         return y - solve_U @ jsp_linalg.cho_solve(factor, U.T @ y)
 
     return dual_preconditioner
+
+
+def nystrom_preconditioner(matvec, n, rank, key, *, dtype=None):
+    """Randomized Nystrom preconditioner (Frangella-Tropp-Udell) for a PSD
+    operator given only through ``matvec``.
+
+    Sketches ``A`` with a rank-``rank`` Nystrom approximation
+    ``A_hat = U diag(lam) U'`` -- a thin-QR'd Gaussian test matrix, one
+    block application ``Y = A Omega``, and the shifted Cholesky/SVD recovery
+    of Frangella, Tropp, and Udell (arXiv:2110.02820, Algorithm 2.1); the
+    stabilization shift ``nu ~ eps * ||Y||_F`` is removed from the recovered
+    eigenvalues. The returned callback applies the FTU preconditioner
+    (their eq. 5.3, up to the positive scalar ``rho + damping``, which CG
+    ignores)::
+
+        v  ->  U ((U'v) / (lam + damping)) + (v - U U'v) / (rho + damping)
+
+    where ``rho`` is the smallest retained Nystrom eigenvalue: eigendirections
+    the sketch resolved are inverted against the live shift, and the
+    unresolved complement is treated as sitting at ``rho`` rather than at
+    zero -- that balance is what carries the FTU condition-number guarantee
+    for fast-decaying spectra. This is the one shipped helper that uses the
+    live ``damping`` argument (Sherman-Morrison/Woodbury ignore it): one
+    construction serves every LM damping value, and calling it with the
+    single-argument ``implicit_preconditioner(v)`` signature applies the
+    undamped inverse (valid only when the retained spectrum is strictly
+    positive).
+
+    The target use is neural-network least squares under the identity
+    metric, where the dual operator is the m x m empirical NTK Gram
+    ``J J'`` -- fast spectral decay plus the LM damping shift is exactly the
+    FTU regime. ``matvec`` must apply a symmetric PSD operator and accept
+    ``(n, k)`` matrices (the same shape contract as ``Metric.solve``); an
+    indefinite operator silently produces NaN through the Cholesky square
+    root. The build costs ``rank`` operator applications plus an
+    ``O(n rank^2)`` QR/SVD, done once at construction -- like every
+    preconditioner it is frozen there, so for a nonlinear problem it
+    approximates the dual at the linearization point it was built from
+    (staleness is safe: preconditioner error never moves the converged
+    root). Each apply is two ``(n, rank)`` matvecs.
+
+    ``key`` is an explicit PRNG key; the same key reproduces the same
+    preconditioner. ``dtype=None`` uses the JAX default float (respects
+    x64) -- pass the operator dtype explicitly for a float32 problem under
+    enabled x64. All operations are traceable; ``n`` and ``rank`` are static
+    Python ints.
+    """
+
+    if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+        raise ValueError("n must be a positive int")
+    if not isinstance(rank, int) or isinstance(rank, bool) or not 0 < rank <= n:
+        raise ValueError("rank must be a positive int <= n")
+    if dtype is None:
+        dtype = jnp.result_type(float)
+    Omega = jnp.linalg.qr(jax.random.normal(key, (n, rank), dtype=dtype))[0]
+    Y = matvec(Omega)
+    # The floor keeps the shift usable for a (near-)zero operator, where
+    # eps * ||Y||_F alone would leave the core singular; tiny/eps stays clear
+    # of the subnormal range through the downstream products.
+    finfo = jnp.finfo(dtype)
+    nu = jnp.maximum(finfo.eps * jnp.linalg.norm(Y), finfo.tiny / finfo.eps)
+    Y_nu = Y + nu * Omega
+    core = Omega.T @ Y_nu
+    L = jnp.linalg.cholesky(0.5 * (core + core.T))
+    B = jsp_linalg.solve_triangular(L, Y_nu.T, lower=True).T
+    U, sigma, _ = jnp.linalg.svd(B, full_matrices=False)
+    lam = jnp.maximum(sigma**2 - nu, 0.0)
+    rho = lam[-1]
+
+    def preconditioner(v, damping=0.0):
+        Utv = U.T @ v
+        return U @ (Utv / (lam + damping)) + (v - U @ Utv) / (rho + damping)
+
+    return preconditioner
