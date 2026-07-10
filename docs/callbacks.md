@@ -387,8 +387,16 @@ treat the budget as coarse.
 
 ### Fixed-Size History Recording
 
-Record per-step diagnostics into preallocated buffers sized by `max_steps`,
-then plot after the solve:
+For the iterate history itself there is no need for a callback:
+`solve(..., save_steps=True)` stacks x0 and every kept post-step iterate onto
+`result.x_history` (a pytree shaped like `x` with a `max_steps + 1` leading
+axis; rows beyond `result.steps` are zero padding), plus the row-aligned
+`result.aux_history` with `has_aux=True`. Slice with
+`result.x_history[: int(result.steps) + 1]` — the histories are
+differentiation-inert.
+
+For other per-step diagnostics, record into preallocated buffers sized by
+`max_steps`, then plot after the solve:
 
 ```python
 max_steps = 200

@@ -1104,6 +1104,94 @@ def test_solve_callback_updates_args_and_user_state():
     assert result.user_state > 0.0
 
 
+def test_solve_save_steps_matches_manual_update_loop():
+    a_true, b_true = 2.0, -1.0
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = a_true * jnp.exp(b_true * ts)
+    x0 = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
+    solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+
+    result = solver.solve(x0, (ts, ys), max_steps=8, save_steps=True)
+    assert int(result.steps) == 8
+    assert result.aux_history is None
+
+    x, lm_state = x0, solver.init(x0, (ts, ys))
+    iterates = [x0]
+    for _ in range(8):
+        x, lm_state, _ = solver.update(x, lm_state, (ts, ys))
+        iterates.append(x)
+    for s, expected in enumerate(iterates):
+        assert jnp.allclose(result.x_history["a"][s], expected["a"])
+        assert jnp.allclose(result.x_history["b"][s], expected["b"])
+    assert jnp.allclose(result.x_history["a"][-1], result.x["a"])
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_solve_save_steps_pads_rows_beyond_steps(jit):
+    def residual(theta, args):
+        return theta - args
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    theta0 = jnp.array([0.0])
+    result = solver.solve(
+        theta0, jnp.array([1.0]), max_steps=20, atol=1e-6, save_steps=True, jit=jit
+    )
+
+    steps = int(result.steps)
+    assert int(result.status) == LMStatus.CONVERGED
+    assert 0 < steps < 20
+    assert result.x_history.shape == (21, 1)
+    assert jnp.array_equal(result.x_history[0], theta0)
+    assert jnp.allclose(result.x_history[steps], result.x)
+    assert jnp.all(result.x_history[steps + 1 :] == 0.0)
+
+
+def test_solve_save_steps_aux_history_aligns_with_iterates():
+    def residual(theta, args):
+        return theta - args, {"total": jnp.sum(theta), "sq": theta**2}
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, has_aux=True
+    )
+    result = solver.solve(
+        jnp.array([0.0, 0.5]),
+        jnp.array([1.0, -1.0]),
+        max_steps=15,
+        atol=1e-6,
+        save_steps=True,
+    )
+
+    steps = int(result.steps)
+    for s in range(steps + 1):
+        x_s = result.x_history[s]
+        assert jnp.allclose(result.aux_history["total"][s], jnp.sum(x_s))
+        assert jnp.allclose(result.aux_history["sq"][s], x_s**2)
+    assert jnp.allclose(result.aux_history["total"][steps], result.aux["total"])
+
+
+def test_solve_save_steps_composes_with_callback_and_user_state():
+    def residual(theta, args):
+        return theta - args
+
+    def callback(ctx):
+        replaced = jnp.where(ctx.step == 1, jnp.asarray([5.0]), ctx.x)
+        return LMSolveAction(x=replaced, user_state=ctx.user_state + 1.0)
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    result = solver.solve(
+        jnp.array([0.0]),
+        jnp.array([1.0]),
+        max_steps=3,
+        callback=callback,
+        user_state=jnp.asarray(0.0),
+        save_steps=True,
+    )
+
+    # x_history records the kept post-action iterate.
+    assert jnp.allclose(result.x_history[1], jnp.array([5.0]))
+    assert int(result.user_state) == int(result.steps)
+
+
 def test_vmap_over_solve_callback_stops_per_lane():
     def residual(theta, _, p):
         return theta - p["target"]

@@ -156,6 +156,13 @@ class LMSolveResult:
     # residual evaluation, well-defined for every status. Differentiable with
     # respect to p through the implicit rule (directly and through x*(p)).
     aux: Any = None
+    # With save_steps=True: the iterate history as a pytree shaped like x with a
+    # (max_steps + 1) leading axis — row 0 is x0, row s the kept iterate after
+    # step s (post-callback-action), rows beyond ``steps`` are zero padding.
+    # aux_history aligns row-for-row with x_history (has_aux only, else None).
+    # Differentiation-inert (zero tangents through the implicit rule).
+    x_history: Any = None
+    aux_history: Any = None
 
 
 def _tree_changed(new, old):
@@ -866,6 +873,7 @@ class UnderdeterminedLevenbergMarquardt:
         xtol=0.0,
         callback=None,
         user_state=None,
+        save_steps=False,
         jit=True,
     ):
         """Run repeated LM updates until a stopping rule fires.
@@ -879,6 +887,12 @@ class UnderdeterminedLevenbergMarquardt:
         ``LMSolveContext`` after each step and may return an ``LMSolveAction``
         to stop or to override x/lm_state/args/user_state. ``p`` is passed to
         the residual and callback but cannot be replaced by the action.
+        ``save_steps=True`` records the full iterate history onto the result:
+        ``x_history`` stacks x0 and every kept post-step iterate along a
+        ``(max_steps + 1)`` leading axis (rows beyond ``steps`` are zero
+        padding — slice with ``result.steps``), and with ``has_aux`` the
+        row-aligned ``aux_history``. The history buffers cost
+        ``(max_steps + 1) x size(x)`` memory and are differentiation-inert.
         """
         self._check_residual_args(args, p)
         if max_steps <= 0:
@@ -901,10 +915,33 @@ class UnderdeterminedLevenbergMarquardt:
             # inside the loop the extra scalars are loop-carried, not
             # re-dispatched per step.
             lm_state = dataclasses.replace(lm_state, hyper=self.hyperparams())
+        history = None
+        if save_steps:
+            # Fixed-size buffers allocated here, where max_steps is a concrete
+            # int (inside the loop it is traced); row 0 of x_history holds x0,
+            # aux rows are filled in the loop from the per-step evaluations.
+            x_history = jax.tree.map(
+                lambda leaf: (
+                    jnp.zeros((max_steps + 1, *jnp.shape(leaf)), jnp.result_type(leaf))
+                    .at[0]
+                    .set(leaf)
+                ),
+                x0,
+            )
+            aux_history = None
+            if self.has_aux:
+                aux0 = self._residual_and_aux(x0, args, p)[1]
+                aux_history = jax.tree.map(
+                    lambda leaf: jnp.zeros(
+                        (max_steps + 1, *jnp.shape(leaf)), jnp.result_type(leaf)
+                    ),
+                    aux0,
+                )
+            history = (x_history, aux_history)
 
         @jax.custom_jvp
         def solve_with_implicit_p(
-            x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
+            x, lm_state, args, p, user_state, history, max_steps, atol, gtol, xtol
         ):
             return self._solve_impl(
                 x,
@@ -912,6 +949,7 @@ class UnderdeterminedLevenbergMarquardt:
                 args,
                 p,
                 user_state,
+                history,
                 max_steps,
                 atol,
                 gtol,
@@ -922,10 +960,12 @@ class UnderdeterminedLevenbergMarquardt:
 
         @solve_with_implicit_p.defjvp
         def solve_with_implicit_p_jvp(primals, tangents):
-            x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol = primals
-            _, _, _, p_dot, _, _, _, _, _ = tangents
+            x, lm_state, args, p, user_state, history, max_steps, atol, gtol, xtol = (
+                primals
+            )
+            _, _, _, p_dot, _, _, _, _, _, _ = tangents
             result = solve_with_implicit_p(
-                x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
+                x, lm_state, args, p, user_state, history, max_steps, atol, gtol, xtol
             )
             x_dot = self._implicit_x_tangent_from_p(
                 result.x, result.args, result.p, p_dot
@@ -943,6 +983,8 @@ class UnderdeterminedLevenbergMarquardt:
                 aux_dot = jax.jvp(
                     aux_at_solution, (result.x, result.p), (x_dot, p_dot)
                 )[1]
+            # The iterate histories are training-trajectory bookkeeping, not
+            # implicit functions of p: zero tangents.
             return (
                 result,
                 LMSolveResult(
@@ -955,11 +997,13 @@ class UnderdeterminedLevenbergMarquardt:
                     p_dot,
                     zero_result.user_state,
                     aux_dot,
+                    zero_result.x_history,
+                    zero_result.aux_history,
                 ),
             )
 
         return solve_with_implicit_p(
-            x0, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
+            x0, lm_state, args, p, user_state, history, max_steps, atol, gtol, xtol
         )
 
     def _solve_impl(
@@ -969,6 +1013,7 @@ class UnderdeterminedLevenbergMarquardt:
         args,
         p,
         user_state,
+        history,
         max_steps,
         atol,
         gtol,
@@ -984,6 +1029,7 @@ class UnderdeterminedLevenbergMarquardt:
                 args,
                 p,
                 user_state,
+                history,
                 max_steps,
                 atol,
                 gtol,
@@ -996,6 +1042,7 @@ class UnderdeterminedLevenbergMarquardt:
             args,
             p,
             user_state,
+            history,
             max_steps,
             atol,
             gtol,
@@ -1193,6 +1240,7 @@ class UnderdeterminedLevenbergMarquardt:
         args,
         p,
         user_state,
+        history,
         max_steps,
         atol,
         gtol,
@@ -1221,6 +1269,7 @@ class UnderdeterminedLevenbergMarquardt:
             x, lm_state, info = self.update(x, lm_state, args, p)
             if not bool(jnp.isfinite(info.loss)):
                 status = LMStatus.NONFINITE
+                history = _record_history(history, steps, x, info)
                 break
             action = None
             if callback is not None:
@@ -1240,6 +1289,7 @@ class UnderdeterminedLevenbergMarquardt:
             action, x, lm_state, args, user_state, problem_changed = self._apply_action(
                 action, x, lm_state, args, user_state
             )
+            history = _record_history(history, steps, x, info)
             if action.stop is not None and bool(action.stop):
                 status = (
                     LMStatus.CALLBACK_STOP
@@ -1262,6 +1312,7 @@ class UnderdeterminedLevenbergMarquardt:
         final_aux = None
         if self.has_aux:
             final_aux = self._residual_and_aux(x, args, p)[1]
+        x_history, aux_history = _finalize_history(history, steps, final_aux)
         return LMSolveResult(
             x,
             lm_state,
@@ -1272,7 +1323,36 @@ class UnderdeterminedLevenbergMarquardt:
             p,
             user_state,
             final_aux,
+            x_history,
+            aux_history,
         )
+
+
+# save_steps bookkeeping shared by the jitted and Python solve loops: row `step` of
+# x_history takes the kept post-action iterate; info.aux was evaluated at the pre-step
+# x, so it lands one row earlier, and _finalize_history fills the last aux row from the
+# final-solution evaluation.
+def _record_history(history, step, x, info):
+    if history is None:
+        return None
+    x_history, aux_history = history
+    x_history = jax.tree.map(lambda buf, leaf: buf.at[step].set(leaf), x_history, x)
+    if aux_history is not None:
+        aux_history = jax.tree.map(
+            lambda buf, leaf: buf.at[step - 1].set(leaf), aux_history, info.aux
+        )
+    return (x_history, aux_history)
+
+
+def _finalize_history(history, steps, final_aux):
+    if history is None:
+        return None, None
+    x_history, aux_history = history
+    if aux_history is not None:
+        aux_history = jax.tree.map(
+            lambda buf, leaf: buf.at[steps].set(leaf), aux_history, final_aux
+        )
+    return x_history, aux_history
 
 
 def _solve_loop_impl(
@@ -1282,6 +1362,7 @@ def _solve_loop_impl(
     args,
     p,
     user_state,
+    history,
     max_steps,
     atol,
     gtol,
@@ -1316,11 +1397,11 @@ def _solve_loop_impl(
     )
 
     def cond(carry):
-        _, _, _, _, _, step, _, stop = carry
+        _, _, _, _, _, _, step, _, stop = carry
         return (~stop) & (step < max_steps)
 
     def body(carry):
-        x, lm_state, args, user_state, _, step, _, _ = carry
+        x, lm_state, args, user_state, history, _, step, _, _ = carry
         x_old, lm_state_old = x, lm_state
         x, lm_state, info = solver.update(x, lm_state, args, p)
         step = step + jnp.asarray(1, dtype=jnp.int32)
@@ -1344,6 +1425,7 @@ def _solve_loop_impl(
         action, x, lm_state, args, user_state, problem_changed = solver._apply_action(
             action, x, lm_state, args, user_state
         )
+        history = _record_history(history, step, x, info)
 
         callback_stop = (
             jnp.asarray(False, dtype=jnp.bool_) if action.stop is None else action.stop
@@ -1375,20 +1457,31 @@ def _solve_loop_impl(
                 ),
             ),
         )
-        return x, lm_state, args, user_state, info, step, status, stop
+        return x, lm_state, args, user_state, history, info, step, status, stop
 
     carry = jax.lax.while_loop(
         cond,
         body,
-        (x, lm_state, args, user_state, info, step, status, stop),
+        (x, lm_state, args, user_state, history, info, step, status, stop),
     )
-    x, lm_state, args, user_state, info, step, status, _ = carry
+    x, lm_state, args, user_state, history, info, step, status, _ = carry
     final_aux = None
     if solver.has_aux:
         final_aux = solver._residual_and_aux(x, args, p)[1]
+    x_history, aux_history = _finalize_history(history, step, final_aux)
     return LMSolveResult(
-        x, lm_state, info, step, status, args, p, user_state, final_aux
+        x,
+        lm_state,
+        info,
+        step,
+        status,
+        args,
+        p,
+        user_state,
+        final_aux,
+        x_history,
+        aux_history,
     )
 
 
-_solve_loop_jit = jax.jit(_solve_loop_impl, static_argnums=(0, 10))
+_solve_loop_jit = jax.jit(_solve_loop_impl, static_argnums=(0, 11))
