@@ -7,6 +7,9 @@ the parameter dimension is often larger than the residual dimension.
 The solver is intentionally small: users provide `residual_fn(x, args, p)`,
 and `UnderdeterminedLevenbergMarquardt` exposes `init()`, `update(...)`, and
 `solve(...)`. It does not depend on Flax, NNX, Optax, or any model framework.
+For square nonsingular systems (root finding, e.g. DAE stage solves), the
+solve-only companion `SquareLevenbergMarquardt` is documented in
+[Square Systems](square_systems.md).
 
 ## Install
 

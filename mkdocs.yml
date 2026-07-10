@@ -47,5 +47,6 @@ nav:
   - Metrics: metrics.md
   - Utilities: utilities.md
   - Implicit Differentiation: implicit_ad.md
+  - Square Systems: square_systems.md
   - Tuning Guide: tuning_guide.md
   - Metric Gauss-Newton: gauss_newton.md

@@ -281,6 +281,94 @@ assert "f32" not in jaxpr, jaxpr
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_square_lm_float64_and_dtype_policy():
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import LMStatus, SquareLevenbergMarquardt
+
+W = 0.1 * jax.random.normal(jax.random.PRNGKey(0), (3, 3), dtype=jnp.float64)
+
+
+def residual(z, args, p):
+    return z + jnp.tanh(W @ z) - p
+
+
+solver = SquareLevenbergMarquardt(residual)
+p = jax.random.normal(jax.random.PRNGKey(1), (3,), dtype=jnp.float64)
+result = solver.solve(jnp.zeros(3, dtype=jnp.float64), p=p, max_steps=50)
+
+assert int(result.status) == LMStatus.CONVERGED
+assert result.x.dtype == jnp.float64
+assert result.residual_norm.dtype == jnp.float64
+# The float64 default atol is 1e-10.
+assert float(result.residual_norm) < 1e-10
+
+jaxpr = str(
+    jax.make_jaxpr(
+        lambda q: solver.solve(jnp.zeros(3, dtype=jnp.float64), p=q, max_steps=50).x
+    )(p)
+)
+assert "f32" not in jaxpr, jaxpr
+
+jvp_jaxpr = str(
+    jax.make_jaxpr(
+        lambda q, q_dot: jax.jvp(
+            lambda r: solver.solve(
+                jnp.zeros(3, dtype=jnp.float64), p=r, max_steps=50
+            ).x,
+            (q,),
+            (q_dot,),
+        )[1]
+    )(p, p)
+)
+assert "f32" not in jvp_jaxpr, jvp_jaxpr
+
+x, x_dot = jax.jvp(
+    lambda q: solver.solve(jnp.zeros(3, dtype=jnp.float64), p=q, max_steps=50).x,
+    (p,),
+    (jnp.ones(3, dtype=jnp.float64),),
+)
+assert x.dtype == jnp.float64 and x_dot.dtype == jnp.float64
+J = jax.jacfwd(lambda z: residual(z, None, p))(x)
+assert jnp.allclose(x_dot, jnp.linalg.solve(J, jnp.ones(3)), atol=1e-10)
+
+# A float32 problem under enabled x64 stays float32.
+W32 = W.astype(jnp.float32)
+
+
+def residual32(z, args, p):
+    return z + jnp.tanh(W32 @ z) - p
+
+
+solver32 = SquareLevenbergMarquardt(residual32)
+result32 = solver32.solve(
+    jnp.zeros(3, dtype=jnp.float32), p=p.astype(jnp.float32), max_steps=50
+)
+assert int(result32.status) == LMStatus.CONVERGED
+assert result32.x.dtype == jnp.float32
+assert result32.residual_norm.dtype == jnp.float32
+
+# A float32 x0 whose residual promotes to float64 is rejected at trace time.
+mismatched = SquareLevenbergMarquardt(lambda z: z.astype(jnp.float64) - 1.0)
+try:
+    mismatched.solve(jnp.zeros(1, dtype=jnp.float32), max_steps=5)
+except ValueError as error:
+    assert "share a dtype" in str(error)
+else:
+    raise AssertionError("expected the dtype mismatch to raise")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_quasiseparable_float64_parallel_matches_sequential():
     # The evidence gating the parallel-apply default (off-CPU + float64):
     # sequential and associative-scan applies must agree, and the parallel

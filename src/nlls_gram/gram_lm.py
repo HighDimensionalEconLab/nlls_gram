@@ -178,6 +178,47 @@ def _zero_tangent_leaf(leaf):
     return jnp.zeros_like(leaf)
 
 
+def canonicalize_residual(residual_fn):
+    """Wrap a residual taking ``(x)``, ``(x, args)``, or ``(x, args, p)`` --
+    always in that order -- into the canonical 3-arg form, so the compiled
+    code is identical for all three. Uninspectable signatures (or ``*args``)
+    are assumed 3-arg. Returns ``(canonical_fn, arity)``.
+    """
+    try:
+        signature = inspect.signature(residual_fn)
+    except (TypeError, ValueError):
+        residual_arity = 3
+    else:
+        residual_arity = 0
+        for parameter in signature.parameters.values():
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            ):
+                residual_arity += 1
+            elif parameter.kind == inspect.Parameter.VAR_POSITIONAL:
+                residual_arity = 3
+                break
+        if residual_arity < 1 or residual_arity > 3:
+            raise ValueError(
+                "residual_fn must take 1 to 3 positional arguments: "
+                "(x), (x, args), or (x, args, p)"
+            )
+    if residual_arity == 1:
+
+        def canonical_residual(x, args, p):
+            return residual_fn(x)
+
+    elif residual_arity == 2:
+
+        def canonical_residual(x, args, p):
+            return residual_fn(x, args)
+
+    else:
+        canonical_residual = residual_fn
+    return canonical_residual, residual_arity
+
+
 class UnderdeterminedLevenbergMarquardt:
     """Metric-damped Levenberg-Marquardt for ``min ||r(x, args, p)||^2`` over a
     JAX pytree ``x``, specialized to ``n_residuals << n_params``: the default
@@ -231,42 +272,7 @@ class UnderdeterminedLevenbergMarquardt:
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=0.75,
     ):
-        # The residual may take (x), (x, args), or (x, args, p), always in that
-        # order; it is wrapped into the canonical 3-arg form here so the
-        # compiled code is identical for all three. Uninspectable signatures
-        # (or *args) are assumed 3-arg.
-        try:
-            signature = inspect.signature(residual_fn)
-        except (TypeError, ValueError):
-            residual_arity = 3
-        else:
-            residual_arity = 0
-            for parameter in signature.parameters.values():
-                if parameter.kind in (
-                    inspect.Parameter.POSITIONAL_ONLY,
-                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                ):
-                    residual_arity += 1
-                elif parameter.kind == inspect.Parameter.VAR_POSITIONAL:
-                    residual_arity = 3
-                    break
-            if residual_arity < 1 or residual_arity > 3:
-                raise ValueError(
-                    "residual_fn must take 1 to 3 positional arguments: "
-                    "(x), (x, args), or (x, args, p)"
-                )
-        if residual_arity == 1:
-
-            def canonical_residual(x, args, p):
-                return residual_fn(x)
-
-        elif residual_arity == 2:
-
-            def canonical_residual(x, args, p):
-                return residual_fn(x, args)
-
-        else:
-            canonical_residual = residual_fn
+        canonical_residual, residual_arity = canonicalize_residual(residual_fn)
         if linear_solver not in ("cholesky", "qr", "cg"):
             raise ValueError(f"unknown linear_solver: {linear_solver}")
         if init_damping <= 0:

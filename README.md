@@ -163,6 +163,13 @@ Matérn/state-space kernel Grams, `metric_from_diagonal`,
 All three solve the same metric-damped linearized subproblem up to the accuracy
 of the chosen linear solver.
 
+For **square nonsingular** systems (e.g. DAE stage roots), the companion
+`SquareLevenbergMarquardt` is a solve-only damped-Newton root solver: a lean
+jitted loop around a direct augmented-QR step (never the Gram), warm-start
+friendly, with implicit differentiation of `solve(...).x` with respect to `p`
+through the square system `J_x ẋ = -J_p ṗ`. See the
+[square systems docs](https://highdimensionaleconlab.github.io/nlls_gram/square_systems/).
+
 ## Docs and Alternatives
 
 Full docs: https://highdimensionaleconlab.github.io/nlls_gram/
