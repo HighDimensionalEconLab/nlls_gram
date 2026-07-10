@@ -39,7 +39,9 @@ def sherman_morrison_preconditioner(solve, u, weight):
     parameter injects an exactly known rank-1 spike ``(c^2/m) u u'`` into
     ``J M^{-1} J'``. The ``damping`` argument is accepted per the
     ``dual_preconditioner`` contract and ignored -- spectral closeness to the
-    damped operator is all a preconditioner needs.
+    damped operator is all a preconditioner needs -- which also makes the
+    helper directly valid as ``implicit_preconditioner`` (the solver calls
+    two-argument callables with zero damping there).
     """
 
     solve_u = solve(u)
@@ -66,7 +68,8 @@ def woodbury_preconditioner(solve, U, weights):
     ``k = 1`` it reduces to ``sherman_morrison_preconditioner``. ``weights``
     must be positive -- not validated, since inputs may be traced. The
     ``damping`` argument is accepted per the ``dual_preconditioner``
-    contract and ignored.
+    contract and ignored, so the helper is directly valid as
+    ``implicit_preconditioner`` too.
     """
 
     U = jnp.asarray(U)
@@ -128,6 +131,9 @@ def pad_dual_preconditioner(base_preconditioner, n_real):
             (base_preconditioner(v[:n_real], damping), v[n_real:] / damping)
         )
 
+    # The padded block divides by the live damping, so the zero-damping
+    # implicit hook must reject this helper at construction.
+    dual_preconditioner.requires_positive_damping = True
     return dual_preconditioner
 
 
@@ -152,9 +158,9 @@ def nystrom_preconditioner(matvec, n, rank, key, *, dtype=None):
     zero -- that balance is what carries the FTU condition-number guarantee
     for fast-decaying spectra. This is the one shipped helper that uses the
     live ``damping`` argument (Sherman-Morrison/Woodbury ignore it): one
-    construction serves every LM damping value, and calling it with the
-    single-argument ``implicit_preconditioner(v)`` signature applies the
-    undamped inverse (valid only when the retained spectrum is strictly
+    construction serves every LM damping value, and passed as
+    ``implicit_preconditioner`` it is called with zero damping and applies
+    the undamped inverse (valid only when the retained spectrum is strictly
     positive).
 
     The target use is neural-network least squares under the identity

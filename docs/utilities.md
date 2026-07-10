@@ -333,9 +333,9 @@ solver = UnderdeterminedLevenbergMarquardt(
 )
 ```
 
-Called through the single-argument `implicit_preconditioner(v)` signature
-the helper applies the undamped inverse, which is valid only when the
-retained spectrum is strictly positive.
+Passed as `implicit_preconditioner` the helper applies its undamped
+(zero-damping) inverse, which is valid only when the retained spectrum is
+strictly positive.
 
 ## Padded Zero Residuals (Fixed Residual Shape)
 
@@ -383,7 +383,8 @@ solvers behave as follows:
   \(J P J^\top\) singular, so the library's implicit rules (dense and cg)
   return a non-finite derivative of `solve(...).x` on padded problems — and
   for the same reason `pad_dual_preconditioner` divides the padded block by
-  the live damping and cannot serve as an `implicit_preconditioner`. The
+  the live damping and is rejected at construction when passed as an
+  `implicit_preconditioner`. The
   minimum-metric-norm derivative still exists mathematically (padding only
   appends redundant equations) and equals the unpadded derivative, so
   differentiate the unpadded formulation to compute it.

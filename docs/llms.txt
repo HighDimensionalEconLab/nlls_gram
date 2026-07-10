@@ -8,7 +8,7 @@
 - [Main docs — API contracts, math, linear solvers, performance notes](https://highdimensionaleconlab.github.io/nlls_gram/)
 - [Callbacks and cookbook — solve-loop callback contract, resettable hyperparameters, recipes](https://highdimensionaleconlab.github.io/nlls_gram/callbacks/)
 - [Metrics — Metric callback contract, cholesky helper, dense and matrix-free examples](https://highdimensionaleconlab.github.io/nlls_gram/metrics/)
-- [Utilities — tridiagonal/state-space-Matérn/shifted-matvec/diagonal/block-diagonal metric constructors; Sherman-Morrison, Woodbury, identity, randomized Nyström (FTU), and padded-residual preconditioners for the required CG dual/implicit hooks](https://highdimensionaleconlab.github.io/nlls_gram/utilities/)
+- [Utilities — tridiagonal/state-space-Matérn/shifted-matvec/diagonal/block-diagonal metric constructors; Sherman-Morrison, Woodbury, identity, and randomized Nyström (FTU) preconditioners serving both required CG hooks, plus the dual-only padded-residual helper](https://highdimensionaleconlab.github.io/nlls_gram/utilities/)
 - [Implicit differentiation — JVP/VJP with respect to p, minimum-norm tangents, aux outputs](https://highdimensionaleconlab.github.io/nlls_gram/implicit_ad/)
 - [Square systems — solve-only damped-Newton root solver for square nonsingular systems (DAE stage solves), direct augmented-QR step, implicit AD via J_x xdot = -J_p pdot](https://highdimensionaleconlab.github.io/nlls_gram/square_systems/)
 - [Metric Gauss-Newton — minimum-norm math and kernel metric choices](https://highdimensionaleconlab.github.io/nlls_gram/gauss_newton/)

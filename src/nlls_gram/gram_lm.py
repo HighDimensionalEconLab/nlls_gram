@@ -219,6 +219,48 @@ def canonicalize_residual(residual_fn):
     return canonical_residual, residual_arity
 
 
+def canonicalize_implicit_preconditioner(implicit_preconditioner):
+    """Normalize an ``implicit_preconditioner`` to the 1-arg form the
+    implicit solve calls. A callable already usable as ``(v)`` -- every
+    pre-1.7 callback, and helpers whose damping argument has a default --
+    passes through unchanged, so no existing behavior shifts. A callable
+    REQUIRING a second argument (a ``(v, damping)`` dual helper such as
+    Sherman-Morrison or Woodbury) is wrapped to be called with an explicit
+    zero damping, the correct value for the undamped implicit dual.
+    Helpers marked ``requires_positive_damping`` (``pad_dual_preconditioner``)
+    are rejected at construction: their zero-damping apply divides by zero.
+    Uninspectable signatures pass through unchanged (the historical 1-arg
+    contract).
+    """
+    if getattr(implicit_preconditioner, "requires_positive_damping", False):
+        raise ValueError(
+            "this preconditioner divides by the live damping and cannot "
+            "serve as implicit_preconditioner (the implicit dual system is "
+            "undamped)"
+        )
+    try:
+        signature = inspect.signature(implicit_preconditioner)
+    except (TypeError, ValueError):
+        return implicit_preconditioner
+    try:
+        signature.bind(object())
+    except TypeError:
+        pass
+    else:
+        return implicit_preconditioner
+    try:
+        signature.bind(object(), object())
+    except TypeError:
+        raise ValueError(
+            "implicit_preconditioner must be callable as (v) or (v, damping)"
+        ) from None
+
+    def canonical_implicit_preconditioner(v):
+        return implicit_preconditioner(v, jnp.asarray(0.0, dtype=v.dtype))
+
+    return canonical_implicit_preconditioner
+
+
 class UnderdeterminedLevenbergMarquardt:
     """Metric-damped Levenberg-Marquardt for ``min ||r(x, args, p)||^2`` over a
     JAX pytree ``x``, specialized to ``n_residuals << n_params``: the default
@@ -244,8 +286,13 @@ class UnderdeterminedLevenbergMarquardt:
     the legacy dense Cholesky solve. Pass ``implicit_solver="cholesky"`` to
     force the dense implicit rule, or ``implicit_solver="cg"`` to force the
     matrix-free rule. A cg-resolved implicit solve likewise requires
-    ``implicit_preconditioner(v)``, an approximation of the UNDAMPED
-    ``(J P J')^{-1} v`` (``identity_preconditioner()`` works here too).
+    ``implicit_preconditioner``, an approximation of the UNDAMPED
+    ``(J P J')^{-1} v``, taking either ``(v)`` or ``(v, damping)`` -- a
+    callable REQUIRING the damping argument is called with an explicit
+    zero, and one where it has a default passes through unchanged, so every
+    shipped dual helper serves both hooks directly except
+    ``pad_dual_preconditioner``, which divides by the live damping and is
+    rejected here at construction.
 
     ``dual_solve_dtype=jnp.float64`` promotes the dual (Gram) solve of the
     dense cholesky paths -- the forward ``linear_solver="cholesky"`` branch
@@ -424,7 +471,11 @@ class UnderdeterminedLevenbergMarquardt:
         self.implicit_tol = implicit_tol
         self.implicit_atol = implicit_atol
         self.implicit_maxiter = implicit_maxiter
-        self.implicit_preconditioner = implicit_preconditioner
+        self.implicit_preconditioner = (
+            None
+            if implicit_preconditioner is None
+            else canonicalize_implicit_preconditioner(implicit_preconditioner)
+        )
         self.dual_solve_dtype = (
             None if dual_solve_dtype is None else jnp.dtype(dual_solve_dtype)
         )

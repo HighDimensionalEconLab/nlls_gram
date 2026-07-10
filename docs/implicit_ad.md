@@ -133,15 +133,25 @@ The solver exposes two concrete implicit solvers plus an automatic selector:
 - `implicit_solver="auto"` chooses the matrix-free CG rule only when
   `linear_solver="cg"`; otherwise it uses the dense Cholesky rule.
 
-A cg-resolved implicit solve requires an explicit `implicit_preconditioner(v)`
+A cg-resolved implicit solve requires an explicit `implicit_preconditioner`
 — an approximation of the undamped \((J_\theta P J_\theta^\top)^{-1} v\) —
 at construction, even if `solve(...).x` is never differentiated. Note that
 the default `implicit_solver="auto"` resolves to CG whenever
 `linear_solver="cg"`, so a forward CG solver always needs both callbacks.
-Pass `identity_preconditioner()` to run the implicit CG unpreconditioned, or
-`implicit_solver="cholesky"` to use the dense rule instead. The forward
-`dual_preconditioner` is never reused implicitly: it approximates the damped
-operator, and the implicit system is undamped.
+The callback may take `(v)` or `(v, damping)`: a callable *requiring* the
+damping argument is called with an explicit zero damping (the implicit
+system is undamped), and one whose damping has a default passes through
+unchanged — so `identity_preconditioner()`,
+`sherman_morrison_preconditioner`, `woodbury_preconditioner`, and
+`nystrom_preconditioner` all serve both hooks directly. The one exception
+is `pad_dual_preconditioner`, which divides by the live damping and is
+rejected at construction (implicit AD on padded problems is singular
+anyway). Pass `identity_preconditioner()` to run the implicit CG
+unpreconditioned, or `implicit_solver="cholesky"` to use the dense rule
+instead. The forward `dual_preconditioner` is never reused implicitly: it
+approximates the damped operator, and the implicit system is undamped —
+reusing one is an explicit choice (pass the same callable to both
+arguments).
 
 The matrix-free rule has the same mathematical contract as the dense rule:
 \(J_\theta P J_\theta^\top\) must be nonsingular, so \(J_\theta\) must have
@@ -177,13 +187,14 @@ Accuracy is controlled separately from the forward iterative solve:
   only with the spike preconditioner below.
 - `implicit_atol=0.0` and `implicit_maxiter=None` are passed to JAX CG.
   `None` leaves the iteration budget to JAX's CG policy.
-- `implicit_preconditioner(v)` is the preconditioner for the undamped
-  implicit dual system, required whenever the implicit solver resolves to
-  cg. It is deliberately separate from
-  `dual_preconditioner(v, damping)`, because the forward callback is defined
-  for damped systems. To reuse one explicitly, write a zero-damping wrapper,
-  for example
-  `implicit_preconditioner=lambda v: dual_preconditioner(v, jnp.asarray(0.0, v.dtype))`.
+- `implicit_preconditioner` is the preconditioner for the undamped implicit
+  dual system, required whenever the implicit solver resolves to cg. It is
+  deliberately a separate argument from `dual_preconditioner`, because the
+  forward callback approximates the damped system and reuse should be a
+  decision, not a default. Reusing one is now just passing the same
+  callable to both arguments: a `(v, damping)` callable is called with an
+  explicit zero damping on the implicit side, so no wrapper is needed
+  (single-argument `(v)` callables remain valid).
 
 Two notes for the
 [unified shifted metric](gauss_newton.md#shifted-metrics-and-the-seminorm-limit)
@@ -194,7 +205,8 @@ Two notes for the
   here to mask it — so at small \(\varepsilon\) the implicit CG needs the
   same
   [Sherman–Morrison/Woodbury spike preconditioner](utilities.md#shermanmorrison-dual-preconditioner)
-  as the forward solve (zero-damping wrapper as above).
+  as the forward solve — pass the helper directly; the implicit hook calls
+  it with zero damping.
 - With `metric_from_shifted_matvec` the implicit CG nests an inner metric CG
   inside every operator application, and the outer solve cannot be more
   accurate than the inner one: for derivative-critical work set the metric's

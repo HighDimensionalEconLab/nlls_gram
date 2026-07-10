@@ -2697,6 +2697,112 @@ def test_implicit_cg_can_explicitly_reuse_zero_damping_dual_preconditioner():
     assert jnp.allclose(p_bar, (3.0 + 2.0 * 4.0) / 5.0, atol=1e-6)
 
 
+def test_implicit_preconditioner_accepts_dual_signature():
+    # A callable REQUIRING (v, damping) serves the implicit hook directly:
+    # the solver calls it with an explicit ZERO damping. The dual here is
+    # diag(1, 25), so v / (diag + damping) at a one-iteration budget is
+    # exact only at damping == 0 — any other value (e.g. a leaked live
+    # damping) misses the analytic tangent by ~1e-3, far outside the
+    # tolerance.
+    def residual(theta, _, p):
+        return jnp.array([theta[0] - p, 5.0 * theta[1] - p])
+
+    dual_eigenvalues = jnp.array([1.0, 25.0])
+
+    def dual_preconditioner(v, damping):
+        return v / (dual_eigenvalues + damping)
+
+    common = dict(
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+        dual_preconditioner=dual_preconditioner,
+        implicit_solver="auto",
+        implicit_tol=0.0,
+        implicit_maxiter=1,
+        geodesic_acceleration=False,
+    )
+    direct = UnderdeterminedLevenbergMarquardt(
+        residual, implicit_preconditioner=dual_preconditioner, **common
+    )
+    wrapped = UnderdeterminedLevenbergMarquardt(
+        residual,
+        implicit_preconditioner=lambda v: dual_preconditioner(
+            v, jnp.asarray(0.0, v.dtype)
+        ),
+        **common,
+    )
+
+    def solved_x(solver, p):
+        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(3.0), jnp.asarray(0.7)
+    expected_dot = jnp.array([0.7, 0.7 / 5.0])
+    _, direct_dot = jax.jvp(lambda q: solved_x(direct, q), (p,), (p_dot,))
+    _, wrapped_dot = jax.jvp(lambda q: solved_x(wrapped, q), (p,), (p_dot,))
+    _, pullback = jax.vjp(lambda q: solved_x(direct, q), p)
+    (p_bar,) = pullback(jnp.array([3.0, 4.0]))
+
+    assert jnp.allclose(direct_dot, expected_dot, atol=1e-6)
+    assert jnp.allclose(direct_dot, wrapped_dot, atol=1e-7)
+    assert jnp.allclose(p_bar, 3.0 + 4.0 / 5.0, atol=1e-6)
+
+
+def test_implicit_preconditioner_arity_edge_cases():
+    def residual(theta, _, p):
+        return jnp.array([theta[0] + 2.0 * theta[1] - p])
+
+    common = dict(
+        init_damping=1e-2,
+        linear_solver="cg",
+        iterative_tol=1e-7,
+        iterative_maxiter=20,
+        dual_preconditioner=identity_preconditioner(),
+        implicit_tol=1e-7,
+    )
+
+    # A 1-arg-callable with a defaulted EXTRA argument passes through
+    # unchanged: were it wrongly called with a zero second argument, the
+    # preconditioner would return the zero vector and the tangent would be
+    # garbage.
+    def one_arg_with_default(v, scale=1.0):
+        return v * scale
+
+    def solved_x(solver, p):
+        return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, implicit_preconditioner=one_arg_with_default, **common
+    )
+    _, x_dot = jax.jvp(
+        lambda q: solved_x(solver, q), (jnp.asarray(3.0),), (jnp.asarray(0.7),)
+    )
+    assert jnp.allclose(x_dot, jnp.array([0.7 / 5.0, 1.4 / 5.0]), atol=1e-6)
+
+    # A jit-wrapped 1-arg callable is accepted unchanged.
+    UnderdeterminedLevenbergMarquardt(
+        residual, implicit_preconditioner=jax.jit(lambda v: v), **common
+    )
+
+    # Zero-argument callables are rejected at construction.
+    with pytest.raises(ValueError, match="callable as .v."):
+        UnderdeterminedLevenbergMarquardt(
+            residual, implicit_preconditioner=lambda: 0, **common
+        )
+
+    # pad_dual_preconditioner divides by the live damping; the zero-damping
+    # implicit hook rejects it at construction instead of dividing by zero.
+    with pytest.raises(ValueError, match="undamped"):
+        UnderdeterminedLevenbergMarquardt(
+            residual,
+            implicit_preconditioner=pad_dual_preconditioner(
+                identity_preconditioner(), 1
+            ),
+            **common,
+        )
+
+
 def test_cg_preconditioned_step_matches_cholesky_identity_step():
     # A valid SPD preconditioner changes only the inner Krylov iteration, not
     # the step the inner solve converges to.
@@ -4248,7 +4354,8 @@ def test_implicit_cg_with_shifted_matvec_metric_matches_dense():
 def test_implicit_cg_woodbury_preconditioner_with_shifted_metric():
     # Under the unified shifted metric, the scalar block injects the rank-k
     # spike (1/eps) J_beta J_beta' into the UNDAMPED implicit dual operator
-    # too. An exact Woodbury preconditioner (zero-damping wrapper) makes a
+    # too. An exact Woodbury preconditioner (passed directly; the implicit
+    # hook calls it with zero damping) makes a
     # one-iteration implicit CG budget reproduce the dense-rule derivative.
     n, k, eps = 12, 2, 1e-3
     t = jnp.arange(n) * 1.0
@@ -4296,9 +4403,9 @@ def test_implicit_cg_woodbury_preconditioner_with_shifted_metric():
                 "implicit_solver": "cg",
                 "implicit_tol": 0.0,
                 "implicit_maxiter": 1,
-                "implicit_preconditioner": lambda v: spike_preconditioner(
-                    v, jnp.asarray(0.0, v.dtype)
-                ),
+                # A (v, damping) helper passes directly; the implicit hook
+                # calls it with zero damping.
+                "implicit_preconditioner": spike_preconditioner,
             },
             q,
         ),
