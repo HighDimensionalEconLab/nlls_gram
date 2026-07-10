@@ -172,8 +172,9 @@ Accuracy is controlled separately from the forward iterative solve:
   only with the spike preconditioner below.
 - `implicit_atol=0.0` and `implicit_maxiter=None` are passed to JAX CG.
   `None` leaves the iteration budget to JAX's CG policy.
-- `implicit_preconditioner(v)` is an optional preconditioner for the undamped
-  implicit dual system. It is deliberately separate from
+- `implicit_preconditioner(v)` is the preconditioner for the undamped
+  implicit dual system, required whenever the implicit solver resolves to
+  cg. It is deliberately separate from
   `dual_preconditioner(v, damping)`, because the forward callback is defined
   for damped systems. To reuse one explicitly, write a zero-damping wrapper,
   for example
@@ -216,6 +217,7 @@ solver = UnderdeterminedLevenbergMarquardt(
     linear_solver="cg",
     iterative_tol=1e-3,
     iterative_maxiter=20,
+    dual_preconditioner=identity_preconditioner(),
     implicit_solver="auto",
     implicit_tol=None,
     implicit_preconditioner=implicit_preconditioner,

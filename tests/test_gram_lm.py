@@ -3788,9 +3788,8 @@ def test_nystrom_preconditioner_matches_ftu_formula():
 
     Omega = jnp.linalg.qr(jax.random.normal(key, (n, rank)))[0]
     Y = A @ Omega
-    nu = jnp.maximum(
-        jnp.finfo(Y.dtype).eps * jnp.linalg.norm(Y), jnp.finfo(Y.dtype).tiny
-    )
+    finfo = jnp.finfo(Y.dtype)
+    nu = jnp.maximum(finfo.eps * jnp.linalg.norm(Y), finfo.tiny / finfo.eps)
     Y_nu = Y + nu * Omega
     core = Omega.T @ Y_nu
     L = jnp.linalg.cholesky(0.5 * (core + core.T))
@@ -3870,8 +3869,11 @@ def test_cg_nystrom_preconditioner_enables_ill_conditioned_convergence():
     def residual(x):
         return K @ x - b
 
+    # rank 16 of 40: the sketch resolves only the decaying head of the K^2
+    # spectrum (the advertised low-rank regime), and the FTU complement
+    # balance carries the rest.
     nystrom = nystrom_preconditioner(
-        lambda V: K @ (K @ V), n, n, jax.random.PRNGKey(52)
+        lambda V: K @ (K @ V), n, 16, jax.random.PRNGKey(52)
     )
     common = dict(
         init_damping=1e-6,
@@ -3937,8 +3939,10 @@ def test_cg_nystrom_mlp_ntk_example():
         linear_solver="cg",
         iterative_tol=1e-6,
         iterative_maxiter=20,
+        # rank 6 of m=10: the NTK spectrum decays fast enough that a low-rank
+        # sketch of its head preconditions the whole solve.
         dual_preconditioner=nystrom_preconditioner(
-            ntk_matvec, m, m, jax.random.PRNGKey(54)
+            ntk_matvec, m, 6, jax.random.PRNGKey(54)
         ),
         implicit_preconditioner=identity_preconditioner(),
     )

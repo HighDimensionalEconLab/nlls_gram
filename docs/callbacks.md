@@ -294,7 +294,11 @@ one solve call, so implicit differentiation still applies:
 
 ```python
 solver = UnderdeterminedLevenbergMarquardt(
-    residual_fn, linear_solver="cg", iterative_maxiter=2
+    residual_fn,
+    linear_solver="cg",
+    iterative_maxiter=2,
+    dual_preconditioner=identity_preconditioner(),
+    implicit_preconditioner=identity_preconditioner(),
 )
 
 

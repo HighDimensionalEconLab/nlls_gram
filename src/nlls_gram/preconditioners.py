@@ -152,7 +152,9 @@ def nystrom_preconditioner(matvec, n, rank, key, *, dtype=None):
     rho = lam[-1]
 
     def preconditioner(v, damping=0.0):
+        # U (U'v)/(lam+damping) + (v - U U'v)/(rho+damping), regrouped so the
+        # apply is two (n, rank) matvecs instead of three.
         Utv = U.T @ v
-        return U @ (Utv / (lam + damping)) + (v - U @ Utv) / (rho + damping)
+        return U @ (Utv / (lam + damping) - Utv / (rho + damping)) + v / (rho + damping)
 
     return preconditioner

@@ -320,9 +320,9 @@ class UnderdeterminedLevenbergMarquardt:
         )
         if missing_dual_preconditioner and missing_implicit_preconditioner:
             raise ValueError(
-                'linear_solver="cg" requires dual_preconditioner, and '
-                'implicit_solver="auto" resolves to cg alongside it, which '
-                "requires implicit_preconditioner; pass "
+                'linear_solver="cg" requires dual_preconditioner, and the '
+                'cg-resolved implicit solver ("cg", or "auto" alongside a cg '
+                "forward solver) requires implicit_preconditioner; pass "
                 "identity_preconditioner() for either to run unpreconditioned "
                 'CG, or implicit_solver="cholesky" for the dense implicit rule'
             )
@@ -925,8 +925,7 @@ class UnderdeterminedLevenbergMarquardt:
         cg_tol = self._implicit_cg_tol(residual.dtype)
         cg_atol = jnp.asarray(self.implicit_atol, dtype=residual.dtype)
 
-        def cg_preconditioner(cotangent):
-            return self.implicit_preconditioner(cotangent)
+        cg_preconditioner = self.implicit_preconditioner
 
         def solve(matvec, rhs):
             solution, _ = jsp_sparse_linalg.cg(

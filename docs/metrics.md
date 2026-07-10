@@ -105,6 +105,8 @@ solver = UnderdeterminedLevenbergMarquardt(
     init_damping=1e-2,
     linear_solver="cg",
     metric=metric_from_shifted_matvec(kernel_matvec, eps),
+    dual_preconditioner=identity_preconditioner(),
+    implicit_preconditioner=identity_preconditioner(),
 )
 ```
 
