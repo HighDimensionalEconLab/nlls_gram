@@ -38,6 +38,7 @@ from nlls_gram.metrics import (
 from nlls_gram.preconditioners import (
     identity_preconditioner,
     nystrom_preconditioner,
+    pad_dual_preconditioner,
     sherman_morrison_preconditioner,
     woodbury_preconditioner,
 )
@@ -63,6 +64,7 @@ __all__ = [
     "metric_from_state_space",
     "metric_from_tridiagonal_precision",
     "nystrom_preconditioner",
+    "pad_dual_preconditioner",
     "sherman_morrison_preconditioner",
     "woodbury_preconditioner",
 ]

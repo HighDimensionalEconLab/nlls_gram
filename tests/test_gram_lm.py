@@ -22,6 +22,7 @@ from nlls_gram import (
     metric_from_state_space,
     metric_from_tridiagonal_precision,
     nystrom_preconditioner,
+    pad_dual_preconditioner,
     sherman_morrison_preconditioner,
     woodbury_preconditioner,
 )
@@ -3957,6 +3958,205 @@ def test_cg_nystrom_mlp_ntk_example():
     # has many interpolating parameter roots.
     assert jnp.allclose(mlp(cg_result.x, ts), targets, atol=2e-3)
     assert jnp.allclose(mlp(cg_result.x, ts), mlp(cholesky_result.x, ts), atol=2e-3)
+
+
+def test_padded_zero_residual_cholesky_matches_unpadded():
+    # Fixed-residual-shape pattern: appending exact-zero residual entries
+    # (zero Jacobian rows) adds a decoupled damping*I block to the dual, so
+    # the cholesky step is unchanged.
+    m, n, pad = 12, 30, 4
+    A = jax.random.normal(jax.random.PRNGKey(55), (m, n))
+    b = jax.random.normal(jax.random.PRNGKey(56), (m,))
+    init_damping = 1e-6
+
+    def residual(theta):
+        return A @ theta - b
+
+    def residual_padded(theta):
+        return jnp.concatenate((A @ theta - b, jnp.zeros(pad)))
+
+    plain = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=init_damping, geodesic_acceleration=False
+    )
+    padded = UnderdeterminedLevenbergMarquardt(
+        residual_padded, init_damping=init_damping, geodesic_acceleration=False
+    )
+    theta0 = jnp.zeros(n)
+    x_plain, _, info_plain = plain.update(theta0, plain.init(theta0))
+    x_padded, _, info_padded = padded.update(theta0, padded.init(theta0))
+
+    # Dual (residual-space) form of the damped step: well-conditioned in
+    # float32, unlike the equivalent n x n primal solve.
+    expected_step = A.T @ jnp.linalg.solve(A @ A.T + init_damping * jnp.eye(m), b)
+    assert bool(info_plain.accepted) and bool(info_padded.accepted)
+    assert jnp.allclose(x_padded, x_plain, rtol=1e-5, atol=1e-6)
+    assert jnp.allclose(x_padded, expected_step, rtol=1e-4, atol=1e-4)
+    assert jnp.allclose(
+        info_padded.loss_candidate, info_plain.loss_candidate, rtol=1e-5
+    )
+    assert jnp.allclose(info_padded.grad_norm, info_plain.grad_norm, rtol=1e-5)
+
+
+def test_padded_zero_residual_geodesic_matches_unpadded():
+    # Nonlinear endgame with geodesic acceleration: the second-order solve
+    # reuses the same factorization, so padding must not change the
+    # accelerated step either.
+    ts = jnp.linspace(0.0, 2.0, 20)
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    x = {"a": 1.9, "b": -0.95}
+    pad = 3
+
+    def residual_padded(x, args, p):
+        return jnp.concatenate((residual_fn(x, args, p), jnp.zeros(pad)))
+
+    kwargs = dict(
+        init_damping=1e-4,
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=1.0,
+    )
+    plain = UnderdeterminedLevenbergMarquardt(residual_fn, **kwargs)
+    padded = UnderdeterminedLevenbergMarquardt(residual_padded, **kwargs)
+
+    x_plain, _, info_plain = plain.update(x, plain.init(x, (ts, ys)), (ts, ys))
+    x_padded, _, info_padded = padded.update(x, padded.init(x, (ts, ys)), (ts, ys))
+
+    # The two dual factorizations have different sizes (m vs m + pad), so
+    # float32 agreement is to solver noise, not bitwise.
+    assert bool(info_plain.accepted) and bool(info_padded.accepted)
+    assert bool(info_padded.used_geodesic) == bool(info_plain.used_geodesic)
+    assert jnp.allclose(x_padded["a"], x_plain["a"], rtol=1e-4, atol=1e-5)
+    assert jnp.allclose(x_padded["b"], x_plain["b"], rtol=1e-4, atol=1e-5)
+    assert jnp.allclose(
+        info_padded.acceleration_ratio,
+        info_plain.acceleration_ratio,
+        rtol=1e-3,
+        atol=1e-4,
+    )
+
+
+def test_padded_zero_residual_cg_with_padded_preconditioner():
+    # The dual operator of a padded problem is blockdiag(J J' + damping I,
+    # damping I); pad_dual_preconditioner extends an exact base inverse with
+    # the exact 1/damping pad block, so a one-iteration CG budget reproduces
+    # the cholesky step.
+    m, n, pad = 10, 24, 3
+    A = jax.random.normal(jax.random.PRNGKey(57), (m, n))
+    b = jax.random.normal(jax.random.PRNGKey(58), (m,))
+    gram = A @ A.T
+    init_damping = 1e-2
+
+    def residual_padded(theta):
+        return jnp.concatenate((A @ theta - b, jnp.zeros(pad)))
+
+    def base_preconditioner(v, damping):
+        return jnp.linalg.solve(gram + damping * jnp.eye(m), v)
+
+    cg_solver = UnderdeterminedLevenbergMarquardt(
+        residual_padded,
+        init_damping=init_damping,
+        linear_solver="cg",
+        iterative_tol=0.0,
+        iterative_maxiter=1,
+        dual_preconditioner=pad_dual_preconditioner(base_preconditioner, m),
+        implicit_preconditioner=identity_preconditioner(),
+        geodesic_acceleration=False,
+    )
+    cholesky_solver = UnderdeterminedLevenbergMarquardt(
+        residual_padded, init_damping=init_damping, geodesic_acceleration=False
+    )
+    theta0 = jnp.zeros(n)
+
+    x_cg, _, info_cg = cg_solver.update(theta0, cg_solver.init(theta0))
+    x_ch, _, info_ch = cholesky_solver.update(theta0, cholesky_solver.init(theta0))
+
+    assert bool(info_cg.accepted) and bool(info_ch.accepted)
+    assert jnp.allclose(x_cg, x_ch, rtol=1e-4, atol=1e-5)
+
+    # A shape-fixed base preconditioner used unwrapped is invalid on the
+    # padded residual space and fails at trace time.
+    mismatched = UnderdeterminedLevenbergMarquardt(
+        residual_padded,
+        init_damping=init_damping,
+        linear_solver="cg",
+        iterative_tol=0.0,
+        iterative_maxiter=1,
+        dual_preconditioner=base_preconditioner,
+        implicit_preconditioner=identity_preconditioner(),
+        geodesic_acceleration=False,
+    )
+    with pytest.raises(ValueError, match="inconsistent size"):
+        mismatched.update(theta0, mismatched.init(theta0))
+
+
+def test_pad_dual_preconditioner_validation():
+    with pytest.raises(ValueError, match="n_real must"):
+        pad_dual_preconditioner(lambda v, damping: v, 0)
+    with pytest.raises(ValueError, match="n_real must"):
+        pad_dual_preconditioner(lambda v, damping: v, 2.0)
+    # A vector shorter than n_real would silently clip through a
+    # shape-generic base; the callback rejects it at trace time instead.
+    padded = pad_dual_preconditioner(identity_preconditioner(), 4)
+    with pytest.raises(ValueError, match="at least"):
+        padded(jnp.ones(3), 0.1)
+    assert jnp.allclose(padded(jnp.ones(6), 0.5), jnp.array([1.0] * 4 + [2.0] * 2))
+
+
+def test_padded_zero_residual_qr_is_rank_deficient():
+    # Padded zero rows make the Jacobian rank-deficient, which the qr
+    # path's triangular solves cannot handle: the padded step is
+    # non-finite where the unpadded one is fine.
+    m, n, pad = 12, 30, 4
+    A = jax.random.normal(jax.random.PRNGKey(60), (m, n))
+    b = jax.random.normal(jax.random.PRNGKey(61), (m,))
+
+    def residual_padded(theta):
+        return jnp.concatenate((A @ theta - b, jnp.zeros(pad)))
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual_padded,
+        init_damping=1e-4,
+        linear_solver="qr",
+        geodesic_acceleration=False,
+    )
+    theta0 = jnp.zeros(n)
+    x_padded, _, info = solver.update(theta0, solver.init(theta0))
+    assert not bool(jnp.all(jnp.isfinite(x_padded))) or not bool(
+        jnp.isfinite(info.loss_candidate)
+    )
+
+
+def test_padded_zero_residual_implicit_ad_is_singular_by_design():
+    # Padded rows are zero Jacobian rows, so the UNDAMPED implicit dual
+    # J P J' is singular: the implicit rules return a non-finite derivative
+    # on padded problems even though the forward solve is fine (the
+    # minimum-metric-norm derivative exists mathematically and equals the
+    # unpadded one — differentiate the unpadded formulation to get it).
+    A = jax.random.normal(jax.random.PRNGKey(59), (3, 8))
+
+    def residual(theta, _, p):
+        return A @ theta - p
+
+    def residual_padded(theta, _, p):
+        return jnp.concatenate((A @ theta - p, jnp.zeros(2)))
+
+    plain = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, geodesic_acceleration=False
+    )
+    padded = UnderdeterminedLevenbergMarquardt(
+        residual_padded, init_damping=1e-2, geodesic_acceleration=False
+    )
+
+    def solved_x(solver, p):
+        return solver.solve(jnp.zeros(8), p=p, max_steps=40, atol=1e-5).x
+
+    p0 = jnp.array([1.0, -0.5, 0.25])
+    x_plain = solved_x(plain, p0)
+    x_padded, x_dot = jax.jvp(lambda p: solved_x(padded, p), (p0,), (jnp.ones(3),))
+    # The forward padded solve is healthy and matches the unpadded solution;
+    # only the implicit tangent is non-finite.
+    assert bool(jnp.all(jnp.isfinite(x_padded)))
+    assert jnp.allclose(x_padded, x_plain, atol=1e-4)
+    assert not bool(jnp.all(jnp.isfinite(x_dot)))
 
 
 def test_implicit_cg_with_shifted_matvec_metric_matches_dense():

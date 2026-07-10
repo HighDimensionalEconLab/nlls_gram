@@ -21,6 +21,7 @@ explicit opt-out.
 | `woodbury_preconditioner(solve, U, weights)` | `dual_preconditioner` for \(B = A + U\operatorname{diag}(w)U^\top\) | one `solve` + \(k \times k\) |
 | `identity_preconditioner()` | the explicit "no preconditioner" choice (both hook signatures) | free |
 | `nystrom_preconditioner(matvec, n, rank, key)` | randomized Nyström `dual_preconditioner` for a PSD operator (FTU) | two \((n, \text{rank})\) GEMVs |
+| `pad_dual_preconditioner(base, n_real)` | extends a `dual_preconditioner` to a zero-padded residual | base + \(O(k)\) |
 
 ## Tridiagonal Precision Metric
 
@@ -336,6 +337,57 @@ Called through the single-argument `implicit_preconditioner(v)` signature
 the helper applies the undamped inverse, which is valid only when the
 retained spectrum is strictly positive.
 
+## Padded Zero Residuals (Fixed Residual Shape)
+
+Some JAX workflows keep a fixed residual shape across problem instances by
+appending residual entries that are identically zero:
+
+```python
+def residual_padded(x):
+    r = residual(x)
+    return jnp.concatenate((r, jnp.zeros(pad, r.dtype)))
+```
+
+The padded rows have zero Jacobian rows, so the residual-space dual operator
+becomes exactly block diagonal —
+\(\operatorname{blockdiag}(J P J^\top + \lambda I,\; \lambda I)\) — and the
+solvers behave as follows:
+
+- **`cholesky`** is unchanged mathematically: the padded block decouples
+  exactly, and the step matches the unpadded step (regression-tested for
+  both the plain and geodesic-accelerated updates). The cost is the larger
+  materialized residual dimension and dual factor; a few padded rows are
+  harmless, large padding pays the dense residual-space price.
+- **`cg`**: a shape-fixed `dual_preconditioner` (a dense solve,
+  `nystrom_preconditioner`, or a Sherman-Morrison/Woodbury built at the
+  unpadded size) fails on the padded residual space and must be wrapped;
+  `pad_dual_preconditioner(base_preconditioner, n_real)` applies the base
+  callback on the first `n_real` coordinates and the exact
+  \(1/\lambda\) inverse on the padded block:
+
+    ```python
+    from nlls_gram import pad_dual_preconditioner
+
+    dual_preconditioner = pad_dual_preconditioner(base_preconditioner, n_real)
+    ```
+
+  A shape-generic base (`identity_preconditioner()`) stays valid unwrapped —
+  it just forgoes the exact padded-block inverse. Do **not** zero the padded
+  block instead: that makes the preconditioner singular rather than SPD,
+  even though it can appear to work when exactly-zero padding never excites
+  those coordinates.
+- **`qr` does not survive padding**: the padded zero rows make the Jacobian
+  rank-deficient, which the QR path's triangular solves cannot handle — the
+  step is non-finite. Use `cholesky` or `cg` for padded problems.
+- **Implicit AD**: the padded rows make the *undamped* implicit dual
+  \(J P J^\top\) singular, so the library's implicit rules (dense and cg)
+  return a non-finite derivative of `solve(...).x` on padded problems — and
+  for the same reason `pad_dual_preconditioner` divides the padded block by
+  the live damping and cannot serve as an `implicit_preconditioner`. The
+  minimum-metric-norm derivative still exists mathematically (padding only
+  appends redundant equations) and equals the unpadded derivative, so
+  differentiate the unpadded formulation to compute it.
+
 ## API
 
 ::: nlls_gram.metric_from_tridiagonal_precision
@@ -359,3 +411,5 @@ retained spectrum is strictly positive.
 ::: nlls_gram.identity_preconditioner
 
 ::: nlls_gram.nystrom_preconditioner
+
+::: nlls_gram.pad_dual_preconditioner

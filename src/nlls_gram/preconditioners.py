@@ -84,6 +84,53 @@ def woodbury_preconditioner(solve, U, weights):
     return dual_preconditioner
 
 
+def pad_dual_preconditioner(base_preconditioner, n_real):
+    """Extend a dual preconditioner to a residual padded with exact zeros.
+
+    The fixed-residual-shape pattern appends ``k`` identically-zero entries to
+    an ``n_real``-entry residual so the compiled shapes stay stable across
+    problem instances. The padded rows have zero Jacobian rows, so the dual
+    operator becomes exactly block diagonal::
+
+        [ J P J' + damping I      0          ]
+        [ 0                       damping I  ]
+
+    and the matching preconditioner applies ``base_preconditioner`` on the
+    first ``n_real`` coordinates and the exact ``1 / damping`` inverse on the
+    padded block -- the second block must NOT be zeroed (that would make the
+    preconditioner singular rather than SPD, even though zeros can appear to
+    work when the padded coordinates are never excited). Wrapping is needed
+    for shape-fixed bases (dense solves, ``nystrom_preconditioner``,
+    Sherman-Morrison/Woodbury built at the unpadded size); a shape-generic
+    base like ``identity_preconditioner()`` stays valid unwrapped, it just
+    forgoes the exact padded-block inverse. Like ``nystrom_preconditioner``
+    this uses the live ``damping`` argument, and because the padded block
+    divides by it, the returned callback serves only the damped forward
+    solve -- never the ``implicit_preconditioner`` hook. Relatedly, padded
+    rows make the undamped implicit dual ``J P J'`` singular, so the
+    library's implicit rules return a non-finite derivative on padded
+    problems; the minimum-metric-norm derivative still exists mathematically
+    and equals the unpadded one, so differentiate the unpadded formulation.
+    """
+
+    if not isinstance(n_real, int) or isinstance(n_real, bool) or n_real <= 0:
+        raise ValueError("n_real must be a positive int")
+
+    def dual_preconditioner(v, damping):
+        # Static shapes, so this raises at trace time; without it a
+        # shape-generic base would silently accept a too-short vector.
+        if v.ndim != 1 or v.shape[0] < n_real:
+            raise ValueError(
+                f"padded residual vector must be 1-D with at least "
+                f"n_real={n_real} entries; got shape {v.shape}"
+            )
+        return jnp.concatenate(
+            (base_preconditioner(v[:n_real], damping), v[n_real:] / damping)
+        )
+
+    return dual_preconditioner
+
+
 def nystrom_preconditioner(matvec, n, rank, key, *, dtype=None):
     """Randomized Nystrom preconditioner (Frangella-Tropp-Udell) for a PSD
     operator given only through ``matvec``.
