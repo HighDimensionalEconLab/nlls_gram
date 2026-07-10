@@ -53,7 +53,11 @@ dropping it.
 
 `update(x, lm_state, args=None, p=None)` performs one LM step. The higher-level
 `solve(x0, args=None, *, p=None, ...)` loop repeatedly calls `update` and
-returns an `LMSolveResult`.
+returns an `LMSolveResult`. Pass `save_steps=True` to also record the full
+iterate history on the result (`x_history`, plus the row-aligned `aux_history`
+with `has_aux=True`) — see
+[history recording](callbacks.md#fixed-size-history-recording) for the layout
+and a plotting recipe.
 
 ### Auxiliary Outputs (`has_aux`)
 

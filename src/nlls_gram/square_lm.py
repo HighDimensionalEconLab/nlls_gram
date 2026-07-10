@@ -6,7 +6,12 @@ import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 from jax.flatten_util import ravel_pytree
 
-from nlls_gram.gram_lm import LMStatus, _zero_tangent_leaf, canonicalize_residual
+from nlls_gram.gram_lm import (
+    LMStatus,
+    _static_key_component,
+    _zero_tangent_leaf,
+    canonicalize_residual,
+)
 
 # Solve-only damped-Newton (Levenberg-Marquardt) root solver for SQUARE
 # nonsingular systems r(x, args, p) = 0, built for hot inner loops (DAE
@@ -90,6 +95,31 @@ class SquareLevenbergMarquardt:
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
         self.has_aux = has_aux
+        # Value-based identity: the jitted solve loop marks the solver itself
+        # static, so equal-config solvers built around the same residual share
+        # the compiled loop across instances instead of retracing per
+        # construction.
+        self._static_key = tuple(
+            _static_key_component(value)
+            for value in (
+                residual_fn,
+                init_damping,
+                damping_decrease,
+                damping_increase,
+                has_aux,
+            )
+        )
+        self._static_hash = hash(self._static_key)
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if type(other) is not type(self):
+            return NotImplemented
+        return self._static_key == other._static_key
+
+    def __hash__(self):
+        return self._static_hash
 
     def solve(
         self,

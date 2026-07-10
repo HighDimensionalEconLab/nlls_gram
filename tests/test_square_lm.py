@@ -380,3 +380,23 @@ def test_solve_inside_outer_jit_composes():
         return solver.solve(jnp.array([1.0]), p=p, max_steps=50).x[0] + p
 
     assert jnp.allclose(stage(jnp.asarray(4.0)), 6.0, atol=1e-5)
+
+
+def test_equal_settings_square_solvers_share_the_compiled_solve_loop():
+    traces = {"count": 0}
+
+    def residual(x, args, p):
+        traces["count"] += 1
+        return x**2 - p
+
+    a = SquareLevenbergMarquardt(residual)
+    b = SquareLevenbergMarquardt(residual)
+    assert a == b
+    assert hash(a) == hash(b)
+
+    a.solve(jnp.array([1.0]), p=jnp.asarray(4.0), max_steps=50)
+    count_after_first = traces["count"]
+    b.solve(jnp.array([1.0]), p=jnp.asarray(4.0), max_steps=50)
+    assert traces["count"] == count_after_first
+
+    assert a != SquareLevenbergMarquardt(residual, init_damping=1e-2)

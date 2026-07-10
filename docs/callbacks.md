@@ -392,8 +392,8 @@ For the iterate history itself there is no need for a callback:
 `result.x_history` (a pytree shaped like `x` with a `max_steps + 1` leading
 axis; rows beyond `result.steps` are zero padding), plus the row-aligned
 `result.aux_history` with `has_aux=True`. Slice with
-`result.x_history[: int(result.steps) + 1]` — the histories are
-differentiation-inert.
+`result.x_history[: int(result.steps) + 1]` (per leaf for a pytree `x`) — the
+histories are differentiation-inert.
 
 For other per-step diagnostics, record into preallocated buffers sized by
 `max_steps`, then plot after the solve:

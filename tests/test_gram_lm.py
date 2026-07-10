@@ -1192,6 +1192,61 @@ def test_solve_save_steps_composes_with_callback_and_user_state():
     assert int(result.user_state) == int(result.steps)
 
 
+def test_vmap_over_solve_save_steps_keeps_per_lane_padding():
+    def residual(theta, _, p):
+        return theta - p["target"]
+
+    def callback(ctx):
+        return LMSolveAction(stop=ctx.step >= ctx.p["stop_after"])
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    x0s = jnp.zeros((3, 1))
+    p = {
+        "target": jnp.arange(1.0, 4.0)[:, None],
+        "stop_after": jnp.arange(1, 4, dtype=jnp.int32),
+    }
+
+    def solve_one(x0, p_one):
+        return solver.solve(
+            x0, p=p_one, max_steps=6, callback=callback, save_steps=True
+        )
+
+    batched = jax.vmap(solve_one)(x0s, p)
+    assert batched.x_history.shape == (3, 7, 1)
+    for i in range(3):
+        single = solve_one(x0s[i], jax.tree.map(lambda leaf, i=i: leaf[i], p))
+        assert int(batched.steps[i]) == int(single.steps)
+        # Lanes that stop early must keep their rows frozen while other lanes
+        # continue, so the padding beyond each lane's steps stays zero.
+        assert jnp.allclose(batched.x_history[i], single.x_history, atol=1e-6)
+        assert jnp.all(batched.x_history[i, int(batched.steps[i]) + 1 :] == 0.0)
+
+
+def test_solve_save_steps_histories_are_differentiation_inert():
+    def residual(theta, _, p):
+        return jnp.array([theta[0] + 2.0 * theta[1] - p]), {"s": jnp.sum(theta)}
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual, init_damping=1e-2, has_aux=True
+    )
+    theta0 = jnp.zeros(2)
+
+    def solved(p):
+        result = solver.solve(theta0, p=p, max_steps=80, atol=1e-8, save_steps=True)
+        return result.x, result.x_history, result.aux_history
+
+    p, p_dot = jnp.asarray(3.0), jnp.asarray(0.7)
+    (_, x_hist, _), (x_dot, x_hist_dot, aux_hist_dot) = jax.jvp(solved, (p,), (p_dot,))
+    assert jnp.allclose(x_dot, jnp.array([p_dot / 5.0, 2.0 * p_dot / 5.0]), atol=1e-6)
+    assert jnp.all(x_hist_dot == 0.0)
+    assert jnp.all(aux_hist_dot["s"] == 0.0)
+
+    # Reverse mode: cotangents on the histories pull back to zero, while the
+    # solution cotangent still flows through the implicit rule.
+    grad_p = jax.grad(lambda p_: jnp.sum(solved(p_)[0]) + jnp.sum(solved(p_)[1]))(p)
+    assert jnp.allclose(grad_p, 3.0 / 5.0, atol=1e-6)
+
+
 def test_vmap_over_solve_callback_stops_per_lane():
     def residual(theta, _, p):
         return theta - p["target"]
@@ -1669,6 +1724,36 @@ def test_solve_does_not_retrace_on_loop_control_changes():
     )
 
     assert traces["count"] == count_after_first
+
+
+def test_equal_settings_solvers_share_the_compiled_solve_loop():
+    traces = {"count": 0}
+
+    def residual(theta, args, p):
+        traces["count"] += 1
+        return theta - args
+
+    def build(**overrides):
+        settings = dict(init_damping=1e-2, cache_jacobian=False)
+        settings.update(overrides)
+        return UnderdeterminedLevenbergMarquardt(residual, **settings)
+
+    a, b = build(), build()
+    assert a == b
+    assert hash(a) == hash(b)
+
+    a.solve(jnp.array([0.0]), jnp.array([1.0]), max_steps=10, atol=1e-6)
+    count_after_first = traces["count"]
+    b.solve(jnp.array([0.0]), jnp.array([1.0]), max_steps=10, atol=1e-6)
+    assert traces["count"] == count_after_first
+
+    # Any static-setting change (or a different residual function) is a
+    # different solver, so it cannot silently reuse the wrong compiled loop.
+    assert a != build(init_damping=2e-2)
+    assert a != build(geodesic_acceleration=False)
+    assert a != UnderdeterminedLevenbergMarquardt(
+        lambda theta, args, p: theta - args, init_damping=1e-2, cache_jacobian=False
+    )
 
 
 @pytest.mark.parametrize("cache_jacobian", [False, True])

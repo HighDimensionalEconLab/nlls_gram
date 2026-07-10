@@ -186,6 +186,32 @@ def _zero_tangent_leaf(leaf):
     return jnp.zeros_like(leaf)
 
 
+class _IdentityKey:
+    """Static-key stand-in comparing by object identity (for unhashable values)."""
+
+    __slots__ = ("obj",)
+
+    def __init__(self, obj):
+        self.obj = obj
+
+    def __eq__(self, other):
+        return isinstance(other, _IdentityKey) and self.obj is other.obj
+
+    def __hash__(self):
+        return id(self.obj)
+
+
+def _static_key_component(value):
+    # Hashable settings (scalars, strings, functions, frozen metrics) key by
+    # value; anything unhashable keys by identity so hashing never raises and
+    # equality stays consistent with the hash.
+    try:
+        hash(value)
+    except TypeError:
+        return _IdentityKey(value)
+    return value
+
+
 def canonicalize_residual(residual_fn):
     """Wrap a residual taking ``(x)``, ``(x, args)``, or ``(x, args, p)`` --
     always in that order -- into the canonical 3-arg form, so the compiled
@@ -509,6 +535,48 @@ class UnderdeterminedLevenbergMarquardt:
         )
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
+        # Value-based identity: the jitted solve loop marks the solver itself
+        # static, so equal-config solvers built around the same residual (and
+        # metric/preconditioner objects) share the compiled loop across
+        # instances instead of retracing once per construction. Keyed on the
+        # constructor arguments -- every derived attribute is a function of them.
+        self._static_key = tuple(
+            _static_key_component(value)
+            for value in (
+                residual_fn,
+                init_damping,
+                damping_decrease,
+                damping_increase,
+                max_damping,
+                linear_solver,
+                iterative_tol,
+                iterative_atol,
+                iterative_maxiter,
+                dual_preconditioner,
+                implicit_solver,
+                implicit_tol,
+                implicit_atol,
+                implicit_maxiter,
+                implicit_preconditioner,
+                self.dual_solve_dtype,
+                metric,
+                has_aux,
+                self.cache_jacobian,
+                geodesic_acceleration,
+                geodesic_acceptance_ratio,
+            )
+        )
+        self._static_hash = hash(self._static_key)
+
+    def __eq__(self, other):
+        if self is other:
+            return True
+        if type(other) is not type(self):
+            return NotImplemented
+        return self._static_key == other._static_key
+
+    def __hash__(self):
+        return self._static_hash
 
     def hyperparams(self, dtype=None):
         """``LMHyperparams`` built from the constructor values."""
@@ -892,7 +960,9 @@ class UnderdeterminedLevenbergMarquardt:
         ``(max_steps + 1)`` leading axis (rows beyond ``steps`` are zero
         padding — slice with ``result.steps``), and with ``has_aux`` the
         row-aligned ``aux_history``. The history buffers cost
-        ``(max_steps + 1) x size(x)`` memory and are differentiation-inert.
+        ``(max_steps + 1) x size(x)`` memory, are differentiation-inert, and
+        (unlike the default) make the jitted loop retrace when ``max_steps``
+        changes, since the buffer shape depends on it.
         """
         self._check_residual_args(args, p)
         if max_steps <= 0:
@@ -915,33 +985,15 @@ class UnderdeterminedLevenbergMarquardt:
             # inside the loop the extra scalars are loop-carried, not
             # re-dispatched per step.
             lm_state = dataclasses.replace(lm_state, hyper=self.hyperparams())
-        history = None
-        if save_steps:
-            # Fixed-size buffers allocated here, where max_steps is a concrete
-            # int (inside the loop it is traced); row 0 of x_history holds x0,
-            # aux rows are filled in the loop from the per-step evaluations.
-            x_history = jax.tree.map(
-                lambda leaf: (
-                    jnp.zeros((max_steps + 1, *jnp.shape(leaf)), jnp.result_type(leaf))
-                    .at[0]
-                    .set(leaf)
-                ),
-                x0,
-            )
-            aux_history = None
-            if self.has_aux:
-                aux0 = self._residual_and_aux(x0, args, p)[1]
-                aux_history = jax.tree.map(
-                    lambda leaf: jnp.zeros(
-                        (max_steps + 1, *jnp.shape(leaf)), jnp.result_type(leaf)
-                    ),
-                    aux0,
-                )
-            history = (x_history, aux_history)
+        # The history buffers need a concrete length, so it is fixed here (like
+        # callback and jit, via closure) and the buffers are allocated inside
+        # the loop implementations; with save_steps=False nothing changes, and
+        # with save_steps=True the buffer shape retraces per max_steps anyway.
+        history_len = max_steps + 1 if save_steps else None
 
         @jax.custom_jvp
         def solve_with_implicit_p(
-            x, lm_state, args, p, user_state, history, max_steps, atol, gtol, xtol
+            x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
         ):
             return self._solve_impl(
                 x,
@@ -949,7 +1001,7 @@ class UnderdeterminedLevenbergMarquardt:
                 args,
                 p,
                 user_state,
-                history,
+                history_len,
                 max_steps,
                 atol,
                 gtol,
@@ -960,12 +1012,10 @@ class UnderdeterminedLevenbergMarquardt:
 
         @solve_with_implicit_p.defjvp
         def solve_with_implicit_p_jvp(primals, tangents):
-            x, lm_state, args, p, user_state, history, max_steps, atol, gtol, xtol = (
-                primals
-            )
-            _, _, _, p_dot, _, _, _, _, _, _ = tangents
+            x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol = primals
+            _, _, _, p_dot, _, _, _, _, _ = tangents
             result = solve_with_implicit_p(
-                x, lm_state, args, p, user_state, history, max_steps, atol, gtol, xtol
+                x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
             )
             x_dot = self._implicit_x_tangent_from_p(
                 result.x, result.args, result.p, p_dot
@@ -1003,7 +1053,7 @@ class UnderdeterminedLevenbergMarquardt:
             )
 
         return solve_with_implicit_p(
-            x0, lm_state, args, p, user_state, history, max_steps, atol, gtol, xtol
+            x0, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
         )
 
     def _solve_impl(
@@ -1013,7 +1063,7 @@ class UnderdeterminedLevenbergMarquardt:
         args,
         p,
         user_state,
-        history,
+        history_len,
         max_steps,
         atol,
         gtol,
@@ -1029,7 +1079,7 @@ class UnderdeterminedLevenbergMarquardt:
                 args,
                 p,
                 user_state,
-                history,
+                history_len,
                 max_steps,
                 atol,
                 gtol,
@@ -1042,7 +1092,7 @@ class UnderdeterminedLevenbergMarquardt:
             args,
             p,
             user_state,
-            history,
+            history_len,
             max_steps,
             atol,
             gtol,
@@ -1240,13 +1290,14 @@ class UnderdeterminedLevenbergMarquardt:
         args,
         p,
         user_state,
-        history,
+        history_len,
         max_steps,
         atol,
         gtol,
         xtol,
         callback,
     ):
+        history = _init_history(self, x, args, p, history_len)
         info = self._initial_info(x, lm_state, args, p)
         lm_state = dataclasses.replace(
             lm_state,
@@ -1331,7 +1382,35 @@ class UnderdeterminedLevenbergMarquardt:
 # save_steps bookkeeping shared by the jitted and Python solve loops: row `step` of
 # x_history takes the kept post-action iterate; info.aux was evaluated at the pre-step
 # x, so it lands one row earlier, and _finalize_history fills the last aux row from the
-# final-solution evaluation.
+# final-solution evaluation. history_len is concrete (static under jit), so the
+# buffers live entirely inside the loop implementations — no host-side allocation
+# and no copy of a jit-input buffer before the in-place row updates. eval_shape
+# gets the aux buffer shapes without paying for a residual evaluation.
+def _init_history(solver, x0, args, p, history_len):
+    if history_len is None:
+        return None
+    x_history = jax.tree.map(
+        lambda leaf: (
+            jnp.zeros((history_len, *jnp.shape(leaf)), jnp.result_type(leaf))
+            .at[0]
+            .set(leaf)
+        ),
+        x0,
+    )
+    aux_history = None
+    if solver.has_aux:
+        aux0 = jax.eval_shape(
+            lambda x_, args_, p_: solver._residual_and_aux(x_, args_, p_)[1],
+            x0,
+            args,
+            p,
+        )
+        aux_history = jax.tree.map(
+            lambda leaf: jnp.zeros((history_len, *leaf.shape), leaf.dtype), aux0
+        )
+    return (x_history, aux_history)
+
+
 def _record_history(history, step, x, info):
     if history is None:
         return None
@@ -1362,13 +1441,14 @@ def _solve_loop_impl(
     args,
     p,
     user_state,
-    history,
+    history_len,
     max_steps,
     atol,
     gtol,
     xtol,
     callback,
 ):
+    history = _init_history(solver, x, args, p, history_len)
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
     info = solver._initial_info(x, lm_state, args, p)
     # Recast damping, hyperparameters, and tolerances to the residual dtype so
@@ -1484,4 +1564,4 @@ def _solve_loop_impl(
     )
 
 
-_solve_loop_jit = jax.jit(_solve_loop_impl, static_argnums=(0, 11))
+_solve_loop_jit = jax.jit(_solve_loop_impl, static_argnums=(0, 6, 11))
