@@ -132,13 +132,20 @@ the whole solve.
 - **Free (traced, no recompile):** `max_steps`, `atol`/`gtol`/`xtol`, the
   array-valued `LMHyperparams` fields (same dtype; a knob compiled out as
   `None` cannot be switched on), and the *values* of `x0`/`args`/`p`.
+  The one exception is `max_steps` with `save_steps=True`: the history
+  buffer's shape depends on it, so each distinct value then retraces.
 - **Recompiles per value (static):** `linear_solver`,
   `implicit_solver`, the `implicit_*` accuracy knobs,
   `geodesic_acceleration`, `cache_jacobian`, `has_aux`, the `Metric`
-  callbacks, `implicit_preconditioner`, the callback function identity, and
-  the solver instance itself.
-  Construct solvers once at setup scope; an inline `lambda` callback at the
-  call site recompiles every solve.
+  callbacks, `implicit_preconditioner`, and the callback function identity.
+  Solvers themselves compare by configuration, so a freshly constructed
+  solver with equal settings (around the same residual, metric, and
+  preconditioner objects) reuses the compiled loop — rebuilding the solver
+  per seed in an ensemble loop is free. What still forces a recompile is
+  rebuilding the *pieces* per call: an inline `lambda` residual or callback
+  at the call site, or a metric/preconditioner reconstructed around fresh
+  arrays (unhashable objects key by identity). Define those once at setup
+  scope.
 
 For crude hyperparameter search: sweep `init_damping` on a log scale by
 replacing the damping in an `init()` state —
@@ -158,7 +165,7 @@ the step count.
 | `qr` gives non-finite steps; other solvers fine | rank-deficient Jacobian | use `cholesky`/`cg` |
 | `MAX_STEPS` but loss small and flat | converged without a stopping rule | set `gtol`/`xtol` |
 | damping grows without bound (float32 `inf`) | rejection storm | `max_damping`, or check residual scaling |
-| every `solve` call recompiles | new solver/callback object per call | construct once at setup scope |
+| every `solve` call recompiles | residual/callback/metric object rebuilt per call (solvers compare by configuration, but their pieces key by identity) | define the pieces once at setup scope |
 | implicit `jax.jvp`/`vjp` wrong or zero | `p` not in the residual signature, or perturbing `args` | move perturbed quantities into `p` |
 | NaN or no progress with a quasiseparable Matérn metric | nugget-free Matérn-3/2/5/2 Gram conditioning wall (cond ~1e21 at n=5000) | add an absolute `nugget` — it folds into the metric exactly |
 

@@ -149,8 +149,11 @@ Contract notes:
 
 ## Performance
 
-Construct the solver once at setup scope — a new instance per call retraces,
-exactly as with the underdetermined solver. Measured on CPU (float32, 32
+Construct the residual once at setup scope — solvers compare by
+configuration, so a fresh equal-settings instance around the same residual
+function reuses the compiled loop, but a residual closure rebuilt per call is
+a new configuration and retraces, exactly as with the underdetermined
+solver. Measured on CPU (float32, 32
 warm-started solves inside one jitted `lax.scan`, the DAE stage pattern;
 `benchmarks/test_square_lm_benchmark.py`), the full adaptive LM solve costs
 1.0–1.6x a fixed-iteration direct-Newton `fori_loop` baseline at
