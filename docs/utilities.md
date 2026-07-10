@@ -163,7 +163,7 @@ about one iteration (measured: ~32 float64 iterations for a Matérn-5/2
 Gram at n=1000, independent of \(\varepsilon\) from 1e-2 to 1e-8). It
 provides `solve` and `norm` only (no matrix-free square root), so it works
 with the `cholesky` and `cg` linear solvers and is rejected for
-`qr`/`lsmr` at construction. Combined with
+`qr` at construction. Combined with
 `implicit_solver="cg"` the whole pipeline — forward solve, JVP, and VJP —
 runs matrix-free (see [Implicit AD](implicit_ad.md)). This is the one
 constructor that meets the
