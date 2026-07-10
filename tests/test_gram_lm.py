@@ -2249,6 +2249,19 @@ def test_solve_result_aux_none_without_has_aux():
     assert result.aux is None
 
 
+def test_aux_non_numeric_leaf_raises():
+    def residual(theta):
+        r = theta**2 - 2.0
+        return r, {"note": "not an array", "val": jnp.max(jnp.abs(r))}
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, has_aux=True)
+    x0 = jnp.array([1.0])
+    with pytest.raises(TypeError, match="aux leaves"):
+        solver.solve(x0, atol=1e-5)
+    with pytest.raises(TypeError, match="aux leaves"):
+        solver.init(x0)
+
+
 def test_solve_implicit_jvp_works_with_has_aux():
     def residual(theta, _, p):
         return jnp.array([theta[0] + 2.0 * theta[1] - p]), {"level": theta[0]}

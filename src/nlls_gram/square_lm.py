@@ -52,8 +52,9 @@ class SquareLevenbergMarquardt:
     ``has_aux=True``), recomputes the Jacobian only after an accepted step,
     and exits immediately on a warm start that already meets ``atol`` --
     without ever computing a Jacobian. ``x`` may be any pytree; the residual
-    must return a single array (or ``(array, aux)`` with ``has_aux=True``)
-    whose flattened size equals the flattened size of ``x``, in the same
+    must return a single array (or ``(array, aux)`` with ``has_aux=True``,
+    where ``aux`` is a pytree whose leaves are JAX numeric types) whose
+    flattened size equals the flattened size of ``x``, in the same
     dtype. Construct the solver once at setup scope; a new instance per call
     retraces.
 

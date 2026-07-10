@@ -58,9 +58,14 @@ returns an `LMSolveResult`.
 ### Auxiliary Outputs (`has_aux`)
 
 With `has_aux=True` (the same convention as Optimistix and `jax.grad`), the
-residual returns a pair `(residual, aux)`, where `aux` is an arbitrary pytree
-of extra outputs the optimizer ignores — per-block diagnostics, validation
-metrics, anything already computed inside the residual:
+residual returns a pair `(residual, aux)`, where `aux` is a pytree of extra
+outputs the optimizer ignores — per-block diagnostics, validation metrics,
+anything already computed inside the residual. Its structure is arbitrary,
+but every leaf must be a JAX numeric type (an array, or a Python/NumPy
+scalar), with fixed shape and dtype across iterations like any jitted value:
+aux rides through the jitted solve loop and the implicit differentiation
+rule, so a non-numeric leaf such as a string raises a `TypeError` at the
+first evaluation. For example:
 
 ```python
 def residual_fn(x, args):

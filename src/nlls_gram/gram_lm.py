@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 import jax.scipy.sparse.linalg as jsp_sparse_linalg
+import numpy as np
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram.metrics import Metric
@@ -541,6 +542,18 @@ class UnderdeterminedLevenbergMarquardt:
     def _residual_and_aux(self, x, args, p):
         if self.has_aux:
             value, aux = self.residual_fn(x, args, p)
+            # aux rides through the jitted loop carry and the implicit-AD
+            # zero-tangent map, so non-numeric leaves can never work; fail
+            # here with a clear message instead of a dtype error deep in
+            # the trace.
+            for leaf in jax.tree.leaves(aux):
+                if not isinstance(
+                    leaf, (jax.Array, np.ndarray, np.generic, bool, int, float, complex)
+                ):
+                    raise TypeError(
+                        "has_aux=True: aux leaves must be JAX numeric types "
+                        f"(arrays or scalars); got {type(leaf).__name__}"
+                    )
             return jnp.ravel(value), aux
         return jnp.ravel(self.residual_fn(x, args, p)), None
 

@@ -46,8 +46,10 @@ z = result.x         # result.residual_norm, result.steps, result.status
 There is no `init`/`update` pair — `solve` is the entire interface. The
 residual convention, `x` pytree flattening, and `LMStatus` codes match the
 underdetermined solver: `x` may be any pytree, and the residual must return a
-single array (or `(array, aux)` with `has_aux=True`) whose flattened size
-equals the flattened size of `x`, in the same dtype. The result is a lean
+single array (or `(array, aux)` with `has_aux=True`, where `aux` is a pytree
+whose leaves are JAX numeric types — it is returned through the jitted loop)
+whose flattened size equals the flattened size of `x`, in the same dtype.
+The result is a lean
 `SquareSolveResult` with `x`, `residual_norm` (the residual 2-norm at the
 returned `x`), `steps`, `status`, and `aux` (with `has_aux=True`). The loop
 controls (`max_steps`, `atol`, `gtol`, `xtol`) are concrete Python scalars,
