@@ -171,16 +171,24 @@ With the default `implicit_solver="auto"`, differentiating `solve(...).x`
 also stays matrix-free for forward CG solves. Pass
 `implicit_solver="cholesky"` to restore the dense implicit AD rule.
 
-An optional `dual_preconditioner(v, damping)` callback is applied as the CG
-preconditioner (for the geodesic-acceleration solve as well). It must be a
-jit-traceable, linear, SPD approximation of
+`linear_solver="cg"` requires a `dual_preconditioner(v, damping)` callback,
+applied as the CG preconditioner (for the geodesic-acceleration solve as
+well). It must be a jit-traceable, linear, SPD approximation of
 \((J P J^\top + \lambda I)^{-1} v\). It never changes the subproblem being
 solved: at inner convergence the step is identical, and a budget-truncated
 step still lies in \(\operatorname{range}(P J^\top)\), preserving the
-minimum-metric-norm structure — so approximations are safe. See
-[Utilities](utilities.md) for a structural rank-1 constructor. Like `metric`,
-it is static configuration: it is not carried in `LMState` and no callback
-action can replace it — construct a new solver to change it.
+minimum-metric-norm structure — so approximations are safe. Nobody should
+run Krylov methods without thinking about preconditioning; to opt out
+explicitly, pass `identity_preconditioner()` for unpreconditioned CG. When
+the implicit solver resolves to CG (the default `implicit_solver="auto"`
+does exactly that when `linear_solver="cg"`), an `implicit_preconditioner`
+is required as well — `identity_preconditioner()` works there too, or pass
+`implicit_solver="cholesky"` for the dense implicit rule. See
+[Utilities](utilities.md) for structural constructors
+(`sherman_morrison_preconditioner`, `woodbury_preconditioner`) and the
+randomized `nystrom_preconditioner`. Like `metric`, preconditioners are
+static configuration: they are not carried in `LMState` and no callback
+action can replace them — construct a new solver to change one.
 
 ### QR
 

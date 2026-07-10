@@ -128,6 +128,16 @@ The solver exposes two concrete implicit solvers plus an automatic selector:
 - `implicit_solver="auto"` chooses the matrix-free CG rule only when
   `linear_solver="cg"`; otherwise it uses the dense Cholesky rule.
 
+A cg-resolved implicit solve requires an explicit `implicit_preconditioner(v)`
+— an approximation of the undamped \((J_\theta P J_\theta^\top)^{-1} v\) —
+at construction, even if `solve(...).x` is never differentiated. Note that
+the default `implicit_solver="auto"` resolves to CG whenever
+`linear_solver="cg"`, so a forward CG solver always needs both callbacks.
+Pass `identity_preconditioner()` to run the implicit CG unpreconditioned, or
+`implicit_solver="cholesky"` to use the dense rule instead. The forward
+`dual_preconditioner` is never reused implicitly: it approximates the damped
+operator, and the implicit system is undamped.
+
 The matrix-free rule has the same mathematical contract as the dense rule:
 \(J_\theta P J_\theta^\top\) must be nonsingular, so \(J_\theta\) must have
 full row rank under the chosen metric. The operator is assumed symmetric

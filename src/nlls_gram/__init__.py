@@ -36,6 +36,7 @@ from nlls_gram.metrics import (
     metric_from_tridiagonal_precision,
 )
 from nlls_gram.preconditioners import (
+    identity_preconditioner,
     sherman_morrison_preconditioner,
     woodbury_preconditioner,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "LMSolveResult",
     "Metric",
     "blockdiag_metric",
+    "identity_preconditioner",
     "matern_state_space",
     "metric_from_cholesky",
     "metric_from_diagonal",

@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt, identity_preconditioner
 
 ITERATIVE_MAXITER = 8
 
@@ -46,6 +46,8 @@ def _make_large_interpolation_problem(
                 "iterative_tol": 0.0,
                 "iterative_atol": 0.0,
                 "iterative_maxiter": ITERATIVE_MAXITER,
+                "dual_preconditioner": identity_preconditioner(),
+                "implicit_preconditioner": identity_preconditioner(),
             }
         )
 

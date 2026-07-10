@@ -3,8 +3,10 @@
 The library ships a small set of constructors and helpers so that models can
 assemble metrics and CG preconditioners from structure they already know,
 instead of hand-rolling callback plumbing. Everything here returns plain
-callables or `Metric` objects; nothing is required — the solver only sees the
-`metric=` and `dual_preconditioner=` arguments.
+callables or `Metric` objects that the solver sees through the `metric=`,
+`dual_preconditioner=`, and `implicit_preconditioner=` arguments. The CG
+paths require explicit preconditioners; `identity_preconditioner()` is the
+explicit opt-out.
 
 | Helper | Builds | Cost per apply |
 | --- | --- | --- |
@@ -17,6 +19,7 @@ callables or `Metric` objects; nothing is required — the solver only sees the
 | `blockdiag_metric(blocks)` | `Metric` over concatenated parameter blocks | sum of blocks |
 | `sherman_morrison_preconditioner(solve, u, weight)` | `dual_preconditioner` for \(B = A + w\,uu^\top\) | one `solve` |
 | `woodbury_preconditioner(solve, U, weights)` | `dual_preconditioner` for \(B = A + U\operatorname{diag}(w)U^\top\) | one `solve` + \(k \times k\) |
+| `identity_preconditioner()` | the explicit "no preconditioner" choice (both hook signatures) | free |
 
 ## Tridiagonal Precision Metric
 
@@ -236,6 +239,28 @@ can be spectrally equivalent to the dual operator uniformly in \(n\),
 keeping the inner CG budget constant where the unpreconditioned budget grows
 with refinement — see the [Tuning Guide](tuning_guide.md).
 
+## Identity Preconditioner
+
+`linear_solver="cg"` requires a `dual_preconditioner`, and a cg-resolved
+implicit solve requires an `implicit_preconditioner` — running Krylov
+methods unpreconditioned should be a decision, not a default.
+`identity_preconditioner()` is that decision made explicit and greppable:
+
+```python
+from nlls_gram import identity_preconditioner
+
+solver = UnderdeterminedLevenbergMarquardt(
+    residual_fn,
+    linear_solver="cg",
+    dual_preconditioner=identity_preconditioner(),
+    implicit_preconditioner=identity_preconditioner(),
+)
+```
+
+The returned callable accepts both hook signatures —
+`dual_preconditioner(v, damping)` and `implicit_preconditioner(v)` — so one
+helper serves both arguments.
+
 ## API
 
 ::: nlls_gram.metric_from_tridiagonal_precision
@@ -255,3 +280,5 @@ with refinement — see the [Tuning Guide](tuning_guide.md).
 ::: nlls_gram.sherman_morrison_preconditioner
 
 ::: nlls_gram.woodbury_preconditioner
+
+::: nlls_gram.identity_preconditioner

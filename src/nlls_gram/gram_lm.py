@@ -187,10 +187,11 @@ class UnderdeterminedLevenbergMarquardt:
     ``update``, a jitted ``solve`` loop with callbacks, and implicit
     differentiation of ``solve`` with respect to ``p``.
 
-    With ``linear_solver="cg"``, ``dual_preconditioner(v, damping)`` supplies a
+    ``linear_solver="cg"`` requires ``dual_preconditioner(v, damping)``: a
     jit-traceable, linear, SPD approximation of
     ``(J P J' + damping I_m)^{-1} v`` used as the CG preconditioner (for the
-    geodesic-acceleration solve as well). It never changes the subproblem: at
+    geodesic-acceleration solve as well); pass ``identity_preconditioner()``
+    to run unpreconditioned CG. It never changes the subproblem: at
     inner convergence the step is identical, and a budget-truncated step still
     lies in ``range(P J')``, so the minimum-metric-norm selection for
     underdetermined residuals is unchanged — the preconditioner may be
@@ -201,7 +202,9 @@ class UnderdeterminedLevenbergMarquardt:
     solve when the forward solver is ``linear_solver="cg"``, and otherwise uses
     the legacy dense Cholesky solve. Pass ``implicit_solver="cholesky"`` to
     force the dense implicit rule, or ``implicit_solver="cg"`` to force the
-    matrix-free rule.
+    matrix-free rule. A cg-resolved implicit solve likewise requires
+    ``implicit_preconditioner(v)``, an approximation of the UNDAMPED
+    ``(J P J')^{-1} v`` (``identity_preconditioner()`` works here too).
     """
 
     def __init__(
@@ -308,6 +311,33 @@ class UnderdeterminedLevenbergMarquardt:
             raise ValueError(
                 'implicit_preconditioner requires implicit_solver="cg" '
                 'or implicit_solver="auto" with linear_solver="cg"'
+            )
+        missing_dual_preconditioner = (
+            linear_solver == "cg" and dual_preconditioner is None
+        )
+        missing_implicit_preconditioner = (
+            resolved_implicit_solver == "cg" and implicit_preconditioner is None
+        )
+        if missing_dual_preconditioner and missing_implicit_preconditioner:
+            raise ValueError(
+                'linear_solver="cg" requires dual_preconditioner, and '
+                'implicit_solver="auto" resolves to cg alongside it, which '
+                "requires implicit_preconditioner; pass "
+                "identity_preconditioner() for either to run unpreconditioned "
+                'CG, or implicit_solver="cholesky" for the dense implicit rule'
+            )
+        if missing_dual_preconditioner:
+            raise ValueError(
+                'linear_solver="cg" requires dual_preconditioner; pass '
+                "identity_preconditioner() to run unpreconditioned CG"
+            )
+        if missing_implicit_preconditioner:
+            raise ValueError(
+                'implicit_solver="cg" requires implicit_preconditioner '
+                '(implicit_solver="auto" resolves to cg when '
+                'linear_solver="cg"); pass identity_preconditioner() to run '
+                'unpreconditioned CG, or implicit_solver="cholesky" for the '
+                "dense implicit rule"
             )
         if metric is None:
             metric = Metric()
@@ -530,12 +560,8 @@ class UnderdeterminedLevenbergMarquardt:
             def gram_matvec(cotangent):
                 return jvp_fn(self.metric_solve(JT(cotangent))) + damping * cotangent
 
-            if self.dual_preconditioner is None:
-                cg_preconditioner = None
-            else:
-
-                def cg_preconditioner(cotangent):
-                    return self.dual_preconditioner(cotangent, damping)
+            def cg_preconditioner(cotangent):
+                return self.dual_preconditioner(cotangent, damping)
 
             def solve_step(rhs):
                 dual_solution, _ = jsp_sparse_linalg.cg(
@@ -899,12 +925,8 @@ class UnderdeterminedLevenbergMarquardt:
         cg_tol = self._implicit_cg_tol(residual.dtype)
         cg_atol = jnp.asarray(self.implicit_atol, dtype=residual.dtype)
 
-        if self.implicit_preconditioner is None:
-            cg_preconditioner = None
-        else:
-
-            def cg_preconditioner(cotangent):
-                return self.implicit_preconditioner(cotangent)
+        def cg_preconditioner(cotangent):
+            return self.implicit_preconditioner(cotangent)
 
         def solve(matvec, rhs):
             solution, _ = jsp_sparse_linalg.cg(

@@ -10,7 +10,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from flax import nnx
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt, identity_preconditioner
 
 
 def assert_float64_tree(tree):
@@ -107,6 +107,8 @@ solver = UnderdeterminedLevenbergMarquardt(
     linear_solver="cg",
     iterative_tol=1e-10,
     iterative_maxiter=20,
+    dual_preconditioner=identity_preconditioner(),
+    implicit_preconditioner=identity_preconditioner(),
 )
 lm_state = solver.init(theta, (matrix, target))
 theta, lm_state, info = solver.update(theta, lm_state, (matrix, target))
@@ -324,6 +326,7 @@ import jax.numpy as jnp
 from nlls_gram import (
     UnderdeterminedLevenbergMarquardt,
     blockdiag_metric,
+    identity_preconditioner,
     metric_from_cholesky,
     metric_from_diagonal,
     metric_from_shifted_matvec,
@@ -430,6 +433,7 @@ def solved_x_cg_implicit(p_value):
         geodesic_acceleration=False,
         implicit_solver="cg",
         implicit_tol=1e-12,
+        implicit_preconditioner=identity_preconditioner(),
     )
     return solver.solve(jnp.zeros(n + k), p=p_value, max_steps=200, atol=1e-12).x
 

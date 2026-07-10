@@ -6,6 +6,7 @@ import pytest
 from nlls_gram import (
     UnderdeterminedLevenbergMarquardt,
     blockdiag_metric,
+    identity_preconditioner,
     matern_state_space,
     metric_from_cholesky,
     metric_from_diagonal,
@@ -162,7 +163,14 @@ def test_shifted_metric_solver_step(benchmark, platform, n, variant, linear_solv
         "metric": metric,
     }
     if linear_solver == "cg":
-        solver_kwargs.update({"iterative_tol": 1e-8, "iterative_maxiter": 100})
+        solver_kwargs.update(
+            {
+                "iterative_tol": 1e-8,
+                "iterative_maxiter": 100,
+                "dual_preconditioner": identity_preconditioner(),
+                "implicit_preconditioner": identity_preconditioner(),
+            }
+        )
     if variant == "matvec_cg_woodbury":
         kernel_solve = _kernel_block(kernel_variant, t, eps).solve
         base = J_alpha @ kernel_solve(J_alpha.T)

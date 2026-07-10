@@ -11,6 +11,23 @@ import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 
 
+def identity_preconditioner():
+    """The identity map as an explicit "no preconditioner" choice.
+
+    ``linear_solver="cg"`` requires ``dual_preconditioner``, and a cg-resolved
+    implicit solve requires ``implicit_preconditioner`` -- nobody should run
+    Krylov methods without thinking about preconditioning, so opting out is an
+    explicit, greppable decision rather than a silent default. The returned
+    callable accepts both hook signatures: ``dual_preconditioner(v, damping)``
+    and ``implicit_preconditioner(v)``.
+    """
+
+    def preconditioner(v, damping=None):
+        return v
+
+    return preconditioner
+
+
 def sherman_morrison_preconditioner(solve, u, weight):
     """Preconditioner for ``B = A + weight * u u'`` from a solve with ``A``.
 

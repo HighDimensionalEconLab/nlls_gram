@@ -152,9 +152,12 @@ Matérn/state-space kernel Grams, `metric_from_diagonal`,
 - `linear_solver="cholesky"`: dense residual-space Gram solve, the default.
 - `linear_solver="qr"`: dense QR solve of the whitened-step problem (requires
   a full-row-rank Jacobian).
-- `linear_solver="cg"`: matrix-free residual-space CG, with an optional
-  `dual_preconditioner` hook (e.g. `sherman_morrison_preconditioner`); under
-  AD, `implicit_solver="auto"` keeps `solve(...).x` matrix-free.
+- `linear_solver="cg"`: matrix-free residual-space CG. A `dual_preconditioner`
+  is required (e.g. `sherman_morrison_preconditioner`, or the randomized
+  `nystrom_preconditioner` for neural-network duals; pass
+  `identity_preconditioner()` to run unpreconditioned CG explicitly); under
+  AD, `implicit_solver="auto"` keeps `solve(...).x` matrix-free and then
+  requires `implicit_preconditioner` the same way.
 
 All three solve the same metric-damped linearized subproblem up to the accuracy
 of the chosen linear solver.
