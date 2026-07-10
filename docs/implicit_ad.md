@@ -120,7 +120,12 @@ The solver exposes two concrete implicit solvers plus an automatic selector:
 
 - `implicit_solver="cholesky"` materializes \(J_\theta^\top\), assembles
   \(J_\theta P J_\theta^\top\), and uses a dense Cholesky solve. This is the
-  historical rule and is still the explicit escape hatch.
+  historical rule and is still the explicit escape hatch. The implicit Gram
+  has **no** `+ damping I` floor, so it is the most conditioning-sensitive
+  solve in the library; `dual_solve_dtype=jnp.float64` runs it in float64
+  for a float32 model (measured on a \(10^{-7}\)-weight spike metric: a
+  float32 implicit tangent wrong by ~5% — and its VJP by ~40% — becomes
+  accurate to ~\(10^{-7}\), with the returned tangent still float32).
 - `implicit_solver="cg"` applies \(y \mapsto J_\theta P J_\theta^\top y\)
   matrix-free using JAX JVP/VJP closures, then solves with CG wrapped in
   `jax.lax.custom_linear_solve(..., symmetric=True)`. This makes both JVP and

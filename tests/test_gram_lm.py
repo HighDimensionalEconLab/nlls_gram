@@ -292,6 +292,25 @@ def test_implicit_solver_options_must_be_valid():
     assert explicit_cg.implicit_solver == "cg"
 
 
+def test_dual_solve_dtype_validation():
+    with pytest.raises(ValueError, match="None or jnp.float64"):
+        UnderdeterminedLevenbergMarquardt(residual_fn, dual_solve_dtype=jnp.float32)
+    with pytest.raises(ValueError, match="dense cholesky paths"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn,
+            linear_solver="cg",
+            iterative_tol=1e-7,
+            iterative_maxiter=20,
+            dual_preconditioner=identity_preconditioner(),
+            implicit_preconditioner=identity_preconditioner(),
+            dual_solve_dtype=jnp.float64,
+        )
+    # x64 is disabled in this test process, so float64 is unavailable and
+    # requesting it raises rather than silently downcasting.
+    with pytest.raises(ValueError, match="requires x64"):
+        UnderdeterminedLevenbergMarquardt(residual_fn, dual_solve_dtype=jnp.float64)
+
+
 def test_default_float32_x_keeps_float32_outputs():
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)

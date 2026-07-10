@@ -246,6 +246,25 @@ class UnderdeterminedLevenbergMarquardt:
     matrix-free rule. A cg-resolved implicit solve likewise requires
     ``implicit_preconditioner(v)``, an approximation of the UNDAMPED
     ``(J P J')^{-1} v`` (``identity_preconditioner()`` works here too).
+
+    ``dual_solve_dtype=jnp.float64`` promotes the dual (Gram) solve of the
+    dense cholesky paths -- the forward ``linear_solver="cholesky"`` branch
+    and the dense implicit rule -- to float64: ``J'`` is cast wide before the
+    metric solve, the m x m assembly, factorization, and triangular solves
+    run wide, and only the returned step/tangent is cast back, so the model,
+    residual, and every output stay at the residual dtype. Forming
+    ``J P J'`` squares the condition number of the whitened Jacobian
+    ``J S`` (``S S' = P``), which is what makes the dense paths
+    float32-fragile; the promotion buys full-x64 robustness for the dual
+    solve at the cost of up to two wide n x m intermediates and roughly
+    1.4x per cholesky update measured at m=100, n=2000 with a trivial
+    residual (real residual/Jacobian costs dominate and stay float32).
+    ``metric.solve`` receives the promoted dtype and must return it
+    (jnp-composed callbacks promote automatically; an iterative callback
+    like ``metric_from_shifted_matvec`` then runs its inner CG in float64
+    with the float64 default tolerance, at callback-dependent cost).
+    Requires x64 support to be enabled -- which by itself leaves explicitly
+    float32 data in float32.
     """
 
     def __init__(
@@ -266,6 +285,7 @@ class UnderdeterminedLevenbergMarquardt:
         implicit_atol=0.0,
         implicit_maxiter=None,
         implicit_preconditioner=None,
+        dual_solve_dtype=None,
         metric=None,
         has_aux=False,
         cache_jacobian=True,
@@ -345,6 +365,21 @@ class UnderdeterminedLevenbergMarquardt:
                 'unpreconditioned CG, or implicit_solver="cholesky" for the '
                 "dense implicit rule"
             )
+        if dual_solve_dtype is not None:
+            if jnp.dtype(dual_solve_dtype) != jnp.dtype(jnp.float64):
+                raise ValueError("dual_solve_dtype must be None or jnp.float64")
+            if linear_solver != "cholesky" and resolved_implicit_solver != "cholesky":
+                raise ValueError(
+                    "dual_solve_dtype promotes only the dense cholesky paths; "
+                    'it requires linear_solver="cholesky" or a '
+                    "cholesky-resolved implicit solver"
+                )
+            if not jax.config.jax_enable_x64:
+                raise ValueError(
+                    "dual_solve_dtype=jnp.float64 requires x64 support; call "
+                    'jax.config.update("jax_enable_x64", True) at startup '
+                    "(explicitly float32 problem data stays float32)"
+                )
         if metric is None:
             metric = Metric()
         has_custom_metric = any(
@@ -390,6 +425,9 @@ class UnderdeterminedLevenbergMarquardt:
         self.implicit_atol = implicit_atol
         self.implicit_maxiter = implicit_maxiter
         self.implicit_preconditioner = implicit_preconditioner
+        self.dual_solve_dtype = (
+            None if dual_solve_dtype is None else jnp.dtype(dual_solve_dtype)
+        )
         self._resolved_implicit_solver = resolved_implicit_solver
         self.metric = metric
         # Only the dense cholesky path materializes J', so the flag is inert
@@ -632,16 +670,35 @@ class UnderdeterminedLevenbergMarquardt:
 
             else:
                 # Damped Gram factorization: cholesky of J P J' + damping I.
-                gram_step_left = self.metric_solve(Jt)
-                linear_matrix = Jt.T @ gram_step_left
-                linear_matrix = linear_matrix + damping * jnp.eye(
-                    resid.shape[0], dtype=resid.dtype
+                # With dual_solve_dtype the whole dual pipeline runs wide:
+                # J' is promoted BEFORE the metric solve (a stiff metric's
+                # 1/eps rows amplify float32 rounding of P J' into O(1) Gram
+                # errors -- promoting only the assembly was measured ~4
+                # digits worse), and the dual solution stays wide through the
+                # final product. Only the returned step is cast back, so it
+                # keeps the residual dtype. metric.solve therefore receives
+                # the promoted dtype; jnp-composed callbacks promote
+                # automatically.
+                dual_dtype = (
+                    resid.dtype
+                    if self.dual_solve_dtype is None
+                    else self.dual_solve_dtype
                 )
+                transposed_jacobian = Jt.astype(dual_dtype)
+                gram_step_left = self.metric_solve(transposed_jacobian)
+                linear_matrix = transposed_jacobian.T @ gram_step_left
+                linear_matrix = linear_matrix + jnp.asarray(
+                    damping, dtype=dual_dtype
+                ) * jnp.eye(resid.shape[0], dtype=dual_dtype)
 
                 linear_factor = jsp_linalg.cho_factor(linear_matrix)
 
                 def solve_step(rhs):
-                    return -gram_step_left @ jsp_linalg.cho_solve(linear_factor, rhs)
+                    dual_solution = jsp_linalg.cho_solve(
+                        linear_factor, rhs.astype(dual_dtype)
+                    )
+                    step = -gram_step_left @ dual_solution
+                    return step.astype(resid.dtype)
 
         # Dual solve for the first-order step (velocity).
         velocity = solve_step(resid)
@@ -904,11 +961,21 @@ class UnderdeterminedLevenbergMarquardt:
             return self._residual_and_aux(x, args, p_value)[0]
 
         residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
-        gram_step_left = self._metric_inverse(Jt)
-        gram = Jt.T @ gram_step_left
+        # The undamped implicit Gram has no + damping I floor, so it benefits
+        # most from dual_solve_dtype promotion; same recipe as the forward
+        # cholesky branch (J' promoted before the metric solve, wide
+        # factor/solve and final product, only the tangent cast back to the
+        # residual dtype).
+        dual_dtype = (
+            residual.dtype if self.dual_solve_dtype is None else self.dual_solve_dtype
+        )
+        transposed_jacobian = Jt.astype(dual_dtype)
+        gram_step_left = self._metric_inverse(transposed_jacobian)
+        gram = transposed_jacobian.T @ gram_step_left
         factor = jsp_linalg.cho_factor(gram)
-        theta_dot = -gram_step_left @ jsp_linalg.cho_solve(factor, residual_p_dot)
-        return unravel(theta_dot)
+        dual_solution = jsp_linalg.cho_solve(factor, residual_p_dot.astype(dual_dtype))
+        theta_dot = -gram_step_left @ dual_solution
+        return unravel(theta_dot.astype(residual.dtype))
 
     def _implicit_x_tangent_from_p_cg(self, x, args, p, p_dot):
         theta, unravel = ravel_pytree(x)

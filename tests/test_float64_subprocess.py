@@ -281,6 +281,177 @@ assert "f32" not in jaxpr, jaxpr
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_dual_solve_dtype_promotes_dense_dual_solve():
+    # A 1e-7 metric weight injects a 1/eps spike into the dual, driving
+    # cond(J P J') ~ 1e7: the float32 cholesky paths lose the step and the
+    # implicit derivative, while dual_solve_dtype=jnp.float64 recovers the
+    # float64 reference on the SAME float32-representable data to ~1e-6,
+    # with every output still float32.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_diagonal
+
+n, m, eps = 12, 4, 1e-7
+A32 = jax.random.normal(jax.random.PRNGKey(0), (m, n), dtype=jnp.float32)
+b32 = jax.random.normal(jax.random.PRNGKey(1), (m,), dtype=jnp.float32)
+w32 = jnp.concatenate([jnp.array([eps], jnp.float32), jnp.ones(n - 1, jnp.float32)])
+# The reference solves the SAME problem (float32 values are exactly
+# representable in float64), isolating solve error from data rounding.
+A64, b64, w64 = (v.astype(jnp.float64) for v in (A32, b32, w32))
+
+
+def make(matrix, target, weights, dual_dtype):
+    def residual(theta, _, p):
+        return matrix @ theta - p * target
+
+    return UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-3,
+        metric=metric_from_diagonal(weights),
+        geodesic_acceleration=False,
+        dual_solve_dtype=dual_dtype,
+    )
+
+
+plain32 = make(A32, b32, w32, None)
+promoted = make(A32, b32, w32, jnp.float64)
+reference = make(A64, b64, w64, None)
+p32, p64 = jnp.float32(1.0), jnp.float64(1.0)
+t032, t064 = jnp.zeros(n, jnp.float32), jnp.zeros(n, jnp.float64)
+
+
+def rel(value, ref):
+    difference = value.astype(jnp.float64) - ref
+    return float(jnp.linalg.norm(difference) / jnp.linalg.norm(ref))
+
+
+# Forward step.
+x_plain = plain32.update(t032, plain32.init(t032, p=p32), p=p32)[0]
+x_promoted = promoted.update(t032, promoted.init(t032, p=p32), p=p32)[0]
+x_reference = reference.update(t064, reference.init(t064, p=p64), p=p64)[0]
+assert x_promoted.dtype == jnp.float32
+assert rel(x_promoted, x_reference) < 1e-6, rel(x_promoted, x_reference)
+assert rel(x_plain, x_reference) > 1e-3, rel(x_plain, x_reference)
+
+
+# Implicit JVP and VJP through the (auto-resolved) dense implicit rule.
+def solved_x(solver, theta0, p_value):
+    return solver.solve(theta0, p=p_value, max_steps=80, atol=0.0, gtol=1e-5).x
+
+
+def tangent(solver, theta0, p_value):
+    return jax.jvp(
+        lambda q: solved_x(solver, theta0, q),
+        (p_value,),
+        (jnp.ones((), p_value.dtype),),
+    )[1]
+
+
+t_promoted = tangent(promoted, t032, p32)
+t_reference = tangent(reference, t064, p64)
+assert t_promoted.dtype == jnp.float32
+assert rel(t_promoted, t_reference) < 1e-6, rel(t_promoted, t_reference)
+assert rel(tangent(plain32, t032, p32), t_reference) > 1e-3
+
+
+def summed_gradient(solver, theta0, p_value):
+    return jax.grad(lambda q: jnp.sum(solved_x(solver, theta0, q)))(p_value)
+
+
+g_promoted = float(summed_gradient(promoted, t032, p32))
+g_reference = float(summed_gradient(reference, t064, p64))
+g_plain = float(summed_gradient(plain32, t032, p32))
+assert abs(g_promoted - g_reference) / abs(g_reference) < 1e-5
+assert abs(g_plain - g_reference) / abs(g_reference) > 1e-2
+
+
+# On a well-conditioned problem the flag changes nothing beyond float32
+# rounding, and the qr-forward + dense-implicit consumer combination is
+# accepted.
+well = jnp.ones(n, jnp.float32)
+plain_well = make(A32, b32, well, None)
+promoted_well = make(A32, b32, well, jnp.float64)
+x_plain_well = plain_well.update(t032, plain_well.init(t032, p=p32), p=p32)[0]
+x_promoted_well = promoted_well.update(
+    t032, promoted_well.init(t032, p=p32), p=p32
+)[0]
+assert jnp.allclose(x_promoted_well, x_plain_well, rtol=1e-5, atol=1e-6)
+
+qr_dense_implicit = UnderdeterminedLevenbergMarquardt(
+    lambda theta, _, p: A32 @ theta - p * b32,
+    linear_solver="qr",
+    geodesic_acceleration=False,
+    dual_solve_dtype=jnp.float64,
+)
+qr_tangent = tangent(qr_dense_implicit, t032, p32)
+assert qr_tangent.dtype == jnp.float32
+assert bool(jnp.all(jnp.isfinite(qr_tangent)))
+
+
+# Geodesic acceleration reuses the promoted solve_step: a nonlinear promoted
+# update matches the float64 reference, and the diagnostics stay float32.
+def make_geodesic(matrix, target, weights, dual_dtype):
+    def residual(theta, _, p):
+        linear = matrix @ theta
+        return linear + 0.05 * linear**2 - p * target
+
+    return UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-3,
+        metric=metric_from_diagonal(weights),
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=10.0,
+        dual_solve_dtype=dual_dtype,
+    )
+
+
+geo_promoted = make_geodesic(A32, b32, w32, jnp.float64)
+geo_reference = make_geodesic(A64, b64, w64, None)
+xg_promoted, _, info_promoted = geo_promoted.update(
+    t032, geo_promoted.init(t032, p=p32), p=p32
+)
+xg_reference, _, info_reference = geo_reference.update(
+    t064, geo_reference.init(t064, p=p64), p=p64
+)
+assert xg_promoted.dtype == jnp.float32
+assert info_promoted.acceleration_ratio.dtype == jnp.float32
+assert bool(info_promoted.used_geodesic) == bool(info_reference.used_geodesic)
+assert rel(xg_promoted, xg_reference) < 1e-5, rel(xg_promoted, xg_reference)
+
+
+# Direct differentiation THROUGH update (no implicit rule) on the promoted
+# path stays valid in both modes and matches the float64 reference.
+def update_x(solver, theta0, p_value):
+    return solver.update(theta0, solver.init(theta0, p=p_value), p=p_value)[0]
+
+
+_, u_dot_promoted = jax.jvp(
+    lambda q: update_x(promoted, t032, q), (p32,), (jnp.float32(1.0),)
+)
+_, u_dot_reference = jax.jvp(
+    lambda q: update_x(reference, t064, q), (p64,), (jnp.float64(1.0),)
+)
+assert u_dot_promoted.dtype == jnp.float32
+assert rel(u_dot_promoted, u_dot_reference) < 1e-5, rel(u_dot_promoted, u_dot_reference)
+
+_, pull_promoted = jax.vjp(lambda q: update_x(promoted, t032, q), p32)
+_, pull_reference = jax.vjp(lambda q: update_x(reference, t064, q), p64)
+cotangent_promoted = float(pull_promoted(jnp.ones(n, jnp.float32))[0])
+cotangent_reference = float(pull_reference(jnp.ones(n, jnp.float64))[0])
+assert abs(cotangent_promoted - cotangent_reference) / abs(cotangent_reference) < 1e-5
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_square_lm_float64_and_dtype_policy():
     script = r"""
 import jax

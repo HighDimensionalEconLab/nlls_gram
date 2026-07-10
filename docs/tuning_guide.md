@@ -50,8 +50,16 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   of materializing \(J^\top\).
 - `cholesky`/`cg` square the condition number (they factor `J P J'`). If the
   Gram system is ill-conditioned or implicit derivatives must be accurate,
-  **enable `jax_enable_x64` first** — it fixes more numerical trouble than
-  any damping adjustment.
+  reach for float64 — it fixes more numerical trouble than any damping
+  adjustment. Two grades: `dual_solve_dtype=jnp.float64` promotes only the
+  dense dual pipeline (cholesky forward branch + dense implicit rule) while
+  the model stays float32 — measured ~1.4x per cholesky update at
+  `m=100, n=2000` for a *trivial* residual (an upper bound: real residual
+  and Jacobian costs dominate and stay float32), recovering the float64
+  dual answer to ~1e-6 on a 1e-7-spike metric where plain float32 is ~5%
+  wrong. Enabling `jax_enable_x64` globally remains the full fix when the
+  model itself needs it (and is still required — it is what makes float64
+  arrays available; explicitly float32 data stays float32).
 
 ## Damping
 

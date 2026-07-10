@@ -158,6 +158,21 @@ $$
 
 This is usually the fastest dense path when \(m \ll n\).
 
+Forming \(J P J^\top\) squares the condition number of the whitened
+Jacobian \(J S\) (with \(S S^\top = P\)), which makes this path
+float32-fragile for stiff duals (e.g. a metric weight injecting a
+\(1/\varepsilon\) spike into \(P\)). `dual_solve_dtype=jnp.float64`
+promotes just the dual pipeline — \(J^\top\) is cast wide *before* the
+metric solve, and the \(m \times m\) assembly, factorization, and
+triangular solves run in float64 — while the model, residual, and returned
+step stay float32. It applies to this branch and to the dense implicit-AD
+rule, and requires x64 support to be enabled (explicitly float32 data stays
+float32). `metric.solve` receives the promoted dtype and must return it:
+jnp-composed callbacks promote automatically, while an iterative callback
+(`metric_from_shifted_matvec`) then runs its inner CG in float64 with the
+float64 default tolerance, at callback-dependent cost. See the
+[Tuning Guide](tuning_guide.md) for when it beats enabling x64 globally.
+
 ### CG
 
 `linear_solver="cg"` uses the same residual-space dual system as Cholesky, but

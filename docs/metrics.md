@@ -37,6 +37,10 @@ Validation rules:
   `geodesic_acceleration=False`.
 - The solver does not infer `norm`, `inv_sqrt`, or `inv_sqrt_transpose` from
   `solve`.
+- `solve` must accept and preserve the dtype it is handed. Normally that is
+  the residual dtype; with `dual_solve_dtype=jnp.float64` the dense cholesky
+  paths hand it float64 inputs and expect float64 back (jnp-composed
+  callbacks satisfy this automatically through standard promotion).
 
 `norm` is separate because `solve` applies \(M^{-1}\), while the norm needs
 \(M\):
