@@ -165,6 +165,8 @@ u \mapsto J P J^\top u + \lambda u.
 $$
 
 It uses JAX linearization for JVPs/VJPs and `jax.scipy.sparse.linalg.cg`.
+The iterative solve defaults to a small fixed budget: `iterative_tol=0.0`,
+`iterative_atol=0.0`, and `iterative_maxiter=8`.
 With the default `implicit_solver="auto"`, differentiating `solve(...).x`
 also stays matrix-free for forward CG solves. Pass
 `implicit_solver="cholesky"` to restore the dense implicit AD rule.
@@ -195,23 +197,7 @@ The returned parameter step is mapped back with `metric.inv_sqrt`.
 The triangular solves require \(S^\top J^\top\) to have full column rank
 (equivalently, \(J\) full row rank): a rank-deficient Jacobian produces a
 non-finite step even though the damped subproblem remains well-posed. Use
-`cholesky`, `cg`, or `lsmr` for rank-deficient problems.
-
-### LSMR
-
-`linear_solver="lsmr"` solves the same whitened-step problem as QR using
-Lineax LSMR and a `lineax.FunctionLinearOperator`:
-
-$$
-z \mapsto
-\begin{bmatrix}
-JSz \\
-\sqrt{\lambda}z
-\end{bmatrix}.
-$$
-
-It returns \(s=Sz\). Iterative solvers default to a small fixed budget:
-`iterative_tol=0.0`, `iterative_atol=0.0`, and `iterative_maxiter=8`.
+`cholesky` or `cg` for rank-deficient problems.
 
 ## Minimal Example
 
@@ -360,10 +346,7 @@ jax.config.update("jax_enable_x64", True)
 residual once and types the lm_state (and any Jacobian cache buffers) from the
 actual problem, so there is no dtype argument to get wrong — a float32
 problem stays float32 even with x64 enabled. `solve` likewise recasts the
-damping and tolerances to the residual dtype internally. One known exception:
-`linear_solver="lsmr"` fails for float32 problems when x64 is enabled, due to
-a dtype-promotion bug inside Lineax's LSMR; the other three solvers handle
-that mixed configuration.
+damping and tolerances to the residual dtype internally.
 
 `update` optimizes exactly the `x` pytree you pass. With Flax NNX, pass only
 the trainable state to the solver and merge it with frozen state inside

@@ -40,7 +40,7 @@ def _make_large_interpolation_problem(
         "init_damping": 1e-2,
         "linear_solver": linear_solver,
     }
-    if linear_solver in ("cg", "lsmr"):
+    if linear_solver == "cg":
         solver_kwargs.update(
             {
                 "iterative_tol": 0.0,
@@ -79,7 +79,6 @@ def _make_large_interpolation_problem(
         "cholesky",
         "qr",
         "cg",
-        "lsmr",
     ],
 )
 @pytest.mark.parametrize("geodesic_acceleration", [False, True])

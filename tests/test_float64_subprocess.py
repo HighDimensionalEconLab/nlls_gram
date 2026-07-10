@@ -104,7 +104,7 @@ theta = jnp.asarray([0.0, 0.0], dtype=jnp.float64)
 solver = UnderdeterminedLevenbergMarquardt(
     linear_residual,
     init_damping=1e-2,
-    linear_solver="lsmr",
+    linear_solver="cg",
     iterative_tol=1e-10,
     iterative_maxiter=20,
 )

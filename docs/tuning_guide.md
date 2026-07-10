@@ -35,7 +35,6 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
 | --- | --- |
 | `m` up to a few thousand | `cholesky` (default) |
 | `m × n` Jacobian too big to materialize, or very large `m` | `cg` |
-| square-root-only metric, matrix-free | `lsmr` |
 | ill-conditioned metric, moderate `m`, full-row-rank `J` | `qr` |
 
 - **Avoid `qr` when massively overparameterized.** It does not use the Gram
@@ -130,11 +129,10 @@ the step count.
 | symptom | likely cause | remedy |
 | --- | --- | --- |
 | `status == NONFINITE` at step 0 | bad initial point or data | check `residual_fn(x0, ...)` directly |
-| `qr` gives non-finite steps; other solvers fine | rank-deficient Jacobian | use `cholesky`/`cg`/`lsmr` |
+| `qr` gives non-finite steps; other solvers fine | rank-deficient Jacobian | use `cholesky`/`cg` |
 | `MAX_STEPS` but loss small and flat | converged without a stopping rule | set `gtol`/`xtol` |
 | damping grows without bound (float32 `inf`) | rejection storm | `max_damping`, or check residual scaling |
 | every `solve` call recompiles | new solver/callback object per call | construct once at setup scope |
-| float32 problem crashes under x64 with `lsmr` | known Lineax dtype issue | use `cholesky`/`cg`/`qr` |
 | implicit `jax.jvp`/`vjp` wrong or zero | `p` not in the residual signature, or perturbing `args` | move perturbed quantities into `p` |
 | NaN or no progress with a quasiseparable Matérn metric | nugget-free Matérn-3/2/5/2 Gram conditioning wall (cond ~1e21 at n=5000) | add an absolute `nugget` — it folds into the metric exactly |
 

@@ -15,7 +15,7 @@ larger than the number of residuals.
 `(x)`, `(x, args)`, or `(x, args, p)`, always in that order. The unknown `x`
 may be any JAX pytree; internally it
 is flattened with `jax.flatten_util.ravel_pytree`. The default dense solver
-uses the residual-space Gram system, with QR, CG, and LSMR alternatives. Use
+uses the residual-space Gram system, with QR and CG alternatives. Use
 `update(...)` for a single LM step or `solve(...)` for an internally jitted loop.
 
 ## Problem
@@ -155,10 +155,8 @@ Matérn/state-space kernel Grams, `metric_from_diagonal`,
 - `linear_solver="cg"`: matrix-free residual-space CG, with an optional
   `dual_preconditioner` hook (e.g. `sherman_morrison_preconditioner`); under
   AD, `implicit_solver="auto"` keeps `solve(...).x` matrix-free.
-- `linear_solver="lsmr"`: matrix-free Lineax LSMR on the damped least-squares
-  problem.
 
-All four solve the same metric-damped linearized subproblem up to the accuracy
+All three solve the same metric-damped linearized subproblem up to the accuracy
 of the chosen linear solver.
 
 ## Docs and Alternatives

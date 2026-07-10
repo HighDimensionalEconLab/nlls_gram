@@ -9,7 +9,7 @@ structure), the next lm_state, and an LMInfo. solve(...) runs repeated LM steps 
 optional callback control. With has_aux=True the residual returns
 (residual, aux) and the aux output is reported on LMInfo. An optional Metric
 defines a positive-definite parameter-space metric for LM damping. The solver
-depends only on JAX plus Lineax for LSMR.
+depends only on JAX.
 
 Tuning heuristics (solver selection, damping, inner-solve scheduling):
 https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/

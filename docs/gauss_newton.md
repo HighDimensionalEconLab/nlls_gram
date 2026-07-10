@@ -134,7 +134,7 @@ and the ordinary minimum-Euclidean-norm Gauss-Newton step
 \(s_{\mathrm{GN},M}\). Passing whitened variables to an ordinary LM solver is
 therefore equivalent to using the metric-aware solver in raw variables; the
 metric-aware Gram solver lets you stay in raw variables with the same
-geometry. (This is precisely the substitution the `qr` and `lsmr` paths make,
+geometry. (This is precisely the substitution the `qr` path makes,
 with \(S = L^{-\top}\).)
 
 ## Rank Deficiency

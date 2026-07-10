@@ -241,10 +241,6 @@ def test_iterative_options_must_be_valid():
             iterative_atol=0.0,
             iterative_maxiter=None,
         )
-    with pytest.raises(ValueError, match="lsmr_conlim must be positive"):
-        UnderdeterminedLevenbergMarquardt(
-            residual_fn, linear_solver="lsmr", lsmr_conlim=0.0
-        )
 
 
 def test_implicit_solver_options_must_be_valid():
@@ -411,42 +407,6 @@ def test_qr_step_matches_cholesky_identity_step():
     assert qr_info.loss.dtype == jnp.float32
 
 
-def test_lsmr_step_matches_closed_form_damped_linear_solution():
-    def residual(theta, args, p):
-        matrix, target = args
-        return matrix @ theta - target
-
-    matrix = jnp.array([[1.0, 2.0], [3.0, -1.0], [2.0, 0.5]])
-    target = jnp.array([1.0, 2.0, -1.0])
-    theta0 = jnp.array([0.0, 0.0])
-    init_damping = 0.1
-
-    solver = UnderdeterminedLevenbergMarquardt(
-        residual,
-        init_damping=init_damping,
-        linear_solver="lsmr",
-        iterative_tol=1e-7,
-        iterative_maxiter=20,
-    )
-    theta, lm_state, info = solver.update(
-        theta0, solver.init(theta0, (matrix, target)), (matrix, target)
-    )
-
-    expected_step = jnp.linalg.solve(
-        matrix.T @ matrix + init_damping * jnp.eye(matrix.shape[1]),
-        matrix.T @ target,
-    )
-    expected_loss = jnp.sum((matrix @ expected_step - target) ** 2)
-
-    assert bool(info.accepted)
-    assert not bool(info.used_geodesic)
-    assert jnp.allclose(theta, expected_step, rtol=1e-5, atol=1e-5)
-    assert jnp.allclose(info.loss, expected_loss, rtol=1e-5, atol=1e-5)
-    assert jnp.allclose(lm_state.damping, init_damping * 0.5)
-    assert theta.dtype == jnp.float32
-    assert info.loss.dtype == jnp.float32
-
-
 def test_qr_step_matches_closed_form_underdetermined_damped_solution():
     def residual(theta, args, p):
         matrix, target = args
@@ -551,31 +511,6 @@ def test_qr_update_jits():
         residual_fn,
         init_damping=1e-2,
         linear_solver="qr",
-    )
-
-    @jax.jit
-    def train_step(x, lm_state):
-        return solver.update(x, lm_state, (ts, ys))
-
-    x, lm_state, info = train_step(x, solver.init(x, (ts, ys)))
-
-    assert bool(info.accepted)
-    assert jnp.isfinite(info.loss)
-    assert jnp.isfinite(lm_state.damping)
-    assert x["a"].dtype == jnp.float32
-    assert x["b"].dtype == jnp.float32
-
-
-def test_lsmr_update_jits():
-    ts = jnp.linspace(0.0, 2.0, 20)
-    ys = 2.0 * jnp.exp(-1.0 * ts)
-    x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
-    solver = UnderdeterminedLevenbergMarquardt(
-        residual_fn,
-        init_damping=1e-2,
-        linear_solver="lsmr",
-        iterative_tol=1e-7,
-        iterative_maxiter=20,
     )
 
     @jax.jit
@@ -734,47 +669,6 @@ def test_qr_geodesic_acceleration_matches_cholesky():
     )
 
 
-def test_lsmr_geodesic_acceleration_matches_cholesky():
-    def residual(theta, target, p):
-        return jnp.array([theta[0] ** 2 - target])
-
-    theta0 = jnp.array([1.9])
-    target = 4.0
-
-    cholesky_solver = UnderdeterminedLevenbergMarquardt(
-        residual,
-        init_damping=1e-6,
-        geodesic_acceleration=True,
-        geodesic_acceptance_ratio=1.0,
-    )
-    lsmr_solver = UnderdeterminedLevenbergMarquardt(
-        residual,
-        init_damping=1e-6,
-        linear_solver="lsmr",
-        iterative_tol=1e-7,
-        iterative_maxiter=20,
-        geodesic_acceleration=True,
-        geodesic_acceptance_ratio=1.0,
-    )
-
-    cholesky_theta, _, cholesky_info = cholesky_solver.update(
-        theta0, cholesky_solver.init(theta0, target), target
-    )
-    lsmr_theta, _, lsmr_info = lsmr_solver.update(
-        theta0, lsmr_solver.init(theta0, target), target
-    )
-
-    assert bool(lsmr_info.accepted)
-    assert bool(lsmr_info.used_geodesic)
-    assert jnp.allclose(lsmr_theta, cholesky_theta, rtol=1e-6, atol=1e-6)
-    assert jnp.allclose(
-        lsmr_info.acceleration_ratio,
-        cholesky_info.acceleration_ratio,
-        rtol=1e-6,
-        atol=1e-6,
-    )
-
-
 def test_geodesic_acceleration_jits():
     def residual(theta, target, p):
         return jnp.array([theta[0] ** 2 - target])
@@ -902,7 +796,7 @@ def test_metric_selects_minimum_norm_interpolating_step():
     assert jnp.allclose(x_metric, jnp.array([0.8, 0.2]), atol=1e-5)
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr"])
 def test_metric_step_matches_closed_form_solution(linear_solver):
     def residual(theta, args, p):
         matrix, target = args
@@ -921,7 +815,7 @@ def test_metric_step_matches_closed_form_solution(linear_solver):
     )
     metric_matrix = L @ L.T
     solver_kwargs = {}
-    if linear_solver in ("cg", "lsmr"):
+    if linear_solver == "cg":
         solver_kwargs = {"iterative_tol": 1e-7, "iterative_maxiter": 30}
 
     solver = UnderdeterminedLevenbergMarquardt(
@@ -987,7 +881,7 @@ def test_geodesic_step_matches_regression_values():
     )
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr"])
 def test_metric_geodesic_acceleration_ratio_uses_metric_norm(linear_solver):
     def residual(theta, _, p):
         return jnp.array(
@@ -1003,7 +897,7 @@ def test_metric_geodesic_acceleration_ratio_uses_metric_norm(linear_solver):
     metric_matrix = L @ L.T
     metric = metric_from_cholesky(L)
     solver_kwargs = {}
-    if linear_solver in ("cg", "lsmr"):
+    if linear_solver == "cg":
         solver_kwargs = {"iterative_tol": 1e-7, "iterative_maxiter": 30}
     solver = UnderdeterminedLevenbergMarquardt(
         residual,
@@ -1494,7 +1388,7 @@ def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
     assert jnp.allclose(x_dot, expected_x_dot, atol=1e-6)
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr"])
 def test_grad_norm_and_step_norm_match_closed_form(linear_solver):
     def residual(theta, args, p):
         matrix, target = args
@@ -1505,7 +1399,7 @@ def test_grad_norm_and_step_norm_match_closed_form(linear_solver):
     theta0 = jnp.zeros(matrix.shape[1])
     init_damping = 0.1
     solver_kwargs = {}
-    if linear_solver in ("cg", "lsmr"):
+    if linear_solver == "cg":
         solver_kwargs = {"iterative_tol": 1e-7, "iterative_maxiter": 30}
 
     solver = UnderdeterminedLevenbergMarquardt(
@@ -1872,37 +1766,6 @@ def test_callback_resets_max_damping_cap():
     assert float(result.lm_state.damping) <= 10.0
 
 
-def test_callback_grows_lsmr_budget_when_loss_small():
-    matrix = jnp.diag(jnp.logspace(0.0, 1.5, 8))
-    target = jnp.linspace(1.0, 2.0, 8)
-
-    def residual(theta, _, __):
-        return matrix @ theta - target
-
-    def grow_budget(ctx):
-        new_maxiter = jnp.where(
-            ctx.info.loss < 2.0,
-            jnp.asarray(60, dtype=jnp.int32),
-            ctx.lm_state.hyper.iterative_maxiter,
-        )
-        new_hyper = dataclasses.replace(
-            ctx.lm_state.hyper, iterative_maxiter=new_maxiter
-        )
-        return LMSolveAction(
-            lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper)
-        )
-
-    solver = UnderdeterminedLevenbergMarquardt(
-        residual, init_damping=1e-1, linear_solver="lsmr", iterative_maxiter=1
-    )
-    theta0 = jnp.zeros(8)
-    fixed = solver.solve(theta0, max_steps=60)
-    scheduled = solver.solve(theta0, max_steps=60, callback=grow_budget)
-
-    assert int(scheduled.lm_state.hyper.iterative_maxiter) == 60
-    assert float(scheduled.info.loss) < 1e-2 * float(fixed.info.loss)
-
-
 @pytest.mark.parametrize("jit", [True, False])
 def test_callback_enabling_none_hyper_knob_raises_clear_error(jit):
     # max_damping=None is compiled out; flipping it on mid-solve must fail
@@ -2202,13 +2065,13 @@ def aux_residual_fn(x, args):
     return r, {"mean_abs": jnp.mean(jnp.abs(r)), "max_abs": jnp.max(jnp.abs(r))}
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "lsmr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr"])
 def test_has_aux_reports_aux_at_pre_step_x(linear_solver):
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": 1.0, "b": 0.0}
     solver_kwargs = {}
-    if linear_solver in ("cg", "lsmr"):
+    if linear_solver == "cg":
         solver_kwargs = {"iterative_tol": 1e-7, "iterative_maxiter": 20}
 
     solver = UnderdeterminedLevenbergMarquardt(
@@ -2617,12 +2480,6 @@ def test_dual_preconditioner_requires_cg():
         UnderdeterminedLevenbergMarquardt(
             residual_fn,
             linear_solver="qr",
-            dual_preconditioner=lambda v, damping: v,
-        )
-    with pytest.raises(ValueError, match="dual_preconditioner"):
-        UnderdeterminedLevenbergMarquardt(
-            residual_fn,
-            linear_solver="lsmr",
             dual_preconditioner=lambda v, damping: v,
         )
 
@@ -3372,12 +3229,11 @@ def test_metric_from_state_space_matern_small_pivot_grad_is_finite():
     assert bool(jnp.isfinite(grad))
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "qr", "lsmr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
 def test_metric_from_state_space_matern_matches_dense_metric_in_solver(linear_solver):
     # End-to-end: the O(n) Matern metric drives the actual solver (and its
     # implicit derivative) to the same solution as the equivalent dense
-    # metric. lsmr exercises inv_sqrt inside a lineax
-    # FunctionLinearOperator.
+    # metric.
     n = 8
     t = jnp.arange(n) * 1.0
     sigma, ell, nugget = 1.3, 0.8, 1e-6
@@ -3393,8 +3249,6 @@ def test_metric_from_state_space_matern_matches_dense_metric_in_solver(linear_so
         return A @ theta - jnp.array([p, 0.5 * p])
 
     solver_kwargs = {"init_damping": 1e-2, "linear_solver": linear_solver}
-    if linear_solver == "lsmr":
-        solver_kwargs.update({"iterative_tol": 1e-10, "iterative_maxiter": 50})
 
     def solved_x(metric, p):
         solver = UnderdeterminedLevenbergMarquardt(
@@ -3511,11 +3365,10 @@ def test_metric_from_shifted_matvec_validation_and_solver_requirements():
         metric_from_shifted_matvec(lambda x: x, 1.0, maxiter=0)
 
     metric = metric_from_shifted_matvec(lambda x: 2.0 * x, 1.0)
-    for linear_solver in ("qr", "lsmr"):
-        with pytest.raises(ValueError, match="inv_sqrt"):
-            UnderdeterminedLevenbergMarquardt(
-                residual_fn, linear_solver=linear_solver, metric=metric
-            )
+    with pytest.raises(ValueError, match="inv_sqrt"):
+        UnderdeterminedLevenbergMarquardt(
+            residual_fn, linear_solver="qr", metric=metric
+        )
     for linear_solver in ("cholesky", "cg"):
         UnderdeterminedLevenbergMarquardt(
             residual_fn, linear_solver=linear_solver, metric=metric
@@ -3572,11 +3425,9 @@ SHIFTED_STEP_CASES = [
     ("dense", "cholesky"),
     ("dense", "qr"),
     ("dense", "cg"),
-    ("dense", "lsmr"),
     ("state_space", "cholesky"),
     ("state_space", "qr"),
     ("state_space", "cg"),
-    ("state_space", "lsmr"),
     ("matvec", "cholesky"),
     ("matvec", "cg"),
 ]

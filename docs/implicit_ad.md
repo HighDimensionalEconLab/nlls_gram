@@ -101,7 +101,7 @@ $$
 J_p\dot p.
 $$
 
-In code, \(P x\) is applied with `metric.solve(x)` when available. If a QR/LSMR
+In code, \(P x\) is applied with `metric.solve(x)` when available. If a QR
 metric is supplied only through square-root callbacks, the same inverse metric is
 applied as \(P x = S S^\top x\) using `metric.inv_sqrt` and
 `metric.inv_sqrt_transpose`.

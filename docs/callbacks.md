@@ -72,8 +72,8 @@ the pre-action problem — and resume after the next update.
 
 `solve()` populates `lm_state.hyper` with an `LMHyperparams` of traced
 per-step values: `damping_decrease`, `damping_increase`, `max_damping`,
-`geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`,
-`iterative_maxiter`, and `lsmr_conlim`. Because they ride in the lm_state, a
+`geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`, and
+`iterative_maxiter`. Because they ride in the lm_state, a
 callback can reset any of them mid-solve — exactly like a damping reset:
 
 ```python

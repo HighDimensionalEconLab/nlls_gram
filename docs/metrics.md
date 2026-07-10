@@ -30,7 +30,7 @@ Validation rules:
 
 - For `linear_solver in {"cholesky", "cg"}`, a custom metric requires
   `metric.solve`.
-- For `linear_solver in {"qr", "lsmr"}`, a custom metric requires both
+- For `linear_solver="qr"`, a custom metric requires both
   `metric.inv_sqrt` and `metric.inv_sqrt_transpose`.
 - If geodesic acceleration is enabled (the default) and a custom metric is
   supplied, `metric.norm` is required — supply it or pass

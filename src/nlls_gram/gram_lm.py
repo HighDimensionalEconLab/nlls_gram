@@ -7,7 +7,6 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 import jax.scipy.sparse.linalg as jsp_sparse_linalg
-import lineax as lx
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram.metrics import Metric
@@ -53,7 +52,6 @@ class LMHyperparams:
     iterative_tol: jax.Array
     iterative_atol: jax.Array
     iterative_maxiter: jax.Array | None
-    lsmr_conlim: jax.Array
 
 
 def _cast_hyper(hyper, dtype):
@@ -71,7 +69,6 @@ def _cast_hyper(hyper, dtype):
         None
         if hyper.iterative_maxiter is None
         else jnp.asarray(hyper.iterative_maxiter, dtype=jnp.int32),
-        jnp.asarray(hyper.lsmr_conlim, dtype=dtype),
     )
 
 
@@ -219,7 +216,6 @@ class UnderdeterminedLevenbergMarquardt:
         iterative_tol=0.0,
         iterative_atol=0.0,
         iterative_maxiter=8,
-        lsmr_conlim=float("inf"),
         dual_preconditioner=None,
         implicit_solver="auto",
         implicit_tol=None,
@@ -268,7 +264,7 @@ class UnderdeterminedLevenbergMarquardt:
 
         else:
             canonical_residual = residual_fn
-        if linear_solver not in ("cholesky", "qr", "cg", "lsmr"):
+        if linear_solver not in ("cholesky", "qr", "cg"):
             raise ValueError(f"unknown linear_solver: {linear_solver}")
         if init_damping <= 0:
             raise ValueError("init_damping must be positive")
@@ -288,8 +284,6 @@ class UnderdeterminedLevenbergMarquardt:
             raise ValueError(
                 "iterative_maxiter must be set when both iterative tolerances are zero"
             )
-        if lsmr_conlim <= 0:
-            raise ValueError("lsmr_conlim must be positive")
         if dual_preconditioner is not None and linear_solver != "cg":
             raise ValueError('dual_preconditioner requires linear_solver="cg"')
         if implicit_solver not in ("auto", "cholesky", "cg"):
@@ -332,10 +326,10 @@ class UnderdeterminedLevenbergMarquardt:
                     f'linear_solver="{linear_solver}" with a custom metric requires '
                     "metric.solve"
                 )
-        if has_custom_metric and linear_solver in ("qr", "lsmr"):
+        if has_custom_metric and linear_solver == "qr":
             if metric.inv_sqrt is None or metric.inv_sqrt_transpose is None:
                 raise ValueError(
-                    f'linear_solver="{linear_solver}" with a custom metric requires '
+                    'linear_solver="qr" with a custom metric requires '
                     "metric.inv_sqrt and metric.inv_sqrt_transpose"
                 )
         if has_custom_metric and geodesic_acceleration and metric.norm is None:
@@ -354,7 +348,6 @@ class UnderdeterminedLevenbergMarquardt:
         self.iterative_tol = iterative_tol
         self.iterative_atol = iterative_atol
         self.iterative_maxiter = iterative_maxiter
-        self.lsmr_conlim = lsmr_conlim
         self.dual_preconditioner = dual_preconditioner
         self.implicit_solver = implicit_solver
         self.implicit_tol = implicit_tol
@@ -398,7 +391,6 @@ class UnderdeterminedLevenbergMarquardt:
             None
             if self.iterative_maxiter is None
             else jnp.asarray(self.iterative_maxiter, dtype=jnp.int32),
-            jnp.asarray(self.lsmr_conlim, dtype=dtype),
         )
 
     def init(self, x0, args=None, *, p=None):
@@ -470,9 +462,9 @@ class UnderdeterminedLevenbergMarquardt:
 
             residual_value = residual_flat
 
-        # Build J': matrix-free JVP/VJP closures for cg/lsmr; m VJP passes for
-        # the dense paths, reused from the cache after a rejected step.
-        if self.linear_solver in ("cg", "lsmr"):
+        # Build J': matrix-free JVP/VJP closures for cg; m VJP passes for the
+        # dense paths, reused from the cache after a rejected step.
+        if self.linear_solver == "cg":
             if self.has_aux:
                 resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
             else:
@@ -555,41 +547,6 @@ class UnderdeterminedLevenbergMarquardt:
                     M=cg_preconditioner,
                 )
                 return -self.metric_solve(JT(dual_solution))
-
-        elif self.linear_solver == "lsmr":
-            transpose_fn = jax.linear_transpose(jvp_fn, theta)
-            grad = transpose_fn(resid)[0]
-            sqrt_damping = jnp.sqrt(damping)
-            zero_tangent = jnp.zeros_like(theta)
-
-            def augmented_matvec(tangent):
-                return jnp.concatenate(
-                    (
-                        jvp_fn(self.metric_inv_sqrt(tangent)),
-                        sqrt_damping * tangent,
-                    )
-                )
-
-            augmented_operator = lx.FunctionLinearOperator(
-                augmented_matvec,
-                jax.ShapeDtypeStruct(theta.shape, theta.dtype),
-            )
-            lsmr_solver = lx.LSMR(
-                rtol=jnp.asarray(hyper.iterative_tol, dtype=resid.dtype),
-                atol=jnp.asarray(hyper.iterative_atol, dtype=resid.dtype),
-                max_steps=hyper.iterative_maxiter,
-                conlim=jnp.asarray(hyper.lsmr_conlim, dtype=resid.dtype),
-            )
-
-            def solve_step(rhs):
-                augmented_rhs = jnp.concatenate((-rhs, zero_tangent))
-                solution = lx.linear_solve(
-                    augmented_operator,
-                    augmented_rhs,
-                    solver=lsmr_solver,
-                    throw=False,
-                )
-                return self.metric_inv_sqrt(solution.value)
 
         else:
             if not self.cache_jacobian:
