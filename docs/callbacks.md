@@ -190,10 +190,17 @@ results = jax.vmap(solve_sample)(x0_batch, p_batch)
 
 JAX batches the internal `while_loop` until every lane has stopped. Lanes that
 finish early keep their result and report their own `steps` and `status`, but
-the compiled call still pays for iterations until the slowest lane stops.
-Callbacks used under `vmap` must be traceable and batch-safe; recipes based on
-`jax.experimental.io_callback`, such as the wall-clock time limit below, are
-host callbacks and should stay outside vmapped solves.
+the compiled call still pays for iterations until the slowest lane stops. Those
+extra masked iterations are discarded work only: a stopped lane's `x`, `steps`,
+and `status` stay frozen at its own stop, whether that stop came from a
+tolerance or from a callback. Tolerances are traced data, so `atol`, `gtol`,
+and `xtol` may themselves be vmapped to give each lane its own stopping
+criterion. `save_steps` composes the same way — a lane that stops early keeps
+its history rows frozen, with the padding beyond its own `steps` staying zero
+while other lanes continue. Callbacks used under `vmap` must be traceable and
+batch-safe; recipes based on `jax.experimental.io_callback`, such as the
+wall-clock time limit below, are host callbacks and should stay outside
+vmapped solves.
 
 ### Logging
 

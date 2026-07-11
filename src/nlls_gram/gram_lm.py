@@ -973,11 +973,13 @@ class UnderdeterminedLevenbergMarquardt:
         self._check_residual_args(args, p)
         if max_steps <= 0:
             raise ValueError("max_steps must be positive")
-        if atol < 0:
+        # Tolerances are traced data inside the loop, so vmapped/traced values
+        # skip the concrete-only sign validation.
+        if not isinstance(atol, jax.core.Tracer) and atol < 0:
             raise ValueError("atol must be nonnegative")
-        if gtol < 0:
+        if not isinstance(gtol, jax.core.Tracer) and gtol < 0:
             raise ValueError("gtol must be nonnegative")
-        if xtol < 0:
+        if not isinstance(xtol, jax.core.Tracer) and xtol < 0:
             raise ValueError("xtol must be nonnegative")
         if lm_state is None:
             # The loop recasts the damping and hyperparameter dtypes itself;

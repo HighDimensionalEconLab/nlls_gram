@@ -1327,6 +1327,128 @@ def test_vmap_over_solve_callback_stops_per_lane():
     assert jnp.allclose(batched.x, loop.x, atol=1e-6)
 
 
+@pytest.mark.parametrize("save_steps", [False, True])
+def test_vmap_over_solve_heterogeneous_convergence_matches_sequential(save_steps):
+    def residual(theta, _, p):
+        return theta - p["target"]
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1.0)
+    x0s = jnp.zeros((2, 1))
+    p = {"target": jnp.array([[1e-4], [3.0]])}
+    atol = 1e-5
+
+    def solve_one(x0, p_one):
+        return solver.solve(x0, p=p_one, max_steps=60, atol=atol, save_steps=save_steps)
+
+    batched = jax.vmap(solve_one)(x0s, p)
+    for i in range(2):
+        single = solve_one(x0s[i], jax.tree.map(lambda leaf, i=i: leaf[i], p))
+        assert int(batched.steps[i]) == int(single.steps)
+        assert int(batched.status[i]) == int(single.status) == LMStatus.CONVERGED
+        assert jnp.allclose(batched.x[i], single.x, atol=1e-6)
+        assert jnp.linalg.norm(batched.x[i] - p["target"][i]) < atol
+        if save_steps:
+            assert jnp.allclose(batched.x_history[i], single.x_history, atol=1e-6)
+            # A lane whose convergence fired must never keep writing rows while
+            # the slower lane continues, so its padding stays exactly zero.
+            assert jnp.all(batched.x_history[i, int(batched.steps[i]) + 1 :] == 0.0)
+    assert int(batched.steps[0]) < int(batched.steps[1])
+
+
+@pytest.mark.parametrize("save_steps", [False, True])
+def test_vmap_over_solve_epoch_conditional_callback_early_stop(save_steps):
+    steps_per_epoch = 3
+    init_damping = 1.0
+
+    def residual(theta, _, p):
+        return theta - p["target"]
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=init_damping)
+
+    # Epoch-boundary early stopping: the expensive check runs only every
+    # steps_per_epoch steps behind a lax.cond, which under vmap lowers to a
+    # select that evaluates both branches for every lane; per-lane stops must
+    # still bind exactly as in the sequential solves.
+    def callback(ctx):
+        def epoch_boundary(_):
+            r = ctx.x - ctx.p["target"]
+            stop = jnp.sum(r * r) < ctx.p["threshold"]
+            status = jnp.where(stop, LMStatus.CONVERGED, LMStatus.RUNNING)
+            return (
+                stop,
+                status.astype(jnp.int32),
+                jnp.asarray(init_damping, ctx.lm_state.damping.dtype),
+            )
+
+        def mid_epoch(_):
+            # RUNNING is the no-op status: solve only reads it when stop fires.
+            return (
+                jnp.asarray(False),
+                jnp.asarray(LMStatus.RUNNING, dtype=jnp.int32),
+                ctx.lm_state.damping,
+            )
+
+        stop, status, damping = jax.lax.cond(
+            ctx.step % steps_per_epoch == 0, epoch_boundary, mid_epoch, None
+        )
+        return LMSolveAction(
+            stop=stop,
+            status=status,
+            lm_state=dataclasses.replace(ctx.lm_state, damping=damping),
+        )
+
+    x0s = jnp.zeros((2, 1))
+    p = {
+        "target": jnp.full((2, 1), 2.0),
+        "threshold": jnp.array([1e-2, 1e-7]),
+    }
+
+    def solve_one(x0, p_one):
+        return solver.solve(
+            x0,
+            p=p_one,
+            max_steps=30,
+            atol=0.0,
+            callback=callback,
+            save_steps=save_steps,
+        )
+
+    batched = jax.vmap(solve_one)(x0s, p)
+    for i in range(2):
+        single = solve_one(x0s[i], jax.tree.map(lambda leaf, i=i: leaf[i], p))
+        assert int(batched.steps[i]) == int(single.steps)
+        assert int(batched.status[i]) == int(single.status) == LMStatus.CONVERGED
+        assert int(batched.steps[i]) % steps_per_epoch == 0
+        assert jnp.allclose(batched.x[i], single.x, atol=1e-6)
+        assert jnp.sum((batched.x[i] - p["target"][i]) ** 2) < p["threshold"][i]
+        if save_steps:
+            assert jnp.allclose(batched.x_history[i], single.x_history, atol=1e-6)
+            assert jnp.all(batched.x_history[i, int(batched.steps[i]) + 1 :] == 0.0)
+    assert int(batched.steps[0]) < int(batched.steps[1])
+
+
+def test_vmap_over_solve_tolerances():
+    def residual(theta, _, p):
+        return theta - p
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    x0 = jnp.zeros(1)
+    target = jnp.array([2.0])
+    atols = jnp.array([5e-2, 1e-5])
+
+    def solve_one(atol):
+        return solver.solve(x0, p=target, max_steps=100, atol=atol)
+
+    batched = jax.vmap(solve_one)(atols)
+    for i in range(2):
+        single = solve_one(atols[i])
+        assert int(batched.steps[i]) == int(single.steps)
+        assert int(batched.status[i]) == int(single.status) == LMStatus.CONVERGED
+        assert jnp.allclose(batched.x[i], single.x, atol=1e-6)
+    # The tight-tolerance lane keeps iterating after the loose lane stopped.
+    assert int(batched.steps[1]) > int(batched.steps[0])
+
+
 @pytest.mark.parametrize("jit", [True, False])
 def test_solve_implicit_jvp_and_vjp_wrt_p_match_underdetermined_root(jit):
     def residual(theta, _, p):
