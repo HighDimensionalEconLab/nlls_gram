@@ -391,7 +391,9 @@ For the iterate history itself there is no need for a callback:
 `solve(..., save_steps=True)` stacks x0 and every kept post-step iterate onto
 `result.x_history` (a pytree shaped like `x` with a `max_steps + 1` leading
 axis; rows beyond `result.steps` are zero padding), plus the row-aligned
-`result.aux_history` with `has_aux=True`. Slice with
+`result.args_history` (the kept post-action args — recorded even when no
+callback ever replaces them, so an args-resampling callback's history is
+complete) and, with `has_aux=True`, `result.aux_history`. Slice with
 `result.x_history[: int(result.steps) + 1]` (per leaf for a pytree `x`) — the
 histories are differentiation-inert.
 

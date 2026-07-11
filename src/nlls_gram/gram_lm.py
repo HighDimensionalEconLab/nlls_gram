@@ -159,10 +159,13 @@ class LMSolveResult:
     # With save_steps=True: the iterate history as a pytree shaped like x with a
     # (max_steps + 1) leading axis — row 0 is x0, row s the kept iterate after
     # step s (post-callback-action), rows beyond ``steps`` are zero padding.
-    # aux_history aligns row-for-row with x_history (has_aux only, else None).
+    # aux_history (has_aux only, else None) and args_history (None when args is
+    # None) align row-for-row with x_history — args row s is the kept
+    # post-action args after step s, the args consumed by step s + 1's update.
     # Differentiation-inert (zero tangents through the implicit rule).
     x_history: Any = None
     aux_history: Any = None
+    args_history: Any = None
 
 
 def _tree_changed(new, old):
@@ -958,11 +961,14 @@ class UnderdeterminedLevenbergMarquardt:
         ``save_steps=True`` records the full iterate history onto the result:
         ``x_history`` stacks x0 and every kept post-step iterate along a
         ``(max_steps + 1)`` leading axis (rows beyond ``steps`` are zero
-        padding — slice with ``result.steps``), and with ``has_aux`` the
-        row-aligned ``aux_history``. The history buffers cost
-        ``(max_steps + 1) x size(x)`` memory, are differentiation-inert, and
-        (unlike the default) make the jitted loop retrace when ``max_steps``
-        changes, since the buffer shape depends on it.
+        padding — slice with ``result.steps``), plus the row-aligned
+        ``args_history`` (the kept post-action args, recorded even when no
+        callback ever replaces them; ``None`` when ``args`` is ``None``) and,
+        with ``has_aux``, the row-aligned ``aux_history``. The history buffers
+        cost ``(max_steps + 1) x (size(x) + size(args) [+ size(aux)])``
+        memory, are differentiation-inert, and (unlike the default) make the
+        jitted loop retrace when ``max_steps`` changes, since the buffer shape
+        depends on it.
         """
         self._check_residual_args(args, p)
         if max_steps <= 0:
@@ -1049,6 +1055,7 @@ class UnderdeterminedLevenbergMarquardt:
                     aux_dot,
                     zero_result.x_history,
                     zero_result.aux_history,
+                    zero_result.args_history,
                 ),
             )
 
@@ -1320,7 +1327,7 @@ class UnderdeterminedLevenbergMarquardt:
             x, lm_state, info = self.update(x, lm_state, args, p)
             if not bool(jnp.isfinite(info.loss)):
                 status = LMStatus.NONFINITE
-                history = _record_history(history, steps, x, info)
+                history = _record_history(history, steps, x, info, args)
                 break
             action = None
             if callback is not None:
@@ -1340,7 +1347,7 @@ class UnderdeterminedLevenbergMarquardt:
             action, x, lm_state, args, user_state, problem_changed = self._apply_action(
                 action, x, lm_state, args, user_state
             )
-            history = _record_history(history, steps, x, info)
+            history = _record_history(history, steps, x, info, args)
             if action.stop is not None and bool(action.stop):
                 status = (
                     LMStatus.CALLBACK_STOP
@@ -1363,7 +1370,9 @@ class UnderdeterminedLevenbergMarquardt:
         final_aux = None
         if self.has_aux:
             final_aux = self._residual_and_aux(x, args, p)[1]
-        x_history, aux_history = _finalize_history(history, steps, final_aux)
+        x_history, aux_history, args_history = _finalize_history(
+            history, steps, final_aux
+        )
         return LMSolveResult(
             x,
             lm_state,
@@ -1376,27 +1385,35 @@ class UnderdeterminedLevenbergMarquardt:
             final_aux,
             x_history,
             aux_history,
+            args_history,
         )
 
 
 # save_steps bookkeeping shared by the jitted and Python solve loops: row `step` of
-# x_history takes the kept post-action iterate; info.aux was evaluated at the pre-step
-# x, so it lands one row earlier, and _finalize_history fills the last aux row from the
-# final-solution evaluation. history_len is concrete (static under jit), so the
-# buffers live entirely inside the loop implementations — no host-side allocation
-# and no copy of a jit-input buffer before the in-place row updates. eval_shape
-# gets the aux buffer shapes without paying for a residual evaluation.
-def _init_history(solver, x0, args, p, history_len):
-    if history_len is None:
-        return None
-    x_history = jax.tree.map(
+# x_history and args_history takes the kept post-action iterate and args; info.aux was
+# evaluated at the pre-step x, so it lands one row earlier, and _finalize_history fills
+# the last aux row from the final-solution evaluation. history_len is concrete (static
+# under jit), so the buffers live entirely inside the loop implementations — no
+# host-side allocation and no copy of a jit-input buffer before the in-place row
+# updates. eval_shape gets the aux buffer shapes without paying for a residual
+# evaluation.
+def _history_buffer(tree, history_len):
+    # Row 0 holds the initial value; tree.map over a None tree returns None.
+    return jax.tree.map(
         lambda leaf: (
             jnp.zeros((history_len, *jnp.shape(leaf)), jnp.result_type(leaf))
             .at[0]
             .set(leaf)
         ),
-        x0,
+        tree,
     )
+
+
+def _init_history(solver, x0, args, p, history_len):
+    if history_len is None:
+        return None
+    x_history = _history_buffer(x0, history_len)
+    args_history = _history_buffer(args, history_len)
     aux_history = None
     if solver.has_aux:
         aux0 = jax.eval_shape(
@@ -1408,30 +1425,33 @@ def _init_history(solver, x0, args, p, history_len):
         aux_history = jax.tree.map(
             lambda leaf: jnp.zeros((history_len, *leaf.shape), leaf.dtype), aux0
         )
-    return (x_history, aux_history)
+    return (x_history, aux_history, args_history)
 
 
-def _record_history(history, step, x, info):
+def _record_history(history, step, x, info, args):
     if history is None:
         return None
-    x_history, aux_history = history
+    x_history, aux_history, args_history = history
     x_history = jax.tree.map(lambda buf, leaf: buf.at[step].set(leaf), x_history, x)
+    args_history = jax.tree.map(
+        lambda buf, leaf: buf.at[step].set(leaf), args_history, args
+    )
     if aux_history is not None:
         aux_history = jax.tree.map(
             lambda buf, leaf: buf.at[step - 1].set(leaf), aux_history, info.aux
         )
-    return (x_history, aux_history)
+    return (x_history, aux_history, args_history)
 
 
 def _finalize_history(history, steps, final_aux):
     if history is None:
-        return None, None
-    x_history, aux_history = history
+        return None, None, None
+    x_history, aux_history, args_history = history
     if aux_history is not None:
         aux_history = jax.tree.map(
             lambda buf, leaf: buf.at[steps].set(leaf), aux_history, final_aux
         )
-    return x_history, aux_history
+    return x_history, aux_history, args_history
 
 
 def _solve_loop_impl(
@@ -1505,7 +1525,7 @@ def _solve_loop_impl(
         action, x, lm_state, args, user_state, problem_changed = solver._apply_action(
             action, x, lm_state, args, user_state
         )
-        history = _record_history(history, step, x, info)
+        history = _record_history(history, step, x, info, args)
 
         callback_stop = (
             jnp.asarray(False, dtype=jnp.bool_) if action.stop is None else action.stop
@@ -1548,7 +1568,7 @@ def _solve_loop_impl(
     final_aux = None
     if solver.has_aux:
         final_aux = solver._residual_and_aux(x, args, p)[1]
-    x_history, aux_history = _finalize_history(history, step, final_aux)
+    x_history, aux_history, args_history = _finalize_history(history, step, final_aux)
     return LMSolveResult(
         x,
         lm_state,
@@ -1561,6 +1581,7 @@ def _solve_loop_impl(
         final_aux,
         x_history,
         aux_history,
+        args_history,
     )
 
 
