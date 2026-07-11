@@ -51,9 +51,11 @@ whose leaves are JAX numeric types — it is returned through the jitted loop)
 whose flattened size equals the flattened size of `x`, in the same dtype.
 The result is a lean
 `SquareSolveResult` with `x`, `residual_norm` (the residual 2-norm at the
-returned `x`), `steps`, `status`, and `aux` (with `has_aux=True`). The loop
-controls (`max_steps`, `atol`, `gtol`, `xtol`) are concrete Python scalars,
-not traceable arguments.
+returned `x`), `steps`, `status`, `aux` (with `has_aux=True`), and the
+pass-through `args` and `p` the solve was called with — the same accessors as
+the underdetermined solver's `LMSolveResult`, so downstream code can read
+`result.args`/`result.p` uniformly. The loop controls (`max_steps`, `atol`,
+`gtol`, `xtol`) are concrete Python scalars, not traceable arguments.
 
 For a DAE stage `0 = g(y, z, t, args, params)` solved for `z`:
 

@@ -29,7 +29,11 @@ class SquareSolveResult:
     default tolerances, ``status == LMStatus.CONVERGED`` holds exactly when it
     is below ``atol``, and a caller enforcing its own root criterion can check
     it directly. ``aux`` is the residual's aux output at the returned ``x``
-    (``has_aux=True`` only).
+    (``has_aux=True`` only). ``args`` and ``p`` are the values the solve was
+    called with, carried through for a uniform result interface with
+    ``LMSolveResult`` (the square solver has no callbacks, so they are exactly
+    the inputs; ``p`` participates in the implicit rule like the
+    underdetermined solver's).
     """
 
     x: Any
@@ -37,6 +41,8 @@ class SquareSolveResult:
     steps: jax.Array
     status: jax.Array
     aux: Any = None
+    args: Any = None
+    p: Any = None
 
 
 class SquareLevenbergMarquardt:
@@ -200,6 +206,8 @@ class SquareLevenbergMarquardt:
                     zero_result.steps,
                     zero_result.status,
                     aux_dot,
+                    zero_result.args,
+                    p_dot,
                 ),
             )
 
@@ -280,6 +288,8 @@ class SquareLevenbergMarquardt:
             jnp.asarray(steps, dtype=jnp.int32),
             jnp.asarray(status, dtype=jnp.int32),
             aux,
+            args,
+            p,
         )
 
 
@@ -419,6 +429,8 @@ def _square_solve_loop_impl(solver, x, args, p, max_steps, atol, gtol, xtol):
         step,
         status,
         aux,
+        args,
+        p,
     )
 
 

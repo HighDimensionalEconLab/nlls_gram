@@ -400,3 +400,41 @@ def test_equal_settings_square_solvers_share_the_compiled_solve_loop():
     assert traces["count"] == count_after_first
 
     assert a != SquareLevenbergMarquardt(residual, init_damping=1e-2)
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_square_solve_result_carries_args_and_p(jit):
+    def residual(x, args, p):
+        return x**2 - args * p
+
+    solver = SquareLevenbergMarquardt(residual)
+    args, p = jnp.asarray(2.0), jnp.asarray(2.0)
+    result = solver.solve(jnp.array([1.0]), args, p=p, max_steps=50, jit=jit)
+
+    assert int(result.status) == LMStatus.CONVERGED
+    assert jnp.array_equal(result.args, args)
+    assert jnp.array_equal(result.p, p)
+    assert jnp.allclose(result.x, jnp.array([2.0]), atol=1e-5)
+
+
+def test_square_solve_result_args_and_p_default_to_none():
+    solver = SquareLevenbergMarquardt(lambda x, args, p: x**2 - 4.0)
+    result = solver.solve(jnp.array([1.0]), max_steps=50)
+
+    assert result.args is None
+    assert result.p is None
+
+
+def test_square_solve_result_p_participates_in_implicit_jvp():
+    solver = SquareLevenbergMarquardt(lambda x, args, p: x**2 - p)
+
+    def solved(p):
+        result = solver.solve(jnp.array([1.0]), p=p, max_steps=50)
+        return result.x, result.p
+
+    p, p_dot = jnp.asarray(4.0), jnp.asarray(1.0)
+    (x, p_out), (x_dot, p_out_dot) = jax.jvp(solved, (p,), (p_dot,))
+    # dx/dp = 1/(2 sqrt(p)) at the root, and result.p passes p_dot through.
+    assert jnp.allclose(x_dot, jnp.array([0.25]), atol=1e-5)
+    assert jnp.allclose(p_out, p)
+    assert jnp.allclose(p_out_dot, p_dot)
