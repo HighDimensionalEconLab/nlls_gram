@@ -4800,7 +4800,12 @@ def test_implicit_cg_woodbury_preconditioner_with_shifted_metric():
 
     p, p_dot = jnp.asarray(1.0), jnp.asarray(1.0)
     _, dense_dot = jax.jvp(
-        lambda q: solved_x({"implicit_solver": "cholesky"}, q), (p,), (p_dot,)
+        # implicit_penalty=0.0: the spiked metric puts 1/eps into the dual
+        # trace, so the trace-scaled default ridge would bias this exact
+        # dense reference.
+        lambda q: solved_x({"implicit_solver": "cholesky", "implicit_penalty": 0.0}, q),
+        (p,),
+        (p_dot,),
     )
     _, spike_dot = jax.jvp(
         lambda q: solved_x(

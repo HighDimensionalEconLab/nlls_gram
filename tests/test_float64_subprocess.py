@@ -687,8 +687,14 @@ def dense_composite(eps):
 
 
 def solved_x(metric, p):
+    # implicit_penalty=0.0: the eps-shifted metric spikes the dual trace by
+    # 1/eps, so a trace-scaled ridge would perturb this exact-limit check.
     solver = UnderdeterminedLevenbergMarquardt(
-        residual, init_damping=1e-6, metric=metric, geodesic_acceleration=False
+        residual,
+        init_damping=1e-6,
+        metric=metric,
+        geodesic_acceleration=False,
+        implicit_penalty=0.0,
     )
     return solver.solve(jnp.zeros(n + k), p=p, max_steps=200, atol=1e-12).x
 
@@ -823,3 +829,49 @@ for line in jaxpr.splitlines():
         text=True,
     )
     assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_float64_dense_implicit_penalty_near_duplicate_rows():
+    # The growth-model pathology: a converged simulation duplicates its
+    # late-horizon states to ~1e-13, so the float64 undamped implicit dual has
+    # eigenvalues far below the factorization noise floor and the unregularized
+    # dense rule goes non-finite. The default ridge must return the min-norm
+    # tangent d sum(x*)/d target = sum(w)/||w||^2 (exact in the duplicate
+    # limit) to high accuracy.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import UnderdeterminedLevenbergMarquardt
+
+w = jnp.array([1.0, 2.0, 3.0])
+wiggles = 1.0 + 1e-13 * jnp.arange(40.0)
+
+
+def residual_fn(x, args, p):
+    return wiggles * (jnp.dot(w, x) - p["target"])
+
+
+x0 = jnp.zeros(3)
+solver = UnderdeterminedLevenbergMarquardt(residual_fn)
+
+
+def sum_x_star(target):
+    return jnp.sum(solver.solve(x0, p={"target": target}, max_steps=50).x)
+
+
+expected = jnp.sum(w) / jnp.dot(w, w)
+_, jvp = jax.jvp(sum_x_star, (1.0,), (1.0,))
+assert jnp.isfinite(jvp), jvp
+assert jnp.allclose(jvp, expected, rtol=1e-8), (jvp, expected)
+grad = jax.grad(sum_x_star)(1.0)
+assert jnp.isfinite(grad), grad
+assert jnp.allclose(grad, expected, rtol=1e-8), (grad, expected)
+"""
+    subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )

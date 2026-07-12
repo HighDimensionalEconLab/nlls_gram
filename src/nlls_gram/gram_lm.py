@@ -338,12 +338,12 @@ class UnderdeterminedLevenbergMarquardt:
     its steady state -- make the undamped dual singular and the unregularized
     factorization non-finite; for such consistent systems the ridge returns
     the minimum-norm tangent with an O(``implicit_penalty * m``) relative
-    bias. The default ``None`` resolves to ``eps`` of the dual-solve dtype
-    (~2.2e-16 in float64, ~1.2e-7 in float32, after any ``dual_solve_dtype``
-    promotion) -- the classic semidefinite-jitter scale, negligible against
-    any well-conditioned tangent; pass ``0.0`` to restore the exact
-    unregularized rule, whose non-finite tangents signal a singular dual
-    loudly.
+    bias. The default ``None`` resolves to ``1e-12`` for a float64 dual solve
+    and ``1e-6`` for float32 (after any ``dual_solve_dtype`` promotion) --
+    empirically orders of magnitude above the factorization noise floor of
+    near-duplicate rows and below any visible tangent bias; pass ``0.0`` to
+    restore the exact unregularized rule, whose non-finite tangents signal a
+    singular dual loudly.
 
     ``dual_solve_dtype=jnp.float64`` promotes the dual (Gram) solve of the
     dense cholesky paths -- the forward ``linear_solver="cholesky"`` branch
@@ -1165,13 +1165,15 @@ class UnderdeterminedLevenbergMarquardt:
         # returned solution (e.g. a simulated trajectory settled onto its steady
         # state) make the undamped dual singular and the factorization non-finite;
         # for such consistent systems the ridge returns the minimum-norm tangent
-        # with an O(implicit_penalty * m) relative bias. The eps default is the
-        # classic semidefinite-jitter scale eps * trace = m * eps * mean(eig),
-        # invisible against well-conditioned tangents. implicit_penalty=0.0
-        # disables (non-finite tangents on a singular dual).
+        # with an O(implicit_penalty * m) relative bias. The defaults sit orders
+        # of magnitude from both empirical edges (see the redundant-rows tests):
+        # near-duplicate float64 rows need > ~1e-14 to factor while visible
+        # tangent bias starts above ~1e-6, and the float32 value stays below the
+        # library's float32 tangent tolerances while dominating float32 assembly
+        # noise. implicit_penalty=0.0 disables (non-finite on a singular dual).
         penalty = self.implicit_penalty
         if penalty is None:
-            penalty = float(jnp.finfo(dual_dtype).eps)
+            penalty = 1e-12 if jnp.dtype(dual_dtype) == jnp.dtype(jnp.float64) else 1e-6
         gram = gram + penalty * jnp.trace(gram) * jnp.eye(
             gram.shape[0], dtype=dual_dtype
         )
