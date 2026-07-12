@@ -331,6 +331,20 @@ class UnderdeterminedLevenbergMarquardt:
     ``pad_dual_preconditioner``, which divides by the live damping and is
     rejected here at construction.
 
+    ``implicit_penalty`` regularizes the DENSE implicit rule only (the cg
+    implicit rule ignores it): the implicit dual is factored as
+    ``J P J' + implicit_penalty * trace(J P J') I_m``. Redundant residual
+    rows at the returned solution -- e.g. a simulated trajectory settled onto
+    its steady state -- make the undamped dual singular and the unregularized
+    factorization non-finite; for such consistent systems the ridge returns
+    the minimum-norm tangent with an O(``implicit_penalty * m``) relative
+    bias. The default ``None`` resolves to ``eps`` of the dual-solve dtype
+    (~2.2e-16 in float64, ~1.2e-7 in float32, after any ``dual_solve_dtype``
+    promotion) -- the classic semidefinite-jitter scale, negligible against
+    any well-conditioned tangent; pass ``0.0`` to restore the exact
+    unregularized rule, whose non-finite tangents signal a singular dual
+    loudly.
+
     ``dual_solve_dtype=jnp.float64`` promotes the dual (Gram) solve of the
     dense cholesky paths -- the forward ``linear_solver="cholesky"`` branch
     and the dense implicit rule -- to float64: ``J'`` is cast wide before the
@@ -369,6 +383,7 @@ class UnderdeterminedLevenbergMarquardt:
         implicit_atol=0.0,
         implicit_maxiter=None,
         implicit_preconditioner=None,
+        implicit_penalty=None,
         dual_solve_dtype=None,
         metric=None,
         has_aux=False,
@@ -407,6 +422,8 @@ class UnderdeterminedLevenbergMarquardt:
             raise ValueError("implicit_atol must be nonnegative")
         if implicit_maxiter is not None and implicit_maxiter <= 0:
             raise ValueError("implicit_maxiter must be positive or None")
+        if implicit_penalty is not None and implicit_penalty < 0:
+            raise ValueError("implicit_penalty must be nonnegative or None")
         if implicit_tol == 0 and implicit_atol == 0 and implicit_maxiter is None:
             raise ValueError(
                 "implicit_maxiter must be set when both implicit tolerances are zero"
@@ -513,6 +530,7 @@ class UnderdeterminedLevenbergMarquardt:
             if implicit_preconditioner is None
             else canonicalize_implicit_preconditioner(implicit_preconditioner)
         )
+        self.implicit_penalty = implicit_penalty
         self.dual_solve_dtype = (
             None if dual_solve_dtype is None else jnp.dtype(dual_solve_dtype)
         )
@@ -561,6 +579,7 @@ class UnderdeterminedLevenbergMarquardt:
                 implicit_atol,
                 implicit_maxiter,
                 implicit_preconditioner,
+                implicit_penalty,
                 self.dual_solve_dtype,
                 metric,
                 has_aux,
@@ -1142,6 +1161,20 @@ class UnderdeterminedLevenbergMarquardt:
         transposed_jacobian = Jt.astype(dual_dtype)
         gram_step_left = self._metric_inverse(transposed_jacobian)
         gram = transposed_jacobian.T @ gram_step_left
+        # Tikhonov ridge scaled by the trace: redundant residual rows at the
+        # returned solution (e.g. a simulated trajectory settled onto its steady
+        # state) make the undamped dual singular and the factorization non-finite;
+        # for such consistent systems the ridge returns the minimum-norm tangent
+        # with an O(implicit_penalty * m) relative bias. The eps default is the
+        # classic semidefinite-jitter scale eps * trace = m * eps * mean(eig),
+        # invisible against well-conditioned tangents. implicit_penalty=0.0
+        # disables (non-finite tangents on a singular dual).
+        penalty = self.implicit_penalty
+        if penalty is None:
+            penalty = float(jnp.finfo(dual_dtype).eps)
+        gram = gram + penalty * jnp.trace(gram) * jnp.eye(
+            gram.shape[0], dtype=dual_dtype
+        )
         factor = jsp_linalg.cho_factor(gram)
         dual_solution = jsp_linalg.cho_solve(factor, residual_p_dot.astype(dual_dtype))
         theta_dot = -gram_step_left @ dual_solution

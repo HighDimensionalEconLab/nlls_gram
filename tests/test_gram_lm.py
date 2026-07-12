@@ -258,6 +258,8 @@ def test_implicit_solver_options_must_be_valid():
         UnderdeterminedLevenbergMarquardt(residual_fn, implicit_atol=-1.0)
     with pytest.raises(ValueError, match="implicit_maxiter must be positive or None"):
         UnderdeterminedLevenbergMarquardt(residual_fn, implicit_maxiter=0)
+    with pytest.raises(ValueError, match="implicit_penalty must be nonnegative"):
+        UnderdeterminedLevenbergMarquardt(residual_fn, implicit_penalty=-1e-8)
     with pytest.raises(ValueError, match="implicit_maxiter must be set"):
         UnderdeterminedLevenbergMarquardt(
             residual_fn,
@@ -1447,6 +1449,42 @@ def test_vmap_over_solve_tolerances():
         assert jnp.allclose(batched.x[i], single.x, atol=1e-6)
     # The tight-tolerance lane keeps iterating after the loose lane stopped.
     assert int(batched.steps[1]) > int(batched.steps[0])
+
+
+def test_dense_implicit_penalty_handles_singular_dual_from_redundant_rows():
+    # Two identical residual rows: the undamped implicit dual J J' is singular
+    # (rank 1) everywhere, but the system is consistent and x*(p) is smooth
+    # with minimum-norm derivative d x* / d target = w / ||w||^2 from x0 = 0.
+    # The default eps * trace ridge resolves it to that min-norm tangent.
+    w = jnp.array([1.0, 2.0, 3.0])
+
+    def duplicated_rows_residual(x, args, p):
+        row = jnp.dot(w, x) - p["target"]
+        return jnp.stack([row, row])
+
+    x0 = jnp.zeros(3)
+    p = {"target": 1.0}
+    expected = jnp.sum(w) / jnp.dot(w, w)
+
+    def sum_x_star(solver, p):
+        return jnp.sum(solver.solve(x0, p=p, max_steps=50).x)
+
+    regularized = UnderdeterminedLevenbergMarquardt(duplicated_rows_residual)
+    vjp_grad = jax.jacobian(lambda p: sum_x_star(regularized, p))(p)["target"]
+    assert jnp.allclose(vjp_grad, expected, rtol=1e-4)
+    _, jvp_grad = jax.jvp(
+        lambda t: sum_x_star(regularized, {"target": t}), (1.0,), (1.0,)
+    )
+    assert jnp.allclose(jvp_grad, expected, rtol=1e-4)
+
+    # An explicit (larger) penalty is plumbed through and still resolves the
+    # singular dual; the bias grows with the penalty but stays O(penalty * m).
+    blunt = UnderdeterminedLevenbergMarquardt(
+        duplicated_rows_residual, implicit_penalty=1e-4
+    )
+    blunt_grad = jax.jacobian(lambda p: sum_x_star(blunt, p))(p)["target"]
+    assert jnp.isfinite(blunt_grad)
+    assert jnp.allclose(blunt_grad, expected, rtol=1e-3)
 
 
 @pytest.mark.parametrize("jit", [True, False])
@@ -4607,10 +4645,11 @@ def test_padded_zero_residual_qr_is_rank_deficient():
 
 def test_padded_zero_residual_implicit_ad_is_singular_by_design():
     # Padded rows are zero Jacobian rows, so the UNDAMPED implicit dual
-    # J P J' is singular: the implicit rules return a non-finite derivative
-    # on padded problems even though the forward solve is fine (the
-    # minimum-metric-norm derivative exists mathematically and equals the
-    # unpadded one — differentiate the unpadded formulation to get it).
+    # J P J' is singular. With implicit_penalty=0.0 the dense rule keeps the
+    # loud unregularized contract (non-finite tangent); the default eps *
+    # trace ridge resolves the padding -- a consistent singularity -- to the
+    # minimum-metric-norm tangent of the unpadded formulation, with no
+    # padding-aware special casing.
     A = jax.random.normal(jax.random.PRNGKey(59), (3, 8))
 
     def residual(theta, _, p):
@@ -4622,7 +4661,13 @@ def test_padded_zero_residual_implicit_ad_is_singular_by_design():
     plain = UnderdeterminedLevenbergMarquardt(
         residual, init_damping=1e-2, geodesic_acceleration=False
     )
-    padded = UnderdeterminedLevenbergMarquardt(
+    padded_loud = UnderdeterminedLevenbergMarquardt(
+        residual_padded,
+        init_damping=1e-2,
+        geodesic_acceleration=False,
+        implicit_penalty=0.0,
+    )
+    padded_default = UnderdeterminedLevenbergMarquardt(
         residual_padded, init_damping=1e-2, geodesic_acceleration=False
     )
 
@@ -4630,13 +4675,18 @@ def test_padded_zero_residual_implicit_ad_is_singular_by_design():
         return solver.solve(jnp.zeros(8), p=p, max_steps=40, atol=1e-5).x
 
     p0 = jnp.array([1.0, -0.5, 0.25])
-    x_plain = solved_x(plain, p0)
-    x_padded, x_dot = jax.jvp(lambda p: solved_x(padded, p), (p0,), (jnp.ones(3),))
+    p_dot = jnp.ones(3)
+    x_plain, x_plain_dot = jax.jvp(lambda p: solved_x(plain, p), (p0,), (p_dot,))
+    x_padded, x_dot = jax.jvp(lambda p: solved_x(padded_loud, p), (p0,), (p_dot,))
     # The forward padded solve is healthy and matches the unpadded solution;
-    # only the implicit tangent is non-finite.
+    # only the unregularized implicit tangent is non-finite.
     assert bool(jnp.all(jnp.isfinite(x_padded)))
     assert jnp.allclose(x_padded, x_plain, atol=1e-4)
     assert not bool(jnp.all(jnp.isfinite(x_dot)))
+    # The default ridge recovers the unpadded implicit tangent.
+    _, x_dot_default = jax.jvp(lambda p: solved_x(padded_default, p), (p0,), (p_dot,))
+    assert bool(jnp.all(jnp.isfinite(x_dot_default)))
+    assert jnp.allclose(x_dot_default, x_plain_dot, atol=1e-4)
 
 
 def test_implicit_cg_with_shifted_matvec_metric_matches_dense():
@@ -4841,12 +4891,14 @@ def test_implicit_cg_vmap_and_hessian_match_dense():
 
 
 def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
-    # J P J' singular with an inconsistent tangent right-hand side: the
-    # dense rule NaNs through cho_solve, and the cg rule's run-to-tolerance
-    # default diverges to non-finite as well. Only a small bounded
-    # implicit_maxiter (the exact-preconditioner budget mode) returns a
-    # finite -- and wrong -- derivative, which is why that mode is reserved
-    # for exact preconditioners.
+    # J P J' singular with an INCONSISTENT tangent right-hand side: the
+    # unregularized dense rule (implicit_penalty=0.0) NaNs through cho_solve,
+    # and the cg rule's run-to-tolerance default diverges to non-finite as
+    # well. Only a small bounded implicit_maxiter (the exact-preconditioner
+    # budget mode) returns a finite -- and wrong -- derivative, which is why
+    # that mode is reserved for exact preconditioners. (No ridge can make an
+    # inconsistent dual meaningful; the default ridge would return a finite,
+    # penalty-inflated tangent here, which is the documented trade-off.)
     A = jnp.array(
         [
             [1.0, 0.0, 0.0, 0.0, 0.0],
@@ -4872,6 +4924,7 @@ def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
             implicit_solver=implicit_solver,
             implicit_tol=1e-8,
             implicit_maxiter=implicit_maxiter,
+            implicit_penalty=0.0,
             iterative_tol=1e-8,
             iterative_maxiter=100,
             geodesic_acceleration=False,
