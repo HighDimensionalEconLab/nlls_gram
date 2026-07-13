@@ -4946,3 +4946,44 @@ def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
     assert not bool(jnp.all(jnp.isfinite(x_dot("cholesky", None))))
     assert not bool(jnp.all(jnp.isfinite(x_dot("cg", None))))
     assert bool(jnp.all(jnp.isfinite(x_dot("cg", 1))))
+
+
+@pytest.mark.parametrize("jit", [True, False])
+def test_callback_returns_bare_lmstatus_members_without_casts(jit):
+    # The spooky-shaped epoch callback: a lax.cond whose branches return bare
+    # LMStatus members / weak values -- no .astype or dtype= casts. The solver
+    # canonicalizes stop to bool and status to int32 at the boundary.
+    def residual(theta, args, p):
+        return theta - args
+
+    def epoch_callback(ctx):
+        def check(_):
+            stop = ctx.info.loss < 1e-8
+            status = jnp.where(stop, LMStatus.CONVERGED, LMStatus.RUNNING)
+            return stop, status
+
+        def keep_running(_):
+            return jnp.asarray(False), jnp.asarray(LMStatus.RUNNING)
+
+        stop, status = jax.lax.cond(ctx.step % 2 == 0, check, keep_running, None)
+        return LMSolveAction(stop=stop, status=status)
+
+    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    result = solver.solve(
+        jnp.array([0.0]),
+        jnp.array([1.0]),
+        max_steps=50,
+        callback=epoch_callback,
+        jit=jit,
+    )
+    assert result.status.dtype == jnp.int32
+    assert int(result.status) == LMStatus.CONVERGED
+
+
+def test_lmstatus_intenum_semantics():
+    assert int(LMStatus.CONVERGED) == 1
+    assert LMStatus(2) is LMStatus.MAX_STEPS
+    assert LMStatus.MAX_STEPS.name == "MAX_STEPS"
+    labels = {LMStatus.CONVERGED: "early_stopping_met"}
+    assert labels.get(LMStatus(int(jnp.asarray(1)))) == "early_stopping_met"
+    assert bool(jnp.asarray(1, dtype=jnp.int32) == LMStatus.CONVERGED)

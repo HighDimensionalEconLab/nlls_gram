@@ -1,4 +1,5 @@
 import dataclasses
+import enum
 import inspect
 from dataclasses import dataclass
 from typing import Any
@@ -21,8 +22,16 @@ from nlls_gram.metrics import Metric
 # branching. Dtypes flow from the residual; damping scalars are cast to match.
 
 
-class LMStatus:
-    """Integer status codes returned by ``solve``."""
+class LMStatus(enum.IntEnum):
+    """Integer status codes returned by ``solve``.
+
+    Members are real ints (``IntEnum``): they work as dict keys, compare
+    against status arrays, and ``LMStatus(int(result.status)).name`` recovers
+    the label for logging. Callbacks may return bare members (or any weak
+    integer value) as ``LMSolveAction.status`` -- the solver canonicalizes to
+    int32 at the boundary, so no ``jnp.asarray(..., dtype=jnp.int32)`` casts
+    are needed, under float32 or x64.
+    """
 
     RUNNING = 0
     CONVERGED = 1
@@ -111,7 +120,9 @@ class LMSolveAction:
     """Optional callback action for ``solve``.
 
     A field left as ``None`` is unchanged. ``status`` is used only when ``stop``
-    is true.
+    is true. ``stop`` and ``status`` are canonicalized by the solver (to bool
+    and int32), so callbacks may return Python bools, bare ``LMStatus``
+    members, or weak-typed arrays without explicit dtype casts.
     """
 
     stop: Any = None
@@ -1565,7 +1576,9 @@ def _solve_loop_impl(
         history = _record_history(history, step, x, info, args)
 
         callback_stop = (
-            jnp.asarray(False, dtype=jnp.bool_) if action.stop is None else action.stop
+            jnp.asarray(False, dtype=jnp.bool_)
+            if action.stop is None
+            else jnp.asarray(action.stop, dtype=jnp.bool_)
         )
         callback_status = (
             jnp.asarray(LMStatus.CALLBACK_STOP, dtype=jnp.int32)
