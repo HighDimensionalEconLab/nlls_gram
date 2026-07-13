@@ -251,6 +251,69 @@ class MultiStart:
             raise TypeError("accept must be callable")
 
 
+def _typed_key(value):
+    # Tag each hashable value/container with its type so the static key keeps 1, 1.0,
+    # and True distinct -- raw == / hash collapse them (hash(1) == hash(True)), which
+    # would silently reuse a mismatched compile. This mirrors jax's own strict-type
+    # equality for static jit arguments; unhashable values still raise here (caught by
+    # _hashable_hook, which degrades the spec to identity-hashing).
+    if isinstance(value, tuple):
+        return (tuple, tuple(_typed_key(v) for v in value))
+    if isinstance(value, frozenset):
+        return (frozenset, frozenset(_typed_key(v) for v in value))
+    return (type(value), value)
+
+
+class DrawNNXModule:
+    """Multi-start ``draw`` hook re-initializing a flax ``nnx.Module`` from a fresh key.
+
+    Given a ``MultiStart`` retry key, builds
+    ``module_cls(*args, rngs=nnx.Rngs(key), **kwargs)`` and returns its ``nnx.Param``
+    state as the new solver start, passing ``args`` through unchanged. Use it instead
+    of hand-rolling a re-init closure per driver::
+
+        draw = DrawNNXModule(SequentialMLP, settings, dtype=dtype)
+        ms = MultiStart(key=key, num_starts=5, draw=draw)
+
+    The drawn parameter state must be type-stable against the solver's ``x0`` (same
+    pytree structure, shapes, and dtypes) -- construct the module with a matching
+    ``param_dtype``/``dtype`` (e.g. pass ``dtype=`` through). The paired
+    ``nnx.GraphDef`` used by the residual's ``nnx.merge`` must come from the same
+    ``module_cls(*args, **kwargs)`` spec.
+
+    Value-hashable on ``(module_cls, args, kwargs)`` with jit's strict-type semantics
+    (``1``, ``1.0``, and ``True`` key distinct compilations): equal specs compare equal
+    and share one jit compilation instead of recompiling per instance (a fresh closure
+    would not). ``args``/``kwargs`` must be hashable for that sharing, and their values
+    must not be mutated after construction (a stale key would reuse the wrong compile);
+    unhashable specs still work but recompile per instance. Requires ``flax`` installed
+    (imported lazily on first draw).
+    """
+
+    def __init__(self, module_cls, *args, **kwargs):
+        self.module_cls = module_cls
+        self.args = args
+        self.kwargs = tuple(sorted(kwargs.items()))
+
+    def __call__(self, key, x_old, args_old):
+        from flax import nnx
+
+        module = self.module_cls(*self.args, rngs=nnx.Rngs(key), **dict(self.kwargs))
+        _, theta = nnx.split(module, nnx.Param)
+        return theta, args_old
+
+    def __hash__(self):
+        return hash((self.module_cls, _typed_key(self.args), _typed_key(self.kwargs)))
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, DrawNNXModule)
+            and self.module_cls is other.module_cls
+            and _typed_key(self.args) == _typed_key(other.args)
+            and _typed_key(self.kwargs) == _typed_key(other.kwargs)
+        )
+
+
 def _tree_changed(new, old):
     new_leaves, new_treedef = jax.tree_util.tree_flatten(new)
     old_leaves, old_treedef = jax.tree_util.tree_flatten(old)

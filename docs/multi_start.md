@@ -26,10 +26,13 @@ result.multi_start.attempt        # which start won (0 = your x0)
 result.multi_start.attempts_run   # how many solves actually ran
 ```
 
-`draw` and `accept` enter the jit cache **by identity**, exactly like
-`callback`: define them once at setup scope, never as fresh lambdas at the
-call site. A `MultiStart` object itself is cheap to rebuild per call (only the
-functions' identities matter), and its `key` is ordinary traced data — new
+`draw` and `accept` are jit **static** arguments, so they key the compile by
+their `__hash__`/`__eq__`. Plain functions, lambdas, and closures hash **by
+identity** — define them once at setup scope, never as fresh lambdas at the
+call site, or each one recompiles. A value-hashable hook keys by value instead:
+`DrawNNXModule` (below) shares one compile across equal specs. A `MultiStart`
+object itself is cheap to rebuild per call (only the hooks' cache keys matter),
+and its `key` is ordinary traced data — new
 keys, new `x0`/`args` values, and (in sequential mode) a different
 `num_starts` among values above one all reuse the compiled solve. Crossing
 `num_starts = 1` to `N > 1` (or back) compiles once more: the single-start
@@ -64,6 +67,20 @@ def draw(key, x_old, args_old):
     _, theta = nnx.split(PolicyMLP(settings, rngs=nnx.Rngs(key)), nnx.Param)
     return theta, args_old
 ```
+
+`DrawNNXModule` packages exactly this draw so you skip the per-driver closure:
+
+```python
+from nlls_gram import DrawNNXModule
+
+draw = DrawNNXModule(PolicyMLP, settings, dtype=dtype)  # equal specs share one compile
+```
+
+It rebuilds `module_cls(*args, rngs=nnx.Rngs(key), **kwargs)` on each retry and returns its
+`nnx.Param` state, passing `args` through unchanged. The drawn state must be type-stable against
+`x0` (same structure, shapes, dtypes), so construct the module with a matching `param_dtype`/`dtype`
+(e.g. thread `dtype=` through). Unlike a fresh closure it is **value-hashable** on
+`(module_cls, args, kwargs)`, so equal specs share a single jit compilation instead of recompiling.
 
 A data-resampling draw (mv2020 style), threading a key inside `args`:
 
@@ -183,3 +200,5 @@ non-solution.
 ::: nlls_gram.MultiStart
 
 ::: nlls_gram.MultiStartInfo
+
+::: nlls_gram.DrawNNXModule

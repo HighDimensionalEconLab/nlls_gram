@@ -20,6 +20,7 @@ https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/
 """
 
 from nlls_gram.gram_lm import (
+    DrawNNXModule,
     LMHyperparams,
     LMInfo,
     LMSolveAction,
@@ -65,6 +66,7 @@ __all__ = [
     "Metric",
     "MultiStart",
     "MultiStartInfo",
+    "DrawNNXModule",
     "blockdiag_metric",
     "identity_preconditioner",
     "matern_state_space",
