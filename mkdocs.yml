@@ -44,6 +44,7 @@ extra_javascript:
 nav:
   - Home: index.md
   - Callbacks and Cookbook: callbacks.md
+  - Multi-Start: multi_start.md
   - Metrics: metrics.md
   - Utilities: utilities.md
   - Implicit Differentiation: implicit_ad.md

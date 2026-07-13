@@ -109,3 +109,41 @@ def test_quasiseparable_matern_metric_runs_on_gpu():
     assert bool(jnp.all(jnp.isfinite(out)))
     assert jnp.allclose(out, out_parallel, rtol=1e-4, atol=1e-5)
     assert jnp.allclose(default.norm(x), parallel.norm(x), rtol=1e-4)
+
+
+def multi_start_residual(theta, args, p):
+    return jnp.array([theta[0] ** 2 - p, 0.1 * theta[1]])
+
+
+def multi_start_draw(key, x, args):
+    return jax.random.uniform(key, x.shape, x.dtype, 0.5, 3.0), args
+
+
+def test_parallel_multi_start_runs_on_gpu():
+    from nlls_gram import LMStatus, MultiStart
+
+    gpu = _gpu_devices()[0]
+    solver = UnderdeterminedLevenbergMarquardt(multi_start_residual, init_damping=1e-2)
+
+    with jax.default_device(gpu):
+        x0 = jnp.array([jnp.nan, 0.0])  # lane 0 fails; drawn lanes converge
+        p = jnp.asarray(4.0)
+        ms = MultiStart(
+            key=jax.random.key(0), num_starts=8, draw=multi_start_draw, parallel=True
+        )
+        result = solver.solve(x0, p=p, max_steps=80, atol=1e-6, multi_start=ms)
+        jax.block_until_ready(result)
+
+    for leaf in jax.tree.leaves(result):
+        assert next(iter(leaf.devices())).platform == "gpu"
+    assert int(result.status) == LMStatus.CONVERGED
+    assert int(result.multi_start.attempt) >= 1
+    assert jnp.allclose(result.x[0] ** 2, p, atol=1e-4)
+
+    # Sequential mode compiles and runs on the GPU as well.
+    with jax.default_device(gpu):
+        seq = MultiStart(key=jax.random.key(1), num_starts=4, draw=multi_start_draw)
+        seq_result = solver.solve(x0, p=p, max_steps=80, atol=1e-6, multi_start=seq)
+        jax.block_until_ready(seq_result)
+    assert int(seq_result.status) == LMStatus.CONVERGED
+    assert next(iter(seq_result.x.devices())).platform == "gpu"

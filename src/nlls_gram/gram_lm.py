@@ -177,6 +177,78 @@ class LMSolveResult:
     x_history: Any = None
     aux_history: Any = None
     args_history: Any = None
+    # MultiStartInfo when solve ran with multi_start=...; None otherwise (an
+    # empty pytree node, so the leaf count is unchanged when the feature is
+    # off). Differentiation-inert (zero tangents through the implicit rule).
+    multi_start: Any = None
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class MultiStartInfo:
+    """Diagnostics attached to ``LMSolveResult.multi_start`` by a multi-start solve.
+
+    ``attempt`` is the winning attempt/lane index (0 = the caller's
+    ``(x0, args)``), ``accepted`` whether the winner passed the success test
+    (``MultiStart.accept``, or ``status == LMStatus.CONVERGED``), and
+    ``attempts_run`` how many starts were solved (sequential mode stops at the
+    first success; parallel mode always runs ``num_starts``). ``loss`` is the
+    ranking loss selection used: the sum of squared residuals at the returned
+    solution, masked to ``+inf`` when nonfinite. Note ``accepted`` describes
+    the multi-start success test, not ``LMInfo.accepted`` (last-step
+    acceptance).
+    """
+
+    attempt: jax.Array
+    accepted: jax.Array
+    attempts_run: jax.Array
+    loss: jax.Array
+
+
+@dataclass(frozen=True, eq=False)
+class MultiStart:
+    """Multi-start configuration for ``solve(multi_start=...)``.
+
+    ``draw(key, x, args) -> (x_new, args_new)`` generates a fresh initial
+    condition; it must be traceable and type-stable (returning the same pytree
+    structure, shapes, and dtypes as its ``(x, args)`` inputs). ``accept(key,
+    result) -> bool`` optionally overrides the success test (default:
+    ``result.status == LMStatus.CONVERGED``); it receives its own key so it can
+    draw fresh validation data, and may return any scalar boolean-like value.
+    Sequential mode (``parallel=False``) solves from ``(x0, args)`` and retries
+    on failure, chaining each attempt's *initial* values into the next
+    ``draw``; parallel mode solves all ``num_starts`` lanes under ``vmap``
+    (lane 0 = the caller's ``(x0, args)``, the rest drawn from the originals)
+    and selects the accepted lane with the lowest loss. The key schedule is
+    ``draw_key, accept_key = jax.random.split(jax.random.fold_in(key, k))``
+    for attempt ``k``.
+
+    ``draw`` and ``accept`` enter the jit cache by identity (like
+    ``callback``): define them once at setup scope, not inline per call.
+    ``MultiStart`` is not a pytree -- ``solve`` unpacks it before tracing, with
+    ``key`` the only traced field.
+    """
+
+    key: Any
+    num_starts: int
+    draw: Any = None
+    accept: Any = None
+    parallel: bool = False
+
+    def __post_init__(self):
+        if isinstance(self.num_starts, bool) or not isinstance(self.num_starts, int):
+            raise ValueError("num_starts must be a Python int >= 1")
+        if self.num_starts < 1:
+            raise ValueError("num_starts must be a Python int >= 1")
+        if self.num_starts > 1 and self.draw is None:
+            raise ValueError(
+                "num_starts > 1 requires draw; pass "
+                "draw=(key, x, args) -> (x_new, args_new)"
+            )
+        if self.draw is not None and not callable(self.draw):
+            raise TypeError("draw must be callable")
+        if self.accept is not None and not callable(self.accept):
+            raise TypeError("accept must be callable")
 
 
 def _tree_changed(new, old):
@@ -224,6 +296,37 @@ def _static_key_component(value):
     except TypeError:
         return _IdentityKey(value)
     return value
+
+
+class _IdentityCallable:
+    """Hashable-by-identity pass-through for unhashable callables used as jit
+    statics (e.g. an eq=True dataclass instance implementing ``__call__``).
+    ``__weakref__`` is required: jax.eval_shape weak-references the callable.
+    """
+
+    __slots__ = ("fn", "__weakref__")
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, *args):
+        return self.fn(*args)
+
+    def __eq__(self, other):
+        return isinstance(other, _IdentityCallable) and self.fn is other.fn
+
+    def __hash__(self):
+        return id(self.fn)
+
+
+def _hashable_hook(fn):
+    if fn is None:
+        return None
+    try:
+        hash(fn)
+    except TypeError:
+        return _IdentityCallable(fn)
+    return fn
 
 
 def canonicalize_residual(residual_fn):
@@ -975,6 +1078,7 @@ class UnderdeterminedLevenbergMarquardt:
         callback=None,
         user_state=None,
         save_steps=False,
+        multi_start=None,
         jit=True,
     ):
         """Run repeated LM updates until a stopping rule fires.
@@ -999,6 +1103,17 @@ class UnderdeterminedLevenbergMarquardt:
         memory, are differentiation-inert, and (unlike the default) make the
         jitted loop retrace when ``max_steps`` changes, since the buffer shape
         depends on it.
+
+        ``multi_start`` (a ``MultiStart``, default ``None``) retries or
+        parallelizes the solve over fresh initial conditions drawn by
+        ``multi_start.draw`` and returns the single best result, with
+        diagnostics on ``result.multi_start`` (a ``MultiStartInfo``).
+        Sequential mode retries only on failure and stops at the first
+        success; ``parallel=True`` solves every start under ``vmap`` and
+        selects the accepted lane with the lowest loss. Gradients with
+        respect to ``p`` flow through the selected solution only, via the
+        same implicit rule as a plain solve. With ``multi_start=None``
+        nothing changes.
         """
         self._check_residual_args(args, p)
         if max_steps <= 0:
@@ -1029,6 +1144,69 @@ class UnderdeterminedLevenbergMarquardt:
         # with save_steps=True the buffer shape retraces per max_steps anyway.
         history_len = max_steps + 1 if save_steps else None
 
+        if multi_start is not None:
+            if not isinstance(multi_start, MultiStart):
+                raise TypeError("multi_start must be a MultiStart or None")
+            num_starts = multi_start.num_starts
+            # A single start never draws: normalizing to None keeps the jit
+            # cache key independent of the (unused) draw identity. The hooks
+            # are jit statics, so unhashable callables get an
+            # identity-hashing wrapper (hash/eq by the wrapped function, so
+            # repeat calls still share the compilation).
+            draw = _hashable_hook(multi_start.draw if num_starts > 1 else None)
+            accept = _hashable_hook(multi_start.accept)
+            parallel = multi_start.parallel and num_starts > 1
+            if draw is not None and jit:
+                # Abstract trace only (no RNG, no FLOPs): fail loudly here
+                # instead of deep inside the while_loop/vmap carry checks.
+                # jit=False validates the first concrete draw instead, so a
+                # successful first attempt never invokes draw.
+                drawn = jax.eval_shape(draw, multi_start.key, x0, args)
+                _check_drawn_types(x0, args, drawn)
+
+            @jax.custom_jvp
+            def solve_multi_start_with_implicit_p(
+                x, lm_state, args, p, user_state, key, max_steps, atol, gtol, xtol
+            ):
+                return self._multi_start_impl(
+                    x,
+                    lm_state,
+                    args,
+                    p,
+                    user_state,
+                    key,
+                    history_len,
+                    max_steps,
+                    atol,
+                    gtol,
+                    xtol,
+                    callback,
+                    jit,
+                    num_starts,
+                    draw,
+                    accept,
+                    parallel,
+                )
+
+            @solve_multi_start_with_implicit_p.defjvp
+            def solve_multi_start_with_implicit_p_jvp(primals, tangents):
+                p_dot = tangents[3]
+                result = solve_multi_start_with_implicit_p(*primals)
+                return result, self._implicit_result_tangent(result, p_dot)
+
+            return solve_multi_start_with_implicit_p(
+                x0,
+                lm_state,
+                args,
+                p,
+                user_state,
+                multi_start.key,
+                max_steps,
+                atol,
+                gtol,
+                xtol,
+            )
+
         @jax.custom_jvp
         def solve_with_implicit_p(
             x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
@@ -1050,46 +1228,9 @@ class UnderdeterminedLevenbergMarquardt:
 
         @solve_with_implicit_p.defjvp
         def solve_with_implicit_p_jvp(primals, tangents):
-            x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol = primals
-            _, _, _, p_dot, _, _, _, _, _ = tangents
-            result = solve_with_implicit_p(
-                x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
-            )
-            x_dot = self._implicit_x_tangent_from_p(
-                result.x, result.args, result.p, p_dot
-            )
-            zero_result = jax.tree.map(_zero_tangent_leaf, result)
-            aux_dot = zero_result.aux
-            if self.has_aux and p is not None:
-                # aux depends on p directly and through the solution x*(p);
-                # linearize the aux map at the returned solution with args
-                # fixed (the same point where the primal result.aux is
-                # evaluated) to account for both paths.
-                def aux_at_solution(x_value, p_value):
-                    return self.residual_fn(x_value, result.args, p_value)[1]
-
-                aux_dot = jax.jvp(
-                    aux_at_solution, (result.x, result.p), (x_dot, p_dot)
-                )[1]
-            # The iterate histories are training-trajectory bookkeeping, not
-            # implicit functions of p: zero tangents.
-            return (
-                result,
-                LMSolveResult(
-                    x_dot,
-                    zero_result.lm_state,
-                    zero_result.info,
-                    zero_result.steps,
-                    zero_result.status,
-                    zero_result.args,
-                    p_dot,
-                    zero_result.user_state,
-                    aux_dot,
-                    zero_result.x_history,
-                    zero_result.aux_history,
-                    zero_result.args_history,
-                ),
-            )
+            p_dot = tangents[3]
+            result = solve_with_implicit_p(*primals)
+            return result, self._implicit_result_tangent(result, p_dot)
 
         return solve_with_implicit_p(
             x0, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
@@ -1138,6 +1279,193 @@ class UnderdeterminedLevenbergMarquardt:
             xtol,
             callback,
         )
+
+    def _multi_start_impl(
+        self,
+        x,
+        lm_state,
+        args,
+        p,
+        user_state,
+        key,
+        history_len,
+        max_steps,
+        atol,
+        gtol,
+        xtol,
+        callback,
+        jit,
+        num_starts,
+        draw,
+        accept,
+        parallel,
+    ):
+        if not jit:
+            return self._multi_start_python(
+                x,
+                lm_state,
+                args,
+                p,
+                user_state,
+                key,
+                history_len,
+                max_steps,
+                atol,
+                gtol,
+                xtol,
+                callback,
+                num_starts,
+                draw,
+                accept,
+                parallel,
+            )
+        if parallel:
+            return _multi_start_parallel_jit(
+                self,
+                x,
+                lm_state,
+                args,
+                p,
+                user_state,
+                key,
+                history_len,
+                max_steps,
+                atol,
+                gtol,
+                xtol,
+                callback,
+                draw,
+                accept,
+                num_starts,
+            )
+        return _multi_start_sequential_jit(
+            self,
+            x,
+            lm_state,
+            args,
+            p,
+            user_state,
+            key,
+            jnp.asarray(num_starts, dtype=jnp.int32),
+            history_len,
+            max_steps,
+            atol,
+            gtol,
+            xtol,
+            callback,
+            draw,
+            accept,
+        )
+
+    def _multi_start_python(
+        self,
+        x,
+        lm_state,
+        args,
+        p,
+        user_state,
+        key,
+        history_len,
+        max_steps,
+        atol,
+        gtol,
+        xtol,
+        callback,
+        num_starts,
+        draw,
+        accept,
+        parallel,
+    ):
+        accept_fn = _accept_converged if accept is None else accept
+        cold = _cold_lm_state(lm_state)
+
+        def run_attempt(x_a, lm_state_a, args_a, attempt):
+            result = self._solve_python(
+                x_a,
+                lm_state_a,
+                args_a,
+                p,
+                user_state,
+                history_len,
+                max_steps,
+                atol,
+                gtol,
+                xtol,
+                callback,
+            )
+            accept_key = jax.random.split(jax.random.fold_in(key, attempt))[1]
+            loss = _ranking_loss(self, result, p, callback)
+            success = _attempt_success(accept_fn, accept_key, result, loss)
+            return result, loss, bool(success)
+
+        best = best_loss = best_attempt = None
+        accepted = False
+        if parallel:
+            for lane in range(num_starts):
+                if lane == 0:
+                    x_l, args_l = x, args
+                else:
+                    draw_key = jax.random.split(jax.random.fold_in(key, lane))[0]
+                    x_l, args_l = draw(draw_key, x, args)
+                    _check_drawn_types(x, args, (x_l, args_l))
+                result, loss, success = run_attempt(x_l, cold, args_l, lane)
+                better = (
+                    best is None
+                    or (success and not accepted)
+                    or (success == accepted and bool(loss < best_loss))
+                )
+                if better:
+                    best, best_loss = result, loss
+                    best_attempt, accepted = lane, success
+            attempts_run = num_starts
+        else:
+            x_a, args_a, lm_state_a = x, args, lm_state
+            for attempt in range(num_starts):
+                if attempt > 0:
+                    draw_key = jax.random.split(jax.random.fold_in(key, attempt))[0]
+                    x_a, args_a = draw(draw_key, x_a, args_a)
+                    _check_drawn_types(x, args, (x_a, args_a))
+                    lm_state_a = cold
+                result, loss, success = run_attempt(x_a, lm_state_a, args_a, attempt)
+                take = (
+                    best is None
+                    or success
+                    or bool(loss < best_loss)
+                    or not bool(jnp.isfinite(best_loss))
+                )
+                if take:
+                    best, best_loss = result, loss
+                    best_attempt, accepted = attempt, success
+                if success:
+                    break
+            attempts_run = attempt + 1
+        info = MultiStartInfo(
+            jnp.asarray(best_attempt, dtype=jnp.int32),
+            jnp.asarray(accepted, dtype=jnp.bool_),
+            jnp.asarray(attempts_run, dtype=jnp.int32),
+            best_loss,
+        )
+        return dataclasses.replace(best, multi_start=info)
+
+    def _implicit_result_tangent(self, result, p_dot):
+        # The tangent is a pure function of the returned solution: relinearize
+        # the residual at (result.x, result.args, result.p), never reusing the
+        # forward iterations. Everything except x, p, and aux -- histories,
+        # counters, multi-start diagnostics -- is bookkeeping with zero
+        # tangents.
+        x_dot = self._implicit_x_tangent_from_p(result.x, result.args, result.p, p_dot)
+        zero_result = jax.tree.map(_zero_tangent_leaf, result)
+        aux_dot = zero_result.aux
+        if self.has_aux and result.p is not None:
+            # aux depends on p directly and through the solution x*(p);
+            # linearize the aux map at the returned solution with args
+            # fixed (the same point where the primal result.aux is
+            # evaluated) to account for both paths.
+            def aux_at_solution(x_value, p_value):
+                return self.residual_fn(x_value, result.args, p_value)[1]
+
+            aux_dot = jax.jvp(aux_at_solution, (result.x, result.p), (x_dot, p_dot))[1]
+        return dataclasses.replace(zero_result, x=x_dot, p=p_dot, aux=aux_dot)
 
     def _implicit_x_tangent_from_p(self, x, args, p, p_dot):
         if p is None:
@@ -1636,3 +1964,234 @@ def _solve_loop_impl(
 
 
 _solve_loop_jit = jax.jit(_solve_loop_impl, static_argnums=(0, 6, 11))
+
+
+def _accept_converged(_, result):
+    return result.status == LMStatus.CONVERGED
+
+
+def _cold_lm_state(lm_state):
+    # Drawn starts must not reuse a Jacobian cache computed at another
+    # (x, args); damping and hyperparameters stay inherited from the caller's
+    # initial state. Never materializes cache arrays from None -- the carry
+    # structure must match the attempt-0 result.
+    if lm_state.jacobian_valid is None:
+        return lm_state
+    return dataclasses.replace(
+        lm_state, jacobian_valid=jnp.zeros_like(lm_state.jacobian_valid)
+    )
+
+
+def _ranking_loss(solver, result, p, callback):
+    # A callback can replace x/args after the last update, leaving info.loss
+    # stale relative to the returned solution, so any callback-bearing solve
+    # pays one extra residual evaluation per attempt. Nonfinite losses mask
+    # to +inf so selection prefers any finite attempt and comparisons never
+    # propagate NaN.
+    if callback is None:
+        loss = result.info.loss
+    else:
+        residual = solver._residual_and_aux(result.x, result.args, p)[0]
+        loss = jnp.sum(residual**2)
+    return jnp.where(jnp.isfinite(loss), loss, jnp.asarray(jnp.inf, dtype=loss.dtype))
+
+
+def _attempt_success(accept_fn, accept_key, result, loss):
+    value = jnp.asarray(accept_fn(accept_key, result))
+    if value.shape != ():
+        raise ValueError(
+            f"multi_start.accept must return a scalar; got shape {value.shape}"
+        )
+    # An accepted-but-nonfinite result never wins: its masked loss is +inf.
+    return value.astype(jnp.bool_) & jnp.isfinite(loss)
+
+
+def _type_spec(tree):
+    # weak_type is part of the spec: a weak/strong mismatch would break the
+    # while_loop carry avals just like a dtype mismatch.
+    leaves, treedef = jax.tree_util.tree_flatten(tree)
+    specs = []
+    for leaf in leaves:
+        if not (hasattr(leaf, "shape") and hasattr(leaf, "dtype")):
+            leaf = jnp.asarray(leaf)
+        specs.append((tuple(leaf.shape), leaf.dtype, getattr(leaf, "weak_type", False)))
+    return treedef, specs
+
+
+def _check_drawn_types(x, args, drawn):
+    # Works on concrete draws and on jax.eval_shape outputs alike; a mismatch
+    # would otherwise surface as an inscrutable while_loop/vmap error.
+    if _type_spec(drawn) != _type_spec((x, args)):
+        raise ValueError(
+            "multi_start.draw must return (x, args) matching the structure, "
+            f"shapes, and dtypes of its inputs; expected {_type_spec((x, args))}, "
+            f"got {_type_spec(drawn)}"
+        )
+
+
+def _multi_start_sequential_impl(
+    solver,
+    x,
+    lm_state,
+    args,
+    p,
+    user_state,
+    key,
+    num_starts,
+    history_len,
+    max_steps,
+    atol,
+    gtol,
+    xtol,
+    callback,
+    draw,
+    accept,
+):
+    accept_fn = _accept_converged if accept is None else accept
+
+    def run_attempt(x_a, lm_state_a, args_a, attempt):
+        result = _solve_loop_impl(
+            solver,
+            x_a,
+            lm_state_a,
+            args_a,
+            p,
+            user_state,
+            history_len,
+            max_steps,
+            atol,
+            gtol,
+            xtol,
+            callback,
+        )
+        accept_key = jax.random.split(jax.random.fold_in(key, attempt))[1]
+        loss = _ranking_loss(solver, result, p, callback)
+        success = _attempt_success(accept_fn, accept_key, result, loss)
+        # p is loop-invariant: splice it out of the carried result and
+        # reattach after selection.
+        return dataclasses.replace(result, p=None), loss, success
+
+    zero = jnp.asarray(0, dtype=jnp.int32)
+    best, best_loss, done = run_attempt(x, lm_state, args, zero)
+    if draw is None:
+        info = MultiStartInfo(zero, done, jnp.asarray(1, dtype=jnp.int32), best_loss)
+        return dataclasses.replace(best, p=p, multi_start=info)
+
+    cold = _cold_lm_state(lm_state)
+
+    def cond(carry):
+        attempt, _, _, _, _, _, done = carry
+        return ~done & (attempt < num_starts)
+
+    def body(carry):
+        attempt, x_prev, args_prev, best, best_loss, best_attempt, _ = carry
+        draw_key = jax.random.split(jax.random.fold_in(key, attempt))[0]
+        x_next, args_next = draw(draw_key, x_prev, args_prev)
+        result, loss, success = run_attempt(x_next, cold, args_next, attempt)
+        # First success wins (the loop exits); among failures keep the lowest
+        # masked loss, and an all-inf history always yields to the newest
+        # attempt so the none-finite case returns the last one.
+        take = success | (loss < best_loss) | ~jnp.isfinite(best_loss)
+        best = jax.tree.map(lambda new, old: jnp.where(take, new, old), result, best)
+        return (
+            attempt + jnp.asarray(1, dtype=jnp.int32),
+            x_next,
+            args_next,
+            best,
+            jnp.where(take, loss, best_loss),
+            jnp.where(take, attempt, best_attempt),
+            success,
+        )
+
+    carry = jax.lax.while_loop(
+        cond,
+        body,
+        (jnp.asarray(1, dtype=jnp.int32), x, args, best, best_loss, zero, done),
+    )
+    attempts_run, _, _, best, best_loss, best_attempt, accepted = carry
+    info = MultiStartInfo(best_attempt, accepted, attempts_run, best_loss)
+    return dataclasses.replace(best, p=p, multi_start=info)
+
+
+def _multi_start_parallel_impl(
+    solver,
+    x,
+    lm_state,
+    args,
+    p,
+    user_state,
+    key,
+    history_len,
+    max_steps,
+    atol,
+    gtol,
+    xtol,
+    callback,
+    draw,
+    accept,
+    num_starts,
+):
+    accept_fn = _accept_converged if accept is None else accept
+    lanes = jnp.arange(num_starts, dtype=jnp.int32)
+    attempt_keys = jax.vmap(lambda i: jax.random.fold_in(key, i))(lanes)
+    lane_keys = jax.vmap(jax.random.split)(attempt_keys)
+    accept_keys = lane_keys[:, 1]
+    draw_keys = lane_keys[1:, 0]
+    xs_drawn, args_drawn = jax.vmap(lambda k: draw(k, x, args))(draw_keys)
+
+    def prepend(first, rest):
+        return jnp.concatenate([jnp.asarray(first)[None], rest], axis=0)
+
+    xs = jax.tree.map(prepend, x, xs_drawn)
+    args_lanes = None if args is None else jax.tree.map(prepend, args, args_drawn)
+    # Under vmap the cache-reuse cond lowers to a select that evaluates both
+    # branches, so a warm Jacobian cache cannot save work: drop it uniformly.
+    cold = _cold_lm_state(lm_state)
+
+    def solve_lane(x_lane, args_lane, accept_key):
+        result = _solve_loop_impl(
+            solver,
+            x_lane,
+            cold,
+            args_lane,
+            p,
+            user_state,
+            history_len,
+            max_steps,
+            atol,
+            gtol,
+            xtol,
+            callback,
+        )
+        loss = _ranking_loss(solver, result, p, callback)
+        success = _attempt_success(accept_fn, accept_key, result, loss)
+        return dataclasses.replace(result, p=None), loss, success
+
+    results, losses, successes = jax.vmap(
+        solve_lane, in_axes=(0, None if args is None else 0, 0)
+    )(xs, args_lanes, accept_keys)
+
+    # Lowest masked loss among successful lanes; with none, lowest loss
+    # overall (all-inf falls back to lane 0). argmin ties break low-index.
+    success_losses = jnp.where(
+        successes, losses, jnp.asarray(jnp.inf, dtype=losses.dtype)
+    )
+    winner = jnp.where(
+        jnp.any(successes), jnp.argmin(success_losses), jnp.argmin(losses)
+    ).astype(jnp.int32)
+    best = jax.tree.map(lambda leaf: leaf[winner], results)
+    info = MultiStartInfo(
+        winner,
+        successes[winner],
+        jnp.asarray(num_starts, dtype=jnp.int32),
+        losses[winner],
+    )
+    return dataclasses.replace(best, p=p, multi_start=info)
+
+
+_multi_start_sequential_jit = jax.jit(
+    _multi_start_sequential_impl, static_argnums=(0, 8, 13, 14, 15)
+)
+_multi_start_parallel_jit = jax.jit(
+    _multi_start_parallel_impl, static_argnums=(0, 7, 12, 13, 14, 15)
+)

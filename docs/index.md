@@ -57,7 +57,9 @@ returns an `LMSolveResult`. Pass `save_steps=True` to also record the full
 iterate history on the result (`x_history`, plus the row-aligned
 `args_history` and, with `has_aux=True`, `aux_history`) — see
 [history recording](callbacks.md#fixed-size-history-recording) for the layout
-and a plotting recipe.
+and a plotting recipe. Pass `multi_start=MultiStart(...)` to retry failed
+solves from fresh initial conditions or race several starts under `vmap`,
+returning the single best result — see [multi-start](multi_start.md).
 
 ### Auxiliary Outputs (`has_aux`)
 
@@ -463,3 +465,7 @@ narrower and focuses on underdetermined LM with explicit parameter-space metrics
 ::: nlls_gram.LMSolveContext
 
 ::: nlls_gram.LMSolveResult
+
+::: nlls_gram.MultiStart
+
+::: nlls_gram.MultiStartInfo

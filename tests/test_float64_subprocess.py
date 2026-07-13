@@ -875,3 +875,104 @@ assert jnp.allclose(grad, expected, rtol=1e-8), (grad, expected)
         capture_output=True,
         text=True,
     )
+
+
+def test_float64_multi_start_modes_and_float32_data_under_x64():
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import (
+    LMSolveAction,
+    LMStatus,
+    MultiStart,
+    UnderdeterminedLevenbergMarquardt,
+)
+
+
+def residual_fn(theta, args, p):
+    return jnp.array([theta[0] + 2.0 * theta[1] - p])
+
+
+# The case that used to force explicit int32 casts in user callbacks: under
+# x64 both lax.cond branches return bare/weak LMStatus values and the solver
+# coerces stop -> bool and status -> int32 at the boundary.
+def epoch_callback(ctx):
+    def check(_):
+        stop = ctx.info.loss < 1e-16
+        return stop, jnp.where(stop, LMStatus.CONVERGED, LMStatus.RUNNING)
+
+    def keep_running(_):
+        return jnp.asarray(False), jnp.asarray(LMStatus.RUNNING)
+
+    stop, status = jax.lax.cond(ctx.step % 2 == 0, check, keep_running, None)
+    return LMSolveAction(stop=stop, status=status)
+
+
+callback_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+cb_result = callback_solver.solve(
+    jnp.zeros(2, dtype=jnp.float64),
+    p=jnp.asarray(3.0, dtype=jnp.float64),
+    max_steps=50,
+    callback=epoch_callback,
+)
+assert cb_result.status.dtype == jnp.int32, cb_result.status.dtype
+assert int(cb_result.status) == LMStatus.CONVERGED, int(cb_result.status)
+
+
+def draw_zeros(key, x, args):
+    return jnp.zeros_like(x), args
+
+
+solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+x0 = jnp.array([jnp.nan, jnp.nan], dtype=jnp.float64)
+p = jnp.asarray(3.0, dtype=jnp.float64)
+expected = jnp.sum(jnp.array([1.0, 2.0])) / 5.0
+
+for parallel in (False, True):
+    ms = MultiStart(
+        key=jax.random.key(0), num_starts=3, draw=draw_zeros, parallel=parallel
+    )
+
+    def sum_x(pv, ms=ms):
+        return jnp.sum(
+            solver.solve(x0, p=pv, max_steps=80, atol=1e-12, multi_start=ms).x
+        )
+
+    result = solver.solve(x0, p=p, max_steps=80, atol=1e-12, multi_start=ms)
+    assert int(result.status) == LMStatus.CONVERGED, int(result.status)
+    assert result.x.dtype == jnp.float64
+    assert result.multi_start.loss.dtype == jnp.float64
+    assert result.multi_start.attempt.dtype == jnp.int32
+    assert result.multi_start.attempts_run.dtype == jnp.int32
+    grad = jax.grad(sum_x)(p)
+    assert jnp.allclose(grad, expected, rtol=1e-8), (grad, expected)
+    jaxpr = str(jax.make_jaxpr(sum_x)(p))
+    assert "f32" not in jaxpr, jaxpr
+
+# x64 enabled but float32 problem data: nothing widens to f64/i64 -- the inf
+# sentinels, masked losses, and argmin winner index all stay narrow.
+x0_f32 = jnp.array([jnp.nan, jnp.nan], dtype=jnp.float32)
+p_f32 = jnp.asarray(3.0, dtype=jnp.float32)
+for parallel in (False, True):
+    ms = MultiStart(
+        key=jax.random.key(1), num_starts=3, draw=draw_zeros, parallel=parallel
+    )
+    result = solver.solve(x0_f32, p=p_f32, max_steps=80, atol=1e-6, multi_start=ms)
+    assert result.x.dtype == jnp.float32, result.x.dtype
+    assert result.info.loss.dtype == jnp.float32
+    assert result.multi_start.loss.dtype == jnp.float32, result.multi_start.loss.dtype
+    assert result.multi_start.attempt.dtype == jnp.int32
+    assert result.multi_start.accepted.dtype == jnp.bool_
+    history = solver.solve(
+        x0_f32, p=p_f32, max_steps=20, atol=1e-6, save_steps=True, multi_start=ms
+    ).x_history
+    assert history.dtype == jnp.float32
+"""
+    subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )

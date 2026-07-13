@@ -162,9 +162,23 @@ throughput read diagnostics once per epoch rather than once per step.
 
 ### Batched Multi-Start
 
-Use `jax.vmap` to run independent solves over a batch of initial guesses or
-external parameters. The result fields are batched arrays and pytrees, so
-selecting the best converged lane is ordinary JAX indexing:
+For the common case — retry a failed solve from fresh starts, or race several
+starts and keep the best — use the built-in
+[`multi_start=MultiStart(...)`](multi_start.md) option on `solve`. It handles
+the key schedule, success test, best-lane selection, and implicit
+differentiation through the winner, and returns a single unbatched result:
+
+```python
+from nlls_gram import MultiStart
+
+ms = MultiStart(key=jax.random.key(0), num_starts=8, draw=draw, parallel=True)
+result = solver.solve(x0, args, max_steps=100, atol=1e-8, multi_start=ms)
+```
+
+The manual `jax.vmap` recipe below remains useful when you need **all** lanes
+back (the feature deliberately returns only the winner). The result fields are
+batched arrays and pytrees, so selecting the best converged lane is ordinary
+JAX indexing:
 
 ```python
 def solve_start(x0):

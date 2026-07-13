@@ -6,7 +6,9 @@ user-supplied residual function taking (x), (x, args), or
 dict, nnx.state(model, nnx.Param), ...). It follows an init/update protocol:
 update(x, lm_state, args=None, p=None) returns the new x pytree (same
 structure), the next lm_state, and an LMInfo. solve(...) runs repeated LM steps with
-optional callback control. With has_aux=True the residual returns
+optional callback control; solve(multi_start=MultiStart(...)) retries failed
+solves from fresh initial conditions or races them in parallel under vmap,
+returning the single best result. With has_aux=True the residual returns
 (residual, aux) and the aux output is reported on LMInfo. An optional Metric
 defines a positive-definite parameter-space metric for LM damping.
 SquareLevenbergMarquardt is a solve-only damped-Newton companion for square
@@ -25,6 +27,8 @@ from nlls_gram.gram_lm import (
     LMSolveResult,
     LMState,
     LMStatus,
+    MultiStart,
+    MultiStartInfo,
     UnderdeterminedLevenbergMarquardt,
 )
 from nlls_gram.metrics import (
@@ -59,6 +63,8 @@ __all__ = [
     "LMSolveContext",
     "LMSolveResult",
     "Metric",
+    "MultiStart",
+    "MultiStartInfo",
     "blockdiag_metric",
     "identity_preconditioner",
     "matern_state_space",
