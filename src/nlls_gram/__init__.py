@@ -52,6 +52,7 @@ from nlls_gram.preconditioners import (
     woodbury_preconditioner,
 )
 from nlls_gram.quasiseparable import matern_state_space
+from nlls_gram.recycled_cg import recycled_cg
 from nlls_gram.square_lm import SquareLevenbergMarquardt, SquareSolveResult
 
 __all__ = [
@@ -82,6 +83,7 @@ __all__ = [
     "metric_with_compute_dtype",
     "nystrom_preconditioner",
     "pad_dual_preconditioner",
+    "recycled_cg",
     "sherman_morrison_preconditioner",
     "woodbury_preconditioner",
 ]
