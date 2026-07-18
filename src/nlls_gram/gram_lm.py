@@ -12,6 +12,12 @@ import numpy as np
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram.metrics import Metric
+from nlls_gram.recycled_cg import (
+    RecycleConfig,
+    RecycleState,
+    build_coarse_operator,
+    deflated_pcg,
+)
 
 # init() -> lm_state, update(x, lm_state, args, p) -> (new_x, lm_state, info),
 # plus a solve() convenience loop. x is ANY pytree; the solver only ravels and
@@ -96,6 +102,8 @@ class LMState:
     # to the constructor values with identical compiled code and no extra
     # per-call buffers in manual update() loops.
     hyper: LMHyperparams | None = None
+    # RecycleState (recycle set only); None compiles away for the default path.
+    recycle: RecycleState | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -567,6 +575,7 @@ class UnderdeterminedLevenbergMarquardt:
         cache_jacobian=True,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=0.75,
+        recycle=None,
     ):
         canonical_residual, residual_arity = canonicalize_residual(residual_fn)
         if linear_solver not in ("cholesky", "qr", "cg"):
@@ -591,6 +600,11 @@ class UnderdeterminedLevenbergMarquardt:
             )
         if dual_preconditioner is not None and linear_solver != "cg":
             raise ValueError('dual_preconditioner requires linear_solver="cg"')
+        if recycle is not None:
+            if linear_solver != "cg":
+                raise ValueError('recycle requires linear_solver="cg"')
+            if not isinstance(recycle, RecycleConfig):
+                raise TypeError("recycle must be a RecycleConfig or None")
         if implicit_solver not in ("auto", "cholesky", "cg"):
             raise ValueError(f"unknown implicit_solver: {implicit_solver}")
         if implicit_tol is not None and implicit_tol < 0:
@@ -733,6 +747,7 @@ class UnderdeterminedLevenbergMarquardt:
         )
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
+        self.recycle = recycle
         # Value-based identity: the jitted solve loop marks the solver itself
         # static, so equal-config solvers built around the same residual (and
         # metric/preconditioner objects) share the compiled loop across
@@ -763,6 +778,7 @@ class UnderdeterminedLevenbergMarquardt:
                 self.cache_jacobian,
                 geodesic_acceleration,
                 geodesic_acceptance_ratio,
+                recycle,
             )
         )
         self._static_hash = hash(self._static_key)
@@ -802,8 +818,9 @@ class UnderdeterminedLevenbergMarquardt:
         self._check_residual_args(args, p)
         residual, aux = self._residual_and_aux(x0, args, p)
         damping = jnp.asarray(self.init_damping, dtype=residual.dtype)
+        recycle = self._init_recycle_state(residual)
         if not self.cache_jacobian:
-            return LMState(damping)
+            return LMState(damping, recycle=recycle)
         theta, _ = ravel_pytree(x0)
         return LMState(
             damping,
@@ -811,6 +828,31 @@ class UnderdeterminedLevenbergMarquardt:
             jnp.zeros((theta.size, residual.size), dtype=residual.dtype),
             jnp.asarray(False, dtype=jnp.bool_),
             jax.tree.map(jnp.zeros_like, aux),
+            recycle=recycle,
+        )
+
+    def _init_recycle_state(self, residual):
+        # Cold recycle state sized from the dual dimension m = residual.size:
+        # zero basis and zero warm starts, valid=False. The zero-U invariant
+        # makes the first deflated solve a pure P-only PCG (no branch).
+        if self.recycle is None:
+            return None
+        m = residual.size
+        k = self.recycle.rank
+        w = self.recycle.resolved_window
+        if k > m or w > m:
+            raise ValueError(
+                f"recycle rank ({k}) and window ({w}) must be <= the dual "
+                f"dimension m ({m})"
+            )
+        dtype = residual.dtype
+        return RecycleState(
+            U=jnp.zeros((m, k), dtype=dtype),
+            dual_velocity=jnp.zeros(m, dtype=dtype),
+            dual_accel=jnp.zeros(m, dtype=dtype),
+            valid=jnp.asarray(False, dtype=jnp.bool_),
+            iterations=jnp.zeros((), dtype=jnp.int32),
+            residual_norm=jnp.zeros((), dtype=dtype),
         )
 
     def _residual_and_aux(self, x, args, p):
@@ -928,6 +970,10 @@ class UnderdeterminedLevenbergMarquardt:
         damping_decrease = jnp.asarray(hyper.damping_decrease, dtype=resid.dtype)
         damping_increase = jnp.asarray(hyper.damping_increase, dtype=resid.dtype)
 
+        # Recycled dual solutions + harvest, captured in call order by the cg
+        # branch's solve_step when recycling is active; consumed below to build
+        # the next RecycleState. Stays None for every non-recycled path.
+        recycle_solves = None
         if self.linear_solver == "cg":
             transpose_fn = jax.linear_transpose(jvp_fn, theta)
 
@@ -945,16 +991,60 @@ class UnderdeterminedLevenbergMarquardt:
             def cg_preconditioner(cotangent):
                 return self.dual_preconditioner(cotangent, damping)
 
-            def solve_step(rhs):
-                dual_solution, _ = jsp_sparse_linalg.cg(
-                    gram_matvec,
-                    rhs,
-                    tol=cg_tol,
-                    atol=cg_atol,
-                    maxiter=hyper.iterative_maxiter,
-                    M=cg_preconditioner,
+            if self.recycle is not None and lm_state.recycle is not None:
+                # Recycled/deflated dual solve: build the coarse operator once on
+                # the current damped gram_matvec (reused across velocity and the
+                # geodesic-acceleration RHS), harvest the next basis from the
+                # velocity solve only, and capture the dual solutions (in call
+                # order: velocity first, acceleration second) so the new
+                # RecycleState can thread out through the returned lm_state.
+                recycle = lm_state.recycle
+                rank = self.recycle.rank
+                window = self.recycle.resolved_window
+                warm_start = self.recycle.warm_start
+                reorthogonalize = self.recycle.reorthogonalize
+                _, e_factor = build_coarse_operator(
+                    gram_matvec, recycle.U, ridge=self.recycle.ridge
                 )
-                return -self.metric_solve(JT(dual_solution))
+                recycle_solves = []
+
+                def solve_step(rhs):
+                    is_velocity = len(recycle_solves) == 0
+                    x0 = None
+                    if warm_start:
+                        x0 = (
+                            recycle.dual_velocity if is_velocity else recycle.dual_accel
+                        )
+                    dual_solution, harvest = deflated_pcg(
+                        gram_matvec,
+                        rhs,
+                        U=recycle.U,
+                        E_factor=e_factor,
+                        M=cg_preconditioner,
+                        x0=x0,
+                        tol=cg_tol,
+                        atol=cg_atol,
+                        maxiter=hyper.iterative_maxiter,
+                        window=window,
+                        rank=rank,
+                        reorthogonalize=reorthogonalize,
+                        harvest=is_velocity,
+                    )
+                    recycle_solves.append((dual_solution, harvest))
+                    return -self.metric_solve(JT(dual_solution))
+
+            else:
+
+                def solve_step(rhs):
+                    dual_solution, _ = jsp_sparse_linalg.cg(
+                        gram_matvec,
+                        rhs,
+                        tol=cg_tol,
+                        atol=cg_atol,
+                        maxiter=hyper.iterative_maxiter,
+                        M=cg_preconditioner,
+                    )
+                    return -self.metric_solve(JT(dual_solution))
 
         else:
             if not self.cache_jacobian:
@@ -1101,14 +1191,36 @@ class UnderdeterminedLevenbergMarquardt:
                 new_damping, jnp.asarray(hyper.max_damping, dtype=resid.dtype)
             )
         loss = jnp.where(improved, loss_candidate, loss_old)
+        # New recycle state: the velocity solve's harvested basis and the (stop-
+        # gradient'd) dual solutions become warm starts for the next step. Threads
+        # through unchanged (None) for every non-recycled path. dual_accel is the
+        # acceleration dual when geodesic acceleration ran, else zeros -- a single
+        # stable carry shape independent of the geodesic flag.
+        new_recycle = lm_state.recycle
+        if recycle_solves is not None:
+            velocity_dual, velocity_harvest = recycle_solves[0]
+            if len(recycle_solves) > 1:
+                accel_dual = recycle_solves[1][0]
+            else:
+                accel_dual = jnp.zeros_like(velocity_dual)
+            new_recycle = RecycleState(
+                U=jax.lax.stop_gradient(velocity_harvest.basis),
+                dual_velocity=jax.lax.stop_gradient(velocity_dual),
+                dual_accel=jax.lax.stop_gradient(accel_dual),
+                valid=jnp.asarray(True, dtype=jnp.bool_),
+                iterations=jax.lax.stop_gradient(velocity_harvest.iterations),
+                residual_norm=jax.lax.stop_gradient(velocity_harvest.residual_norm),
+            )
         # The input hyper (not the fallback) passes through so the loop carry
         # structure and dtypes are stable.
         if self.cache_jacobian:
             new_lm_state = LMState(
-                new_damping, resid, Jt, ~improved, aux, lm_state.hyper
+                new_damping, resid, Jt, ~improved, aux, lm_state.hyper, new_recycle
             )
         else:
-            new_lm_state = LMState(new_damping, hyper=lm_state.hyper)
+            new_lm_state = LMState(
+                new_damping, hyper=lm_state.hyper, recycle=new_recycle
+            )
         return (
             unravel(theta_new),
             new_lm_state,
@@ -1190,9 +1302,10 @@ class UnderdeterminedLevenbergMarquardt:
         if not isinstance(xtol, jax.core.Tracer) and xtol < 0:
             raise ValueError("xtol must be nonnegative")
         if lm_state is None:
-            # The loop recasts the damping and hyperparameter dtypes itself;
-            # only the Jacobian cache needs an eager init() for the shapes.
-            if self.cache_jacobian:
+            # The loop recasts the damping and hyperparameter dtypes itself; the
+            # Jacobian cache (cache_jacobian) and the recycle state (sized from
+            # the residual) need an eager init() for their shapes.
+            if self.cache_jacobian or self.recycle is not None:
                 lm_state = self.init(x0, args, p=p)
             else:
                 lm_state = LMState(jnp.asarray(self.init_damping))
@@ -1682,6 +1795,13 @@ class UnderdeterminedLevenbergMarquardt:
                     "dataclasses.replace(ctx.lm_state, ...) to preserve the "
                     "cache fields"
                 )
+            if self.recycle is not None and lm_state.recycle is None:
+                raise ValueError(
+                    "recycle is set but the callback action returned an lm_state "
+                    "without the RecycleState; use dataclasses.replace("
+                    "ctx.lm_state, ...) to preserve the recycle field (rank and "
+                    "window are static and cannot change mid-solve)"
+                )
             # Trace-time guard so the hyper contract fails identically with
             # and without jit (jit would reject the carry mismatch anyway).
             if previous_hyper is not None and (
@@ -2034,15 +2154,26 @@ def _accept_converged(_, result):
 
 
 def _cold_lm_state(lm_state):
-    # Drawn starts must not reuse a Jacobian cache computed at another
-    # (x, args); damping and hyperparameters stay inherited from the caller's
-    # initial state. Never materializes cache arrays from None -- the carry
+    # Drawn starts must not reuse a Jacobian cache or a deflation basis harvested
+    # at another (x, args); damping and hyperparameters stay inherited from the
+    # caller's initial state. Never materializes fields from None -- the carry
     # structure must match the attempt-0 result.
-    if lm_state.jacobian_valid is None:
+    updates = {}
+    if lm_state.jacobian_valid is not None:
+        updates["jacobian_valid"] = jnp.zeros_like(lm_state.jacobian_valid)
+    if lm_state.recycle is not None:
+        recycle = lm_state.recycle
+        updates["recycle"] = RecycleState(
+            U=jnp.zeros_like(recycle.U),
+            dual_velocity=jnp.zeros_like(recycle.dual_velocity),
+            dual_accel=jnp.zeros_like(recycle.dual_accel),
+            valid=jnp.zeros_like(recycle.valid),
+            iterations=jnp.zeros_like(recycle.iterations),
+            residual_norm=jnp.zeros_like(recycle.residual_norm),
+        )
+    if not updates:
         return lm_state
-    return dataclasses.replace(
-        lm_state, jacobian_valid=jnp.zeros_like(lm_state.jacobian_valid)
-    )
+    return dataclasses.replace(lm_state, **updates)
 
 
 def _ranking_loss(solver, result, p, callback):

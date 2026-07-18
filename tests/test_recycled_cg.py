@@ -1,3 +1,4 @@
+import dataclasses
 import types
 
 import jax
@@ -7,7 +8,11 @@ import jax.scipy.sparse.linalg as jsp_sparse_linalg
 import pytest
 
 from nlls_gram import (
+    LMSolveAction,
     LMStatus,
+    MultiStart,
+    RecycleConfig,
+    RecycleState,
     UnderdeterminedLevenbergMarquardt,
     gram_lm,
     identity_preconditioner,
@@ -760,7 +765,9 @@ def test_deflated_pcg_count_zero_warm_started():
     )
     assert int(harvest.iterations) == 0
     assert bool(jnp.all(jnp.isfinite(harvest.basis)))
-    assert jnp.allclose(y, x_star, rtol=1e-5, atol=1e-5)
+    # the returned solution is converged to tol (the differentiable pass solves
+    # from zeros, independently of the warm-started harvest pass).
+    assert float(jnp.linalg.norm(A @ y - b)) <= 1e-3 * float(jnp.linalg.norm(b))
     _, next_factor = build_coarse_operator(lambda v: A @ v, harvest.basis)
     assert bool(jnp.all(jnp.isfinite(next_factor[0])))
 
@@ -785,8 +792,11 @@ def test_harvest_false_returns_carried_basis():
     )
     y_off, off = deflated_pcg(lambda v: A @ v, b, harvest=False, **common)
     y_on, on = deflated_pcg(lambda v: A @ v, b, harvest=True, **common)
+    # harvest=False returns the carried basis and skips the harvest pass (0
+    # reported iterations), but solves the same system.
     assert jnp.array_equal(off.basis, U)
-    assert int(off.iterations) == int(on.iterations)
+    assert int(off.iterations) == 0
+    assert int(on.iterations) > 0
     assert jnp.allclose(y_off, y_on, rtol=1e-5, atol=1e-5)
 
 
@@ -884,3 +894,311 @@ def test_deflated_pcg_rejects_bad_rank_window(kwargs):
             maxiter=10,
             **kwargs,
         )
+
+
+# --- LM-level recycling integration -----------------------------------------
+
+
+def isolated_mode_problem(m=24, n=30, num_small=3):
+    # A mildly nonlinear underdetermined least squares whose Gauss-Newton dual
+    # operator J J' has `num_small` isolated small eigenvalues plus a bulk near 1
+    # -- the regime where the additive deflation clusters the spectrum. The
+    # nonlinearity forces several LM steps so a carried basis can pay off.
+    Um, _ = jnp.linalg.qr(jax.random.normal(jax.random.key(1), (m, m)))
+    Vn, _ = jnp.linalg.qr(jax.random.normal(jax.random.key(2), (n, n)))
+    small = jnp.array([0.02, 0.05, 0.12])[:num_small]
+    sv = jnp.concatenate([small, jnp.ones(m - num_small)])
+    G = Um @ (sv[:, None] * Vn[:m, :])
+    b = jax.random.normal(jax.random.key(3), (m,))
+
+    def residual(x):
+        linear = G @ x - b
+        return linear + 0.03 * linear**2
+
+    return residual, jnp.zeros(n)
+
+
+def _reset_recycle(lm_state):
+    recycle = lm_state.recycle
+    return dataclasses.replace(
+        lm_state,
+        recycle=RecycleState(
+            jnp.zeros_like(recycle.U),
+            jnp.zeros_like(recycle.dual_velocity),
+            jnp.zeros_like(recycle.dual_accel),
+            jnp.zeros_like(recycle.valid),
+            jnp.zeros_like(recycle.iterations),
+            jnp.zeros_like(recycle.residual_norm),
+        ),
+    )
+
+
+def test_recycle_requires_cg():
+    with pytest.raises(ValueError, match="recycle requires"):
+        UnderdeterminedLevenbergMarquardt(
+            lambda x: x, linear_solver="cholesky", recycle=RecycleConfig(rank=2)
+        )
+
+
+def test_recycle_config_hashing_shares_compilation():
+    # Equal RecycleConfig -> equal solver static key -> shared jit cache; a
+    # different rank is a different compiled program.
+    residual, _ = isolated_mode_problem()
+    common = dict(
+        linear_solver="cg",
+        dual_preconditioner=identity_preconditioner(),
+        implicit_preconditioner=identity_preconditioner(),
+    )
+    a = UnderdeterminedLevenbergMarquardt(
+        residual, recycle=RecycleConfig(rank=4), **common
+    )
+    b = UnderdeterminedLevenbergMarquardt(
+        residual, recycle=RecycleConfig(rank=4), **common
+    )
+    c = UnderdeterminedLevenbergMarquardt(
+        residual, recycle=RecycleConfig(rank=5), **common
+    )
+    assert a == b and hash(a) == hash(b)
+    assert a != c
+
+
+def test_init_allocates_cold_recycle_state():
+    residual, x0 = isolated_mode_problem()
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        linear_solver="cg",
+        dual_preconditioner=identity_preconditioner(),
+        implicit_preconditioner=identity_preconditioner(),
+        recycle=RecycleConfig(rank=4),
+    )
+    state = solver.init(x0)
+    assert state.recycle is not None
+    assert not bool(state.recycle.valid)
+    assert state.recycle.U.shape == (24, 4)
+    assert jnp.all(state.recycle.U == 0)
+    assert int(state.recycle.iterations) == 0
+
+
+def test_recycling_reduces_total_inner_iterations():
+    # A manual update() sequence: carrying the harvested basis across steps cuts
+    # the total inner (velocity) CG iterations vs the identical solver with the
+    # basis cold-reset each step (the controlled no-recycle baseline).
+    residual, x0 = isolated_mode_problem()
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-4,
+        linear_solver="cg",
+        geodesic_acceleration=False,
+        dual_preconditioner=identity_preconditioner(),
+        implicit_preconditioner=identity_preconditioner(),
+        iterative_maxiter=40,
+        iterative_tol=1e-8,
+        recycle=RecycleConfig(rank=3),
+    )
+
+    def total_inner(reset):
+        x, state = x0, solver.init(x0)
+        total = 0
+        for _ in range(8):
+            x, state, info = solver.update(x, state)
+            total += int(state.recycle.iterations)
+            if reset:
+                state = _reset_recycle(state)
+        return total, float(info.loss)
+
+    recycled_total, recycled_loss = total_inner(reset=False)
+    baseline_total, baseline_loss = total_inner(reset=True)
+    assert recycled_loss < 1e-8 and baseline_loss < 1e-8
+    assert recycled_total < 0.75 * baseline_total
+
+
+def test_recycled_solve_converges_ill_conditioned():
+    residual, x0 = isolated_mode_problem()
+    common = dict(
+        init_damping=1e-4,
+        linear_solver="cg",
+        geodesic_acceleration=False,
+        dual_preconditioner=identity_preconditioner(),
+        implicit_preconditioner=identity_preconditioner(),
+        iterative_maxiter=6,
+        iterative_tol=1e-8,
+    )
+    recycled = UnderdeterminedLevenbergMarquardt(
+        residual, recycle=RecycleConfig(rank=3), **common
+    )
+    result = recycled.solve(x0, max_steps=60, atol=1e-6)
+    assert int(result.status) == LMStatus.CONVERGED
+    assert float(result.info.loss) < 1e-6
+
+
+def test_recycled_update_reverse_ad_matches_cholesky():
+    # update()'s recycled path stays reverse-differentiable and matches the dense
+    # cholesky reference: the deflation/harvest are stop_gradient'd, so only the
+    # (converged) step carries gradient. Differentiate w.r.t. the target data.
+    ts = jnp.linspace(0.0, 2.0, 20)
+
+    def residual_data(x, args, p):
+        return x["a"] * jnp.exp(x["b"] * ts) - args
+
+    x = {"a": 1.0, "b": 0.0}
+    cholesky = UnderdeterminedLevenbergMarquardt(residual_data, init_damping=1e-2)
+    recycled = UnderdeterminedLevenbergMarquardt(
+        residual_data,
+        init_damping=1e-2,
+        linear_solver="cg",
+        dual_preconditioner=identity_preconditioner(),
+        implicit_preconditioner=identity_preconditioner(),
+        iterative_tol=1e-9,
+        iterative_maxiter=60,
+        recycle=RecycleConfig(rank=4),
+    )
+
+    def loss_of(solver):
+        def loss(ys):
+            new_x, _, _ = solver.update(x, solver.init(x, ys), ys)
+            return jnp.sum(new_x["a"] ** 2 + new_x["b"] ** 2)
+
+        return loss
+
+    ys = 2.0 * jnp.exp(-1.0 * ts)
+    g_recycled = jax.grad(loss_of(recycled))(ys)
+    g_cholesky = jax.grad(loss_of(cholesky))(ys)
+    assert jnp.allclose(g_recycled, g_cholesky, rtol=1e-3, atol=1e-4)
+
+
+def test_recycled_solve_implicit_p_derivative_matches_plain():
+    # solve()'s p-derivative comes from the implicit rule at the converged root;
+    # recycling only changes the forward path, so the jacobian matches plain cg.
+    ts = jnp.linspace(0.0, 2.0, 12)
+
+    def residual_p(x, args, p):
+        return x * ts - p
+
+    common = dict(
+        init_damping=1e-3,
+        linear_solver="cg",
+        dual_preconditioner=identity_preconditioner(),
+        implicit_preconditioner=identity_preconditioner(),
+        iterative_tol=1e-10,
+        iterative_maxiter=40,
+    )
+    plain = UnderdeterminedLevenbergMarquardt(residual_p, **common)
+    recycled = UnderdeterminedLevenbergMarquardt(
+        residual_p, recycle=RecycleConfig(rank=3), **common
+    )
+    x0 = jnp.zeros(())
+
+    def solved(solver, p):
+        return solver.solve(x0, p=p, max_steps=40, atol=1e-9).x
+
+    p = jnp.asarray(1.7)
+    j_plain = jax.jacobian(lambda q: solved(plain, q))(p)
+    j_recycled = jax.jacobian(lambda q: solved(recycled, q))(p)
+    assert jnp.allclose(j_recycled, j_plain, rtol=1e-4, atol=1e-5)
+
+
+def test_recycled_multi_start_vmap():
+    residual, x0 = isolated_mode_problem()
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-4,
+        linear_solver="cg",
+        geodesic_acceleration=False,
+        dual_preconditioner=identity_preconditioner(),
+        implicit_preconditioner=identity_preconditioner(),
+        iterative_maxiter=8,
+        iterative_tol=1e-8,
+        recycle=RecycleConfig(rank=3),
+    )
+
+    def draw(key, x, args):
+        return x + 0.01 * jax.random.normal(key, x.shape), args
+
+    for parallel in (False, True):
+        ms = MultiStart(
+            key=jax.random.key(0), num_starts=3, draw=draw, parallel=parallel
+        )
+        result = solver.solve(x0, max_steps=60, atol=1e-6, multi_start=ms)
+        assert int(result.status) == LMStatus.CONVERGED
+        assert float(result.info.loss) < 1e-6
+
+
+def test_recycled_callback_maxiter_schedule_composes():
+    # A callback that grows iterative_maxiter mid-solve composes with recycling:
+    # rank/window are static (untouched), the traced maxiter rides hyper.
+    residual, x0 = isolated_mode_problem()
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-4,
+        linear_solver="cg",
+        geodesic_acceleration=False,
+        dual_preconditioner=identity_preconditioner(),
+        implicit_preconditioner=identity_preconditioner(),
+        iterative_maxiter=2,
+        iterative_tol=1e-8,
+        recycle=RecycleConfig(rank=3),
+    )
+
+    def schedule(ctx):
+        grown = dataclasses.replace(
+            ctx.lm_state,
+            hyper=dataclasses.replace(
+                ctx.lm_state.hyper,
+                iterative_maxiter=jnp.where(
+                    ctx.info.loss < 1e-2, jnp.int32(8), jnp.int32(2)
+                ),
+            ),
+        )
+        return LMSolveAction(lm_state=grown)
+
+    result = solver.solve(x0, max_steps=60, atol=1e-6, callback=schedule)
+    assert int(result.status) == LMStatus.CONVERGED
+
+
+def test_recycled_multi_start_cold_resets_basis():
+    # _cold_lm_state must reset the recycle basis for drawn starts.
+    residual, x0 = isolated_mode_problem()
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        linear_solver="cg",
+        dual_preconditioner=identity_preconditioner(),
+        implicit_preconditioner=identity_preconditioner(),
+        recycle=RecycleConfig(rank=3),
+    )
+    state = solver.init(x0)
+    # populate a basis, then cold-reset
+    _, warmed, _ = solver.update(x0, state)
+    assert bool(warmed.recycle.valid)
+    cold = gram_lm._cold_lm_state(warmed)
+    assert not bool(cold.recycle.valid)
+    assert jnp.all(cold.recycle.U == 0)
+    assert jnp.all(cold.recycle.dual_velocity == 0)
+
+
+def test_recycled_update_nan_residual_rejects_step():
+    # A residual that goes non-finite makes the recycled dual solve non-finite;
+    # LM must reject the step (never accept a NaN candidate).
+    def residual(x):
+        return jnp.array(
+            [
+                x[0] ** 2 - 4.0,
+                x[0] - 1.0,
+                x[0] + 2.0,
+                2.0 * x[0],
+                3.0 * x[0],
+                jnp.log(x[0]),
+            ]
+        )
+
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=1e-2,
+        linear_solver="cg",
+        dual_preconditioner=identity_preconditioner(),
+        implicit_preconditioner=identity_preconditioner(),
+        iterative_maxiter=10,
+        recycle=RecycleConfig(rank=1),
+    )
+    x0 = jnp.array([-1.0])  # log(-1) -> nan in the residual
+    _, _, info = solver.update(x0, solver.init(x0))
+    assert not bool(info.accepted)

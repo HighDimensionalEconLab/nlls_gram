@@ -448,7 +448,45 @@ solvers behave as follows:
   appends redundant equations) and equals the unpadded derivative, so
   differentiate the unpadded formulation to compute it.
 
+## Krylov Recycling / Deflation
+
+`recycle=RecycleConfig(rank=k)` on a `cg` solver carries a deflation basis
+across LM steps: each step harvests an eigCG-style basis from its CG iterations
+and recycles it into the next step's two-level additive preconditioner
+`M_defl(r) = P(r) + U E^{-1}(U'r)` (first-level `P` = the user's
+`dual_preconditioner`, unchanged) plus a deflated warm start. See the
+[tuning guide](tuning_guide.md#recycling-and-deflation-across-steps) for when it
+pays off and how to configure `rank`/`window`.
+
+The building blocks are also exposed for standalone matrix-free solves:
+
+- [`deflated_pcg`](#nlls_gram.deflated_pcg) — two-level deflated PCG with the
+  harvest; returns `(solution, HarvestState)`.
+- [`build_coarse_operator`](#nlls_gram.build_coarse_operator) — precompute
+  `W = A U` and the ridged Cholesky factor of `E = U'A U` (built once per step,
+  reused across right-hand sides).
+- `RecycleState` rides `LMState.recycle`; its `iterations` / `residual_norm`
+  fields report the last velocity solve's diagnostics.
+
+The `E`-ridge is a trace-scaled shift with a dtype-keyed absolute floor
+(`1e-12` float64, `1e-6` float32, floored at `tiny/eps`), so the coarse
+Cholesky stays finite even for a zero or rank-deficient `U`; it lives only
+inside a preconditioner and never moves the converged root. The harvest
+reorthonormalizes its window (`reorthogonalize=True`, the robust default) so the
+emitted basis is orthonormal; a genuinely non-finite operator still propagates
+loudly rather than being clamped.
+
 ## API
+
+::: nlls_gram.RecycleConfig
+
+::: nlls_gram.RecycleState
+
+::: nlls_gram.deflated_pcg
+
+::: nlls_gram.build_coarse_operator
+
+::: nlls_gram.recycled_cg
 
 ::: nlls_gram.metric_from_tridiagonal_precision
 

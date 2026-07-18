@@ -127,6 +127,39 @@ its sketch-and-shift construction targets exactly the fast-decaying spectra
 those duals show, and it reads the live damping, so one construction serves
 the whole solve.
 
+## Recycling and Deflation Across Steps
+
+When a frozen first-level `dual_preconditioner` plateaus above the accuracy bar
+— it clusters most of the dual spectrum but leaves a handful of slow modes that
+the fixed budget cannot resolve — carry a **deflation basis** across LM steps.
+Pass `recycle=RecycleConfig(rank=k)` (requires `linear_solver="cg"`). The
+first-level `P` is unchanged; a second-level basis `U` is harvested from each
+step's CG iterations (an eigCG-style thick restart) and recycled into the next
+step's two-level preconditioner `M_defl(r) = P(r) + U E^{-1}(U'r)`, plus a
+deflated, warm-started initial guess, at zero rebuild cost. Across a sequence of
+slowly drifting shifted duals the carried basis adapts the *effective*
+preconditioner every step, closing the terminal gap a frozen `P` cannot.
+
+- The additive scheme lifts each deflated eigenvalue `λ → λ + 1`, so it
+  *clusters* (and speeds CG) when the slow modes are small outliers near 0 and
+  `P` normalizes the bulk near 1 — the classic deflation regime. It is a strict
+  win precisely when a few isolated modes dominate the residual budget.
+- **Prefer a damping-independent first-level `P`** (Sherman-Morrison, Woodbury,
+  cholesky-metric — all ignore λ). Eigenvector deflation is shift-invariant for
+  the unpreconditioned operator; under a λ-dependent `P` (nystrom, pad) the
+  preconditioned Ritz vectors drift with λ, weakening cross-step reuse (still
+  helpful, just approximate).
+- `RecycleConfig.rank` (`k`) and `window` (`w`, default `max(2·rank, rank+4)`)
+  are **static compile knobs** — one program per value. `window` is the primary
+  memory knob (a transient `(m, w)` harvest buffer); keep it small.
+- Recycling **composes** with the `iterative_maxiter` schedule above: the
+  carried basis shrinks the budget each step needs, and the traced schedule
+  (still resettable in a callback) then grows it toward the endgame. `warm_start`
+  (on by default) reuses the previous dual solution as the initial guess.
+- Recycling never changes the converged root or the implicit p-derivative (both
+  are defined at the solution); it only accelerates the forward inner solves, and
+  the harvest is `stop_gradient`'d.
+
 ## What Is Free to Sweep
 
 - **Free (traced, no recompile):** `max_steps`, `atol`/`gtol`/`xtol`, the
@@ -137,7 +170,8 @@ the whole solve.
 - **Recompiles per value (static):** `linear_solver`,
   `implicit_solver`, the `implicit_*` accuracy knobs,
   `geodesic_acceleration`, `cache_jacobian`, `has_aux`, the `Metric`
-  callbacks, `implicit_preconditioner`, and the callback function identity.
+  callbacks, `implicit_preconditioner`, `recycle` (the `RecycleConfig`, whose
+  `rank`/`window` size the carried basis), and the callback function identity.
   Solvers themselves compare by configuration, so a freshly constructed
   solver with equal settings (around the same residual, metric, and
   preconditioner objects) reuses the compiled loop — rebuilding the solver

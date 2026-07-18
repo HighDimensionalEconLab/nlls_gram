@@ -52,7 +52,14 @@ from nlls_gram.preconditioners import (
     woodbury_preconditioner,
 )
 from nlls_gram.quasiseparable import matern_state_space
-from nlls_gram.recycled_cg import recycled_cg
+from nlls_gram.recycled_cg import (
+    HarvestState,
+    RecycleConfig,
+    RecycleState,
+    build_coarse_operator,
+    deflated_pcg,
+    recycled_cg,
+)
 from nlls_gram.square_lm import SquareLevenbergMarquardt, SquareSolveResult
 
 __all__ = [
@@ -70,6 +77,11 @@ __all__ = [
     "MultiStart",
     "MultiStartInfo",
     "DrawNNXModule",
+    "RecycleConfig",
+    "RecycleState",
+    "HarvestState",
+    "build_coarse_operator",
+    "deflated_pcg",
     "blockdiag_metric",
     "repeated_blockdiag_metric",
     "identity_preconditioner",

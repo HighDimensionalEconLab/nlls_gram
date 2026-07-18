@@ -24,6 +24,7 @@ improvements carry over; a jax release that moves those internals will fail
 loudly at import time rather than silently diverge.
 """
 
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import jax
@@ -175,24 +176,93 @@ class HarvestState(NamedTuple):
     residual_norm: jax.Array
 
 
+@dataclass(frozen=True)
+class RecycleConfig:
+    """Static, value-hashable configuration for Krylov recycling across LM steps.
+
+    All fields are ints/bools/None, so equal configs hash equal and share a
+    compiled program when this rides the solver's static key. ``rank`` and
+    ``window`` are shape-determining (they size the carried basis and the harvest
+    window), hence static -- not resettable mid-solve by a callback.
+
+    Attributes:
+        rank: ``k``, the number of deflation vectors carried across steps.
+        window: ``w``, the harvest window; ``None`` selects
+            ``max(2 * rank, rank + 4)``.
+        warm_start: reuse the previous step's dual solution as the initial guess.
+        reorthogonalize: robust reorthonormalized ``Q'A Q`` harvest (vs the cheap
+            coefficient-tridiagonal route); see :func:`deflated_pcg`.
+        ridge: trace-scaled ridge fraction on ``E = U'A U``; ``None`` uses the
+            dtype-keyed default in :func:`build_coarse_operator`.
+    """
+
+    rank: int
+    window: int | None = None
+    warm_start: bool = True
+    reorthogonalize: bool = True
+    ridge: float | None = None
+
+    def __post_init__(self):
+        if self.rank <= 0:
+            raise ValueError(f"RecycleConfig.rank must be positive, got {self.rank}")
+        if self.window is not None and self.window < self.rank:
+            raise ValueError(
+                f"RecycleConfig.window ({self.window}) must be >= rank ({self.rank})"
+            )
+
+    @property
+    def resolved_window(self):
+        """The concrete window, applying the ``max(2 * rank, rank + 4)`` default."""
+        if self.window is not None:
+            return self.window
+        return max(2 * self.rank, self.rank + 4)
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class RecycleState:
+    """Carried recycling state on ``LMState``: the basis and warm starts.
+
+    All fields are traced arrays of fixed shape (``rank`` and ``window`` are
+    static), so it vmaps cleanly for ``multi_start`` and rides the solve loop's
+    ``while_loop`` carry. Populated by ``init()`` (zeros, ``valid=False``) and
+    refreshed each accepted/rejected LM step; ``stop_gradient``'d so no AD path
+    flows through the harvest.
+
+    Attributes:
+        U: ``(m, rank)`` deflation basis (zeros when ``valid`` is False).
+        dual_velocity: ``(m,)`` previous velocity dual solution (warm start).
+        dual_accel: ``(m,)`` previous geodesic-acceleration dual solution
+            (zeros when geodesic acceleration is off).
+        valid: ``()`` bool, whether the basis has been populated by a solve.
+        iterations: ``()`` int, PCG iterations of the last velocity solve
+            (0 before the first step); a diagnostic, not used by the algorithm.
+        residual_norm: ``()`` final velocity-solve residual norm (0 before the
+            first step); a diagnostic.
+    """
+
+    U: jax.Array
+    dual_velocity: jax.Array
+    dual_accel: jax.Array
+    valid: jax.Array
+    iterations: jax.Array
+    residual_norm: jax.Array
+
+
 def build_coarse_operator(A, U, *, ridge=None):
     """Precompute the deflation coarse operator ``W = A U`` and ``chol(U'A U)``.
 
-    Built once per LM step and reused across every right-hand side (velocity and
-    geodesic acceleration share one operator). ``E = U'A U`` is symmetrized and
-    shifted by a trace-scaled ridge with a dtype-keyed absolute floor so the
-    Cholesky factor stays finite even for a zero or rank-deficient ``U`` -- the
-    ridge lives only inside a preconditioner and never moves the converged root.
+    ``A`` is a hermitian positive-definite matvec callable (or square matrix) and
+    ``U`` an ``(m, k)`` deflation basis. Returns ``(W, E_factor)`` where
+    ``W = A U`` and ``E_factor`` is the :func:`jax.scipy.linalg.cho_factor` of the
+    ridged, symmetrized ``E = U'A U``. Built once per LM step and reused across
+    every right-hand side (velocity and geodesic acceleration share one operator).
 
-    Args:
-        A: hermitian positive-definite matvec callable (or square matrix).
-        U: ``(m, k)`` deflation basis (``k`` columns).
-        ridge: trace-scaled ridge fraction ``gamma``; ``None`` uses a dtype-keyed
-            default (``1e-12`` float64, ``1e-6`` float32).
-
-    Returns:
-        ``(W, E_factor)`` where ``W = A U`` and ``E_factor`` is the
-        ``jax.scipy.linalg.cho_factor`` of the ridged ``U'A U``.
+    The ridge is a trace-scaled shift ``ridge`` (fraction ``gamma``; ``None`` uses
+    a dtype-keyed default, ``1e-12`` float64 / ``1e-6`` float32) with an absolute
+    floor, so the Cholesky factor stays finite even for a zero or rank-deficient
+    ``U``. It lives only inside a preconditioner and never moves the converged
+    root.
     """
     Amv = _normalize_matvec(A)
     W = _apply_columns(Amv, U)
@@ -365,35 +435,31 @@ def deflated_pcg(
     :func:`recycled_cg`.
 
     Derivatives are implicit: the solution is wrapped in the same
-    ``lax.custom_linear_solve`` the parity path reuses (warm-started at the
-    harvested rough solution so the primal re-solve costs ~one matvec), and the
-    basis/harvest are ``stop_gradient``'d. Callers must not differentiate through
-    the harvest directly.
+    ``lax.custom_linear_solve`` the parity path reuses (a second, differentiable
+    solve from zeros, deflation-accelerated by ``M_defl``, kept separate from the
+    harvest pass so higher-order AD stays correct), and the basis/harvest are
+    ``stop_gradient``'d. Callers must not differentiate through the harvest
+    directly.
 
-    Args:
-        A: hermitian positive-definite matvec callable (or square matrix).
-        b: right-hand side ``(m,)``.
-        U: ``(m, rank)`` deflation basis (zeros for a cold start).
-        E_factor: ``cho_factor`` of the ridged ``U'A U`` from
-            :func:`build_coarse_operator`.
-        M: first-level preconditioner ``P`` (callable); ``None`` is identity.
-        x0: warm start ``(m,)`` (previous dual solution); ``None`` is zeros.
-        tol: relative convergence tolerance on ``||b - A y||``.
-        atol: absolute convergence tolerance.
-        maxiter: iteration cap; ``None`` uses ``10 * m``.
-        window: harvest window ``w`` (static); ``None`` uses
-            ``max(2 * rank, rank + 4)``.
-        rank: number of deflation vectors ``k`` (static); ``None`` uses
-            ``U.shape[1]``.
-        reorthogonalize: full QR re-orthonormalization of the window at harvest.
-        harvest: when ``False`` (static), skip the Rayleigh-Ritz / QR / extra
-            matvecs and return the carried ``U`` unchanged in the ``HarvestState``.
-            Used for a right-hand side that shares the operator with an already
-            harvested solve (e.g. the geodesic-acceleration correction).
+    ``A`` is a hermitian positive-definite matvec callable (or square matrix) and
+    ``b`` the ``(m,)`` right-hand side. ``U`` is the ``(m, rank)`` deflation basis
+    (zeros for a cold start) and ``E_factor`` the ``cho_factor`` of the ridged
+    ``U'A U`` from :func:`build_coarse_operator`. ``M`` is the first-level
+    preconditioner ``P`` (``None`` is identity); ``x0`` the ``(m,)`` warm start
+    (previous dual solution; ``None`` is zeros). ``tol``/``atol`` are the relative
+    and absolute convergence tolerances on ``||b - A y||`` and ``maxiter`` the
+    iteration cap (``None`` uses ``10 * m``).
 
-    Returns:
-        ``(y, harvest_state)`` with ``y`` the solution and ``harvest_state`` a
-        :class:`HarvestState`.
+    ``rank`` (``k``, default ``U.shape[1]``) and ``window`` (``w``, default
+    ``max(2 * rank, rank + 4)``) are static shapes. ``reorthogonalize`` selects
+    the robust reorthonormalized ``Q'A Q`` harvest (vs the cheaper
+    coefficient-tridiagonal route). ``harvest=False`` (static) skips the
+    Rayleigh-Ritz / QR / extra matvecs and returns the carried ``U`` unchanged --
+    for a right-hand side that shares the operator with an already harvested solve
+    (e.g. the geodesic-acceleration correction).
+
+    Returns ``(y, harvest_state)`` with ``y`` the solution and ``harvest_state`` a
+    :class:`HarvestState`.
     """
     Amv = _normalize_matvec(A)
     P = _identity if M is None else _normalize_matvec(M)
@@ -416,41 +482,49 @@ def deflated_pcg(
         c = jsp_linalg.cho_solve(E_factor, jnp.matmul(U.T, r, precision=_HIGHEST))
         return P(r) + jnp.matmul(U, c, precision=_HIGHEST)
 
-    # Deflated + warm-started initial guess: removes the range(U) component of the
-    # solution error before the first iteration (exact when U spans an invariant
-    # subspace); reduces to x0 when U = 0.
-    if x0 is None:
-        resid0 = b
-        warm = jnp.zeros(m, dtype)
+    # Harvest pass: the augmented core solve (deflated + warm-started initial
+    # guess -- removes the range(U) component of the error, exact when U spans an
+    # invariant subspace, reduces to x0 when U = 0) produces the next basis and
+    # the velocity diagnostics. Skipped when harvest is off (the shared-operator
+    # RHS reuses the carried basis) so that solve costs only the differentiable
+    # pass below.
+    if harvest:
+        if x0 is None:
+            resid0 = b
+            warm = jnp.zeros(m, dtype)
+        else:
+            warm = x0
+            resid0 = b - Amv(x0)
+        x_start = warm + jnp.matmul(
+            U,
+            jsp_linalg.cho_solve(E_factor, jnp.matmul(U.T, resid0, precision=_HIGHEST)),
+            precision=_HIGHEST,
+        )
+        _, count, resid_norm, U_next = _deflated_pcg_core(
+            Amv,
+            b,
+            x_start,
+            M_defl,
+            U,
+            maxiter=maxiter,
+            tol=tol,
+            atol=atol,
+            window=w,
+            rank=k,
+            reorthogonalize=reorthogonalize,
+            harvest=True,
+        )
     else:
-        warm = x0
-        resid0 = b - Amv(x0)
-    x_start = warm + jnp.matmul(
-        U,
-        jsp_linalg.cho_solve(E_factor, jnp.matmul(U.T, resid0, precision=_HIGHEST)),
-        precision=_HIGHEST,
-    )
+        count = jnp.zeros((), jnp.int32)
+        resid_norm = jnp.zeros((), dtype)
+        U_next = U
 
-    x_rough, count, resid_norm, U_next = _deflated_pcg_core(
-        Amv,
-        b,
-        x_start,
-        M_defl,
-        U,
-        maxiter=maxiter,
-        tol=tol,
-        atol=atol,
-        window=w,
-        rank=k,
-        reorthogonalize=reorthogonalize,
-        harvest=harvest,
-    )
-
-    # Attach implicit derivatives via the same custom_linear_solve wrapper the
-    # parity path reuses, warm-started at the rough solution: the primal solve is
-    # already at tol so its while_loop exits immediately (~one matvec), while the
-    # tangent/cotangent solves iterate deflation-accelerated within maxiter.
-    x_ws = lax.stop_gradient(x_rough)
+    # Differentiable solution via the same custom_linear_solve wrapper the parity
+    # path reuses. Warm-started from zeros so the primal and every tangent /
+    # cotangent solve are correct-from-scratch (deflation-accelerated by M_defl):
+    # warm-starting at the harvested rough solution instead breaks higher-order AD
+    # (geodesic acceleration nests a jvp through the residual around this solve).
+    x_ws = jnp.zeros_like(b)
 
     def deflated_solve(matvec, rhs):
         return _recycled_cg_solve(
@@ -460,9 +534,9 @@ def deflated_pcg(
     y = lax.custom_linear_solve(
         Amv, b, solve=deflated_solve, transpose_solve=deflated_solve, symmetric=True
     )
-    harvest = HarvestState(
+    harvest_state = HarvestState(
         basis=lax.stop_gradient(U_next),
         iterations=lax.stop_gradient(count),
         residual_norm=lax.stop_gradient(resid_norm),
     )
-    return y, harvest
+    return y, harvest_state

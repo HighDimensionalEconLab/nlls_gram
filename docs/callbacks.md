@@ -343,6 +343,14 @@ a coarse CG stage, then a Cholesky solver warm-started with `result.x` and
 `result.lm_state` — the implicit derivative is unaffected since it is defined
 at the returned solution only.
 
+This schedule composes unchanged with Krylov recycling
+([`recycle=RecycleConfig(...)`](tuning_guide.md#recycling-and-deflation-across-steps)):
+`rank`/`window` are static shapes the callback must not touch, while the carried
+deflation basis shrinks the budget each step needs and the schedule then grows
+it toward the endgame. The callback contract is the same — preserve the recycle
+state with `dataclasses.replace(ctx.lm_state, ...)` (a fresh `LMState` that drops
+it is rejected, exactly like the Jacobian cache).
+
 ### Validation Early Stopping
 
 Compute held-out metrics in the callback and stop when they jointly clear
