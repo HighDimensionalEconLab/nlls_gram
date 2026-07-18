@@ -2975,7 +2975,7 @@ def test_cg_requires_dual_preconditioner():
             implicit_preconditioner=identity_preconditioner(),
         )
     # Both callbacks missing reports both remedies in one error.
-    with pytest.raises(ValueError, match="dual_preconditioner, and"):
+    with pytest.raises(ValueError, match="and the cg-resolved"):
         LevenbergMarquardt(residual_fn, linear_solver="cg")
 
 

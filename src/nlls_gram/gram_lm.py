@@ -104,6 +104,11 @@ class LMState:
     hyper: LMHyperparams | None = None
     # RecycleState (recycle set only); None compiles away for the default path.
     recycle: RecycleState | None = None
+    # preconditioner_factory state: precond is the prepare()-built pytree at the
+    # current x; precond_valid means x has not moved since it was built (so the
+    # carried state is reused instead of rebuilt). Both None for the default path.
+    precond: Any = None
+    precond_valid: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -322,6 +327,66 @@ class DrawNNXModule:
         )
 
 
+class PreconditionerFactory:
+    """θ-adaptive dual preconditioner: a value-hashable ``(prepare, apply)`` pair.
+
+    For ``linear_solver="cg"``, supplies a dual preconditioner REBUILT from the
+    current iterate every step, replacing the frozen ``dual_preconditioner``.
+    Pass exactly one of ``dual_preconditioner`` or ``preconditioner_factory``.
+    Use it when the dual operator ``J M^{-1} J' + damping I`` rotates enough as
+    LM drifts ``x`` that a preconditioner frozen at ``x0`` decays into an
+    ineffective (breakdown-inducing) approximation downstream, while one rebuilt
+    from the live iterate keeps the inner CG converging::
+
+        def prepare(x, args, p):
+            # model-structured build from the CURRENT iterate x
+            return diag  # any fixed-shape pytree of arrays
+
+        def apply(state, v, damping):
+            return v / (state + damping)  # SPD, linear in v
+
+        solver = LevenbergMarquardt(
+            residual_fn,
+            linear_solver="cg",
+            preconditioner_factory=PreconditionerFactory(prepare, apply),
+            iterative_maxiter=...,
+        )
+
+    - ``prepare(x, args, p) -> state`` builds a fixed-shape pytree of arrays from
+      the CURRENT solver iterate ``x`` (the user pytree, NOT the raveled flat
+      ``theta`` — model-structured access is the point), the residual ``args``,
+      and ``p``. Runs inside the jitted loop as traced ops (no recompile), once
+      per accepted step: after a rejected step ``x`` did not move, so the carried
+      state is reused and only the live ``damping`` changes.
+    - ``apply(state, v, damping) -> vector`` is the per-iteration apply: an SPD,
+      linear-in-``v`` approximation of ``(J M^{-1} J' + damping I)^{-1} v``. It
+      must stay well-defined at ``damping = 0``, since the cg-resolved implicit
+      derivative reuses it (undamped) at the converged solution unless an
+      explicit ``implicit_preconditioner`` is given.
+
+    Value-hashable on ``(prepare, apply)`` with jit's static-key semantics: equal
+    pairs share one compiled solve loop (like ``DrawNNXModule`` and the frozen
+    preconditioner identities). Define ``prepare``/``apply`` once at setup scope
+    so their identities are stable; a fresh closure per call keys a new compile.
+    ``prepare`` and ``apply`` must be hashable for that sharing; an unhashable
+    pair still works but keys the solver by identity (recompiling per instance).
+    """
+
+    def __init__(self, prepare, apply):
+        self.prepare = prepare
+        self.apply = apply
+
+    def __hash__(self):
+        return hash((self.prepare, self.apply))
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, PreconditionerFactory)
+            and self.prepare == other.prepare
+            and self.apply == other.apply
+        )
+
+
 def _tree_changed(new, old):
     new_leaves, new_treedef = jax.tree_util.tree_flatten(new)
     old_leaves, old_treedef = jax.tree_util.tree_flatten(old)
@@ -510,6 +575,19 @@ class LevenbergMarquardt:
     underdetermined residuals is unchanged — the preconditioner may be
     approximate even though ``metric.solve`` must stay exact.
 
+    ``preconditioner_factory`` (a ``PreconditionerFactory``) is the θ-adaptive
+    alternative to the frozen ``dual_preconditioner``: exactly one of the two is
+    required for ``linear_solver="cg"``. Its ``prepare(x, args, p)`` rebuilds the
+    preconditioner state from the CURRENT iterate inside the jitted loop (once
+    per accepted step; a rejected step reuses the carried state since ``x`` did
+    not move), and ``apply(state, v, damping)`` is the per-iteration apply. Reach
+    for it when a preconditioner frozen at ``x0`` decays as LM drifts ``x`` (the
+    dual operator rotates) where one rebuilt from the live iterate keeps CG
+    converging. It composes with ``recycle`` (unchanged deflation on top of the
+    rebuilt first level) and, when the implicit solve resolves to cg, seeds the
+    implicit preconditioner from the state at the converged solution unless an
+    explicit ``implicit_preconditioner`` overrides it.
+
     ``solve(...).x`` has a custom implicit AD rule with respect to ``p``. By
     default, ``implicit_solver="auto"`` uses a fully matrix-free CG implicit
     solve when the forward solver is ``linear_solver="cg"``, and otherwise uses
@@ -571,6 +649,7 @@ class LevenbergMarquardt:
         iterative_atol=0.0,
         iterative_maxiter=8,
         dual_preconditioner=None,
+        preconditioner_factory=None,
         implicit_solver="auto",
         implicit_tol=None,
         implicit_atol=0.0,
@@ -608,6 +687,14 @@ class LevenbergMarquardt:
             )
         if dual_preconditioner is not None and linear_solver != "cg":
             raise ValueError('dual_preconditioner requires linear_solver="cg"')
+        if preconditioner_factory is not None:
+            if linear_solver != "cg":
+                raise ValueError('preconditioner_factory requires linear_solver="cg"')
+            if dual_preconditioner is not None:
+                raise ValueError(
+                    "pass exactly one of dual_preconditioner or "
+                    "preconditioner_factory for a cg linear_solver, not both"
+                )
         if recycle is not None:
             if linear_solver != "cg":
                 raise ValueError('recycle requires linear_solver="cg"')
@@ -639,23 +726,31 @@ class LevenbergMarquardt:
                 'or implicit_solver="auto" with linear_solver="cg"'
             )
         missing_dual_preconditioner = (
-            linear_solver == "cg" and dual_preconditioner is None
+            linear_solver == "cg"
+            and dual_preconditioner is None
+            and preconditioner_factory is None
         )
+        # A factory serves the implicit hook too (undamped apply at the solution),
+        # so it satisfies the cg implicit requirement like an explicit one.
         missing_implicit_preconditioner = (
-            resolved_implicit_solver == "cg" and implicit_preconditioner is None
+            resolved_implicit_solver == "cg"
+            and implicit_preconditioner is None
+            and preconditioner_factory is None
         )
         if missing_dual_preconditioner and missing_implicit_preconditioner:
             raise ValueError(
-                'linear_solver="cg" requires dual_preconditioner, and the '
-                'cg-resolved implicit solver ("cg", or "auto" alongside a cg '
-                "forward solver) requires implicit_preconditioner; pass "
-                "identity_preconditioner() for either to run unpreconditioned "
-                'CG, or implicit_solver="cholesky" for the dense implicit rule'
+                'linear_solver="cg" requires dual_preconditioner (or '
+                "preconditioner_factory), and the cg-resolved implicit solver "
+                '("cg", or "auto" alongside a cg forward solver) requires '
+                "implicit_preconditioner; pass identity_preconditioner() for "
+                'either to run unpreconditioned CG, or implicit_solver="cholesky" '
+                "for the dense implicit rule"
             )
         if missing_dual_preconditioner:
             raise ValueError(
-                'linear_solver="cg" requires dual_preconditioner; pass '
-                "identity_preconditioner() to run unpreconditioned CG"
+                'linear_solver="cg" requires dual_preconditioner or '
+                "preconditioner_factory; pass identity_preconditioner() to run "
+                "unpreconditioned CG"
             )
         if missing_implicit_preconditioner:
             raise ValueError(
@@ -720,6 +815,7 @@ class LevenbergMarquardt:
         self.iterative_atol = iterative_atol
         self.iterative_maxiter = iterative_maxiter
         self.dual_preconditioner = dual_preconditioner
+        self.preconditioner_factory = preconditioner_factory
         self.implicit_solver = implicit_solver
         self.implicit_tol = implicit_tol
         self.implicit_atol = implicit_atol
@@ -774,6 +870,7 @@ class LevenbergMarquardt:
                 iterative_atol,
                 iterative_maxiter,
                 dual_preconditioner,
+                preconditioner_factory,
                 implicit_solver,
                 implicit_tol,
                 implicit_atol,
@@ -827,8 +924,14 @@ class LevenbergMarquardt:
         residual, aux = self._residual_and_aux(x0, args, p)
         damping = jnp.asarray(self.init_damping, dtype=residual.dtype)
         recycle = self._init_recycle_state(residual)
+        precond, precond_valid = self._init_precond(x0, args, p)
         if not self.cache_jacobian:
-            return LMState(damping, recycle=recycle)
+            return LMState(
+                damping,
+                recycle=recycle,
+                precond=precond,
+                precond_valid=precond_valid,
+            )
         theta, _ = ravel_pytree(x0)
         return LMState(
             damping,
@@ -837,7 +940,18 @@ class LevenbergMarquardt:
             jnp.asarray(False, dtype=jnp.bool_),
             jax.tree.map(jnp.zeros_like, aux),
             recycle=recycle,
+            precond=precond,
+            precond_valid=precond_valid,
         )
+
+    def _init_precond(self, x0, args, p):
+        # State built at x0 and valid there: the first update reuses it (x has
+        # not moved yet), so init pays the one build and the first step does not
+        # rebuild. None for the default path.
+        if self.preconditioner_factory is None:
+            return None, None
+        state = jax.lax.stop_gradient(self.preconditioner_factory.prepare(x0, args, p))
+        return state, jnp.asarray(True, dtype=jnp.bool_)
 
     def _init_recycle_state(self, residual):
         # Cold recycle state sized from the dual dimension m = residual.size:
@@ -996,8 +1110,37 @@ class LevenbergMarquardt:
             def gram_matvec(cotangent):
                 return jvp_fn(self.metric_solve(JT(cotangent))) + damping * cotangent
 
-            def cg_preconditioner(cotangent):
-                return self.dual_preconditioner(cotangent, damping)
+            # θ-adaptive preconditioner: rebuild the state from the pre-step x
+            # (this step's dual linearization point), or reuse the carried state
+            # when the previous step was rejected (x did not move) -- the
+            # jacobian_valid lax.cond pattern, so the rebuild cost is skipped
+            # exactly when nothing changed. apply reads the live damping, so a
+            # reused state is still correct at the new damping.
+            if self.preconditioner_factory is not None:
+                if lm_state.precond is None:
+                    raise ValueError(
+                        "preconditioner_factory is set but the lm_state has no "
+                        "preconditioner state; create the lm_state with "
+                        "init(x, args, p=p)"
+                    )
+                precond_state = jax.lax.cond(
+                    lm_state.precond_valid,
+                    lambda _: lm_state.precond,
+                    lambda _: jax.lax.stop_gradient(
+                        self.preconditioner_factory.prepare(x, args, p)
+                    ),
+                    operand=None,
+                )
+
+                def cg_preconditioner(cotangent):
+                    return self.preconditioner_factory.apply(
+                        precond_state, cotangent, damping
+                    )
+
+            else:
+
+                def cg_preconditioner(cotangent):
+                    return self.dual_preconditioner(cotangent, damping)
 
             if self.recycle is not None and lm_state.recycle is not None:
                 # Recycled/deflated dual solve: build the coarse operator once on
@@ -1241,15 +1384,36 @@ class LevenbergMarquardt:
                 iterations=jax.lax.stop_gradient(velocity_harvest.iterations),
                 residual_norm=jax.lax.stop_gradient(velocity_harvest.residual_norm),
             )
+        # Carry the state built at this step's pre-step x; precond_valid = ~improved
+        # marks it reusable next step exactly when the step was rejected (x did
+        # not move). On acceptance the carried state is stale but shape-stable --
+        # the flag forces a rebuild at the new x before it is applied.
+        new_precond = lm_state.precond
+        new_precond_valid = lm_state.precond_valid
+        if self.preconditioner_factory is not None:
+            new_precond = precond_state
+            new_precond_valid = ~improved
         # The input hyper (not the fallback) passes through so the loop carry
         # structure and dtypes are stable.
         if self.cache_jacobian:
             new_lm_state = LMState(
-                new_damping, resid, Jt, ~improved, aux, lm_state.hyper, new_recycle
+                new_damping,
+                resid,
+                Jt,
+                ~improved,
+                aux,
+                lm_state.hyper,
+                new_recycle,
+                new_precond,
+                new_precond_valid,
             )
         else:
             new_lm_state = LMState(
-                new_damping, hyper=lm_state.hyper, recycle=new_recycle
+                new_damping,
+                hyper=lm_state.hyper,
+                recycle=new_recycle,
+                precond=new_precond,
+                precond_valid=new_precond_valid,
             )
         return (
             unravel(theta_new),
@@ -1333,9 +1497,14 @@ class LevenbergMarquardt:
             raise ValueError("xtol must be nonnegative")
         if lm_state is None:
             # The loop recasts the damping and hyperparameter dtypes itself; the
-            # Jacobian cache (cache_jacobian) and the recycle state (sized from
-            # the residual) need an eager init() for their shapes.
-            if self.cache_jacobian or self.recycle is not None:
+            # Jacobian cache (cache_jacobian), the recycle state (sized from the
+            # residual), and the preconditioner state (built by prepare) need an
+            # eager init() for their shapes.
+            if (
+                self.cache_jacobian
+                or self.recycle is not None
+                or self.preconditioner_factory is not None
+            ):
                 lm_state = self.init(x0, args, p=p)
             else:
                 lm_state = LMState(jnp.asarray(self.init_damping))
@@ -1748,7 +1917,25 @@ class LevenbergMarquardt:
         cg_tol = self._implicit_cg_tol(residual.dtype)
         cg_atol = jnp.asarray(self.implicit_atol, dtype=residual.dtype)
 
-        cg_preconditioner = self.implicit_preconditioner
+        # An explicit implicit_preconditioner wins; otherwise a factory seeds the
+        # implicit preconditioner from the state at the converged solution
+        # (undamped, since the implicit dual has no damping floor). x/args/p are
+        # the traced returned solution, so prepare() yields a traced state (never
+        # a closure constant) and repeated solves at different p do not recompile;
+        # stop_gradient because the preconditioner never moves the root.
+        if self.implicit_preconditioner is not None:
+            cg_preconditioner = self.implicit_preconditioner
+        elif self.preconditioner_factory is not None:
+            precond_state = jax.lax.stop_gradient(
+                self.preconditioner_factory.prepare(x, args, p)
+            )
+            zero_damping = jnp.zeros((), dtype=residual.dtype)
+
+            def cg_preconditioner(v):
+                return self.preconditioner_factory.apply(precond_state, v, zero_damping)
+
+        else:
+            cg_preconditioner = None
 
         def solve(matvec, rhs):
             solution, _ = jsp_sparse_linalg.cg(
@@ -1831,6 +2018,13 @@ class LevenbergMarquardt:
                     "without the RecycleState; use dataclasses.replace("
                     "ctx.lm_state, ...) to preserve the recycle field (rank and "
                     "window are static and cannot change mid-solve)"
+                )
+            if self.preconditioner_factory is not None and lm_state.precond is None:
+                raise ValueError(
+                    "preconditioner_factory is set but the callback action "
+                    "returned an lm_state without the preconditioner state; use "
+                    "dataclasses.replace(ctx.lm_state, ...) to preserve the "
+                    "precond and precond_valid fields"
                 )
             # Trace-time guard so the hyper contract fails identically with
             # and without jit (jit would reject the carry mismatch anyway).
@@ -2184,13 +2378,19 @@ def _accept_converged(_, result):
 
 
 def _cold_lm_state(lm_state):
-    # Drawn starts must not reuse a Jacobian cache or a deflation basis harvested
-    # at another (x, args); damping and hyperparameters stay inherited from the
-    # caller's initial state. Never materializes fields from None -- the carry
-    # structure must match the attempt-0 result.
+    # Drawn starts must not reuse a Jacobian cache, a deflation basis, or a
+    # preconditioner state built at another (x, args); damping and
+    # hyperparameters stay inherited from the caller's initial state. Never
+    # materializes fields from None -- the carry structure must match the
+    # attempt-0 result.
     updates = {}
     if lm_state.jacobian_valid is not None:
         updates["jacobian_valid"] = jnp.zeros_like(lm_state.jacobian_valid)
+    if lm_state.precond is not None:
+        # Zero the stale state and mark it invalid so the drawn start's first
+        # update rebuilds prepare() at its own x before applying it.
+        updates["precond"] = jax.tree.map(jnp.zeros_like, lm_state.precond)
+        updates["precond_valid"] = jnp.zeros_like(lm_state.precond_valid)
     if lm_state.recycle is not None:
         recycle = lm_state.recycle
         updates["recycle"] = RecycleState(

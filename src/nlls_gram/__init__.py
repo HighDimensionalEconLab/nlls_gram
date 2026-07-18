@@ -31,6 +31,7 @@ from nlls_gram.gram_lm import (
     LMStatus,
     MultiStart,
     MultiStartInfo,
+    PreconditionerFactory,
 )
 from nlls_gram.metrics import (
     Metric,
@@ -74,6 +75,7 @@ __all__ = [
     "MultiStart",
     "MultiStartInfo",
     "DrawNNXModule",
+    "PreconditionerFactory",
     "RecycleConfig",
     "RecycleState",
     "HarvestState",

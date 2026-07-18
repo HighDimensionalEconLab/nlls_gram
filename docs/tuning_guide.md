@@ -132,6 +132,18 @@ its sketch-and-shift construction targets exactly the fast-decaying spectra
 those duals show, and it reads the live damping, so one construction serves
 the whole solve.
 
+Those helpers are all *frozen* at one linearization point. When the dual
+operator rotates enough as LM drifts `x` that a preconditioner built at `x0`
+decays into an ineffective approximation — the inner CG stalls or breaks down
+several steps in, while rebuilding from the current iterate would keep it
+converging — pass a
+[`PreconditionerFactory(prepare, apply)`](utilities.md#iterate-adaptive-preconditioner-factory)
+instead of `dual_preconditioner`. Its `prepare(x, args, p)` rebuilds the
+preconditioner state from the current iterate inside the jitted loop (once per
+accepted step; a rejected step reuses the carried state), so keep `prepare`
+cheap. It composes with recycling and seeds the implicit derivative's
+preconditioner from the state at the solution.
+
 ## Recycling and Deflation Across Steps
 
 When a frozen first-level `dual_preconditioner` plateaus above the accuracy bar
