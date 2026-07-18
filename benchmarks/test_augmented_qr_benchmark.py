@@ -2,12 +2,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nlls_gram import SquareLevenbergMarquardt
+from nlls_gram import UnderdeterminedLevenbergMarquardt
 
-# The DAE stage pattern from issue #14: 32 repeated warm-started square
-# solves over slowly drifting targets. The direct-Newton fori_loop variant is
-# the baseline the square solver is gated against (target: <= ~2x overhead
-# for the small systems that dominate DAE stage solves).
+# The DAE stage pattern: 32 repeated warm-started algebraic solves over slowly
+# drifting targets. A fixed-iteration direct-Newton loop is the lower-overhead
+# baseline for the small systems where augmented QR is intended to be used.
 
 N_SOLVES = 32
 NEWTON_STEPS = 4
@@ -21,10 +20,10 @@ def _devices(platform):
 
 
 def _make_problem(n, device):
-    W = jax.device_put(0.1 * jax.random.normal(jax.random.PRNGKey(66), (n, n)), device)
-    b0 = jax.device_put(jax.random.normal(jax.random.PRNGKey(67), (n,)), device)
+    W = jax.device_put(0.1 * jax.random.normal(jax.random.key(66), (n, n)), device)
+    b0 = jax.device_put(jax.random.normal(jax.random.key(67), (n,)), device)
     drift = jax.device_put(
-        0.02 * jax.random.normal(jax.random.PRNGKey(68), (N_SOLVES, n)), device
+        0.02 * jax.random.normal(jax.random.key(68), (N_SOLVES, n)), device
     )
     targets = b0 + jnp.cumsum(drift, axis=0)
 
@@ -36,7 +35,7 @@ def _make_problem(n, device):
 
 @pytest.mark.parametrize("platform", ["cpu", "gpu"])
 @pytest.mark.parametrize("n", [1, 4, 8])
-@pytest.mark.parametrize("method", ["square_lm", "direct_newton"])
+@pytest.mark.parametrize("method", ["augmented_qr", "direct_newton"])
 def test_warm_started_stage_solves(benchmark, platform, n, method):
     if not _devices(platform):
         pytest.skip(f"JAX {platform!r} backend is not available")
@@ -44,8 +43,13 @@ def test_warm_started_stage_solves(benchmark, platform, n, method):
     residual, targets = _make_problem(n, device)
     z0 = jax.device_put(jnp.zeros(n), device)
 
-    if method == "square_lm":
-        solver = SquareLevenbergMarquardt(residual)
+    if method == "augmented_qr":
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            linear_solver="augmented_qr",
+            geodesic_acceleration=False,
+            cache_jacobian=False,
+        )
 
         def stage(z, target):
             result = solver.solve(z, p=target, max_steps=8, atol=1e-5)

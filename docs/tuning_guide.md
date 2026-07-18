@@ -36,6 +36,7 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
 | `m` up to a few thousand | `cholesky` (default) |
 | `m × n` Jacobian too big to materialize, or very large `m` | `cg` |
 | ill-conditioned metric, moderate `m`, full-row-rank `J` | `qr` |
+| small system with possibly rank-deficient `J` | `augmented_qr` |
 
 - **Avoid `qr` when massively overparameterized.** It does not use the Gram
   form: it factors the whitened `n × m` matrix, so cost scales with `n`
@@ -43,6 +44,10 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   requires full row rank — rank-deficient Jacobians produce non-finite steps.
   Its advantage is conditioning (it avoids squaring the condition number);
   reach for it only when that is the binding constraint.
+- **Use `augmented_qr` for small systems when rank robustness matters.** It
+  directly factors `[J S; sqrt(damping) I]`, whose damping block guarantees
+  full column rank, but its width is the parameter count. That is attractive
+  for DAE algebraic roots and expensive when `n` is large.
 - `cg` returns an *approximate* step under its iteration budget. That is
   usually fine — LM's accept/reject absorbs inexactness — but see the
   scheduling pattern below. With the default `implicit_solver="auto"`,
@@ -162,7 +167,7 @@ the step count.
 | symptom | likely cause | remedy |
 | --- | --- | --- |
 | `status == NONFINITE` at step 0 | bad initial point or data | check `residual_fn(x0, ...)` directly |
-| `qr` gives non-finite steps; other solvers fine | rank-deficient Jacobian | use `cholesky`/`cg` |
+| `qr` gives non-finite steps; other solvers fine | rank-deficient Jacobian | use `augmented_qr`, `cholesky`, or `cg` |
 | `MAX_STEPS` but loss small and flat | converged without a stopping rule | set `gtol`/`xtol` |
 | damping grows without bound (float32 `inf`) | rejection storm | `max_damping`, or check residual scaling |
 | every `solve` call recompiles | residual/callback/metric object rebuilt per call (solvers compare by configuration, but their pieces key by identity) | define the pieces once at setup scope |

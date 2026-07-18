@@ -348,10 +348,13 @@ def test_metric_requirements_per_linear_solver():
         UnderdeterminedLevenbergMarquardt(
             residual_fn, metric=Metric(norm=jnp.linalg.norm)
         )
-    with pytest.raises(ValueError, match="metric.inv_sqrt"):
-        UnderdeterminedLevenbergMarquardt(
-            residual_fn, linear_solver="qr", metric=Metric(solve=lambda x: x)
-        )
+    for linear_solver in ("qr", "augmented_qr"):
+        with pytest.raises(ValueError, match="metric.inv_sqrt"):
+            UnderdeterminedLevenbergMarquardt(
+                residual_fn,
+                linear_solver=linear_solver,
+                metric=Metric(solve=lambda x: x),
+            )
     with pytest.raises(ValueError, match="metric.norm"):
         UnderdeterminedLevenbergMarquardt(
             residual_fn,
@@ -396,7 +399,8 @@ def test_cg_step_matches_cholesky_identity_step():
     assert cg_info.loss.dtype == jnp.float32
 
 
-def test_qr_step_matches_cholesky_identity_step():
+@pytest.mark.parametrize("linear_solver", ["qr", "augmented_qr"])
+def test_qr_steps_match_cholesky_identity_step(linear_solver):
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": 1.0, "b": 0.0}
@@ -406,7 +410,7 @@ def test_qr_step_matches_cholesky_identity_step():
         init_damping=1e-2,
     )
     qr_solver = UnderdeterminedLevenbergMarquardt(
-        residual_fn, init_damping=1e-2, linear_solver="qr"
+        residual_fn, init_damping=1e-2, linear_solver=linear_solver
     )
 
     cholesky_x, cholesky_state, cholesky_info = cholesky_solver.update(
@@ -439,7 +443,8 @@ def test_qr_step_matches_cholesky_identity_step():
     assert qr_info.loss.dtype == jnp.float32
 
 
-def test_qr_step_matches_closed_form_underdetermined_damped_solution():
+@pytest.mark.parametrize("linear_solver", ["qr", "augmented_qr"])
+def test_qr_steps_match_closed_form_underdetermined_damped_solution(linear_solver):
     def residual(theta, args, p):
         matrix, target = args
         return matrix @ theta - target
@@ -452,7 +457,7 @@ def test_qr_step_matches_closed_form_underdetermined_damped_solution():
     solver = UnderdeterminedLevenbergMarquardt(
         residual,
         init_damping=init_damping,
-        linear_solver="qr",
+        linear_solver=linear_solver,
     )
     theta, lm_state, info = solver.update(
         theta0, solver.init(theta0, (matrix, target)), (matrix, target)
@@ -471,6 +476,70 @@ def test_qr_step_matches_closed_form_underdetermined_damped_solution():
     assert jnp.allclose(lm_state.damping, init_damping * 0.5)
     assert theta.dtype == jnp.float32
     assert info.loss.dtype == jnp.float32
+
+
+@pytest.mark.parametrize(
+    "matrix",
+    [
+        jnp.array([[1.0, 2.0], [0.5, -1.0]]),
+        jnp.array([[1.0, 2.0], [0.5, -1.0], [2.0, 0.25]]),
+    ],
+)
+def test_augmented_qr_matches_closed_form_for_square_and_overdetermined(matrix):
+    def residual(theta, args, p):
+        matrix, target = args
+        return matrix @ theta - target
+
+    target = jnp.arange(1, matrix.shape[0] + 1, dtype=matrix.dtype)
+    theta0 = jnp.zeros(matrix.shape[1])
+    damping = 0.1
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=damping,
+        linear_solver="augmented_qr",
+        geodesic_acceleration=False,
+    )
+    theta, _, info = solver.update(
+        theta0,
+        solver.init(theta0, (matrix, target)),
+        (matrix, target),
+    )
+    expected = jnp.linalg.solve(
+        matrix.T @ matrix + damping * jnp.eye(matrix.shape[1]),
+        matrix.T @ target,
+    )
+
+    assert bool(info.accepted)
+    assert jnp.allclose(theta, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_augmented_qr_rank_deficient_jacobian_has_finite_damped_step():
+    def residual(theta, args, p):
+        matrix, target = args
+        return matrix @ theta - target
+
+    matrix = jnp.array([[1.0, 0.0], [2.0, 0.0]])
+    target = jnp.array([1.0, 2.0])
+    theta0 = jnp.zeros(2)
+    damping = 1e-3
+    solver = UnderdeterminedLevenbergMarquardt(
+        residual,
+        init_damping=damping,
+        linear_solver="augmented_qr",
+        geodesic_acceleration=False,
+    )
+    theta, _, info = solver.update(
+        theta0,
+        solver.init(theta0, (matrix, target)),
+        (matrix, target),
+    )
+    expected = jnp.linalg.solve(
+        matrix.T @ matrix + damping * jnp.eye(2), matrix.T @ target
+    )
+
+    assert bool(info.accepted)
+    assert bool(jnp.all(jnp.isfinite(theta)))
+    assert jnp.allclose(theta, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_qr_float32_handles_ill_conditioned_case_where_cholesky_fails():
@@ -537,14 +606,15 @@ def test_cg_update_jits():
     assert x["b"].dtype == jnp.float32
 
 
-def test_qr_update_jits():
+@pytest.mark.parametrize("linear_solver", ["qr", "augmented_qr"])
+def test_qr_updates_jit(linear_solver):
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
     solver = UnderdeterminedLevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
-        linear_solver="qr",
+        linear_solver=linear_solver,
     )
 
     @jax.jit
@@ -832,7 +902,7 @@ def test_metric_selects_minimum_norm_interpolating_step():
     assert jnp.allclose(x_metric, jnp.array([0.8, 0.2]), atol=1e-5)
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "augmented_qr"])
 def test_metric_step_matches_closed_form_solution(linear_solver):
     def residual(theta, args, p):
         matrix, target = args
@@ -922,7 +992,7 @@ def test_geodesic_step_matches_regression_values():
     )
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "augmented_qr"])
 def test_metric_geodesic_acceleration_ratio_uses_metric_norm(linear_solver):
     def residual(theta, _, p):
         return jnp.array(
@@ -1752,7 +1822,7 @@ def test_vmap_over_solve_matches_loop_and_implicit_ad():
     assert jnp.allclose(p_bar, expected_p_bar, atol=1e-5)
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr", "augmented_qr"])
 def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
     def residual(theta, _, p):
         return jnp.array([theta[0] + 2.0 * theta[1] - p])
@@ -1774,7 +1844,7 @@ def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
         init_damping=1e-2,
         linear_solver=linear_solver,
         metric=metric,
-        # The qr case deliberately supplies a square-root-only metric (no
+        # The QR cases deliberately supply a square-root-only metric (no
         # norm), which the geodesic default would reject at construction.
         geodesic_acceleration=False,
     )
@@ -1793,7 +1863,7 @@ def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
     assert jnp.allclose(x_dot, expected_x_dot, atol=1e-6)
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "augmented_qr"])
 def test_grad_norm_and_step_norm_match_closed_form(linear_solver):
     def residual(theta, args, p):
         matrix, target = args
@@ -2512,7 +2582,7 @@ def aux_residual_fn(x, args):
     return r, {"mean_abs": jnp.mean(jnp.abs(r)), "max_abs": jnp.max(jnp.abs(r))}
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "augmented_qr"])
 def test_has_aux_reports_aux_at_pre_step_x(linear_solver):
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
@@ -3523,7 +3593,7 @@ def test_blockdiag_metric_identity_block_defaults():
         blockdiag_metric([])
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr", "augmented_qr"])
 def test_structural_metrics_match_dense_metric_in_solver(linear_solver):
     # End-to-end: the O(n) tridiagonal metric drives the actual solver (and
     # its implicit derivative) to the same solution as the equivalent dense
@@ -3746,14 +3816,14 @@ def test_repeated_blockdiag_metric_norm_ad_matches_blockdiag():
     )
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr", "augmented_qr"])
 @pytest.mark.parametrize("geodesic_acceleration", [False, True])
 def test_repeated_blockdiag_metric_implicit_ad_matches_blockdiag(
     linear_solver, geodesic_acceleration
 ):
     # End-to-end: the repeated metric drives solve() and its implicit JVP/VJP to
     # the same answers as the equivalent expanded blockdiag metric, across the
-    # cholesky and qr steps, with geodesic acceleration exercising norm.
+    # dense solver steps, with geodesic acceleration exercising norm.
     idx = jnp.arange(3)
     K = 0.6 ** jnp.abs(idx[:, None] - idx[None, :])
     weights = jnp.array([4.0, 0.25])
@@ -4022,7 +4092,7 @@ def test_metric_from_state_space_matern_small_pivot_grad_is_finite():
     assert bool(jnp.isfinite(grad))
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr", "augmented_qr"])
 def test_metric_from_state_space_matern_matches_dense_metric_in_solver(linear_solver):
     # End-to-end: the O(n) Matern metric drives the actual solver (and its
     # implicit derivative) to the same solution as the equivalent dense

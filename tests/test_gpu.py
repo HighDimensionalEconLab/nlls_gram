@@ -23,7 +23,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr", "augmented_qr"])
 def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
     def residual(theta, target, p):
         return jnp.array([theta[0] ** 2 - target])
@@ -58,7 +58,7 @@ def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
     assert jnp.isfinite(info.acceleration_ratio)
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr", "augmented_qr"])
 def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
     def residual(theta, target, p):
         return jnp.array([theta[0] ** 2 - target])

@@ -152,6 +152,9 @@ Matérn/state-space kernel Grams, `metric_from_diagonal`,
 - `linear_solver="cholesky"`: dense residual-space Gram solve, the default.
 - `linear_solver="qr"`: dense QR solve of the whitened-step problem (requires
   a full-row-rank Jacobian).
+- `linear_solver="augmented_qr"`: direct augmented QR in parameter space;
+  robust to rank-deficient Jacobians when damping is positive and best suited
+  to small systems.
 - `linear_solver="cg"`: matrix-free residual-space CG. A `dual_preconditioner`
   is required (e.g. `sherman_morrison_preconditioner`, or the randomized
   `nystrom_preconditioner` for neural-network duals; pass
@@ -160,15 +163,8 @@ Matérn/state-space kernel Grams, `metric_from_diagonal`,
   requires `implicit_preconditioner` the same way — at construction, even
   if the solve is never differentiated.
 
-All three solve the same metric-damped linearized subproblem up to the accuracy
+All four solve the same metric-damped linearized subproblem up to the accuracy
 of the chosen linear solver.
-
-For **square nonsingular** systems (e.g. DAE stage roots), the companion
-`SquareLevenbergMarquardt` is a solve-only damped-Newton root solver: a lean
-jitted loop around a direct augmented-QR step (never the Gram), warm-start
-friendly, with implicit differentiation of `solve(...).x` with respect to `p`
-through the square system `J_x ẋ = -J_p ṗ`. See the
-[square systems docs](https://highdimensionaleconlab.github.io/nlls_gram/square_systems/).
 
 ## Docs and Alternatives
 
