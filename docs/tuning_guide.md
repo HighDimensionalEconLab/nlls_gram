@@ -35,6 +35,7 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
 | --- | --- |
 | `m` up to a few thousand | `cholesky` (default) |
 | `m × n` Jacobian too big to materialize, or very large `m` | `cg` |
+| large/matrix-free and the dual is ill-conditioned at small damping | `lsmr` |
 | ill-conditioned metric, moderate `m`, full-row-rank `J` | `qr` |
 | small system with possibly rank-deficient `J` | `augmented_qr` |
 
@@ -48,6 +49,36 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   directly factors `[J S; sqrt(damping) I]`, whose damping block guarantees
   full column rank, but its width is the parameter count. That is attractive
   for DAE algebraic roots and expensive when `n` is large.
+- **Use `lsmr` as the matrix-free sibling of `augmented_qr`.** It solves the
+  same whitened damped subproblem `min_u ||r + B u||² + damping ||u||²`
+  (`B = J S`, `S = metric.inv_sqrt`, step `s = S u`) by
+  [LSMR](https://web.stanford.edu/group/SOL/software/lsmr/) bidiagonalization
+  using only `J`/`Jᵀ` matvecs — no materialized Jacobian, no QR. Its payoff over
+  `cg` is conditioning: the `cg` dual operator `J M⁻¹ Jᵀ + damping I` has the
+  **square** of the whitened operator's condition number, so at small damping
+  (`~1e10` in the motivating case) `eps·cond` puts an accuracy floor on the step
+  that even dense direct solves hit, and CG truncation concentrates in the slow,
+  selection-critical eigendirections. `lsmr` works at `cond(B) ~ sqrt` of that,
+  restoring certifiable endgame accuracy. Reach for it when a matrix-free solve
+  is required *and* the dual is ill-conditioned near the solution; when the dual
+  is well-conditioned (or a good `dual_preconditioner` exists), `cg` is cheaper
+  per step. `lsmr` requires the metric's `inv_sqrt`/`inv_sqrt_transpose` (the
+  identity metric supplies them); `recycle`/`dual_preconditioner`/
+  `preconditioner_factory` are `cg`-only. When the whitened operator itself is
+  badly conditioned (`cond(B)` still large — e.g. `~1e8`, where plain LSMR needs
+  thousands of endgame iterations), pass a `whitened_preconditioner` (a
+  `WhitenedPreconditioner`): a parameter-space right-preconditioner `R⁻¹` running
+  LSMR on `B R⁻¹` to cluster the spectrum and cut the endgame count to the tens (a
+  Schur-complement factor is canonical). Its `damp` then regularizes in the `RᵀR`
+  metric, so the step is the surrogate `u = -(BᵀB + λ RᵀR)⁻¹ Bᵀ r` — admissible
+  because LM guards on the true `||r||` and the `λ → 0` selection limit is
+  `R`-invariant. Its stopping maps the same
+  `iterative_tol`/`iterative_atol`/`iterative_maxiter` hooks (relative/absolute
+  bound on the normal-equations residual, measured on the preconditioned operator,
+  callback-schedulable). Differentiating a forward `lsmr` `solve(...).x` uses the
+  dense cholesky implicit rule by default (`implicit_solver="auto"`); pass
+  `implicit_solver="cg"` with an `implicit_preconditioner` for a matrix-free
+  derivative at very large `m`.
 - `cg` returns an *approximate* step under its iteration budget. That is
   usually fine — LM's accept/reject absorbs inexactness — but see the
   scheduling pattern below. With the default `implicit_solver="auto"`,

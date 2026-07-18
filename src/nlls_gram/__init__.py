@@ -32,7 +32,9 @@ from nlls_gram.gram_lm import (
     MultiStart,
     MultiStartInfo,
     PreconditionerFactory,
+    WhitenedPreconditioner,
 )
+from nlls_gram.lsmr import LSMRState, lsmr
 from nlls_gram.metrics import (
     Metric,
     blockdiag_metric,
@@ -76,6 +78,7 @@ __all__ = [
     "MultiStartInfo",
     "DrawNNXModule",
     "PreconditionerFactory",
+    "WhitenedPreconditioner",
     "RecycleConfig",
     "RecycleState",
     "HarvestState",
@@ -84,6 +87,8 @@ __all__ = [
     "blockdiag_metric",
     "repeated_blockdiag_metric",
     "identity_preconditioner",
+    "lsmr",
+    "LSMRState",
     "matern_state_space",
     "metric_from_cholesky",
     "metric_from_diagonal",

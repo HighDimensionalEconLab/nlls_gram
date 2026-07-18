@@ -251,6 +251,17 @@ algebraic roots. In the package's usual \(m\ll n\) regime, `qr` performs the
 same damped solve after reducing to residual dimension and is substantially
 cheaper when its full-row-rank assumption holds.
 
+`linear_solver="lsmr"` solves that same whitened augmented system iteratively by
+LSMR bidiagonalization, using only \(J\)/\(J^\top\) matvecs — the matrix-free
+sibling of `augmented_qr`. Because it works on \(B = JS\) rather than the `cg`
+dual \(J M^{-1} J^\top + \lambda I\), whose condition number is the *square*, it
+keeps the step accurate at small \(\lambda\) where the squared dual solve hits
+its `eps·cond` floor. It requires the metric's `inv_sqrt`/`inv_sqrt_transpose`
+and accepts an optional `whitened_preconditioner` (a `WhitenedPreconditioner`
+parameter-space right-preconditioner `R⁻¹`) that clusters the LSMR spectrum when
+the whitened operator is itself ill-conditioned; it is detailed in the
+[utilities guide](utilities.md#matrix-free-lsmr-whitened-subproblem).
+
 ## Minimal Example
 
 ```python

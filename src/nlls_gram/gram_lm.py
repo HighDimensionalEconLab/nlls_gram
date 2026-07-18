@@ -11,6 +11,7 @@ import jax.scipy.sparse.linalg as jsp_sparse_linalg
 import numpy as np
 from jax.flatten_util import ravel_pytree
 
+from nlls_gram.lsmr import lsmr_solve
 from nlls_gram.metrics import Metric
 from nlls_gram.recycled_cg import (
     RecycleConfig,
@@ -387,6 +388,63 @@ class PreconditionerFactory:
         )
 
 
+class WhitenedPreconditioner:
+    """Parameter-space right-preconditioner for ``linear_solver="lsmr"``: a
+    value-hashable pair ``(solve, solve_transpose)`` applying ``R^{-1}`` and
+    ``R^{-T}``.
+
+    LSMR then runs on the preconditioned operator ``B R^{-1}`` (``B = J S``): the
+    iteration variable is ``z``, the operator is ``x -> B(solve(x, damping))``,
+    the adjoint is ``w -> solve_transpose(Bᵀ w, damping)``, and the returned step
+    un-preconditions the final iterate as ``u = R^{-1} z``. A well-chosen ``R``
+    (a Schur-complement factor of the parameter-space normal operator is the
+    canonical construction) clusters the spectrum of ``B R^{-1}`` and cuts the
+    endgame iteration count by orders of magnitude::
+
+        def solve(v, damping):
+            return jsp_linalg.solve_triangular(R, v)              # R^{-1} v
+
+        def solve_transpose(w, damping):
+            return jsp_linalg.solve_triangular(R.T, w)            # R^{-T} w
+
+        solver = LevenbergMarquardt(
+            residual_fn, linear_solver="lsmr",
+            whitened_preconditioner=WhitenedPreconditioner(solve, solve_transpose),
+        )
+
+    - ``solve(v, damping) -> vector`` applies ``R^{-1}`` on a parameter-space
+      vector; ``solve_transpose(w, damping) -> vector`` applies ``R^{-T}``. Both
+      receive the live ``damping`` (like ``dual_preconditioner(v, damping)``), so
+      a ``damping``-analytic ``R`` folds ``lambda`` in exactly.
+    - **Surrogate subproblem**: LSMR's scalar ``damp = sqrt(damping)`` applied to
+      ``B R^{-1}`` regularizes in the ``RᵀR`` metric, so the computed step is
+      ``u = -(BᵀB + damping RᵀR)^{-1} Bᵀ r`` -- a documented surrogate of the
+      plain ``I``-metric-damped subproblem. This is admissible: LM acceptance
+      guards on the true ``||r||``, and the ``damping -> 0`` selection limit is
+      ``R``-invariant (it is the minimum-metric-norm step regardless of ``R``).
+    - LSMR stopping (``iterative_tol``/``iterative_atol``) is measured on the
+      preconditioned operator -- the well-conditioned ``z`` coordinates.
+
+    ``None`` (the default) runs plain LSMR. Value-hashable on
+    ``(solve, solve_transpose)`` with jit's static-key semantics: equal pairs
+    share one compiled solve loop, so define the callables once at setup scope.
+    """
+
+    def __init__(self, solve, solve_transpose):
+        self.solve = solve
+        self.solve_transpose = solve_transpose
+
+    def __hash__(self):
+        return hash((self.solve, self.solve_transpose))
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, WhitenedPreconditioner)
+            and self.solve == other.solve
+            and self.solve_transpose == other.solve_transpose
+        )
+
+
 def _tree_changed(new, old):
     new_leaves, new_treedef = jax.tree_util.tree_flatten(new)
     old_leaves, old_treedef = jax.tree_util.tree_flatten(old)
@@ -565,6 +623,27 @@ class LevenbergMarquardt:
     systems, including square algebraic roots, rather than the package's usual
     massively underdetermined regime.
 
+    ``linear_solver="lsmr"`` is the matrix-free sibling of ``augmented_qr``: it
+    solves the same whitened damped subproblem
+    ``min_u ||r + B u||^2 + damping ||u||^2`` (``B = J S``, ``S = metric.inv_sqrt``,
+    step ``s = S u``) by LSMR bidiagonalization from ``J``/``J'`` matvecs alone.
+    Because it works on ``B`` -- whose condition number is the square root of the
+    ``cg`` dual ``J P J' + damping I`` -- it keeps the step accurate at small
+    damping where the squared dual solve hits its ``eps * cond`` floor. It needs
+    the metric's ``inv_sqrt``/``inv_sqrt_transpose`` (the identity metric supplies
+    them) and maps the same ``iterative_tol``/``iterative_atol``/
+    ``iterative_maxiter`` hooks onto its normal-equations stopping test.
+    ``dual_preconditioner``, ``preconditioner_factory``, and ``recycle`` are
+    ``cg``-only. Its own preconditioner is ``whitened_preconditioner`` (a
+    ``WhitenedPreconditioner``): a parameter-space right-preconditioner ``R^{-1}``
+    running LSMR on ``B R^{-1}`` to cluster the spectrum, which cuts the endgame
+    iteration count by orders of magnitude when ``B`` itself is ill-conditioned
+    (a Schur-complement factor is canonical). Its ``damp`` then regularizes in the
+    ``R'R`` metric -- the step ``u = -(B'B + damping R'R)^{-1} B' r`` is a
+    documented surrogate whose ``damping -> 0`` selection limit is ``R``-invariant.
+    Differentiating a forward ``lsmr`` solve uses the dense cholesky implicit rule
+    under ``implicit_solver="auto"``.
+
     ``linear_solver="cg"`` requires ``dual_preconditioner(v, damping)``: a
     jit-traceable, linear, SPD approximation of
     ``(J P J' + damping I_m)^{-1} v`` used as the CG preconditioner (for the
@@ -650,6 +729,7 @@ class LevenbergMarquardt:
         iterative_maxiter=8,
         dual_preconditioner=None,
         preconditioner_factory=None,
+        whitened_preconditioner=None,
         implicit_solver="auto",
         implicit_tol=None,
         implicit_atol=0.0,
@@ -665,7 +745,7 @@ class LevenbergMarquardt:
         recycle=None,
     ):
         canonical_residual, residual_arity = canonicalize_residual(residual_fn)
-        if linear_solver not in ("cholesky", "qr", "augmented_qr", "cg"):
+        if linear_solver not in ("cholesky", "qr", "augmented_qr", "cg", "lsmr"):
             raise ValueError(f"unknown linear_solver: {linear_solver}")
         if init_damping <= 0:
             raise ValueError("init_damping must be positive")
@@ -695,6 +775,8 @@ class LevenbergMarquardt:
                     "pass exactly one of dual_preconditioner or "
                     "preconditioner_factory for a cg linear_solver, not both"
                 )
+        if whitened_preconditioner is not None and linear_solver != "lsmr":
+            raise ValueError('whitened_preconditioner requires linear_solver="lsmr"')
         if recycle is not None:
             if linear_solver != "cg":
                 raise ValueError('recycle requires linear_solver="cg"')
@@ -792,7 +874,7 @@ class LevenbergMarquardt:
                     f'linear_solver="{linear_solver}" with a custom metric requires '
                     "metric.solve"
                 )
-        if has_custom_metric and linear_solver in ("qr", "augmented_qr"):
+        if has_custom_metric and linear_solver in ("qr", "augmented_qr", "lsmr"):
             if metric.inv_sqrt is None or metric.inv_sqrt_transpose is None:
                 raise ValueError(
                     f'linear_solver="{linear_solver}" with a custom metric requires '
@@ -816,6 +898,7 @@ class LevenbergMarquardt:
         self.iterative_maxiter = iterative_maxiter
         self.dual_preconditioner = dual_preconditioner
         self.preconditioner_factory = preconditioner_factory
+        self.whitened_preconditioner = whitened_preconditioner
         self.implicit_solver = implicit_solver
         self.implicit_tol = implicit_tol
         self.implicit_atol = implicit_atol
@@ -871,6 +954,7 @@ class LevenbergMarquardt:
                 iterative_maxiter,
                 dual_preconditioner,
                 preconditioner_factory,
+                whitened_preconditioner,
                 implicit_solver,
                 implicit_tol,
                 implicit_atol,
@@ -1038,9 +1122,9 @@ class LevenbergMarquardt:
 
             residual_value = residual_flat
 
-        # Build J': matrix-free JVP/VJP closures for cg; m VJP passes for the
-        # dense paths, reused from the cache after a rejected step.
-        if self.linear_solver == "cg":
+        # Build J': matrix-free JVP/VJP closures for cg and lsmr; m VJP passes for
+        # the dense paths, reused from the cache after a rejected step.
+        if self.linear_solver in ("cg", "lsmr"):
             if self.has_aux:
                 resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
             else:
@@ -1196,6 +1280,99 @@ class LevenbergMarquardt:
                         M=cg_preconditioner,
                     )
                     return -self.metric_solve(JT(dual_solution))
+
+        elif self.linear_solver == "lsmr":
+            # Matrix-free whitened damped LS: min_u ||r + B u||^2 + damping ||u||^2
+            # with B = J S (S = metric.inv_sqrt). Working on B (condition sqrt of
+            # the cg dual's J M^{-1} J' + damping I) restores endgame accuracy in
+            # the selection-critical slow directions where the squared dual solve
+            # bottoms out at eps * cond. Step s = S u.
+            transpose_fn = jax.linear_transpose(jvp_fn, theta)
+
+            def JT(cotangent):
+                return transpose_fn(cotangent)[0]
+
+            grad = JT(resid)
+            lsmr_tol = jnp.asarray(hyper.iterative_tol, dtype=resid.dtype)
+            lsmr_atol = jnp.asarray(hyper.iterative_atol, dtype=resid.dtype)
+            sqrt_damping = jnp.sqrt(damping)
+            m = resid.shape[0]
+            n = theta.shape[0]
+            # None (uncapped) has no meaning for a fixed-shape loop; a
+            # tolerance-only stop still needs a hard cap. min(m, n) is the
+            # bidiagonalization's exact-arithmetic termination bound.
+            lsmr_maxiter = (
+                hyper.iterative_maxiter
+                if hyper.iterative_maxiter is not None
+                else 4 * min(m, n)
+            )
+
+            # Parameter-space right-preconditioner R^{-1} (whitened_preconditioner):
+            # run LSMR on the preconditioned operator A_r = B R^{-1} in the z
+            # variable, then un-precondition u = R^{-1} z. A good R clusters the
+            # spectrum of B R^{-1} and cuts iterations; damp then regularizes in the
+            # R'R metric (a documented surrogate). None -> plain LSMR.
+            if self.whitened_preconditioner is not None:
+
+                def apply_Rinv(v):
+                    return self.whitened_preconditioner.solve(v, damping)
+
+                def apply_RinvT(w):
+                    return self.whitened_preconditioner.solve_transpose(w, damping)
+
+            else:
+
+                def apply_Rinv(v):
+                    return v
+
+                def apply_RinvT(w):
+                    return w
+
+            def A_matvec(z):  # A_r = B R^{-1}
+                return jvp_fn(self.metric_inv_sqrt(apply_Rinv(z)))
+
+            def At_matvec(w):  # A_r' = R^{-T} B'
+                return apply_RinvT(self.metric_inv_sqrt_transpose(JT(w)))
+
+            # N = A_r'A_r + damping I: the SPD normal operator custom_linear_solve
+            # differentiates through (the implicit rule for the preconditioned
+            # damped LS solution in z-space).
+            def N_matvec(z):
+                return At_matvec(A_matvec(z)) + damping * z
+
+            def solve_N(_, c):
+                # Solve N z = c for arbitrary c via LSMR on the augmented operator
+                # [A_r; sqrt(damping) I] with rhs [0; c / sqrt(damping)]: its normal
+                # equations are exactly N z = c, at condition sqrt(cond(N)).
+                # Stopping is measured on the preconditioned operator. The forward c
+                # and every cotangent RHS route through here.
+                def A_aug(zz):
+                    return jnp.concatenate([A_matvec(zz), sqrt_damping * zz])
+
+                def At_aug(ww):
+                    return At_matvec(ww[:m]) + sqrt_damping * ww[m:]
+
+                b_aug = jnp.concatenate([jnp.zeros(m, resid.dtype), c / sqrt_damping])
+                z, _ = lsmr_solve(
+                    A_aug,
+                    At_aug,
+                    b_aug,
+                    jnp.zeros((), resid.dtype),
+                    lsmr_tol,
+                    lsmr_atol,
+                    lsmr_maxiter,
+                    n,
+                )
+                return z
+
+            def solve_step(rhs):
+                # z solves min ||A_r z + rhs||^2 + damping ||z||^2; c = A_r'(-rhs),
+                # and the step un-preconditions the final iterate: u = R^{-1} z.
+                c = At_matvec(-rhs)
+                z = jax.lax.custom_linear_solve(
+                    N_matvec, c, solve=solve_N, transpose_solve=solve_N, symmetric=True
+                )
+                return self.metric_inv_sqrt(apply_Rinv(z))
 
         else:
             if not self.cache_jacobian:

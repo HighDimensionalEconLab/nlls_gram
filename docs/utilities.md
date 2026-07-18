@@ -499,6 +499,58 @@ solvers behave as follows:
   appends redundant equations) and equals the unpadded derivative, so
   differentiate the unpadded formulation to compute it.
 
+## Matrix-Free LSMR (Whitened Subproblem)
+
+`linear_solver="lsmr"` solves the whitened damped LM subproblem
+`min_u ||r + B u||² + damping ||u||²` (`B = J S`, `S = metric.inv_sqrt`,
+`S Sᵀ = M⁻¹`, step `s = S u`) with [LSMR](https://web.stanford.edu/group/SOL/software/lsmr/)
+Golub-Kahan bidiagonalization, using only `J`/`Jᵀ` matvecs — the matrix-free
+counterpart of `augmented_qr`. It exists for the same reason `qr`/`augmented_qr`
+do: the `cg` dual operator `J M⁻¹ Jᵀ + damping I` has the *square* of the
+whitened operator's condition number, so at small damping its step bottoms out
+at an `eps·cond` floor (which dense direct solves hit too) with the error
+concentrated in the slow, selection-critical directions. LSMR works at
+`cond(B) ~ sqrt`, restoring endgame accuracy. See the
+[tuning guide](tuning_guide.md#solver-selection) for when to prefer it over `cg`.
+
+- **Stopping** maps the standard hooks: the normal-equations residual
+  `||Bᵀ(B u + r) + damping·u|| = |zetabar|` (LSMR's exact monotone quantity) is
+  driven below `iterative_tol · ||Bᵀr|| + iterative_atol`, capped by
+  `iterative_maxiter` (all traced, so a callback can reschedule them). With
+  `iterative_maxiter=None` a `min(m, n)`-scaled fallback cap applies.
+- **Metric** it needs `metric.inv_sqrt` and `metric.inv_sqrt_transpose` (the
+  default identity metric supplies both); it does not use `metric.solve`.
+- **Preconditioning** its hook is `whitened_preconditioner` (a
+  `WhitenedPreconditioner`), a parameter-space **right-preconditioner** applying
+  `R⁻¹`/`R⁻ᵀ` via `solve(v, damping)`/`solve_transpose(w, damping)`. The solver
+  runs LSMR on the preconditioned operator `B R⁻¹` — operator `x → B(solve(x))`,
+  adjoint `w → solve_transpose(Bᵀ w)`, and the step un-preconditions the final
+  iterate `u = R⁻¹ z`. A good `R` (a Schur-complement factor of the
+  parameter-space normal operator is canonical) clusters the spectrum of `B R⁻¹`
+  and cuts the endgame iteration count by orders of magnitude — an ill-conditioned
+  whitened operator can need thousands of plain iterations versus tens
+  preconditioned. **Surrogate semantics**: LSMR's scalar `damp` on `B R⁻¹`
+  regularizes in the `RᵀR` metric, so the computed step is
+  `u = -(BᵀB + damping RᵀR)⁻¹ Bᵀ r` — a documented surrogate of the `I`-damped
+  subproblem. It is admissible: LM acceptance guards on the true `||r||`, and the
+  `damping → 0` selection limit is `R`-invariant (the minimum-metric-norm step
+  regardless of `R`), so equivalence checks must use `R=None` or the `RᵀR`-damped
+  dense reference. Stopping (`iterative_tol`/`iterative_atol`) is measured on the
+  preconditioned operator. The half-solves receive the live `damping` like
+  `dual_preconditioner(v, damping)`. `None` (default) runs plain LSMR.
+  `dual_preconditioner`, `preconditioner_factory`, and `recycle` remain `cg`-only
+  and are rejected loudly for `lsmr`.
+- **Differentiation**: reverse-AD through `update` works (the whitened solution
+  is wrapped in `lax.custom_linear_solve` on the SPD normal operator
+  `BᵀB + damping I`). Differentiating a forward `solve(...).x` uses the dense
+  cholesky implicit rule by default (`implicit_solver="auto"` → cholesky, since
+  `lsmr` is not `cg`); set `implicit_solver="cg"` with an `implicit_preconditioner`
+  for a fully matrix-free derivative at very large `m`.
+
+The standalone [`lsmr`](#nlls_gram.lsmr) function (operator/transpose matvecs,
+`b`, `damp`) is exposed too, returning `(x, LSMRState)` with iteration count and
+final normal-equations residual.
+
 ## Krylov Recycling / Deflation
 
 `recycle=RecycleConfig(rank=k)` on a `cg` solver carries a deflation basis
@@ -538,6 +590,12 @@ loudly rather than being clamped.
 ::: nlls_gram.build_coarse_operator
 
 ::: nlls_gram.recycled_cg
+
+::: nlls_gram.lsmr
+
+::: nlls_gram.LSMRState
+
+::: nlls_gram.WhitenedPreconditioner
 
 ::: nlls_gram.metric_from_tridiagonal_precision
 
