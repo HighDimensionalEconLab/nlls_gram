@@ -496,3 +496,209 @@ def blockdiag_metric(blocks):
         inv_sqrt=blockwise([metric.inv_sqrt for metric in metrics]),
         inv_sqrt_transpose=blockwise([metric.inv_sqrt_transpose for metric in metrics]),
     )
+
+
+def repeated_blockdiag_metric(
+    block_metric: Metric,
+    block_size: int,
+    repeats: int,
+    *,
+    additional: tuple[Metric, int] | None = None,
+) -> Metric:
+    """Batch ``repeats`` identical block-diagonal blocks into one ``Metric``.
+
+    Equivalent to ``blockdiag_metric([(block_metric, block_size)] * repeats)``
+    (optionally with a single trailing block), but each callback fires **once**
+    per apply instead of once per copy. The total leading size is
+    ``repeats * block_size + additional_size`` and is *derived*, not passed, so
+    a layout mismatch is caught rather than silently reshaped. The head of the
+    parameter vector is ``repeats`` copies of ``block_metric``; the optional
+    ``additional=(metric, size)`` is a single trailing block for the finite set
+    of variables that sit outside the repeated structure (initial conditions,
+    scalar parameters).
+
+    ``solve``, ``inv_sqrt``, and ``inv_sqrt_transpose`` reshape and moveaxis the
+    repeated head from ``(repeats * block_size, k)`` to
+    ``(block_size, repeats * k)`` and invoke the base callback a single time — a
+    dense Cholesky block does two triangular solves total, not two per copy —
+    then reshape back; ``norm`` combines the per-copy block norms in quadrature.
+    Both vector and ``(n, k)`` matrix inputs work (``norm`` is vector-only, as
+    everywhere in ``Metric``).
+
+    A fully-default ``Metric()`` block is the identity on its span. A block that
+    defines some callbacks but leaves others ``None`` propagates the missing
+    callbacks as ``None`` on the composite (the same contract as
+    ``blockdiag_metric``, so the solver's construction-time validation applies).
+    This returns a plain ``Metric`` honoring the ``(n,)``/``(n, k)`` contract,
+    so it also composes inside ``blockdiag_metric`` for heterogeneous layouts.
+
+    ``block_size``, ``repeats``, and any ``additional`` size must be positive
+    integers (``ValueError`` otherwise). Unlike ``blockdiag_metric``'s
+    permissive slicing, the reshape here assumes an exact
+    ``(repeats, block_size)`` multiple, so a callback input whose leading size
+    is not ``total_size`` — or whose ndim is not in ``{1, 2}`` — raises
+    ``ValueError`` rather than silently consuming the wrong rows.
+    """
+
+    if (
+        not isinstance(block_size, int)
+        or isinstance(block_size, bool)
+        or block_size < 1
+    ):
+        raise ValueError("block_size must be a positive integer")
+    if not isinstance(repeats, int) or isinstance(repeats, bool) or repeats < 1:
+        raise ValueError("repeats must be a positive integer")
+    if additional is None:
+        additional_metric = None
+        additional_size = 0
+    else:
+        additional_metric, additional_size = additional
+        if (
+            not isinstance(additional_size, int)
+            or isinstance(additional_size, bool)
+            or additional_size < 1
+        ):
+            raise ValueError("additional size must be a positive integer")
+
+    repeated_size = repeats * block_size
+    total_size = repeated_size + additional_size
+
+    def is_identity(metric):
+        return (
+            metric.solve is None
+            and metric.norm is None
+            and metric.inv_sqrt is None
+            and metric.inv_sqrt_transpose is None
+        )
+
+    block_is_identity = is_identity(block_metric)
+    additional_is_identity = additional_metric is not None and is_identity(
+        additional_metric
+    )
+
+    def check_leading_size(x):
+        if x.ndim not in (1, 2):
+            raise ValueError("metric callbacks require a vector or matrix")
+        if x.shape[0] != total_size:
+            raise ValueError(
+                f"metric leading size must be {total_size}, got {x.shape[0]}"
+            )
+
+    def identity(x):
+        return x
+
+    def make_apply(block_callback, additional_callback):
+        if block_callback is None and not block_is_identity:
+            return None
+        if (
+            additional_metric is not None
+            and additional_callback is None
+            and not additional_is_identity
+        ):
+            return None
+        apply_block = identity if block_callback is None else block_callback
+        apply_additional = (
+            identity if additional_callback is None else additional_callback
+        )
+
+        def apply(x):
+            check_leading_size(x)
+            trailing_shape = x.shape[1:]
+            combined = jnp.moveaxis(
+                x[:repeated_size].reshape((repeats, block_size) + trailing_shape),
+                0,
+                1,
+            ).reshape(block_size, -1)
+            transformed = apply_block(combined)
+            repeated = jnp.moveaxis(
+                transformed.reshape((block_size, repeats) + trailing_shape),
+                0,
+                1,
+            ).reshape((repeated_size,) + trailing_shape)
+            if additional_metric is None:
+                return repeated
+            return jnp.concatenate(
+                [repeated, apply_additional(x[repeated_size:])], axis=0
+            )
+
+        return apply
+
+    def make_norm(block_norm, additional_norm):
+        if block_norm is None and not block_is_identity:
+            return None
+        if (
+            additional_metric is not None
+            and additional_norm is None
+            and not additional_is_identity
+        ):
+            return None
+        norm_block = jnp.linalg.norm if block_norm is None else block_norm
+        norm_additional = (
+            jnp.linalg.norm if additional_norm is None else additional_norm
+        )
+
+        def norm(x):
+            check_leading_size(x)
+            if x.ndim != 1:
+                raise ValueError("metric norm requires a vector")
+            blocks = x[:repeated_size].reshape(repeats, block_size)
+            squared_norm = jnp.sum(jax.vmap(norm_block)(blocks) ** 2)
+            if additional_metric is not None:
+                squared_norm = squared_norm + norm_additional(x[repeated_size:]) ** 2
+            return jnp.sqrt(squared_norm)
+
+        return norm
+
+    additional_solve = None if additional_metric is None else additional_metric.solve
+    additional_norm = None if additional_metric is None else additional_metric.norm
+    additional_inv_sqrt = (
+        None if additional_metric is None else additional_metric.inv_sqrt
+    )
+    additional_inv_sqrt_transpose = (
+        None if additional_metric is None else additional_metric.inv_sqrt_transpose
+    )
+    return Metric(
+        solve=make_apply(block_metric.solve, additional_solve),
+        norm=make_norm(block_metric.norm, additional_norm),
+        inv_sqrt=make_apply(block_metric.inv_sqrt, additional_inv_sqrt),
+        inv_sqrt_transpose=make_apply(
+            block_metric.inv_sqrt_transpose,
+            additional_inv_sqrt_transpose,
+        ),
+    )
+
+
+def metric_with_compute_dtype(metric: Metric, dtype) -> Metric:
+    """Wrap a ``Metric`` so every callback computes in ``dtype``.
+
+    Each callback upcasts its input to ``dtype``, applies the wrapped metric,
+    and restores the caller's dtype on output. This keeps an ill-conditioned
+    factorization or solve in wide precision (float64) while the solver's
+    residual/parameter dtype and loop-carried pytrees stay at the problem dtype
+    — so JVP tangents and carried pytrees keep a stable dtype contract. The
+    output round-trips to ``x.dtype``, a no-op when the solver has already
+    promoted its duals to ``dtype``.
+
+    ``None`` callbacks are preserved (a wrapped partial ``Metric`` stays
+    partial), so the solver's construction-time validation is unchanged.
+    """
+
+    dtype = jnp.dtype(dtype)
+
+    # The callback computes wide, then restores the solver's residual/parameter
+    # dtype so JVP tangents and loop-carried pytrees keep a stable contract.
+    def wrap(callback):
+        if callback is None:
+            return None
+
+        def apply(x):
+            return callback(x.astype(dtype)).astype(x.dtype)
+
+        return apply
+
+    return Metric(
+        solve=wrap(metric.solve),
+        norm=wrap(metric.norm),
+        inv_sqrt=wrap(metric.inv_sqrt),
+        inv_sqrt_transpose=wrap(metric.inv_sqrt_transpose),
+    )

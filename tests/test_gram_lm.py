@@ -21,8 +21,10 @@ from nlls_gram import (
     metric_from_shifted_matvec,
     metric_from_state_space,
     metric_from_tridiagonal_precision,
+    metric_with_compute_dtype,
     nystrom_preconditioner,
     pad_dual_preconditioner,
+    repeated_blockdiag_metric,
     sherman_morrison_preconditioner,
     woodbury_preconditioner,
 )
@@ -3605,6 +3607,185 @@ def test_blockdiag_metric_implicit_ad_matches_dense_metric():
     _, block_pullback = jax.vjp(lambda q: solved_x(composite, q), p)
     _, dense_pullback = jax.vjp(lambda q: solved_x(dense, q), p)
     assert jnp.allclose(block_pullback(x_bar)[0], dense_pullback(x_bar)[0], atol=1e-4)
+
+
+REPEATED_BLOCK = jnp.array(
+    [
+        [2.0, 0.2, 0.1, 0.0],
+        [0.2, 1.8, 0.0, 0.1],
+        [0.1, 0.0, 1.5, 0.2],
+        [0.0, 0.1, 0.2, 1.2],
+    ]
+)
+
+
+def test_repeated_blockdiag_metric_matches_blockdiag():
+    # repeated_blockdiag_metric must equal the expanded blockdiag_metric of the
+    # same blocks, callback for callback, and match a ground-truth dense metric.
+    block_size, repeats = 4, 3
+    weights = jnp.array([0.3, 0.7])
+    block = metric_from_cholesky(jnp.linalg.cholesky(REPEATED_BLOCK))
+    additional = metric_from_diagonal(weights)
+    repeated = repeated_blockdiag_metric(
+        block, block_size, repeats, additional=(additional, weights.shape[0])
+    )
+    reference = blockdiag_metric(
+        [(block, block_size)] * repeats + [(additional, weights.shape[0])]
+    )
+    total = block_size * repeats + weights.shape[0]
+    M = jsp_linalg.block_diag(*([REPEATED_BLOCK] * repeats), jnp.diag(weights))
+
+    x = jax.random.normal(jax.random.PRNGKey(10), (total,))
+    X = jax.random.normal(jax.random.PRNGKey(11), (total, 3))
+
+    assert jnp.allclose(repeated.solve(x), reference.solve(x), atol=1e-5)
+    assert jnp.allclose(repeated.solve(X), reference.solve(X), atol=1e-5)
+    assert jnp.allclose(repeated.solve(x), jnp.linalg.solve(M, x), atol=1e-5)
+    assert jnp.allclose(repeated.solve(X), jnp.linalg.solve(M, X), atol=1e-5)
+    assert jnp.allclose(repeated.norm(x), reference.norm(x), atol=1e-5)
+    assert jnp.allclose(repeated.norm(x), jnp.sqrt(x @ M @ x), atol=1e-5)
+
+    S = repeated.inv_sqrt(jnp.eye(total))
+    assert jnp.allclose(S, reference.inv_sqrt(jnp.eye(total)), atol=1e-5)
+    assert jnp.allclose(S @ S.T, jnp.linalg.inv(M), atol=1e-5)
+    assert jnp.allclose(
+        repeated.inv_sqrt_transpose(jnp.eye(total)),
+        reference.inv_sqrt_transpose(jnp.eye(total)),
+        atol=1e-5,
+    )
+    assert jnp.allclose(repeated.inv_sqrt_transpose(jnp.eye(total)), S.T, atol=1e-5)
+
+
+def test_repeated_blockdiag_metric_batches_one_call():
+    # The base callback fires exactly once, on the whole repeated head reshaped
+    # to (block_size, repeats * columns) -- the anti-degeneration guard against
+    # regressing to one call per copy.
+    block_size, repeats, rhs_columns = 4, 3, 5
+    received_shapes = []
+
+    def solve(x):
+        received_shapes.append(x.shape)
+        return x
+
+    metric = repeated_blockdiag_metric(Metric(solve=solve), block_size, repeats)
+    metric.solve(jnp.ones((block_size * repeats, rhs_columns)))
+
+    assert received_shapes == [(block_size, repeats * rhs_columns)]
+
+
+def test_repeated_blockdiag_metric_partial_and_identity():
+    block_size, repeats = 4, 3
+    total = block_size * repeats
+
+    # A block defining only solve marks the other callbacks missing on the
+    # composite (same contract as blockdiag_metric).
+    partial = repeated_blockdiag_metric(Metric(solve=lambda x: x), block_size, repeats)
+    assert partial.solve is not None
+    assert partial.norm is None
+    assert partial.inv_sqrt is None
+    assert partial.inv_sqrt_transpose is None
+
+    # A bare Metric() block is the identity on its span; the additional block's
+    # weighting must survive.
+    weights = jnp.array([0.3, 0.7])
+    identity_repeated = repeated_blockdiag_metric(
+        Metric(), block_size, repeats, additional=(metric_from_diagonal(weights), 2)
+    )
+    M = jsp_linalg.block_diag(jnp.eye(total), jnp.diag(weights))
+    x = jax.random.normal(jax.random.PRNGKey(12), (total + 2,))
+    assert identity_repeated.solve is not None
+    assert jnp.allclose(identity_repeated.solve(x), jnp.linalg.solve(M, x), atol=1e-6)
+    assert jnp.allclose(identity_repeated.norm(x), jnp.sqrt(x @ M @ x), atol=1e-5)
+
+    with pytest.raises(ValueError, match="leading size"):
+        identity_repeated.solve(jnp.ones(block_size))
+    with pytest.raises(ValueError, match="positive integer"):
+        repeated_blockdiag_metric(Metric(), block_size, 0)
+
+
+def test_metric_with_compute_dtype_preserves_caller_dtype():
+    # The wrapper restores the caller's dtype and preserves None callbacks; the
+    # genuine wide-precision path is checked in the x64 subprocess suite.
+    factor = jnp.linalg.cholesky(jnp.array([[2.0, 0.2], [0.2, 1.5]]))
+    wrapped = metric_with_compute_dtype(metric_from_cholesky(factor), jnp.float64)
+    value = jnp.array([1.0, -0.5], dtype=jnp.float32)
+
+    solved = wrapped.solve(value)
+    assert solved.dtype == value.dtype
+    assert jnp.allclose(solved, metric_from_cholesky(factor).solve(value), atol=1e-6)
+
+    partial = metric_with_compute_dtype(Metric(solve=lambda x: 2.0 * x), jnp.float64)
+    assert partial.solve is not None
+    assert partial.norm is None
+    assert partial.inv_sqrt is None
+    assert partial.inv_sqrt_transpose is None
+
+
+def test_repeated_blockdiag_metric_norm_ad_matches_blockdiag():
+    # AD through the vmapped block norm must match the expanded blockdiag norm
+    # for both forward (jvp) and reverse (grad) modes, away from zero where
+    # jnp.linalg.norm's gradient is defined.
+    block_size, repeats = 4, 3
+    weights = jnp.array([0.3, 0.7])
+    block = metric_from_cholesky(jnp.linalg.cholesky(REPEATED_BLOCK))
+    additional = metric_from_diagonal(weights)
+    repeated = repeated_blockdiag_metric(
+        block, block_size, repeats, additional=(additional, 2)
+    )
+    reference = blockdiag_metric([(block, block_size)] * repeats + [(additional, 2)])
+    total = block_size * repeats + 2
+    v = jax.random.normal(jax.random.PRNGKey(13), (total,))
+    dv = jax.random.normal(jax.random.PRNGKey(14), (total,))
+
+    val_rep, tangent_rep = jax.jvp(repeated.norm, (v,), (dv,))
+    val_ref, tangent_ref = jax.jvp(reference.norm, (v,), (dv,))
+    assert jnp.allclose(val_rep, val_ref, atol=1e-5)
+    assert jnp.allclose(tangent_rep, tangent_ref, atol=1e-5)
+    assert jnp.allclose(
+        jax.grad(repeated.norm)(v), jax.grad(reference.norm)(v), atol=1e-5
+    )
+
+
+@pytest.mark.parametrize("linear_solver", ["cholesky", "qr"])
+@pytest.mark.parametrize("geodesic_acceleration", [False, True])
+def test_repeated_blockdiag_metric_implicit_ad_matches_blockdiag(
+    linear_solver, geodesic_acceleration
+):
+    # End-to-end: the repeated metric drives solve() and its implicit JVP/VJP to
+    # the same answers as the equivalent expanded blockdiag metric, across the
+    # cholesky and qr steps, with geodesic acceleration exercising norm.
+    idx = jnp.arange(3)
+    K = 0.6 ** jnp.abs(idx[:, None] - idx[None, :])
+    weights = jnp.array([4.0, 0.25])
+    block = metric_from_cholesky(jnp.linalg.cholesky(K))
+    additional = metric_from_diagonal(weights)
+    repeated = repeated_blockdiag_metric(block, 3, 2, additional=(additional, 2))
+    reference = blockdiag_metric([(block, 3), (block, 3), (additional, 2)])
+    A = jnp.stack([jnp.ones(8), jnp.arange(8, dtype=jnp.float32)])
+
+    def residual(theta, _, p):
+        return A @ theta - jnp.array([p, 0.5 * p])
+
+    def solved_x(metric, p):
+        solver = UnderdeterminedLevenbergMarquardt(
+            residual,
+            init_damping=1e-2,
+            linear_solver=linear_solver,
+            geodesic_acceleration=geodesic_acceleration,
+            metric=metric,
+        )
+        return solver.solve(jnp.zeros(8), p=p, max_steps=60, atol=1e-6).x
+
+    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
+    x_rep, x_rep_dot = jax.jvp(lambda q: solved_x(repeated, q), (p,), (p_dot,))
+    x_ref, x_ref_dot = jax.jvp(lambda q: solved_x(reference, q), (p,), (p_dot,))
+    assert jnp.allclose(x_rep, x_ref, atol=1e-4)
+    assert jnp.allclose(x_rep_dot, x_ref_dot, atol=1e-4)
+
+    x_bar = jnp.linspace(-1.0, 1.0, 8)
+    _, rep_pullback = jax.vjp(lambda q: solved_x(repeated, q), p)
+    _, ref_pullback = jax.vjp(lambda q: solved_x(reference, q), p)
+    assert jnp.allclose(rep_pullback(x_bar)[0], ref_pullback(x_bar)[0], atol=1e-4)
 
 
 def dense_matern_gram(t, sigma, ell, nu):

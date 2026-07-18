@@ -629,6 +629,120 @@ for nu in (1.5, 2.5):
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_repeated_blockdiag_metric_float64_matches_blockdiag():
+    # In genuine float64: the batched repeated metric matches the expanded
+    # blockdiag metric to machine precision on every callback (vector and
+    # matrix), fires the base callback once, preserves the compute-dtype
+    # round-trip, and stays exact when nested inside blockdiag_metric (the
+    # human_capital composition). Norm AD matches forward and reverse.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import (
+    Metric,
+    blockdiag_metric,
+    metric_from_cholesky,
+    metric_from_diagonal,
+    metric_with_compute_dtype,
+    repeated_blockdiag_metric,
+)
+
+
+def rel(a, b):
+    return float(jnp.linalg.norm(jnp.ravel(a - b)) / jnp.linalg.norm(jnp.ravel(a)))
+
+
+block_size, repeats = 4, 3
+A = jnp.array(
+    [
+        [2.0, 0.2, 0.1, 0.0],
+        [0.2, 1.8, 0.0, 0.1],
+        [0.1, 0.0, 1.5, 0.2],
+        [0.0, 0.1, 0.2, 1.2],
+    ]
+)
+weights = jnp.array([0.3, 0.7])
+block = metric_from_cholesky(jnp.linalg.cholesky(A))
+additional = metric_from_diagonal(weights)
+repeated = repeated_blockdiag_metric(
+    block, block_size, repeats, additional=(additional, weights.shape[0])
+)
+reference = blockdiag_metric(
+    [(block, block_size)] * repeats + [(additional, weights.shape[0])]
+)
+total = block_size * repeats + weights.shape[0]
+x = jax.random.normal(jax.random.PRNGKey(0), (total,))
+X = jax.random.normal(jax.random.PRNGKey(1), (total, 5))
+
+for callback in ("solve", "inv_sqrt", "inv_sqrt_transpose"):
+    for arg in (x, X):
+        a = getattr(reference, callback)(arg)
+        b = getattr(repeated, callback)(arg)
+        assert rel(a, b) < 1e-12, (callback, arg.ndim, rel(a, b))
+assert rel(reference.norm(x), repeated.norm(x)) < 1e-12
+
+# The base callback fires exactly once, on the combined (block_size, repeats*k).
+received = []
+
+
+def record(v):
+    received.append(v.shape)
+    return v
+
+
+recorded = repeated_blockdiag_metric(Metric(solve=record), block_size, repeats)
+recorded.solve(jnp.ones((block_size * repeats, 5)))
+assert received == [(block_size, repeats * 5)], received
+
+# Compute-dtype wrapper: exact in float64, and a float32 input round-trips.
+wrapped = metric_with_compute_dtype(reference, jnp.float64)
+for callback in ("solve", "inv_sqrt", "inv_sqrt_transpose", "norm"):
+    arg = x if callback == "norm" else X
+    a = getattr(reference, callback)(arg)
+    b = getattr(wrapped, callback)(arg)
+    assert rel(a, b) < 1e-12, (callback, rel(a, b))
+x32 = x.astype(jnp.float32)
+solved32 = wrapped.solve(x32)
+assert solved32.dtype == jnp.float32, solved32.dtype
+wide = reference.solve(x32.astype(jnp.float64))
+assert rel(wide, solved32.astype(jnp.float64)) < 1e-6
+
+# Nested composition (human_capital pattern): a repeated block with no
+# additional term, composed inside blockdiag_metric with a heterogeneous
+# trailing block, equals the fully-expanded blockdiag_metric.
+other = metric_from_diagonal(jnp.array([1.5, 0.4, 2.0]))
+repeated_no_additional = repeated_blockdiag_metric(block, block_size, 2)
+nested = blockdiag_metric([(repeated_no_additional, 2 * block_size), (other, 3)])
+expanded = blockdiag_metric([(block, block_size)] * 2 + [(other, 3)])
+nested_total = 2 * block_size + 3
+y = jax.random.normal(jax.random.PRNGKey(2), (nested_total,))
+Y = jax.random.normal(jax.random.PRNGKey(3), (nested_total, 4))
+for callback in ("solve", "inv_sqrt", "inv_sqrt_transpose"):
+    for arg in (y, Y):
+        a = getattr(expanded, callback)(arg)
+        b = getattr(nested, callback)(arg)
+        assert rel(a, b) < 1e-12, ("nested", callback, arg.ndim, rel(a, b))
+assert rel(expanded.norm(y), nested.norm(y)) < 1e-12
+
+# Norm AD (forward + reverse) through the nested composite matches the
+# expanded reference to machine precision.
+dy = jax.random.normal(jax.random.PRNGKey(4), (nested_total,))
+_, tangent_nested = jax.jvp(nested.norm, (y,), (dy,))
+_, tangent_expanded = jax.jvp(expanded.norm, (y,), (dy,))
+assert rel(tangent_expanded, tangent_nested) < 1e-12
+assert rel(jax.grad(expanded.norm)(y), jax.grad(nested.norm)(y)) < 1e-12
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_shifted_metric_eps_limit_matches_kkt():
     # The unified shifted metric M = blockdiag(K, 0) + eps I: as eps -> 0
     # the minimum-M-norm interpolant converges at rate O(eps) to the

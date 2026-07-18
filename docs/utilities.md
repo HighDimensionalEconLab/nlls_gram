@@ -17,6 +17,8 @@ explicit opt-out.
 | `metric_from_shifted_matvec(matvec, shift)` | matrix-free `Metric` for \(M = A + \varepsilon I\) via inner CG | \(O(\text{iters} \times \text{matvec})\) |
 | `metric_from_diagonal(weights)` | `Metric` from \(M = \operatorname{diag}(w)\) | \(O(n)\) |
 | `blockdiag_metric(blocks)` | `Metric` over concatenated parameter blocks | sum of blocks |
+| `repeated_blockdiag_metric(block, block_size, repeats, *, additional)` | `Metric` batching `repeats` identical blocks + optional trailing block | one apply per callback (not per copy) |
+| `metric_with_compute_dtype(metric, dtype)` | `Metric` computing in `dtype`, restoring the caller's dtype | same as wrapped metric |
 | `sherman_morrison_preconditioner(solve, u, weight)` | `dual_preconditioner` for \(B = A + w\,uu^\top\) | one `solve` |
 | `woodbury_preconditioner(solve, U, weights)` | `dual_preconditioner` for \(B = A + U\operatorname{diag}(w)U^\top\) | one `solve` + \(k \times k\) |
 | `identity_preconditioner()` | the explicit "no preconditioner" choice (both hook signatures) | free |
@@ -204,6 +206,63 @@ that block. A block that defines some callbacks but leaves others `None`
 propagates the missing callbacks as `None` on the composite, so the solver's
 construction-time validation applies exactly as it would to that block
 alone.
+
+### Repeated Block Metric
+
+When many parameter blocks share the *same* metric — a multi-country model
+whose per-country kernel-coefficient block \(K_\varepsilon\) repeats across
+countries, plus a small block of finite-dimensional variables — the layout is
+\(\operatorname{blockdiag}(K_\varepsilon \times 5,\ \varepsilon I_3)\).
+`repeated_blockdiag_metric` batches the identical copies so each callback fires
+**once**, not once per copy:
+
+```python
+from nlls_gram import (
+    metric_from_cholesky,
+    metric_from_diagonal,
+    repeated_blockdiag_metric,
+)
+
+alpha_metric = metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n)))
+metric = repeated_blockdiag_metric(
+    alpha_metric,
+    block_size=n,
+    repeats=5,
+    additional=(metric_from_diagonal(eps * jnp.ones(3)), 3),
+)
+```
+
+This equals `blockdiag_metric([(alpha_metric, n)] * 5 + [(scalar_block, 3)])`,
+but instead of five separate solves the repeated head (leading size \(5n\)) is
+reshaped to \((n, 5k)\) and the base callback runs once — a dense Cholesky
+block does two triangular solves total, not two per copy. The total leading
+size `repeats * block_size + additional_size` is derived, so a layout mismatch
+raises rather than silently consuming the wrong rows. Because it returns a plain
+`Metric` honoring the `(n,)`/`(n, k)` contract, it also composes *inside*
+`blockdiag_metric` for heterogeneous layouts (a repeated country block next to a
+separate aggregate block). Build the metric once at setup scope — like every
+constructor here it returns fresh closures, so rebuilding it inside a
+`jax.grad`/`vmap` sweep keys a new compilation each time.
+
+### Compute-Dtype Wrapper
+
+`metric_with_compute_dtype(metric, dtype)` wraps a metric so each callback
+upcasts its input to `dtype`, applies the wrapped metric, and restores the
+caller's dtype on output. This keeps an ill-conditioned factorization or solve
+in wide precision (float64) while the solver's residual/parameter dtype and
+loop-carried pytrees stay at the problem dtype — the output round-trips to
+`x.dtype`, a no-op once the solver has already promoted its duals to `dtype`:
+
+```python
+from nlls_gram import metric_from_cholesky, metric_with_compute_dtype
+
+metric = metric_with_compute_dtype(
+    metric_from_cholesky(jnp.linalg.cholesky(K)), jnp.float64
+)
+```
+
+`None` callbacks are preserved, so a wrapped partial `Metric` stays partial and
+the solver's construction-time validation is unchanged.
 
 ## Sherman–Morrison Dual Preconditioner
 
@@ -404,6 +463,10 @@ solvers behave as follows:
 ::: nlls_gram.metric_from_diagonal
 
 ::: nlls_gram.blockdiag_metric
+
+::: nlls_gram.repeated_blockdiag_metric
+
+::: nlls_gram.metric_with_compute_dtype
 
 ::: nlls_gram.sherman_morrison_preconditioner
 
