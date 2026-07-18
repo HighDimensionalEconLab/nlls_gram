@@ -492,6 +492,14 @@ class UnderdeterminedLevenbergMarquardt:
     ``update``, a jitted ``solve`` loop with callbacks, and implicit
     differentiation of ``solve`` with respect to ``p``.
 
+    ``linear_solver="augmented_qr"`` solves the whitened LM subproblem by a
+    direct reduced QR factorization of ``[J S; sqrt(damping) I]``. Unlike the
+    residual-dimension-reduced ``"qr"`` path, it remains well-defined for a
+    rank-deficient Jacobian whenever damping is positive, but its factorization
+    width is the flattened parameter count. It is therefore intended for small
+    systems, including square algebraic roots, rather than the package's usual
+    massively underdetermined regime.
+
     ``linear_solver="cg"`` requires ``dual_preconditioner(v, damping)``: a
     jit-traceable, linear, SPD approximation of
     ``(J P J' + damping I_m)^{-1} v`` used as the CG preconditioner (for the
@@ -578,7 +586,7 @@ class UnderdeterminedLevenbergMarquardt:
         recycle=None,
     ):
         canonical_residual, residual_arity = canonicalize_residual(residual_fn)
-        if linear_solver not in ("cholesky", "qr", "cg"):
+        if linear_solver not in ("cholesky", "qr", "augmented_qr", "cg"):
             raise ValueError(f"unknown linear_solver: {linear_solver}")
         if init_damping <= 0:
             raise ValueError("init_damping must be positive")
@@ -689,10 +697,10 @@ class UnderdeterminedLevenbergMarquardt:
                     f'linear_solver="{linear_solver}" with a custom metric requires '
                     "metric.solve"
                 )
-        if has_custom_metric and linear_solver == "qr":
+        if has_custom_metric and linear_solver in ("qr", "augmented_qr"):
             if metric.inv_sqrt is None or metric.inv_sqrt_transpose is None:
                 raise ValueError(
-                    'linear_solver="qr" with a custom metric requires '
+                    f'linear_solver="{linear_solver}" with a custom metric requires '
                     "metric.inv_sqrt and metric.inv_sqrt_transpose"
                 )
         if has_custom_metric and geodesic_acceleration and metric.norm is None:
@@ -1054,8 +1062,30 @@ class UnderdeterminedLevenbergMarquardt:
                 ).T
             grad = Jt @ resid
 
-            if self.linear_solver == "qr":
-                # Whitened factorization: augmented QR of S'J' with sqrt(damping).
+            if self.linear_solver == "augmented_qr":
+                transformed_Jt = self.metric_inv_sqrt_transpose(Jt)
+                n = transformed_Jt.shape[0]
+                augmented_matrix = jnp.concatenate(
+                    (
+                        transformed_Jt.T,
+                        jnp.sqrt(damping) * jnp.eye(n, dtype=resid.dtype),
+                    ),
+                    axis=0,
+                )
+                Q, R = jnp.linalg.qr(augmented_matrix, mode="reduced")
+
+                def solve_step(rhs):
+                    augmented_rhs = jnp.concatenate(
+                        (-rhs, jnp.zeros(n, dtype=rhs.dtype))
+                    )
+                    transformed_step = jsp_linalg.solve_triangular(
+                        R,
+                        Q.T @ augmented_rhs,
+                    )
+                    return self.metric_inv_sqrt(transformed_step)
+
+            elif self.linear_solver == "qr":
+                # Whitened residual-dimension reduction followed by augmented QR.
                 transformed_Jt = self.metric_inv_sqrt_transpose(Jt)
                 if transformed_Jt.shape[0] >= transformed_Jt.shape[1]:
                     R = jnp.linalg.qr(transformed_Jt, mode="r")

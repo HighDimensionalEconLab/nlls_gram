@@ -7,9 +7,6 @@ the parameter dimension is often larger than the residual dimension.
 The solver is intentionally small: users provide `residual_fn(x, args, p)`,
 and `UnderdeterminedLevenbergMarquardt` exposes `init()`, `update(...)`, and
 `solve(...)`. It does not depend on Flax, NNX, Optax, or any model framework.
-For square nonsingular systems (root finding, e.g. DAE stage solves), the
-solve-only companion `SquareLevenbergMarquardt` is documented in
-[Square Systems](square_systems.md).
 
 ## Install
 
@@ -234,7 +231,25 @@ The returned parameter step is mapped back with `metric.inv_sqrt`.
 The triangular solves require \(S^\top J^\top\) to have full column rank
 (equivalently, \(J\) full row rank): a rank-deficient Jacobian produces a
 non-finite step even though the damped subproblem remains well-posed. Use
-`cholesky` or `cg` for rank-deficient problems.
+`cholesky`, `cg`, or `augmented_qr` for rank-deficient problems.
+
+### Augmented QR
+
+`linear_solver="augmented_qr"` directly factors the whitened augmented system
+
+$$
+\begin{bmatrix}JS\\\sqrt{\lambda}I\end{bmatrix}z
+\approx
+\begin{bmatrix}-r\\0\end{bmatrix},
+\qquad s=Sz.
+$$
+
+It never forms a Gram matrix and remains full column rank for finite \(J\) when
+\(\lambda>0\), including when \(J\) is rank deficient. Its factorization width
+is the parameter count \(n\), so it is intended for small systems such as DAE
+algebraic roots. In the package's usual \(m\ll n\) regime, `qr` performs the
+same damped solve after reducing to residual dimension and is substantially
+cheaper when its full-row-rank assumption holds.
 
 ## Minimal Example
 

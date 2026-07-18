@@ -11,9 +11,9 @@ solves from fresh initial conditions or races them in parallel under vmap,
 returning the single best result. With has_aux=True the residual returns
 (residual, aux) and the aux output is reported on LMInfo. An optional Metric
 defines a positive-definite parameter-space metric for LM damping.
-SquareLevenbergMarquardt is a solve-only damped-Newton companion for square
-nonsingular systems (DAE stage roots) with a direct dense step and implicit
-differentiation. The solvers depend only on JAX.
+The dense linear-solver choices include residual-space Cholesky, reduced QR,
+and direct augmented QR for small or rank-deficient systems. The solver depends
+only on JAX.
 
 Tuning heuristics (solver selection, damping, inner-solve scheduling):
 https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/
@@ -60,12 +60,9 @@ from nlls_gram.recycled_cg import (
     deflated_pcg,
     recycled_cg,
 )
-from nlls_gram.square_lm import SquareLevenbergMarquardt, SquareSolveResult
 
 __all__ = [
     "UnderdeterminedLevenbergMarquardt",
-    "SquareLevenbergMarquardt",
-    "SquareSolveResult",
     "LMState",
     "LMHyperparams",
     "LMInfo",
