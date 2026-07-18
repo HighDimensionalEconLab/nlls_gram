@@ -14,6 +14,11 @@ from nlls_gram import (
     metric_from_cholesky,
     recycled_cg,
 )
+from nlls_gram.recycled_cg import (
+    HarvestState,
+    build_coarse_operator,
+    deflated_pcg,
+)
 
 
 def residual_fn(x, args, p):
@@ -396,3 +401,486 @@ def test_cg_dual_preconditioner_enables_ill_conditioned_convergence(use_recycled
 
     assert int(preconditioned_result.status) == LMStatus.CONVERGED
     assert int(plain_result.status) != LMStatus.CONVERGED
+
+
+# --- deflated / recycled PCG ------------------------------------------------
+#
+# The additive two-level preconditioner M_defl = P + U E^-1 U' shifts each
+# deflated eigenvalue lambda -> lambda + P|_u, so it CLUSTERS (and speeds CG)
+# when the deflated modes are small outliers near 0 and the first-level P
+# normalizes the bulk near 1. The fixtures below use that regime: a few tiny
+# isolated eigenvalues plus a tight bulk near 1.
+
+
+def clustered_spd(n, small_eigs, bulk=1.0, bulk_spread=1e-4, seed=0):
+    key = jax.random.key(seed)
+    Q, _ = jnp.linalg.qr(jax.random.normal(key, (n, n)))
+    k = small_eigs.shape[0]
+    bulk_eigs = bulk + bulk_spread * jax.random.uniform(
+        jax.random.key(seed + 1), (n - k,)
+    )
+    eigs = jnp.concatenate([small_eigs, bulk_eigs])
+    A = (Q * eigs) @ Q.T
+    A = 0.5 * (A + A.T)
+    return A, Q, eigs
+
+
+def max_subspace_angle_deg(U, V):
+    # Largest principal angle between range(U) and range(V) (both orthonormal).
+    cos_angles = jnp.linalg.svd(U.T @ V, compute_uv=False)
+    return float(jnp.degrees(jnp.arccos(jnp.clip(jnp.min(cos_angles), 0.0, 1.0))))
+
+
+def test_deflated_pcg_cold_matches_recycled_cg_bitwise():
+    # U=0 with a non-identity first-level P: the coarse correction and deflated
+    # init vanish exactly (ridge floor keeps E finite while U'r=0), and the two
+    # cond-functions both read ||r||^2, so the iterates are bitwise identical.
+    n, k = 40, 4
+    A, _, _ = clustered_spd(n, jnp.array([0.01, 0.02, 0.04, 0.08]))
+    b = jax.random.normal(jax.random.key(1), (n,))
+    weights = jnp.diag(A)
+
+    def matvec(v):
+        return A @ v
+
+    def P(v):
+        return v / weights
+
+    U0 = jnp.zeros((n, k))
+    _, E_factor = build_coarse_operator(matvec, U0)
+    got, harvest = deflated_pcg(
+        matvec,
+        b,
+        U=U0,
+        E_factor=E_factor,
+        M=P,
+        tol=1e-5,
+        atol=0.0,
+        maxiter=300,
+        window=3 * k,
+        rank=k,
+    )
+    expected, _ = recycled_cg(matvec, b, tol=1e-5, atol=0.0, maxiter=300, M=P)
+
+    assert isinstance(harvest, HarvestState)
+    assert jnp.array_equal(got, expected)
+
+
+def test_deflated_pcg_solves_spd_system():
+    A, b = spd_test_system()
+    n, k = b.shape[0], 3
+    U0 = jnp.zeros((n, k))
+    _, E_factor = build_coarse_operator(lambda v: A @ v, U0)
+    got, _ = deflated_pcg(
+        lambda v: A @ v,
+        b,
+        U=U0,
+        E_factor=E_factor,
+        tol=1e-7,
+        atol=0.0,
+        maxiter=200,
+        window=2 * k,
+        rank=k,
+    )
+    assert jnp.allclose(got, jnp.linalg.solve(A, b), rtol=1e-4, atol=1e-4)
+
+
+def test_exact_basis_reduces_iterations():
+    # A supplied basis spanning the k smallest eigenvectors clusters those modes
+    # and cuts the iteration count to a fixed tolerance well below undeflated CG.
+    n, k = 50, 4
+    small = jnp.array([0.01, 0.02, 0.04, 0.08])
+    A, Q, eigs = clustered_spd(n, small)
+    b = jax.random.normal(jax.random.key(1), (n,))
+    order = jnp.argsort(eigs)
+    U_exact = Q[:, order[:k]]
+
+    def matvec(v):
+        return A @ v
+
+    common = dict(tol=1e-6, atol=0.0, maxiter=300, window=3 * k, rank=k)
+    _, cold = deflated_pcg(
+        matvec,
+        b,
+        U=jnp.zeros((n, k)),
+        E_factor=build_coarse_operator(matvec, jnp.zeros((n, k)))[1],
+        **common,
+    )
+    _, defl = deflated_pcg(
+        matvec,
+        b,
+        U=U_exact,
+        E_factor=build_coarse_operator(matvec, U_exact)[1],
+        **common,
+    )
+    assert int(defl.iterations) <= int(cold.iterations) // 2
+    assert int(defl.iterations) <= 3
+
+
+def test_harvest_approximates_smallest_eigenvectors():
+    # One solve harvests a basis that approximates the true smallest eigenvectors
+    # of the operator (subspace angle vs dense eigh) and is orthonormal.
+    n, k = 50, 4
+    small = jnp.array([0.01, 0.02, 0.04, 0.08])
+    A, _, _ = clustered_spd(n, small)
+    b = jax.random.normal(jax.random.key(1), (n,))
+    _, evecs = jnp.linalg.eigh(A)
+    true_small = evecs[:, :k]
+
+    _, harvest = deflated_pcg(
+        lambda v: A @ v,
+        b,
+        U=jnp.zeros((n, k)),
+        E_factor=build_coarse_operator(lambda v: A @ v, jnp.zeros((n, k)))[1],
+        tol=1e-6,
+        atol=0.0,
+        maxiter=n,
+        window=3 * k,
+        rank=k,
+    )
+    U = harvest.basis
+    assert float(jnp.max(jnp.abs(U.T @ U - jnp.eye(k)))) < 1e-4
+    assert max_subspace_angle_deg(U, true_small) < 5.0
+
+
+def test_recycling_reduces_total_iterations():
+    # A slowly drifting sequence A_j = A + t_j Delta: carrying the harvested basis
+    # across solves drops the total iteration count well below the no-recycle run.
+    n, k = 60, 4
+    small = jnp.array([1e-3, 5e-3, 2e-2, 8e-2])
+    A, _, _ = clustered_spd(n, small)
+    D = jax.random.normal(jax.random.key(7), (n, n))
+    Delta = (D @ D.T) / n
+    b0 = jax.random.normal(jax.random.key(3), (n,))
+    w = 2 * k
+
+    def total_iterations(recycle):
+        total = 0
+        U = jnp.zeros((n, k))
+        for j in range(8):
+            Aj = A + (0.005 * j) * Delta
+            Aj = 0.5 * (Aj + Aj.T)
+
+            def matvec(v, Aj=Aj):
+                return Aj @ v
+
+            U_in = U if recycle else jnp.zeros((n, k))
+            _, E_factor = build_coarse_operator(matvec, U_in)
+            _, harvest = deflated_pcg(
+                matvec,
+                b0 + 0.02 * j,
+                U=U_in,
+                E_factor=E_factor,
+                tol=1e-6,
+                atol=0.0,
+                maxiter=500,
+                window=w,
+                rank=k,
+            )
+            total += int(harvest.iterations)
+            U = harvest.basis
+        return total
+
+    cold_total = total_iterations(recycle=False)
+    recycled_total = total_iterations(recycle=True)
+    assert recycled_total < 0.7 * cold_total
+
+
+def test_deflated_pcg_gradient_matches_dense_solve():
+    # Derivatives are implicit through the custom_linear_solve wrapper; the
+    # deflation and harvest are stop_gradient'd, so the gradient matches the dense
+    # linear solve regardless of the (populated) deflation basis.
+    n, k = 30, 3
+    A, _, _ = clustered_spd(n, jnp.array([0.02, 0.05, 0.1]))
+    b = jax.random.normal(jax.random.key(1), (n,))
+    A_inv = jnp.linalg.inv(A)
+    w = 3 * k
+
+    _, harvest = deflated_pcg(
+        lambda v: A @ v,
+        b,
+        U=jnp.zeros((n, k)),
+        E_factor=build_coarse_operator(lambda v: A @ v, jnp.zeros((n, k)))[1],
+        tol=1e-7,
+        atol=0.0,
+        maxiter=200,
+        window=w,
+        rank=k,
+    )
+    U = harvest.basis
+
+    def loss(rhs):
+        _, E_factor = build_coarse_operator(lambda v: A @ v, U)
+        x, _ = deflated_pcg(
+            lambda v: A @ v,
+            rhs,
+            U=U,
+            E_factor=E_factor,
+            tol=1e-7,
+            atol=0.0,
+            maxiter=300,
+            window=w,
+            rank=k,
+        )
+        return jnp.sum(x**2)
+
+    def loss_dense(rhs):
+        return jnp.sum((A_inv @ rhs) ** 2)
+
+    got = jax.grad(loss)(b)
+    expected = jax.grad(loss_dense)(b)
+    assert jnp.allclose(got, expected, rtol=1e-3, atol=1e-3)
+
+
+def test_deflated_pcg_jits():
+    n, k = 30, 3
+    A, _, _ = clustered_spd(n, jnp.array([0.02, 0.05, 0.1]))
+    b = jax.random.normal(jax.random.key(1), (n,))
+    w = 3 * k
+
+    @jax.jit
+    def solve(rhs):
+        U0 = jnp.zeros((n, k))
+        _, E_factor = build_coarse_operator(lambda v: A @ v, U0)
+        x, harvest = deflated_pcg(
+            lambda v: A @ v,
+            rhs,
+            U=U0,
+            E_factor=E_factor,
+            tol=1e-5,
+            atol=0.0,
+            maxiter=200,
+            window=w,
+            rank=k,
+        )
+        return x, harvest.iterations
+
+    x, iters = solve(b)
+    assert jnp.allclose(x, jnp.linalg.solve(A, b), rtol=1e-3, atol=1e-3)
+    assert int(iters) >= 1
+
+
+def test_reorthogonalize_false_also_solves():
+    # The cheap coefficient-tridiagonal harvest still yields the correct solution
+    # (the harvest quality only affects the NEXT solve, never correctness).
+    n, k = 40, 4
+    A, _, _ = clustered_spd(n, jnp.array([0.01, 0.02, 0.04, 0.08]))
+    b = jax.random.normal(jax.random.key(1), (n,))
+    U0 = jnp.zeros((n, k))
+    _, E_factor = build_coarse_operator(lambda v: A @ v, U0)
+    got, harvest = deflated_pcg(
+        lambda v: A @ v,
+        b,
+        U=U0,
+        E_factor=E_factor,
+        tol=1e-6,
+        atol=0.0,
+        maxiter=200,
+        window=2 * k,
+        rank=k,
+        reorthogonalize=False,
+    )
+    assert jnp.allclose(got, jnp.linalg.solve(A, b), rtol=1e-3, atol=1e-3)
+    assert bool(jnp.all(jnp.isfinite(harvest.basis)))
+
+
+def test_harvest_ring_wrap_indexing():
+    # Force CG past the window so the ring buffer wraps (start = count - w > 0),
+    # exercising the perm / off-boundary indexing. The robust reorthogonalize=True
+    # harvest still resolves the smallest eigenvectors from the correct windowed
+    # sub-block (a buggy perm would send the subspace angle to ~90 deg); the cheap
+    # reorthogonalize=False route is polluted under wrap but must stay finite and
+    # orthonormal with Rayleigh quotients inside the spectrum.
+    n, k = 90, 3
+    A, _, eigs = clustered_spd(n, jnp.array([1e-3, 1e-2, 1e-1]), seed=4)
+    b = jax.random.normal(jax.random.key(1), (n,))
+    _, evecs = jnp.linalg.eigh(A)
+    true_small = evecs[:, :k]
+    lo, hi = float(jnp.min(eigs)), float(jnp.max(eigs))
+    w = 6
+
+    _, robust = deflated_pcg(
+        lambda v: A @ v,
+        b,
+        U=jnp.zeros((n, k)),
+        E_factor=build_coarse_operator(lambda v: A @ v, jnp.zeros((n, k)))[1],
+        tol=1e-8,
+        atol=0.0,
+        maxiter=n,
+        window=w,
+        rank=k,
+        reorthogonalize=True,
+    )
+    assert int(robust.iterations) > w  # ring wrapped
+    assert float(jnp.max(jnp.abs(robust.basis.T @ robust.basis - jnp.eye(k)))) < 1e-5
+    assert max_subspace_angle_deg(robust.basis, true_small) < 30.0
+
+    _, cheap = deflated_pcg(
+        lambda v: A @ v,
+        b,
+        U=jnp.zeros((n, k)),
+        E_factor=build_coarse_operator(lambda v: A @ v, jnp.zeros((n, k)))[1],
+        tol=1e-8,
+        atol=0.0,
+        maxiter=n,
+        window=w,
+        rank=k,
+        reorthogonalize=False,
+    )
+    assert bool(jnp.all(jnp.isfinite(cheap.basis)))
+    assert float(jnp.max(jnp.abs(cheap.basis.T @ cheap.basis - jnp.eye(k)))) < 1e-5
+    ritz = jnp.diag(cheap.basis.T @ (A @ cheap.basis))
+    assert bool(jnp.all((ritz >= lo - 1e-6) & (ritz <= hi + 1e-6)))
+
+
+def test_deflated_pcg_count_zero_warm_started():
+    # Warm-starting at the exact solution with a cold U drives count == 0 (the
+    # loop never runs). The all-invalid harvest must return a finite orthonormal
+    # basis (via the sentinel finite fallback), and it must not poison the next
+    # build_coarse_operator.
+    n, k = 40, 4
+    A, _, _ = clustered_spd(n, jnp.array([0.01, 0.02, 0.04, 0.08]))
+    b = jax.random.normal(jax.random.key(1), (n,))
+    x_star = jnp.linalg.solve(A, b)
+    U0 = jnp.zeros((n, k))
+    _, E_factor = build_coarse_operator(lambda v: A @ v, U0)
+    # tol loose enough that the (float32) warm start is already converged, so the
+    # loop never runs.
+    y, harvest = deflated_pcg(
+        lambda v: A @ v,
+        b,
+        U=U0,
+        E_factor=E_factor,
+        x0=x_star,
+        tol=1e-3,
+        atol=0.0,
+        maxiter=200,
+        window=3 * k,
+        rank=k,
+    )
+    assert int(harvest.iterations) == 0
+    assert bool(jnp.all(jnp.isfinite(harvest.basis)))
+    assert jnp.allclose(y, x_star, rtol=1e-5, atol=1e-5)
+    _, next_factor = build_coarse_operator(lambda v: A @ v, harvest.basis)
+    assert bool(jnp.all(jnp.isfinite(next_factor[0])))
+
+
+def test_harvest_false_returns_carried_basis():
+    # harvest=False skips the Rayleigh-Ritz and returns the carried U verbatim; the
+    # solution is unchanged from harvest=True (only the emitted basis differs).
+    n, k = 40, 4
+    A, Q, eigs = clustered_spd(n, jnp.array([0.01, 0.02, 0.04, 0.08]))
+    b = jax.random.normal(jax.random.key(1), (n,))
+    order = jnp.argsort(eigs)
+    U = Q[:, order[:k]]
+    _, E_factor = build_coarse_operator(lambda v: A @ v, U)
+    common = dict(
+        U=U,
+        E_factor=E_factor,
+        tol=1e-7,
+        atol=0.0,
+        maxiter=200,
+        window=3 * k,
+        rank=k,
+    )
+    y_off, off = deflated_pcg(lambda v: A @ v, b, harvest=False, **common)
+    y_on, on = deflated_pcg(lambda v: A @ v, b, harvest=True, **common)
+    assert jnp.array_equal(off.basis, U)
+    assert int(off.iterations) == int(on.iterations)
+    assert jnp.allclose(y_off, y_on, rtol=1e-5, atol=1e-5)
+
+
+def test_build_coarse_operator_cold_is_finite():
+    # Zero U -> E = 0; the trace-scaled ridge's absolute floor keeps the Cholesky
+    # factor finite and M_defl == P (since U'r = 0), so cold start is a no-op.
+    n, k = 20, 3
+    A, _, _ = clustered_spd(n, jnp.array([0.02, 0.05, 0.1]))
+    U0 = jnp.zeros((n, k))
+    W, E_factor = build_coarse_operator(lambda v: A @ v, U0)
+    assert bool(jnp.all(jnp.isfinite(W)))
+    assert bool(jnp.all(jnp.isfinite(E_factor[0])))
+    r = jax.random.normal(jax.random.key(2), (n,))
+    coarse = U0 @ jsp_linalg.cho_solve(E_factor, U0.T @ r)
+    assert jnp.allclose(coarse, jnp.zeros(n))
+
+
+def test_degenerate_basis_stays_finite():
+    # A rank-deficient U (duplicate columns) must not produce NaN: the ridge keeps
+    # E factorable and the solve still converges to the correct solution.
+    n, k = 30, 3
+    A, Q, eigs = clustered_spd(n, jnp.array([0.02, 0.05, 0.1]))
+    b = jax.random.normal(jax.random.key(1), (n,))
+    order = jnp.argsort(eigs)
+    u = Q[:, order[0]]
+    U_dup = jnp.stack([u, u, Q[:, order[1]]], axis=1)  # duplicate column
+    _, E_factor = build_coarse_operator(lambda v: A @ v, U_dup)
+    got, harvest = deflated_pcg(
+        lambda v: A @ v,
+        b,
+        U=U_dup,
+        E_factor=E_factor,
+        tol=1e-6,
+        atol=0.0,
+        maxiter=200,
+        window=2 * k,
+        rank=k,
+    )
+    assert bool(jnp.all(jnp.isfinite(got)))
+    assert bool(jnp.all(jnp.isfinite(harvest.basis)))
+    assert jnp.allclose(got, jnp.linalg.solve(A, b), rtol=1e-3, atol=1e-3)
+
+
+def test_deflated_pcg_nan_operator_propagates():
+    # A NaN entering through the ITERATION path (not build_coarse_operator or the
+    # init) propagates to non-finite output; it is never clamped to a quiet
+    # pseudo-solution. E_factor is built from the FINITE operator; the matvec goes
+    # NaN only on nonzero inputs, so the init matvec on zeros stays finite and the
+    # NaN first appears at the first A(p) inside the loop.
+    n, k = 20, 3
+    A, _, _ = clustered_spd(n, jnp.array([0.02, 0.05, 0.1]))
+    b = jax.random.normal(jax.random.key(1), (n,))
+    U0 = jnp.zeros((n, k))
+    _, E_factor = build_coarse_operator(lambda v: A @ v, U0)
+
+    def nan_matvec(v):
+        return jnp.where(jnp.any(v != 0), (A @ v) * jnp.nan, A @ v)
+
+    got, _ = deflated_pcg(
+        nan_matvec,
+        b,
+        U=U0,
+        E_factor=E_factor,
+        tol=1e-5,
+        atol=0.0,
+        maxiter=20,
+        window=2 * k,
+        rank=k,
+    )
+    assert bool(jnp.any(~jnp.isfinite(got)))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(rank=0),
+        dict(window=2, rank=5),
+        dict(window=100, rank=3),
+    ],
+)
+def test_deflated_pcg_rejects_bad_rank_window(kwargs):
+    n = 20
+    A, _, _ = clustered_spd(n, jnp.array([0.02, 0.05, 0.1]))
+    b = jax.random.normal(jax.random.key(1), (n,))
+    U0 = jnp.zeros((n, 3))
+    _, E_factor = build_coarse_operator(lambda v: A @ v, U0)
+    with pytest.raises(ValueError):
+        deflated_pcg(
+            lambda v: A @ v,
+            b,
+            U=U0,
+            E_factor=E_factor,
+            tol=1e-5,
+            atol=0.0,
+            maxiter=10,
+            **kwargs,
+        )

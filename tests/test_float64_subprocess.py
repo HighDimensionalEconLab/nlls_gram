@@ -991,6 +991,121 @@ assert jnp.allclose(grad, expected, rtol=1e-8), (grad, expected)
     )
 
 
+def test_float64_deflated_pcg_build_and_harvest():
+    # In genuine float64: build_coarse_operator, deflated_pcg, and the eigCG
+    # harvest stay float64 end to end (no f32 in the jaxpr); U=0 reproduces
+    # recycled_cg bitwise; an exact-eigenvector basis cuts the iteration count;
+    # the harvested basis matches the true smallest eigenvectors to a tight f64
+    # bound; and the implicit gradient matches the dense linear solve.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram.recycled_cg import build_coarse_operator, deflated_pcg, recycled_cg
+
+n, k = 50, 4
+Q, _ = jnp.linalg.qr(jax.random.normal(jax.random.key(0), (n, n)))
+small = jnp.array([0.01, 0.02, 0.04, 0.08])
+bulk = 1.0 + 1e-4 * jax.random.uniform(jax.random.key(2), (n - k,))
+eigs = jnp.concatenate([small, bulk])
+A = (Q * eigs) @ Q.T
+A = 0.5 * (A + A.T)
+b = jax.random.normal(jax.random.key(1), (n,))
+w = 3 * k
+
+
+def matvec(v):
+    return A @ v
+
+
+# dtypes stay float64
+U0 = jnp.zeros((n, k))
+W, E_factor = build_coarse_operator(matvec, U0)
+assert W.dtype == jnp.float64
+assert E_factor[0].dtype == jnp.float64
+y, harvest = deflated_pcg(
+    matvec, b, U=U0, E_factor=E_factor, tol=1e-10, atol=0.0,
+    maxiter=200, window=w, rank=k,
+)
+assert y.dtype == jnp.float64
+assert harvest.basis.dtype == jnp.float64
+assert harvest.residual_norm.dtype == jnp.float64
+assert jnp.allclose(y, jnp.linalg.solve(A, b), rtol=1e-8, atol=1e-8)
+
+# no f32 anywhere in the traced program
+jaxpr = str(
+    jax.make_jaxpr(
+        lambda rhs: deflated_pcg(
+            matvec, rhs, U=U0, E_factor=E_factor, tol=1e-10, atol=0.0,
+            maxiter=200, window=w, rank=k,
+        )[0]
+    )(b)
+)
+assert "f32" not in jaxpr, jaxpr
+
+# U=0 reproduces recycled_cg bitwise (non-identity first-level P)
+weights = jnp.diag(A)
+
+
+def P(v):
+    return v / weights
+
+
+yd, _ = deflated_pcg(
+    matvec, b, U=U0, E_factor=E_factor, M=P,
+    tol=1e-10, atol=0.0, maxiter=300, window=w, rank=k,
+)
+yr, _ = recycled_cg(matvec, b, tol=1e-10, atol=0.0, maxiter=300, M=P)
+assert bool(jnp.array_equal(yd, yr))
+
+# exact-eigenvector basis cuts iterations
+order = jnp.argsort(eigs)
+U_exact = Q[:, order[:k]]
+_, cold = deflated_pcg(
+    matvec, b, U=U0, E_factor=E_factor, tol=1e-10, atol=0.0,
+    maxiter=300, window=w, rank=k,
+)
+_, defl = deflated_pcg(
+    matvec, b, U=U_exact, E_factor=build_coarse_operator(matvec, U_exact)[1],
+    tol=1e-10, atol=0.0, maxiter=300, window=w, rank=k,
+)
+assert int(defl.iterations) < int(cold.iterations)
+
+# harvested basis matches the true smallest eigenvectors to a tight f64 bound
+_, evecs = jnp.linalg.eigh(A)
+cos_angles = jnp.linalg.svd(harvest.basis.T @ evecs[:, :k], compute_uv=False)
+assert float(jnp.min(cos_angles)) > 1.0 - 1e-8, float(jnp.min(cos_angles))
+assert float(jnp.max(jnp.abs(harvest.basis.T @ harvest.basis - jnp.eye(k)))) < 1e-12
+
+# implicit gradient matches the dense solve to a tight f64 bound
+A_inv = jnp.linalg.inv(A)
+
+
+def loss(rhs):
+    x, _ = deflated_pcg(
+        matvec, rhs, U=U_exact,
+        E_factor=build_coarse_operator(matvec, U_exact)[1],
+        tol=1e-12, atol=0.0, maxiter=300, window=w, rank=k,
+    )
+    return jnp.sum(x**2)
+
+
+got = jax.grad(loss)(b)
+expected = jax.grad(lambda rhs: jnp.sum((A_inv @ rhs) ** 2))(b)
+assert jnp.allclose(got, expected, rtol=1e-9, atol=1e-9), float(
+    jnp.max(jnp.abs(got - expected))
+)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_float64_multi_start_modes_and_float32_data_under_x64():
     script = r"""
 import jax
