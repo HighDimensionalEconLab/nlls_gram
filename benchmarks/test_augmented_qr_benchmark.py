@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt
+from nlls_gram import LevenbergMarquardt
 
 # The DAE stage pattern: 32 repeated warm-started algebraic solves over slowly
 # drifting targets. A fixed-iteration direct-Newton loop is the lower-overhead
@@ -44,7 +44,7 @@ def test_warm_started_stage_solves(benchmark, platform, n, method):
     z0 = jax.device_put(jnp.zeros(n), device)
 
     if method == "augmented_qr":
-        solver = UnderdeterminedLevenbergMarquardt(
+        solver = LevenbergMarquardt(
             residual,
             linear_solver="augmented_qr",
             geodesic_acceleration=False,

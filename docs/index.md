@@ -5,7 +5,7 @@ JAX pytrees. It is designed for underdetermined or interpolating problems where
 the parameter dimension is often larger than the residual dimension.
 
 The solver is intentionally small: users provide `residual_fn(x, args, p)`,
-and `UnderdeterminedLevenbergMarquardt` exposes `init()`, `update(...)`, and
+and `LevenbergMarquardt` exposes `init()`, `update(...)`, and
 `solve(...)`. It does not depend on Flax, NNX, Optax, or any model framework.
 
 ## Install
@@ -76,7 +76,7 @@ def residual_fn(x, args):
     return r, {"max_abs": jnp.max(jnp.abs(r))}
 
 
-solver = UnderdeterminedLevenbergMarquardt(residual_fn, has_aux=True)
+solver = LevenbergMarquardt(residual_fn, has_aux=True)
 ```
 
 Each step's `LMInfo.aux` holds the aux from the residual evaluation at the
@@ -257,7 +257,7 @@ cheaper when its full-row-rank assumption holds.
 import jax
 import jax.numpy as jnp
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt
+from nlls_gram import LevenbergMarquardt
 
 
 def residual_fn(x, args):
@@ -269,7 +269,7 @@ ts = jnp.linspace(0.0, 2.0, 20)
 ys = 2.0 * jnp.exp(-1.0 * ts)
 x = {"a": 1.0, "b": 0.0}
 
-solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
 lm_state = solver.init(x, (ts, ys))
 
 
@@ -328,7 +328,7 @@ the Gram assembly). The flag only affects `linear_solver="cholesky"` — the
 matrix-free solvers never materialize a Jacobian, so it is ignored for them.
 
 ```python
-solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
 lm_state = solver.init(x0, args)  # x0 required to size the cache
 ```
 
@@ -443,7 +443,7 @@ narrower and focuses on underdetermined LM with explicit parameter-space metrics
 
 ## API Reference
 
-::: nlls_gram.UnderdeterminedLevenbergMarquardt
+::: nlls_gram.LevenbergMarquardt
 
 ::: nlls_gram.Metric
 

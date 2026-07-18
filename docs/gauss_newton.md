@@ -263,7 +263,7 @@ With tiny damping, one `update` reproduces both:
 ```python
 import jax.numpy as jnp
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_cholesky
+from nlls_gram import LevenbergMarquardt, metric_from_cholesky
 
 
 def residual(theta, _, __):
@@ -272,12 +272,12 @@ def residual(theta, _, __):
 
 theta0 = jnp.zeros(2)
 
-identity_solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-9)
+identity_solver = LevenbergMarquardt(residual, init_damping=1e-9)
 x_identity, _, _ = identity_solver.update(theta0, identity_solver.init(theta0))
 # x_identity ≈ [0.5, 0.5]
 
 L = jnp.linalg.cholesky(jnp.diag(jnp.array([1.0, 4.0])))
-metric_solver = UnderdeterminedLevenbergMarquardt(
+metric_solver = LevenbergMarquardt(
     residual, init_damping=1e-9, metric=metric_from_cholesky(L)
 )
 x_metric, _, _ = metric_solver.update(theta0, metric_solver.init(theta0))

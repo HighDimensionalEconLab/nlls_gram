@@ -77,7 +77,7 @@ plus a Sherman–Morrison dual preconditioner — are collected in
 ```python
 import jax.numpy as jnp
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_cholesky
+from nlls_gram import LevenbergMarquardt, metric_from_cholesky
 
 
 def residual_fn(theta, args):
@@ -88,7 +88,7 @@ def residual_fn(theta, args):
 metric_matrix = jnp.array([[2.0, 0.2], [0.2, 1.0]])
 L = jnp.linalg.cholesky(metric_matrix)
 
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
     metric=metric_from_cholesky(L),
@@ -102,9 +102,9 @@ acceleration). `metric_from_shifted_matvec` builds \(M = A + \varepsilon I\)
 from a matvec alone, running an inner CG to a tight, dtype-aware tolerance:
 
 ```python
-from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_shifted_matvec
+from nlls_gram import LevenbergMarquardt, metric_from_shifted_matvec
 
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
     linear_solver="cg",

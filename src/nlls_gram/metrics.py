@@ -23,7 +23,7 @@ class Metric:
 
     Fields left as ``None`` default to the identity metric. Which fields are
     required depends on the solver configuration; see
-    ``UnderdeterminedLevenbergMarquardt``.
+    ``LevenbergMarquardt``.
     """
 
     solve: Callable | None = None

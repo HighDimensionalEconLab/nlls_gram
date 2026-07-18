@@ -310,7 +310,7 @@ methods unpreconditioned should be a decision, not a default.
 ```python
 from nlls_gram import identity_preconditioner
 
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     residual_fn,
     linear_solver="cg",
     dual_preconditioner=identity_preconditioner(),
@@ -363,7 +363,7 @@ import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram import (
-    UnderdeterminedLevenbergMarquardt,
+    LevenbergMarquardt,
     identity_preconditioner,
     nystrom_preconditioner,
 )
@@ -380,7 +380,7 @@ def ntk_matvec(V):  # (m, k) -> J (J' V), frozen at x0
     )(V)
 
 
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     residual,
     linear_solver="cg",
     iterative_tol=1e-6,

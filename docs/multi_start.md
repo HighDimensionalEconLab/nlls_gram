@@ -10,7 +10,7 @@ plain code path.
 ```python
 import jax
 import jax.numpy as jnp
-from nlls_gram import MultiStart, UnderdeterminedLevenbergMarquardt
+from nlls_gram import MultiStart, LevenbergMarquardt
 
 def residual(theta, args, p):
     return theta[0] ** 2 - p  # stalls when started at theta = 0
@@ -19,7 +19,7 @@ def draw(key, x, args):
     # Fresh initial condition; args may be redrawn too (see below).
     return jax.random.uniform(key, x.shape, x.dtype, 0.5, 3.0), args
 
-solver = UnderdeterminedLevenbergMarquardt(residual)
+solver = LevenbergMarquardt(residual)
 ms = MultiStart(key=jax.random.key(0), num_starts=5, draw=draw)
 result = solver.solve(jnp.zeros(1), p=jnp.asarray(4.0), atol=1e-8, multi_start=ms)
 result.multi_start.attempt        # which start won (0 = your x0)

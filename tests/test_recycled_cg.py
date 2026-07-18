@@ -8,12 +8,12 @@ import jax.scipy.sparse.linalg as jsp_sparse_linalg
 import pytest
 
 from nlls_gram import (
+    LevenbergMarquardt,
     LMSolveAction,
     LMStatus,
     MultiStart,
     RecycleConfig,
     RecycleState,
-    UnderdeterminedLevenbergMarquardt,
     gram_lm,
     identity_preconditioner,
     metric_from_cholesky,
@@ -135,7 +135,7 @@ def test_swap_fixture_reaches_forked_cg(monkeypatch):
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": 1.0, "b": 0.0}
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         linear_solver="cg",
@@ -159,8 +159,8 @@ def test_cg_step_matches_cholesky_identity_step(use_recycled_cg):
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": 1.0, "b": 0.0}
 
-    cholesky_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-    cg_solver = UnderdeterminedLevenbergMarquardt(
+    cholesky_solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
+    cg_solver = LevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         linear_solver="cg",
@@ -194,7 +194,7 @@ def test_cg_update_jits(use_recycled_cg):
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         linear_solver="cg",
@@ -223,13 +223,13 @@ def test_cg_geodesic_acceleration_matches_cholesky(use_recycled_cg):
     theta0 = jnp.array([1.9])
     target = 4.0
 
-    cholesky_solver = UnderdeterminedLevenbergMarquardt(
+    cholesky_solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
     )
-    cg_solver = UnderdeterminedLevenbergMarquardt(
+    cg_solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
         linear_solver="cg",
@@ -267,8 +267,8 @@ def test_cg_preconditioned_step_matches_cholesky_identity_step(use_recycled_cg):
     x = {"a": 1.0, "b": 0.0}
     weights = 1.0 + jnp.arange(20, dtype=jnp.float32) / 10.0
 
-    cholesky_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
-    cg_solver = UnderdeterminedLevenbergMarquardt(
+    cholesky_solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
+    cg_solver = LevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         linear_solver="cg",
@@ -301,7 +301,7 @@ def test_cg_preconditioned_update_jits(use_recycled_cg):
     ys = 2.0 * jnp.exp(-1.0 * ts)
     x = {"a": jnp.asarray(1.0), "b": jnp.asarray(0.0)}
     weights = 1.0 + jnp.arange(20, dtype=jnp.float32) / 10.0
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
         linear_solver="cg",
@@ -329,13 +329,13 @@ def test_cg_preconditioned_geodesic_matches_cholesky(use_recycled_cg):
     theta0 = jnp.array([1.9])
     target = 4.0
 
-    cholesky_solver = UnderdeterminedLevenbergMarquardt(
+    cholesky_solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
     )
-    cg_solver = UnderdeterminedLevenbergMarquardt(
+    cg_solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
         linear_solver="cg",
@@ -393,10 +393,10 @@ def test_cg_dual_preconditioner_enables_ill_conditioned_convergence(use_recycled
         implicit_preconditioner=identity_preconditioner(),
         metric=metric_from_cholesky(L),
     )
-    plain = UnderdeterminedLevenbergMarquardt(
+    plain = LevenbergMarquardt(
         residual, dual_preconditioner=identity_preconditioner(), **common
     )
-    preconditioned = UnderdeterminedLevenbergMarquardt(
+    preconditioned = LevenbergMarquardt(
         residual, dual_preconditioner=preconditioner, **common
     )
     x0 = jnp.zeros(n)
@@ -935,7 +935,7 @@ def _reset_recycle(lm_state):
 
 def test_recycle_requires_cg():
     with pytest.raises(ValueError, match="recycle requires"):
-        UnderdeterminedLevenbergMarquardt(
+        LevenbergMarquardt(
             lambda x: x, linear_solver="cholesky", recycle=RecycleConfig(rank=2)
         )
 
@@ -949,22 +949,16 @@ def test_recycle_config_hashing_shares_compilation():
         dual_preconditioner=identity_preconditioner(),
         implicit_preconditioner=identity_preconditioner(),
     )
-    a = UnderdeterminedLevenbergMarquardt(
-        residual, recycle=RecycleConfig(rank=4), **common
-    )
-    b = UnderdeterminedLevenbergMarquardt(
-        residual, recycle=RecycleConfig(rank=4), **common
-    )
-    c = UnderdeterminedLevenbergMarquardt(
-        residual, recycle=RecycleConfig(rank=5), **common
-    )
+    a = LevenbergMarquardt(residual, recycle=RecycleConfig(rank=4), **common)
+    b = LevenbergMarquardt(residual, recycle=RecycleConfig(rank=4), **common)
+    c = LevenbergMarquardt(residual, recycle=RecycleConfig(rank=5), **common)
     assert a == b and hash(a) == hash(b)
     assert a != c
 
 
 def test_init_allocates_cold_recycle_state():
     residual, x0 = isolated_mode_problem()
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         linear_solver="cg",
         dual_preconditioner=identity_preconditioner(),
@@ -984,7 +978,7 @@ def test_recycling_reduces_total_inner_iterations():
     # the total inner (velocity) CG iterations vs the identical solver with the
     # basis cold-reset each step (the controlled no-recycle baseline).
     residual, x0 = isolated_mode_problem()
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         init_damping=1e-4,
         linear_solver="cg",
@@ -1023,9 +1017,7 @@ def test_recycled_solve_converges_ill_conditioned():
         iterative_maxiter=6,
         iterative_tol=1e-8,
     )
-    recycled = UnderdeterminedLevenbergMarquardt(
-        residual, recycle=RecycleConfig(rank=3), **common
-    )
+    recycled = LevenbergMarquardt(residual, recycle=RecycleConfig(rank=3), **common)
     result = recycled.solve(x0, max_steps=60, atol=1e-6)
     assert int(result.status) == LMStatus.CONVERGED
     assert float(result.info.loss) < 1e-6
@@ -1041,8 +1033,8 @@ def test_recycled_update_reverse_ad_matches_cholesky():
         return x["a"] * jnp.exp(x["b"] * ts) - args
 
     x = {"a": 1.0, "b": 0.0}
-    cholesky = UnderdeterminedLevenbergMarquardt(residual_data, init_damping=1e-2)
-    recycled = UnderdeterminedLevenbergMarquardt(
+    cholesky = LevenbergMarquardt(residual_data, init_damping=1e-2)
+    recycled = LevenbergMarquardt(
         residual_data,
         init_damping=1e-2,
         linear_solver="cg",
@@ -1082,10 +1074,8 @@ def test_recycled_solve_implicit_p_derivative_matches_plain():
         iterative_tol=1e-10,
         iterative_maxiter=40,
     )
-    plain = UnderdeterminedLevenbergMarquardt(residual_p, **common)
-    recycled = UnderdeterminedLevenbergMarquardt(
-        residual_p, recycle=RecycleConfig(rank=3), **common
-    )
+    plain = LevenbergMarquardt(residual_p, **common)
+    recycled = LevenbergMarquardt(residual_p, recycle=RecycleConfig(rank=3), **common)
     x0 = jnp.zeros(())
 
     def solved(solver, p):
@@ -1099,7 +1089,7 @@ def test_recycled_solve_implicit_p_derivative_matches_plain():
 
 def test_recycled_multi_start_vmap():
     residual, x0 = isolated_mode_problem()
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         init_damping=1e-4,
         linear_solver="cg",
@@ -1127,7 +1117,7 @@ def test_recycled_callback_maxiter_schedule_composes():
     # A callback that grows iterative_maxiter mid-solve composes with recycling:
     # rank/window are static (untouched), the traced maxiter rides hyper.
     residual, x0 = isolated_mode_problem()
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         init_damping=1e-4,
         linear_solver="cg",
@@ -1158,7 +1148,7 @@ def test_recycled_callback_maxiter_schedule_composes():
 def test_recycled_multi_start_cold_resets_basis():
     # _cold_lm_state must reset the recycle basis for drawn starts.
     residual, x0 = isolated_mode_problem()
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         linear_solver="cg",
         dual_preconditioner=identity_preconditioner(),
@@ -1190,7 +1180,7 @@ def test_recycled_update_nan_residual_rejects_step():
             ]
         )
 
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         init_damping=1e-2,
         linear_solver="cg",

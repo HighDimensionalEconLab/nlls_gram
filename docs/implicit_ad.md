@@ -236,7 +236,7 @@ Two notes for the
 Example sketch for a large matrix-free residual:
 
 ```python
-from nlls_gram import UnderdeterminedLevenbergMarquardt
+from nlls_gram import LevenbergMarquardt
 
 
 def residual(theta, _, p):
@@ -249,7 +249,7 @@ def implicit_preconditioner(v):
     return approximate_undamped_dual_solve(v)
 
 
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     residual,
     linear_solver="cg",
     iterative_tol=1e-3,
@@ -285,7 +285,7 @@ Example:
 import jax
 import jax.numpy as jnp
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt
+from nlls_gram import LevenbergMarquardt
 
 
 # p without args still uses the three-argument form; the second argument is
@@ -294,7 +294,7 @@ def residual(theta, _, p):
     return jnp.array([theta[0] + 2.0 * theta[1] - p])
 
 
-solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+solver = LevenbergMarquardt(residual, init_damping=1e-2)
 theta0 = jnp.zeros(2)
 
 
@@ -376,7 +376,7 @@ def residual(theta, _, p):
     return r, {"m": theta[0] * theta[1] + p**2}
 
 
-solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2, has_aux=True)
+solver = LevenbergMarquardt(residual, init_damping=1e-2, has_aux=True)
 
 
 def solved_aux_m(p):

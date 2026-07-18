@@ -11,7 +11,7 @@ Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX pytrees, aimed
 at underdetermined or interpolating problems where the number of parameters is
 larger than the number of residuals.
 
-`UnderdeterminedLevenbergMarquardt` minimizes a user residual taking
+`LevenbergMarquardt` minimizes a user residual taking
 `(x)`, `(x, args)`, or `(x, args, p)`, always in that order. The unknown `x`
 may be any JAX pytree; internally it
 is flattened with `jax.flatten_util.ravel_pytree`. The default dense solver
@@ -76,7 +76,7 @@ uv add nlls-gram "jax[cuda13]"
 import jax
 import jax.numpy as jnp
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt
+from nlls_gram import LevenbergMarquardt
 
 
 def residual_fn(x, args):
@@ -88,7 +88,7 @@ ts = jnp.linspace(0.0, 2.0, 20)
 ys = 2.0 * jnp.exp(-1.0 * ts)
 x = {"a": 1.0, "b": 0.0}
 
-solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
 lm_state = solver.init(x, (ts, ys))
 
 
@@ -130,10 +130,10 @@ For a dense SPD metric \(M = LL^\top\), use the Cholesky helper:
 ```python
 import jax.numpy as jnp
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_cholesky
+from nlls_gram import LevenbergMarquardt, metric_from_cholesky
 
 L = jnp.linalg.cholesky(metric_matrix)
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
     metric=metric_from_cholesky(L),

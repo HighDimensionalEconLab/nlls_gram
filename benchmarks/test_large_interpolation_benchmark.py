@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt, identity_preconditioner
+from nlls_gram import LevenbergMarquardt, identity_preconditioner
 
 ITERATIVE_MAXITER = 8
 
@@ -51,8 +51,8 @@ def _make_large_interpolation_problem(
             }
         )
 
-    base_solver = UnderdeterminedLevenbergMarquardt(residual, **solver_kwargs)
-    solver = UnderdeterminedLevenbergMarquardt(
+    base_solver = LevenbergMarquardt(residual, **solver_kwargs)
+    solver = LevenbergMarquardt(
         residual,
         **solver_kwargs,
         geodesic_acceleration=geodesic_acceleration,

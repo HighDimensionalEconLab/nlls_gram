@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import pytest
 
 from nlls_gram import (
-    UnderdeterminedLevenbergMarquardt,
+    LevenbergMarquardt,
     matern_state_space,
     metric_from_state_space,
 )
@@ -29,7 +29,7 @@ def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
         return jnp.array([theta[0] ** 2 - target])
 
     gpu = _gpu_devices()[0]
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
         linear_solver=linear_solver,
@@ -64,7 +64,7 @@ def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
         return jnp.array([theta[0] ** 2 - target])
 
     gpu = _gpu_devices()[0]
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
         linear_solver=linear_solver,
@@ -123,7 +123,7 @@ def test_parallel_multi_start_runs_on_gpu():
     from nlls_gram import LMStatus, MultiStart
 
     gpu = _gpu_devices()[0]
-    solver = UnderdeterminedLevenbergMarquardt(multi_start_residual, init_damping=1e-2)
+    solver = LevenbergMarquardt(multi_start_residual, init_damping=1e-2)
 
     with jax.default_device(gpu):
         x0 = jnp.array([jnp.nan, 0.0])  # lane 0 fails; drawn lanes converge

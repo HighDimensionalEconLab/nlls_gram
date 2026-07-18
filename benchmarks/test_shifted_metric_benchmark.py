@@ -4,7 +4,7 @@ import jax.scipy.sparse.linalg as jsp_sparse_linalg
 import pytest
 
 from nlls_gram import (
-    UnderdeterminedLevenbergMarquardt,
+    LevenbergMarquardt,
     blockdiag_metric,
     identity_preconditioner,
     matern_state_space,
@@ -179,7 +179,7 @@ def test_shifted_metric_solver_step(benchmark, platform, n, variant, linear_solv
             base_solve, J_beta, (1.0 / eps) * jnp.ones(k)
         )
 
-    solver = UnderdeterminedLevenbergMarquardt(residual, **solver_kwargs)
+    solver = LevenbergMarquardt(residual, **solver_kwargs)
     x0 = jax.device_put(jnp.zeros(n + k), device)
     lm_state = solver.init(x0, None)
 

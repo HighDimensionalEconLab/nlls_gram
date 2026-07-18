@@ -1,11 +1,11 @@
 import jax
 import jax.numpy as jnp
 
-from nlls_gram import LMStatus, UnderdeterminedLevenbergMarquardt
+from nlls_gram import LevenbergMarquardt, LMStatus
 
 
 def augmented_qr_solver(residual, *, has_aux=False):
-    return UnderdeterminedLevenbergMarquardt(
+    return LevenbergMarquardt(
         residual,
         linear_solver="augmented_qr",
         geodesic_acceleration=False,

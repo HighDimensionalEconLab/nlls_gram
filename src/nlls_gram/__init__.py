@@ -1,6 +1,6 @@
-"""Metric-aware underdetermined Levenberg-Marquardt least-squares for JAX.
+"""Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX.
 
-UnderdeterminedLevenbergMarquardt minimizes ||r(x, args, p)||^2 for a
+LevenbergMarquardt minimizes ||r(x, args, p)||^2 for a
 user-supplied residual function taking (x), (x, args), or
 (x, args, p), where x is any JAX pytree (a flat array, a
 dict, nnx.state(model, nnx.Param), ...). It follows an init/update protocol:
@@ -21,6 +21,7 @@ https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/
 
 from nlls_gram.gram_lm import (
     DrawNNXModule,
+    LevenbergMarquardt,
     LMHyperparams,
     LMInfo,
     LMSolveAction,
@@ -30,7 +31,6 @@ from nlls_gram.gram_lm import (
     LMStatus,
     MultiStart,
     MultiStartInfo,
-    UnderdeterminedLevenbergMarquardt,
 )
 from nlls_gram.metrics import (
     Metric,
@@ -62,7 +62,7 @@ from nlls_gram.recycled_cg import (
 )
 
 __all__ = [
-    "UnderdeterminedLevenbergMarquardt",
+    "LevenbergMarquardt",
     "LMState",
     "LMHyperparams",
     "LMInfo",

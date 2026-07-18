@@ -11,7 +11,7 @@ import jax.numpy as jnp
 from flax import nnx
 
 from nlls_gram import (
-    UnderdeterminedLevenbergMarquardt,
+    LevenbergMarquardt,
     identity_preconditioner,
     nystrom_preconditioner,
 )
@@ -35,7 +35,7 @@ x = {
     "a": jnp.asarray(1.0, dtype=jnp.float64),
     "b": jnp.asarray(0.0, dtype=jnp.float64),
 }
-solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
 lm_state = solver.init(x, (ts, ys))
 for _ in range(5):
     x, lm_state, info = solver.update(x, lm_state, (ts, ys))
@@ -68,7 +68,7 @@ def quadratic_residual(theta, target, p):
 
 theta = jnp.asarray([1.9], dtype=jnp.float64)
 target = jnp.asarray(4.0, dtype=jnp.float64)
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     quadratic_residual,
     init_damping=1e-12,
     geodesic_acceleration=True,
@@ -105,7 +105,7 @@ def linear_residual(theta, args, p):
 matrix = jnp.asarray([[1.0, 2.0], [3.0, -1.0], [2.0, 0.5]], dtype=jnp.float64)
 target = jnp.asarray([1.0, 2.0, -1.0], dtype=jnp.float64)
 theta = jnp.asarray([0.0, 0.0], dtype=jnp.float64)
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     linear_residual,
     init_damping=1e-2,
     linear_solver="cg",
@@ -139,7 +139,7 @@ matrix = jnp.asarray(
 )
 target = jnp.asarray([1.0, -2.0], dtype=jnp.float64)
 theta = jnp.zeros(matrix.shape[1], dtype=jnp.float64)
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     linear_residual,
     init_damping=1e-2,
     linear_solver="qr",
@@ -194,7 +194,7 @@ assert pre32(jnp.ones(n_dual, jnp.float32), jnp.float32(0.5)).dtype == jnp.float
 
 # A cg solver whose dual preconditioner is a (float64) Nystrom sketch of
 # J J' keeps the whole update float64.
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     linear_residual,
     init_damping=1e-2,
     linear_solver="cg",
@@ -248,7 +248,7 @@ def nnx_residual_fn(x, args, p):
     return model(ts) - ys
 
 
-solver = UnderdeterminedLevenbergMarquardt(nnx_residual_fn, init_damping=1e-12)
+solver = LevenbergMarquardt(nnx_residual_fn, init_damping=1e-12)
 lm_state = solver.init(nnx_params, (x_nnx, y_nnx))
 nnx_params, lm_state, info = solver.update(nnx_params, lm_state, (x_nnx, y_nnx))
 trained = nnx.merge(graphdef, nnx_params)
@@ -292,7 +292,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt, metric_from_diagonal
+from nlls_gram import LevenbergMarquardt, metric_from_diagonal
 
 n, m, eps = 12, 4, 1e-7
 A32 = jax.random.normal(jax.random.PRNGKey(0), (m, n), dtype=jnp.float32)
@@ -307,7 +307,7 @@ def make(matrix, target, weights, dual_dtype):
     def residual(theta, _, p):
         return matrix @ theta - p * target
 
-    return UnderdeterminedLevenbergMarquardt(
+    return LevenbergMarquardt(
         residual,
         init_damping=1e-3,
         metric=metric_from_diagonal(weights),
@@ -380,7 +380,7 @@ x_promoted_well = promoted_well.update(
 )[0]
 assert jnp.allclose(x_promoted_well, x_plain_well, rtol=1e-5, atol=1e-6)
 
-qr_dense_implicit = UnderdeterminedLevenbergMarquardt(
+qr_dense_implicit = LevenbergMarquardt(
     lambda theta, _, p: A32 @ theta - p * b32,
     linear_solver="qr",
     geodesic_acceleration=False,
@@ -398,7 +398,7 @@ def make_geodesic(matrix, target, weights, dual_dtype):
         linear = matrix @ theta
         return linear + 0.05 * linear**2 - p * target
 
-    return UnderdeterminedLevenbergMarquardt(
+    return LevenbergMarquardt(
         residual,
         init_damping=1e-3,
         metric=metric_from_diagonal(weights),
@@ -458,7 +458,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from nlls_gram import LMStatus, UnderdeterminedLevenbergMarquardt
+from nlls_gram import LMStatus, LevenbergMarquardt
 
 W = 0.1 * jax.random.normal(jax.random.PRNGKey(0), (3, 3), dtype=jnp.float64)
 
@@ -467,7 +467,7 @@ def residual(z, args, p):
     return z + jnp.tanh(W @ z) - p
 
 
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     residual,
     linear_solver="augmented_qr",
     geodesic_acceleration=False,
@@ -524,7 +524,7 @@ def residual32(z, args, p):
     return z + jnp.tanh(W32 @ z) - p
 
 
-solver32 = UnderdeterminedLevenbergMarquardt(
+solver32 = LevenbergMarquardt(
     residual32,
     linear_solver="augmented_qr",
     geodesic_acceleration=False,
@@ -766,7 +766,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from nlls_gram import (
-    UnderdeterminedLevenbergMarquardt,
+    LevenbergMarquardt,
     blockdiag_metric,
     identity_preconditioner,
     metric_from_cholesky,
@@ -812,7 +812,7 @@ def dense_composite(eps):
 def solved_x(metric, p):
     # implicit_penalty=0.0: the eps-shifted metric spikes the dual trace by
     # 1/eps, so a trace-scaled ridge would perturb this exact-limit check.
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
         metric=metric,
@@ -874,7 +874,7 @@ assert derivative_errors[1e-12] < 1e-8, derivative_errors
 # the nested-tolerance guidance) reproduces the dense-rule derivative in
 # both directions.
 def solved_x_cg_implicit(p_value):
-    solver = UnderdeterminedLevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
         metric=matvec_composite(1e-12),
@@ -911,14 +911,14 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from nlls_gram import LMStatus, UnderdeterminedLevenbergMarquardt
+from nlls_gram import LMStatus, LevenbergMarquardt
 
 
 def residual(theta, args, p):
     return theta - args
 
 
-solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+solver = LevenbergMarquardt(residual, init_damping=1e-2)
 for jit in (True, False):
     result = solver.solve(
         jnp.zeros(1, dtype=jnp.float32),
@@ -966,7 +966,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from nlls_gram import UnderdeterminedLevenbergMarquardt
+from nlls_gram import LevenbergMarquardt
 
 w = jnp.array([1.0, 2.0, 3.0])
 wiggles = 1.0 + 1e-13 * jnp.arange(40.0)
@@ -977,7 +977,7 @@ def residual_fn(x, args, p):
 
 
 x0 = jnp.zeros(3)
-solver = UnderdeterminedLevenbergMarquardt(residual_fn)
+solver = LevenbergMarquardt(residual_fn)
 
 
 def sum_x_star(target):
@@ -1125,7 +1125,7 @@ from nlls_gram import (
     LMSolveAction,
     LMStatus,
     MultiStart,
-    UnderdeterminedLevenbergMarquardt,
+    LevenbergMarquardt,
 )
 
 
@@ -1148,7 +1148,7 @@ def epoch_callback(ctx):
     return LMSolveAction(stop=stop, status=status)
 
 
-callback_solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+callback_solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
 cb_result = callback_solver.solve(
     jnp.zeros(2, dtype=jnp.float64),
     p=jnp.asarray(3.0, dtype=jnp.float64),
@@ -1163,7 +1163,7 @@ def draw_zeros(key, x, args):
     return jnp.zeros_like(x), args
 
 
-solver = UnderdeterminedLevenbergMarquardt(residual_fn, init_damping=1e-2)
+solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
 x0 = jnp.array([jnp.nan, jnp.nan], dtype=jnp.float64)
 p = jnp.asarray(3.0, dtype=jnp.float64)
 expected = jnp.sum(jnp.array([1.0, 2.0])) / 5.0

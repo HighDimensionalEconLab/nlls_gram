@@ -5,9 +5,9 @@ from flax import nnx
 
 from nlls_gram import (
     DrawNNXModule,
+    LevenbergMarquardt,
     LMStatus,
     MultiStart,
-    UnderdeterminedLevenbergMarquardt,
 )
 
 
@@ -31,7 +31,7 @@ def test_nnx_state_params_recover_known_parameters():
         model = nnx.merge(graphdef, x)
         return model(ts) - ys
 
-    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual, init_damping=1e-2)
     lm_state = solver.init(x, (ts, ys))
 
     @jax.jit
@@ -63,7 +63,7 @@ def test_nnx_wrt_filter_freezes_unselected_initialized_params():
         model = nnx.merge(graphdef, trainable, frozen)
         return model(ts) - ys
 
-    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual, init_damping=1e-2)
     lm_state = solver.init(trainable, (ts, ys))
 
     @jax.jit
@@ -112,7 +112,7 @@ def test_multi_start_nnx_redraw_recovers_from_bad_init(parallel):
     _, theta_good = nnx.split(CurveMLP(rngs=nnx.Rngs(1)), nnx.Param)
     theta_bad = jax.tree.map(lambda leaf: leaf * jnp.nan, theta_good)
 
-    solver = UnderdeterminedLevenbergMarquardt(curve_residual, init_damping=1e-2)
+    solver = LevenbergMarquardt(curve_residual, init_damping=1e-2)
     ms = MultiStart(
         key=jax.random.key(2), num_starts=4, draw=draw_curve_params, parallel=parallel
     )
@@ -179,7 +179,7 @@ def test_draw_nnx_module_shares_one_compilation():
         traces["n"] += 1
         return nnx.merge(CURVE_GRAPHDEF, theta)(ts) - ys
 
-    solver = UnderdeterminedLevenbergMarquardt(counting_residual, init_damping=1e-2)
+    solver = LevenbergMarquardt(counting_residual, init_damping=1e-2)
 
     def solve_with(draw):
         ms = MultiStart(key=jax.random.key(2), num_starts=4, draw=draw, parallel=False)
@@ -214,7 +214,7 @@ def test_draw_nnx_module_matches_inline_closure():
     _, theta_good = nnx.split(CurveMLP(rngs=nnx.Rngs(1)), nnx.Param)
     theta_bad = jax.tree.map(lambda leaf: leaf * jnp.nan, theta_good)
 
-    solver = UnderdeterminedLevenbergMarquardt(curve_residual, init_damping=1e-2)
+    solver = LevenbergMarquardt(curve_residual, init_damping=1e-2)
 
     def run(draw):
         ms = MultiStart(key=jax.random.key(2), num_starts=4, draw=draw, parallel=False)
@@ -243,7 +243,7 @@ def test_multi_start_draw_nnx_module_recovers_from_bad_init(parallel):
     _, theta_good = nnx.split(CurveMLP(rngs=nnx.Rngs(1)), nnx.Param)
     theta_bad = jax.tree.map(lambda leaf: leaf * jnp.nan, theta_good)
 
-    solver = UnderdeterminedLevenbergMarquardt(curve_residual, init_damping=1e-2)
+    solver = LevenbergMarquardt(curve_residual, init_damping=1e-2)
     ms = MultiStart(
         key=jax.random.key(2),
         num_starts=4,

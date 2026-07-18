@@ -9,7 +9,7 @@ and `n` the parameter count; the package targets `m << n`.
 ## Starting Point
 
 ```python
-solver = UnderdeterminedLevenbergMarquardt(residual_fn)
+solver = LevenbergMarquardt(residual_fn)
 result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
 ```
 

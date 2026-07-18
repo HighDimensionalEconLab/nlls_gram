@@ -5,10 +5,10 @@ import jax.numpy as jnp
 import pytest
 
 from nlls_gram import (
+    LevenbergMarquardt,
     LMSolveAction,
     LMStatus,
     MultiStart,
-    UnderdeterminedLevenbergMarquardt,
 )
 
 # Shared problems. The linear residual has the closed-form min-norm solution
@@ -125,9 +125,7 @@ def test_multi_start_none_is_inert():
         traces["count"] += 1
         return theta - args
 
-    solver = UnderdeterminedLevenbergMarquardt(
-        residual, init_damping=1e-2, cache_jacobian=False
-    )
+    solver = LevenbergMarquardt(residual, init_damping=1e-2, cache_jacobian=False)
     result = solver.solve(jnp.array([0.0]), jnp.array([1.0]), max_steps=10, atol=1e-6)
     assert result.multi_start is None
 
@@ -143,7 +141,7 @@ def test_multi_start_none_is_inert():
 
 
 def test_sequential_first_attempt_success_matches_plain_solve():
-    solver = UnderdeterminedLevenbergMarquardt(residual_linear, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     x0 = jnp.zeros(2)
     p = jnp.asarray(3.0)
     plain = solver.solve(x0, p=p, max_steps=80, atol=1e-6)
@@ -160,7 +158,7 @@ def test_sequential_first_attempt_success_matches_plain_solve():
 
 
 def test_sequential_retries_until_converged():
-    solver = UnderdeterminedLevenbergMarquardt(residual_saddle, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_saddle, init_damping=1e-2)
     p = jnp.asarray(4.0)
     ms = MultiStart(key=jax.random.key(2), num_starts=3, draw=draw_jump)
     result = solver.solve(
@@ -175,7 +173,7 @@ def test_sequential_retries_until_converged():
 
 
 def test_sequential_all_fail_returns_best_finite_loss():
-    solver = UnderdeterminedLevenbergMarquardt(residual_inconsistent, init_damping=1.0)
+    solver = LevenbergMarquardt(residual_inconsistent, init_damping=1.0)
     x0 = jnp.array([37.0])
     p = jnp.asarray(0.0)
     key = jax.random.key(3)
@@ -203,7 +201,7 @@ def test_sequential_all_fail_returns_best_finite_loss():
 
 @pytest.mark.parametrize("jit", [True, False])
 def test_sequential_none_finite_returns_last_attempt(jit):
-    solver = UnderdeterminedLevenbergMarquardt(residual_nan, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_nan, init_damping=1e-2)
     ms = MultiStart(key=jax.random.key(4), num_starts=3, draw=draw_normal)
     result = solver.solve(
         jnp.array([0.0]), max_steps=10, atol=1e-6, multi_start=ms, jit=jit
@@ -217,7 +215,7 @@ def test_sequential_none_finite_returns_last_attempt(jit):
 
 
 def test_accept_hook_rejection_triggers_retry_and_acceptance():
-    solver = UnderdeterminedLevenbergMarquardt(residual_two_basin, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_two_basin, init_damping=1e-2)
     x0 = jnp.array([-2.0])
     key = jax.random.key(5)
 
@@ -238,7 +236,7 @@ def test_accept_hook_rejection_triggers_retry_and_acceptance():
 
 @pytest.mark.parametrize("parallel", [False, True])
 def test_accept_true_on_nonfinite_result_never_wins(parallel):
-    solver = UnderdeterminedLevenbergMarquardt(residual_nan, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_nan, init_damping=1e-2)
     ms = MultiStart(
         key=jax.random.key(6),
         num_starts=3,
@@ -256,7 +254,7 @@ def test_accept_and_draw_receive_documented_key_schedule():
     RECORDED_ACCEPT_KEYS.clear()
     RECORDED_DRAW_KEYS.clear()
     RECORDED_DRAW_INPUTS.clear()
-    solver = UnderdeterminedLevenbergMarquardt(residual_inconsistent, init_damping=1.0)
+    solver = LevenbergMarquardt(residual_inconsistent, init_damping=1.0)
     key = jax.random.key(7)
     num_starts = 3
     ms = MultiStart(
@@ -290,7 +288,7 @@ def test_sequential_draw_receives_previous_initial_values():
     def mutating_callback(ctx):
         return LMSolveAction(x=ctx.x + 100.0, args=ctx.args + 1.0)
 
-    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1.0)
+    solver = LevenbergMarquardt(residual, init_damping=1.0)
     x0 = jnp.array([2.0])
     args0 = jnp.asarray(0.5)
     ms = MultiStart(key=jax.random.key(8), num_starts=3, draw=recording_draw)
@@ -319,7 +317,7 @@ def test_sequential_draw_receives_previous_initial_values():
 
 @pytest.mark.parametrize("parallel", [False, True])
 def test_num_starts_one_matches_plain_solve(parallel):
-    solver = UnderdeterminedLevenbergMarquardt(residual_linear, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     x0 = jnp.zeros(2)
     p = jnp.asarray(3.0)
     plain = solver.solve(x0, p=p, max_steps=80, atol=1e-6)
@@ -334,7 +332,7 @@ def test_num_starts_one_matches_plain_solve(parallel):
 
 
 def test_parallel_matches_manual_vmap_recipe():
-    solver = UnderdeterminedLevenbergMarquardt(residual_two_basin, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_two_basin, init_damping=1e-2)
     x0 = jnp.array([-2.0])
     key = jax.random.key(10)
     num_starts = 8
@@ -363,7 +361,7 @@ def test_parallel_matches_manual_vmap_recipe():
 
 
 def test_parallel_exact_tie_breaks_to_lowest_lane():
-    solver = UnderdeterminedLevenbergMarquardt(residual_linear, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     ms = MultiStart(
         key=jax.random.key(11), num_starts=4, draw=draw_constant, parallel=True
     )
@@ -374,7 +372,7 @@ def test_parallel_exact_tie_breaks_to_lowest_lane():
 
 
 def test_parallel_all_fail_and_all_nonfinite_fallbacks():
-    solver = UnderdeterminedLevenbergMarquardt(residual_inconsistent, init_damping=1.0)
+    solver = LevenbergMarquardt(residual_inconsistent, init_damping=1.0)
     x0 = jnp.array([37.0])
     p = jnp.asarray(0.0)
     key = jax.random.key(12)
@@ -392,7 +390,7 @@ def test_parallel_all_fail_and_all_nonfinite_fallbacks():
     assert int(result.multi_start.attempt) == int(jnp.argmin(losses))
     assert not bool(result.multi_start.accepted)
 
-    nan_solver = UnderdeterminedLevenbergMarquardt(residual_nan, init_damping=1e-2)
+    nan_solver = LevenbergMarquardt(residual_nan, init_damping=1e-2)
     nan_ms = MultiStart(key=key, num_starts=3, draw=draw_normal, parallel=True)
     nan_result = nan_solver.solve(
         jnp.array([0.0]), max_steps=5, atol=1e-6, multi_start=nan_ms
@@ -402,7 +400,7 @@ def test_parallel_all_fail_and_all_nonfinite_fallbacks():
 
 
 def test_sequential_grad_through_winning_start_matches_closed_form():
-    solver = UnderdeterminedLevenbergMarquardt(residual_linear, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     x0 = jnp.array([jnp.nan, jnp.nan])  # attempt 0 fails NONFINITE
     ms = MultiStart(key=jax.random.key(13), num_starts=2, draw=draw_zeros)
 
@@ -424,7 +422,7 @@ def test_sequential_grad_through_winning_start_matches_closed_form():
 
 
 def test_parallel_grad_matches_closed_form_and_second_order():
-    solver = UnderdeterminedLevenbergMarquardt(residual_nonlinear, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_nonlinear, init_damping=1e-2)
     x0 = jnp.array([jnp.nan, jnp.nan])
     ms = MultiStart(
         key=jax.random.key(14), num_starts=3, draw=draw_zeros, parallel=True
@@ -454,9 +452,7 @@ def test_multi_start_does_not_retrace_on_value_changes():
         traces["count"] += 1
         return theta - args
 
-    solver = UnderdeterminedLevenbergMarquardt(
-        residual, init_damping=1e-2, cache_jacobian=False
-    )
+    solver = LevenbergMarquardt(residual, init_damping=1e-2, cache_jacobian=False)
     ms = MultiStart(
         key=jax.random.key(0), num_starts=3, draw=counting_draw, accept=counting_accept
     )
@@ -512,7 +508,7 @@ def test_multi_start_does_not_retrace_on_value_changes():
 
 def test_jit_false_matches_jit_true_and_draw_is_lazy():
     CALLS["draw"] = 0
-    solver = UnderdeterminedLevenbergMarquardt(residual_two_basin, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_two_basin, init_damping=1e-2)
     x0 = jnp.array([-2.0])
     ms = MultiStart(
         key=jax.random.key(15),
@@ -546,7 +542,7 @@ def test_jit_false_matches_jit_true_and_draw_is_lazy():
 
 
 def test_multi_start_inside_vmap_matches_loop():
-    solver = UnderdeterminedLevenbergMarquardt(residual_linear, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     x0 = jnp.array([jnp.nan, jnp.nan])
 
     def solve_from(p, key):
@@ -581,7 +577,7 @@ def test_multi_start_validation_errors():
     with pytest.raises(TypeError, match="accept must be callable"):
         MultiStart(key=key, num_starts=1, accept=5)
 
-    solver = UnderdeterminedLevenbergMarquardt(residual_linear, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     x0 = jnp.zeros(2)
     with pytest.raises(TypeError, match="MultiStart"):
         solver.solve(x0, p=jnp.asarray(3.0), multi_start=42)
@@ -604,7 +600,7 @@ def test_multi_start_validation_errors():
 
 
 def test_save_steps_composes_with_multi_start():
-    solver = UnderdeterminedLevenbergMarquardt(residual_linear, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     p = jnp.asarray(3.0)
     max_steps = 20
     ms = MultiStart(key=jax.random.key(20), num_starts=2, draw=draw_zeros)
@@ -660,7 +656,7 @@ def test_mv2020_style_draw_resamples_args(parallel):
         new_args = jax.lax.cond(ctx.step == 1, fresh, lambda _: ctx.args, None)
         return LMSolveAction(args=new_args)
 
-    solver = UnderdeterminedLevenbergMarquardt(residual, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual, init_damping=1e-2)
     args0 = {"data": jnp.array([1.0, -2.0, 0.5]), "key": jax.random.key(22)}
     x0 = jnp.array([jnp.nan, jnp.nan, jnp.nan])  # forces one retry
     p = jnp.asarray(2.0)
@@ -699,9 +695,7 @@ def test_mv2020_style_draw_resamples_args(parallel):
 
 
 def test_warm_lm_state_applies_to_attempt_zero_only():
-    solver = UnderdeterminedLevenbergMarquardt(
-        residual_linear, init_damping=1e-2, cache_jacobian=True
-    )
+    solver = LevenbergMarquardt(residual_linear, init_damping=1e-2, cache_jacobian=True)
     p = jnp.asarray(3.0)
     warm = solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).lm_state
     x0 = jnp.array([jnp.nan, jnp.nan])
@@ -732,9 +726,7 @@ def test_attempt_zero_honors_a_valid_jacobian_cache():
     # must consume it exactly like a plain solve does (same trajectory), which
     # a mistaken _cold_lm_state on attempt 0 would break; the wrong first step
     # must also be observable against an invalidated-cache solve.
-    solver = UnderdeterminedLevenbergMarquardt(
-        residual_linear, init_damping=1e-2, cache_jacobian=True
-    )
+    solver = LevenbergMarquardt(residual_linear, init_damping=1e-2, cache_jacobian=True)
     p = jnp.asarray(3.0)
     x0 = jnp.zeros(2)
     poisoned = dataclasses.replace(
@@ -787,7 +779,7 @@ def test_unhashable_callable_hooks_work_under_jit(parallel):
     with pytest.raises(TypeError):
         hash(draw)
 
-    solver = UnderdeterminedLevenbergMarquardt(residual_linear, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     ms = MultiStart(
         key=jax.random.key(28),
         num_starts=3,
@@ -811,9 +803,7 @@ def test_args_only_redraw_invalidates_jacobian_cache():
     def residual(theta, args, p):
         return jnp.array([args[0] * theta[0] - 4.0])
 
-    solver = UnderdeterminedLevenbergMarquardt(
-        residual, init_damping=1e-2, cache_jacobian=True
-    )
+    solver = LevenbergMarquardt(residual, init_damping=1e-2, cache_jacobian=True)
 
     def draw_args_only(key, x, args):
         return x, jnp.array([2.0])
@@ -837,9 +827,7 @@ def test_multi_start_has_aux_tangents(parallel):
         r = jnp.array([theta[0] + 2.0 * theta[1] - p])
         return r, {"scaled": p * theta[0]}
 
-    solver = UnderdeterminedLevenbergMarquardt(
-        residual, init_damping=1e-2, has_aux=True
-    )
+    solver = LevenbergMarquardt(residual, init_damping=1e-2, has_aux=True)
     x0 = jnp.array([jnp.nan, jnp.nan])
     ms = MultiStart(
         key=jax.random.key(26), num_starts=2, draw=draw_zeros, parallel=parallel

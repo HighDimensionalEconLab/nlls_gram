@@ -314,7 +314,7 @@ limits the rate. Grow the CG budget once the loss crosses a threshold —
 one solve call, so implicit differentiation still applies:
 
 ```python
-solver = UnderdeterminedLevenbergMarquardt(
+solver = LevenbergMarquardt(
     residual_fn,
     linear_solver="cg",
     iterative_maxiter=2,

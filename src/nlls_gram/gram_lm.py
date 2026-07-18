@@ -483,7 +483,7 @@ def canonicalize_implicit_preconditioner(implicit_preconditioner):
     return canonical_implicit_preconditioner
 
 
-class UnderdeterminedLevenbergMarquardt:
+class LevenbergMarquardt:
     """Metric-damped Levenberg-Marquardt for ``min ||r(x, args, p)||^2`` over a
     JAX pytree ``x``, specialized to ``n_residuals << n_params``: the default
     path factors the small damped Gram system in residual space. With metric
