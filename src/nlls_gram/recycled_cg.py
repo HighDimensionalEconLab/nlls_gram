@@ -337,7 +337,9 @@ def _deflated_pcg_core(
         Toff_ = Toff.at[slot].set(off_k)
         return x_, r_, z_, gamma_, p_, k + 1, V_, Tdiag_, Toff_, beta / alpha
 
-    init = (x0, r0, z0, gamma0, p0, jnp.array(0), V0, Tdiag0, Toff0, boa0)
+    # int32 counter: LMState carries RecycleState.iterations as int32, and the
+    # x64 default of jnp.array(0) (int64) would break the solve-loop carry.
+    init = (x0, r0, z0, gamma0, p0, jnp.zeros((), jnp.int32), V0, Tdiag0, Toff0, boa0)
     x_f, r_f, _, _, _, count, V, Tdiag, Toff, _ = lax.while_loop(
         cond_fun, body_fun, init
     )

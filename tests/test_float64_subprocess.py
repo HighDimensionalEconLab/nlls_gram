@@ -1214,3 +1214,50 @@ for parallel in (False, True):
         capture_output=True,
         text=True,
     )
+
+
+def test_float64_recycled_solve_carry_dtypes():
+    # Regression: under x64 the deflated-PCG loop counter defaulted to int64
+    # while LMState carried RecycleState.iterations as int32, breaking the
+    # solve-loop carry on every recycled cg solve.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import (
+    LevenbergMarquardt,
+    LMStatus,
+    RecycleConfig,
+    identity_preconditioner,
+)
+
+A = jax.random.normal(jax.random.key(0), (20, 6))
+b = jax.random.normal(jax.random.key(1), (20,))
+
+
+def residual(theta):
+    return A @ theta - b + 0.1 * jnp.sum(theta**2)
+
+
+solver = LevenbergMarquardt(
+    residual,
+    linear_solver="cg",
+    iterative_maxiter=30,
+    iterative_tol=1e-10,
+    dual_preconditioner=identity_preconditioner(),
+    implicit_preconditioner=identity_preconditioner(),
+    recycle=RecycleConfig(rank=3),
+)
+result = solver.solve(jnp.zeros(6), max_steps=60, gtol=1e-9)
+assert int(result.status) == LMStatus.CONVERGED, int(result.status)
+assert result.lm_state.recycle.iterations.dtype == jnp.int32
+assert result.lm_state.recycle.residual_norm.dtype == jnp.float64
+assert float(result.info.grad_norm) < 1e-6, float(result.info.grad_norm)
+"""
+    subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
