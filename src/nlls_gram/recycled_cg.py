@@ -31,16 +31,32 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 from jax import lax
-from jax._src.scipy.sparse.linalg import (
-    _add,
-    _identity,
-    _isolve,
-    _mul,
-    _normalize_matvec,
-    _sub,
-    _vdot_real_tree,
-)
 from jax.tree_util import tree_leaves
+
+# Compatibility policy: only the CG Krylov loop is vendored here; the surrounding
+# plumbing (x0/maxiter normalization and the custom_linear_solve wrapper) is
+# imported from jax's private jax._src so upstream fixes carry over. That module
+# is not a public API -- a jax release that moves or renames it must fail loudly
+# at import time rather than let this fork silently diverge, so the import is
+# guarded and re-raised with actionable remediation.
+try:
+    from jax._src.scipy.sparse.linalg import (
+        _add,
+        _identity,
+        _isolve,
+        _mul,
+        _normalize_matvec,
+        _sub,
+        _vdot_real_tree,
+    )
+except ImportError as exc:  # pragma: no cover - only on an upstream jax break
+    from importlib.metadata import version
+
+    raise ImportError(
+        f"nlls-gram {version('nlls-gram')} tracks jax's private conjugate-gradient "
+        "plumbing (jax._src.scipy.sparse.linalg); this jax version appears to have "
+        "moved or renamed it. Pin jax to a known-good range or upgrade nlls-gram."
+    ) from exc
 
 _HIGHEST = lax.Precision.HIGHEST
 
@@ -118,7 +134,12 @@ def _recycled_cg_solve(A, b, x0=None, *, maxiter, tol=1e-5, atol=0.0, M=_identit
 
 
 def recycled_cg(A, b, x0=None, *, tol=1e-5, atol=0.0, maxiter=None, M=None):
-    """Drop-in fork of :func:`jax.scipy.sparse.linalg.cg`.
+    """Upstream-parity fork of :func:`jax.scipy.sparse.linalg.cg` (no recycling).
+
+    Despite the name this is the plain CG parity path: it does no recycling and
+    reproduces upstream CG exactly. Cross-step Krylov recycling / deflation lives
+    in :func:`deflated_pcg` and :class:`RecycleConfig`; this fork only vendors the
+    Krylov loop as their shared, upstream-tracking extension point.
 
     Semantics are identical to the upstream solver: ``A`` is a hermitian
     positive-definite matvec callable (or matrix), convergence is
@@ -164,6 +185,9 @@ def recycled_cg(A, b, x0=None, *, tol=1e-5, atol=0.0, maxiter=None, M=None):
 class HarvestState(NamedTuple):
     """Diagnostics and the next deflation basis emitted by :func:`deflated_pcg`.
 
+    A ``NamedTuple``: positional unpacking
+    (``basis, iterations, residual_norm = state``) is part of the stable API.
+
     Attributes:
         basis: ``(m, k)`` orthonormal deflation basis harvested from the solve,
             recycled into the next solve. ``stop_gradient``'d.
@@ -203,12 +227,45 @@ class RecycleConfig:
     ridge: float | None = None
 
     def __post_init__(self):
+        # rank/window are shape-determining static ints (bool is an int subclass
+        # but is not a valid size, so reject it explicitly).
+        if isinstance(self.rank, bool) or not isinstance(self.rank, int):
+            raise TypeError(
+                f"RecycleConfig.rank must be an int, got {type(self.rank).__name__}"
+            )
         if self.rank <= 0:
             raise ValueError(f"RecycleConfig.rank must be positive, got {self.rank}")
-        if self.window is not None and self.window < self.rank:
-            raise ValueError(
-                f"RecycleConfig.window ({self.window}) must be >= rank ({self.rank})"
+        if self.window is not None:
+            if isinstance(self.window, bool) or not isinstance(self.window, int):
+                raise TypeError(
+                    "RecycleConfig.window must be an int or None, got "
+                    f"{type(self.window).__name__}"
+                )
+            if self.window < self.rank:
+                raise ValueError(
+                    f"RecycleConfig.window ({self.window}) must be >= "
+                    f"rank ({self.rank})"
+                )
+        if not isinstance(self.warm_start, bool):
+            raise TypeError(
+                "RecycleConfig.warm_start must be a bool, got "
+                f"{type(self.warm_start).__name__}"
             )
+        if not isinstance(self.reorthogonalize, bool):
+            raise TypeError(
+                "RecycleConfig.reorthogonalize must be a bool, got "
+                f"{type(self.reorthogonalize).__name__}"
+            )
+        if self.ridge is not None:
+            if isinstance(self.ridge, bool) or not isinstance(self.ridge, (int, float)):
+                raise TypeError(
+                    "RecycleConfig.ridge must be a float or None, got "
+                    f"{type(self.ridge).__name__}"
+                )
+            if self.ridge < 0:
+                raise ValueError(
+                    f"RecycleConfig.ridge must be nonnegative, got {self.ridge}"
+                )
 
     @property
     def resolved_window(self):

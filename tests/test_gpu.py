@@ -4,6 +4,7 @@ import pytest
 
 from nlls_gram import (
     LevenbergMarquardt,
+    identity_preconditioner,
     matern_state_space,
     metric_from_state_space,
 )
@@ -23,7 +24,22 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "qr", "augmented_qr"])
+# Matrix-free params (cg with an explicit identity preconditioner, plain lsmr)
+# ride alongside the dense ones; they auto-skip without a GPU like the rest.
+_MATRIX_FREE_GPU_KWARGS = {
+    "cg": {
+        "iterative_tol": 1e-7,
+        "iterative_maxiter": 10,
+        "dual_preconditioner": identity_preconditioner(),
+        "implicit_preconditioner": identity_preconditioner(),
+    },
+    "lsmr": {"iterative_tol": 1e-8, "iterative_maxiter": 10},
+}
+
+
+@pytest.mark.parametrize(
+    "linear_solver", ["cholesky", "qr", "augmented_qr", "cg", "lsmr"]
+)
 def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
     def residual(theta, target, p):
         return jnp.array([theta[0] ** 2 - target])
@@ -35,6 +51,7 @@ def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
         linear_solver=linear_solver,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
+        **_MATRIX_FREE_GPU_KWARGS.get(linear_solver, {}),
     )
 
     with jax.default_device(gpu):
@@ -58,7 +75,9 @@ def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
     assert jnp.isfinite(info.acceleration_ratio)
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "qr", "augmented_qr"])
+@pytest.mark.parametrize(
+    "linear_solver", ["cholesky", "qr", "augmented_qr", "cg", "lsmr"]
+)
 def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
     def residual(theta, target, p):
         return jnp.array([theta[0] ** 2 - target])
@@ -70,6 +89,7 @@ def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
         linear_solver=linear_solver,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
+        **_MATRIX_FREE_GPU_KWARGS.get(linear_solver, {}),
     )
 
     with jax.default_device(gpu):

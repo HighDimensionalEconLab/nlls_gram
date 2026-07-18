@@ -640,3 +640,61 @@ def test_whitened_preconditioner_hashing_shares_compilation():
     c = LevenbergMarquardt(residual, **common)  # plain
     assert a == b_solver and hash(a) == hash(b_solver)
     assert a != c
+
+
+# --- chained two-phase AD contract -------------------------------------------
+
+
+def test_chained_solve_derivative_is_final_phase_implicit_rule():
+    # The two-phase pattern (fast solver to a plateau, then a certifying lsmr
+    # solve warm-started from it) must differentiate as the implicit rule at
+    # the FINAL converged point only: solve()'s custom JVP consumes the p
+    # tangent alone, so warm-start (x0/lm_state) tangents from an unconverged
+    # phase 1 are dropped by construction.
+    n = 6
+    A = jax.random.normal(jax.random.key(0), (n, n)) + 3.0 * jnp.eye(n)
+    p0 = jnp.exp(0.2 * jax.random.normal(jax.random.key(1), (n,)))
+
+    def residual(x, args, p):
+        return A @ x + 0.1 * jnp.tanh(x) - p
+
+    phase1 = LevenbergMarquardt(residual, init_damping=1e-2)
+    phase2 = LevenbergMarquardt(
+        residual,
+        linear_solver="lsmr",
+        init_damping=1e-10,
+        iterative_tol=1e-13,
+        iterative_atol=1e-13,
+        iterative_maxiter=200,
+        geodesic_acceleration=False,
+    )
+    reference = LevenbergMarquardt(residual, init_damping=1e-2)
+
+    def chained(p):
+        plateau = phase1.solve(jnp.zeros(n), p=p, max_steps=2, atol=0.0)
+        return phase2.solve(plateau.x, p=p, max_steps=20, atol=1e-12).x
+
+    def direct(p):
+        return reference.solve(jnp.zeros(n), p=p, max_steps=60, atol=1e-12).x
+
+    tangent = jnp.linspace(-1.0, 1.0, n)
+    x_chained, dx_chained = jax.jvp(chained, (p0,), (tangent,))
+    x_direct, dx_direct = jax.jvp(direct, (p0,), (tangent,))
+    # Well-determined system: unique root, so both paths converge to the same
+    # x* and the chained derivative must equal the single-solve implicit rule.
+    assert jnp.allclose(x_chained, x_direct, rtol=1e-5, atol=1e-6)
+    assert jnp.allclose(dx_chained, dx_direct, rtol=1e-4, atol=1e-5)
+
+    # Reverse mode agrees with forward mode through the chain.
+    cotangent = jnp.cos(jnp.arange(n, dtype=p0.dtype))
+    _, pullback = jax.vjp(chained, p0)
+    (p_bar,) = pullback(cotangent)
+    assert jnp.allclose(p_bar @ tangent, cotangent @ dx_chained, rtol=1e-4, atol=1e-5)
+
+    # The phase boundary carries no derivative: perturbing the warm start
+    # leaves the chained solution's tangent at exactly zero.
+    def from_start(x0):
+        return phase2.solve(x0, p=p0, max_steps=20, atol=1e-12).x
+
+    _, dx_start = jax.jvp(from_start, (0.1 * jnp.ones(n),), (jnp.ones(n),))
+    assert jnp.allclose(dx_start, jnp.zeros(n), atol=1e-12)

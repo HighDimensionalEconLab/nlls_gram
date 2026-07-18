@@ -12,8 +12,12 @@ returning the single best result. With has_aux=True the residual returns
 (residual, aux) and the aux output is reported on LMInfo. An optional Metric
 defines a positive-definite parameter-space metric for LM damping.
 The dense linear-solver choices include residual-space Cholesky, reduced QR,
-and direct augmented QR for small or rank-deficient systems. The solver depends
-only on JAX.
+and direct augmented QR for small or rank-deficient systems. Two matrix-free
+solvers use only J/J' products: residual-space CG on the metric-damped dual
+(with a required dual preconditioner) and LSMR on the whitened subproblem
+(with an optional WhitenedPreconditioner right-preconditioner), the latter
+staying accurate at small damping where the squared dual solve degrades. The
+solver depends only on JAX.
 
 Tuning heuristics (solver selection, damping, inner-solve scheduling):
 https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/

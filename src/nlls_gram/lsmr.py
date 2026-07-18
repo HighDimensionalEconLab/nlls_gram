@@ -29,6 +29,9 @@ _HIGHEST = lax.Precision.HIGHEST
 class LSMRState(NamedTuple):
     """Diagnostics emitted by :func:`lsmr` alongside the solution.
 
+    A ``NamedTuple``: positional unpacking
+    (``iterations, normal_residual = state``) is part of the stable API.
+
     Attributes:
         iterations: number of LSMR iterations run (``()`` int32).
         normal_residual: final ``||A'(b - A x) - damp^2 x||`` (``()`` scalar), the
@@ -192,8 +195,21 @@ def lsmr(A, At, b, *, damp=0.0, atol=1e-6, btol=0.0, maxiter, n=None):
 
     ``A``/``At`` are the operator and its transpose as matvec callables, ``b`` the
     right-hand side. ``n`` (the solution size) defaults to ``At(b).shape[0]``.
+    ``atol`` (relative, scaled by ``normar0 = ||A'b||``) and ``btol`` (absolute)
+    bound the normal-equations residual; in the LM solver these carry the
+    package's ``iterative_tol`` -> ``atol`` and ``iterative_atol`` -> ``btol``.
     Returns ``(x, LSMRState)``; not reverse-differentiable (raw loop).
     """
+    # Concrete (non-tracer) inputs are validated up front, mirroring the solver
+    # constructors; traced values (the LM hooks pass these) skip the check.
+    if not isinstance(damp, jax.core.Tracer) and float(damp) < 0.0:
+        raise ValueError("damp must be nonnegative")
+    if not isinstance(atol, jax.core.Tracer) and float(atol) < 0.0:
+        raise ValueError("atol must be nonnegative")
+    if not isinstance(btol, jax.core.Tracer) and float(btol) < 0.0:
+        raise ValueError("btol must be nonnegative")
+    if not isinstance(maxiter, jax.core.Tracer) and int(maxiter) <= 0:
+        raise ValueError("maxiter must be positive")
     if n is None:
         n = At(b).shape[0]
     return lsmr_solve(A, At, b, damp, atol, btol, maxiter, n)

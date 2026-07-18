@@ -1845,7 +1845,9 @@ def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
     assert jnp.allclose(x_dot, expected_x_dot, atol=1e-6)
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "augmented_qr"])
+@pytest.mark.parametrize(
+    "linear_solver", ["cholesky", "cg", "qr", "augmented_qr", "lsmr"]
+)
 def test_grad_norm_and_step_norm_match_closed_form(linear_solver):
     def residual(theta, args, p):
         matrix, target = args
@@ -1863,6 +1865,8 @@ def test_grad_norm_and_step_norm_match_closed_form(linear_solver):
             "dual_preconditioner": identity_preconditioner(),
             "implicit_preconditioner": identity_preconditioner(),
         }
+    elif linear_solver == "lsmr":
+        solver_kwargs = {"iterative_tol": 1e-10, "iterative_maxiter": 50}
 
     solver = LevenbergMarquardt(
         residual,
@@ -2481,15 +2485,19 @@ def test_cache_jacobian_requires_sized_lm_state():
         )
 
 
-def test_cache_jacobian_is_inert_for_non_cholesky_solvers():
+@pytest.mark.parametrize("linear_solver", ["cg", "lsmr"])
+def test_cache_jacobian_is_inert_for_non_cholesky_solvers(linear_solver):
+    solver_kwargs = {"iterative_tol": 1e-7, "iterative_maxiter": 20}
+    if linear_solver == "cg":
+        solver_kwargs |= {
+            "dual_preconditioner": identity_preconditioner(),
+            "implicit_preconditioner": identity_preconditioner(),
+        }
     solver = LevenbergMarquardt(
         residual_fn,
-        linear_solver="cg",
-        dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        linear_solver=linear_solver,
         cache_jacobian=True,
-        iterative_tol=1e-7,
-        iterative_maxiter=20,
+        **solver_kwargs,
     )
     assert not solver.cache_jacobian
     ts = jnp.linspace(0.0, 2.0, 20)
@@ -2544,7 +2552,9 @@ def aux_residual_fn(x, args):
     return r, {"mean_abs": jnp.mean(jnp.abs(r)), "max_abs": jnp.max(jnp.abs(r))}
 
 
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg", "qr", "augmented_qr"])
+@pytest.mark.parametrize(
+    "linear_solver", ["cholesky", "cg", "qr", "augmented_qr", "lsmr"]
+)
 def test_has_aux_reports_aux_at_pre_step_x(linear_solver):
     ts = jnp.linspace(0.0, 2.0, 20)
     ys = 2.0 * jnp.exp(-1.0 * ts)
@@ -2557,6 +2567,8 @@ def test_has_aux_reports_aux_at_pre_step_x(linear_solver):
             "dual_preconditioner": identity_preconditioner(),
             "implicit_preconditioner": identity_preconditioner(),
         }
+    elif linear_solver == "lsmr":
+        solver_kwargs = {"iterative_tol": 1e-8, "iterative_maxiter": 20}
 
     solver = LevenbergMarquardt(
         aux_residual_fn,

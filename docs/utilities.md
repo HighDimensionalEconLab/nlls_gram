@@ -165,8 +165,8 @@ spectral tail at \(\approx \varepsilon\) and CG resolves a cluster in
 about one iteration (measured: ~32 float64 iterations for a Matérn-5/2
 Gram at n=1000, independent of \(\varepsilon\) from 1e-2 to 1e-8). It
 provides `solve` and `norm` only (no matrix-free square root), so it works
-with the `cholesky` and `cg` linear solvers and is rejected for
-`qr` at construction. Combined with
+with the `cholesky` and `cg` linear solvers and is rejected for `qr`,
+`augmented_qr`, and `lsmr` (which all require `inv_sqrt`) at construction. Combined with
 `implicit_solver="cg"` the whole pipeline — forward solve, JVP, and VJP —
 runs matrix-free (see [Implicit AD](implicit_ad.md)). This is the one
 constructor that meets the
@@ -488,7 +488,9 @@ solvers behave as follows:
   those coordinates.
 - **`qr` does not survive padding**: the padded zero rows make the Jacobian
   rank-deficient, which the QR path's triangular solves cannot handle — the
-  step is non-finite. Use `cholesky` or `cg` for padded problems.
+  step is non-finite. Use `cholesky` or `cg`, or the damped augmented
+  `augmented_qr` / `lsmr` (full column rank for \(\lambda>0\) even when \(J\)
+  is rank-deficient), for padded problems.
 - **Implicit AD**: the padded rows make the *undamped* implicit dual
   \(J P J^\top\) singular, so the library's implicit rules (dense and cg)
   return a non-finite derivative of `solve(...).x` on padded problems — and
@@ -556,8 +558,9 @@ final normal-equations residual.
 `recycle=RecycleConfig(rank=k)` on a `cg` solver carries a deflation basis
 across LM steps: each step harvests an eigCG-style basis from its CG iterations
 and recycles it into the next step's two-level additive preconditioner
-`M_defl(r) = P(r) + U E^{-1}(U'r)` (first-level `P` = the user's
-`dual_preconditioner`, unchanged) plus a deflated warm start. See the
+`M_defl(r) = P(r) + U E^{-1}(U'r)` (first-level `P` = the frozen
+`dual_preconditioner`, or the `preconditioner_factory`'s current iterate-built
+`apply` when one is used) plus a deflated warm start. See the
 [tuning guide](tuning_guide.md#recycling-and-deflation-across-steps) for when it
 pays off and how to configure `rank`/`window`.
 
@@ -586,6 +589,8 @@ loudly rather than being clamped.
 ::: nlls_gram.RecycleState
 
 ::: nlls_gram.deflated_pcg
+
+::: nlls_gram.HarvestState
 
 ::: nlls_gram.build_coarse_operator
 

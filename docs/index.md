@@ -212,9 +212,13 @@ is required as well — `identity_preconditioner()` works there too, or pass
 `implicit_solver="cholesky"` for the dense implicit rule. See
 [Utilities](utilities.md) for structural constructors
 (`sherman_morrison_preconditioner`, `woodbury_preconditioner`) and the
-randomized `nystrom_preconditioner`. Like `metric`, preconditioners are
-static configuration: they are not carried in `LMState` and no callback
-action can replace them — construct a new solver to change one.
+randomized `nystrom_preconditioner`. Like `metric`, the preconditioner
+*callable* is static configuration: it is not carried in `LMState` and no
+callback action can replace it — construct a new solver to change one. A
+`preconditioner_factory` is the exception in the other direction: the callable
+pair stays static, but its *prepared state* (`precond`/`precond_valid`, rebuilt
+from the live iterate each accepted step) IS carried on `LMState`, so a `solve`
+callback that rebuilds `lm_state` must preserve those two fields.
 
 ### QR
 
@@ -231,7 +235,8 @@ The returned parameter step is mapped back with `metric.inv_sqrt`.
 The triangular solves require \(S^\top J^\top\) to have full column rank
 (equivalently, \(J\) full row rank): a rank-deficient Jacobian produces a
 non-finite step even though the damped subproblem remains well-posed. Use
-`cholesky`, `cg`, or `augmented_qr` for rank-deficient problems.
+`cholesky` or `cg`, or the damped augmented solvers `augmented_qr` / `lsmr`
+(which stay full column rank for \(\lambda>0\)), for rank-deficient problems.
 
 ### Augmented QR
 
@@ -250,6 +255,8 @@ is the parameter count \(n\), so it is intended for small systems such as DAE
 algebraic roots. In the package's usual \(m\ll n\) regime, `qr` performs the
 same damped solve after reducing to residual dimension and is substantially
 cheaper when its full-row-rank assumption holds.
+
+### LSMR
 
 `linear_solver="lsmr"` solves that same whitened augmented system iteratively by
 LSMR bidiagonalization, using only \(J\)/\(J^\top\) matvecs — the matrix-free

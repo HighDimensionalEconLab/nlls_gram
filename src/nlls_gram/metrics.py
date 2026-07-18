@@ -341,7 +341,8 @@ def metric_from_shifted_matvec(
     ``shift <= 0`` raises; a traced ``shift`` is not validated and must be
     positive. Only ``solve`` and ``norm`` are provided (there is no
     matrix-free square root), so the solver accepts this metric for the
-    ``cholesky`` and ``cg`` paths and rejects ``qr`` at construction.
+    ``cholesky`` and ``cg`` paths and rejects ``qr``, ``augmented_qr``, and
+    ``lsmr`` -- which all require ``inv_sqrt`` -- at construction.
 
     ``solve`` runs ``jax.scipy.sparse.linalg.cg`` on the shifted matvec, so
     it meets the library's exactness contract only in the tight-``tol``

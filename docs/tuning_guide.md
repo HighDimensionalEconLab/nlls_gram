@@ -218,8 +218,10 @@ preconditioner every step, closing the terminal gap a frozen `P` cannot.
 - **Recompiles per value (static):** `linear_solver`,
   `implicit_solver`, the `implicit_*` accuracy knobs,
   `geodesic_acceleration`, `cache_jacobian`, `has_aux`, the `Metric`
-  callbacks, `implicit_preconditioner`, `recycle` (the `RecycleConfig`, whose
-  `rank`/`window` size the carried basis), and the callback function identity.
+  callbacks, `dual_preconditioner`, `preconditioner_factory`,
+  `whitened_preconditioner`, `implicit_preconditioner`, `recycle` (the
+  `RecycleConfig`, whose `rank`/`window` size the carried basis), and the
+  callback function identity.
   Solvers themselves compare by configuration, so a freshly constructed
   solver with equal settings (around the same residual, metric, and
   preconditioner objects) reuses the compiled loop — rebuilding the solver
@@ -244,7 +246,7 @@ the step count.
 | symptom | likely cause | remedy |
 | --- | --- | --- |
 | `status == NONFINITE` at step 0 | bad initial point or data | check `residual_fn(x0, ...)` directly |
-| `qr` gives non-finite steps; other solvers fine | rank-deficient Jacobian | use `augmented_qr`, `cholesky`, or `cg` |
+| `qr` gives non-finite steps; other solvers fine | rank-deficient Jacobian | use the damped augmented `augmented_qr` / `lsmr`, or `cholesky` / `cg` |
 | `MAX_STEPS` but loss small and flat | converged without a stopping rule | set `gtol`/`xtol` |
 | damping grows without bound (float32 `inf`) | rejection storm | `max_damping`, or check residual scaling |
 | every `solve` call recompiles | residual/callback/metric object rebuilt per call (solvers compare by configuration, but their pieces key by identity) | define the pieces once at setup scope |

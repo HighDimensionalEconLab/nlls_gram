@@ -15,8 +15,9 @@ larger than the number of residuals.
 `(x)`, `(x, args)`, or `(x, args, p)`, always in that order. The unknown `x`
 may be any JAX pytree; internally it
 is flattened with `jax.flatten_util.ravel_pytree`. The default dense solver
-uses the residual-space Gram system, with QR and CG alternatives. Use
-`update(...)` for a single LM step or `solve(...)` for an internally jitted loop.
+uses the residual-space Gram system, with QR, CG, and matrix-free LSMR
+alternatives. Use `update(...)` for a single LM step or `solve(...)` for an
+internally jitted loop.
 
 ## Problem
 
@@ -161,9 +162,21 @@ Matérn/state-space kernel Grams, `metric_from_diagonal`,
   `identity_preconditioner()` to run unpreconditioned CG explicitly);
   `implicit_solver="auto"` keeps `solve(...).x` matrix-free under AD and
   requires `implicit_preconditioner` the same way — at construction, even
-  if the solve is never differentiated.
+  if the solve is never differentiated. When the dual operator rotates as LM
+  drifts `x`, pass `preconditioner_factory=PreconditionerFactory(prepare,
+  apply)` instead — a θ-adaptive preconditioner rebuilt from the live iterate
+  each step — and `recycle=RecycleConfig(rank=k)` to carry a deflation basis
+  across steps, recycling each solve's Krylov subspace into the next.
+- `linear_solver="lsmr"`: matrix-free LSMR on the whitened augmented system,
+  the iterative sibling of `augmented_qr`, using only J/Jᵀ products. It works
+  on the whitened Jacobian rather than its squared dual, so it stays accurate
+  at small damping where the Gram-based solves hit their `eps·cond` floor. An
+  optional `whitened_preconditioner=WhitenedPreconditioner(solve,
+  solve_transpose)` right-preconditions the operator to cluster its spectrum;
+  its scalar damping then regularizes in the `RᵀR` metric — a documented
+  surrogate whose `damping → 0` minimum-metric-norm limit is unchanged.
 
-All four solve the same metric-damped linearized subproblem up to the accuracy
+All five solve the same metric-damped linearized subproblem up to the accuracy
 of the chosen linear solver.
 
 ## Docs and Alternatives

@@ -92,22 +92,44 @@ def _cast_hyper(hyper, dtype):
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class LMState:
+    """Carried LM solver state threaded through ``init``/``update``/``solve``.
+
+    Only ``damping`` is always live; the remaining fields are populated by the
+    features that need them and stay ``None`` on the default path (compiled away
+    at no cost). A ``solve`` callback that rebuilds ``lm_state`` must PRESERVE the
+    fields it does not mean to change -- in particular the ``recycle`` basis and
+    the ``precond``/``precond_valid`` factory state, which carry across steps.
+
+    Attributes:
+        damping: ``()`` current LM damping ``lambda``.
+        resid: cached residual at the current ``x`` (``cache_jacobian=True`` only,
+            else ``None``).
+        Jt: cached transpose-Jacobian ``J'`` output at the current ``x``
+            (``cache_jacobian=True`` only).
+        jacobian_valid: ``()`` bool -- the cached ``resid``/``Jt`` are still
+            current because the last step was rejected so ``x`` did not move
+            (``cache_jacobian=True`` only).
+        aux: residual aux pytree at the current ``x`` (``has_aux=True``).
+        hyper: per-step :class:`LMHyperparams`, populated by ``solve``; ``None``
+            (``init``'s default) falls back to the constructor values with
+            identical compiled code and no extra per-call buffers in manual
+            ``update`` loops.
+        recycle: :class:`~nlls_gram.RecycleState` carrying the deflation basis and
+            warm starts across steps (``recycle`` set only).
+        precond: ``preconditioner_factory`` prepared state (the ``prepare``-built
+            pytree) at the current ``x``; ``None`` on the default path.
+        precond_valid: ``()`` bool -- the carried ``precond`` is still current
+            because ``x`` has not moved since it was built (so it is reused, not
+            rebuilt); ``None`` on the default path.
+    """
+
     damping: jax.Array
-    # Jacobian cache (cache_jacobian=True only): residual, J', and aux at the
-    # current x; jacobian_valid means the last step was rejected so x did not move.
     resid: jax.Array | None = None
     Jt: jax.Array | None = None
     jacobian_valid: jax.Array | None = None
-    aux: Any = None  # arbitrary residual aux pytree
-    # LMHyperparams, populated by solve(); None (init()'s default) falls back
-    # to the constructor values with identical compiled code and no extra
-    # per-call buffers in manual update() loops.
+    aux: Any = None
     hyper: LMHyperparams | None = None
-    # RecycleState (recycle set only); None compiles away for the default path.
     recycle: RecycleState | None = None
-    # preconditioner_factory state: precond is the prepare()-built pytree at the
-    # current x; precond_valid means x has not moved since it was built (so the
-    # carried state is reused instead of rebuilt). Both None for the default path.
     precond: Any = None
     precond_valid: jax.Array | None = None
 
@@ -115,17 +137,42 @@ class LMState:
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class LMInfo:
-    loss: jax.Array  # min(old, new) sum of squared residuals
+    """Per-step diagnostics returned by ``update`` (and for each ``solve`` step).
+
+    The loss/damping fields report the accept/reject outcome of the step, while
+    ``grad_norm``/``step_norm``/``aux`` are evaluated at the PRE-step ``x`` (the
+    iterate the step was computed from), so they describe the point entering the
+    step, not the one it produced.
+
+    Attributes:
+        loss: ``min(loss_old, loss_candidate)`` sum of squared residuals (at the
+            retained iterate).
+        loss_old: sum of squared residuals at the pre-step ``x``.
+        loss_candidate: sum of squared residuals at the trial point.
+        accepted: ``()`` bool, whether the trial step was accepted.
+        damping: ``()`` post-update damping ``lambda``.
+        damping_factor: ``()`` multiplicative damping update applied this step.
+        used_geodesic: ``()`` bool, whether the geodesic-acceleration correction
+            entered the accepted step.
+        acceleration_ratio: ``()`` geodesic acceleration-to-velocity norm ratio.
+        grad_norm: ``()`` ``||J' r||`` at the pre-step ``x``.
+        step_norm: ``()`` ``||candidate step||``, reported even when the step is
+            rejected.
+        aux: residual aux output at the pre-step ``x`` (``has_aux=True``, else
+            ``None``).
+    """
+
+    loss: jax.Array
     loss_old: jax.Array
     loss_candidate: jax.Array
     accepted: jax.Array
-    damping: jax.Array  # post-update damping
+    damping: jax.Array
     damping_factor: jax.Array
     used_geodesic: jax.Array
     acceleration_ratio: jax.Array
-    grad_norm: jax.Array  # ||J' r|| at the pre-step x
-    step_norm: jax.Array  # ||candidate step||, reported even when rejected
-    aux: Any = None  # residual aux output at the pre-step x (has_aux)
+    grad_norm: jax.Array
+    step_norm: jax.Array
+    aux: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -374,6 +421,10 @@ class PreconditionerFactory:
     """
 
     def __init__(self, prepare, apply):
+        if not callable(prepare):
+            raise TypeError("PreconditionerFactory.prepare must be callable")
+        if not callable(apply):
+            raise TypeError("PreconditionerFactory.apply must be callable")
         self.prepare = prepare
         self.apply = apply
 
@@ -431,6 +482,10 @@ class WhitenedPreconditioner:
     """
 
     def __init__(self, solve, solve_transpose):
+        if not callable(solve):
+            raise TypeError("WhitenedPreconditioner.solve must be callable")
+        if not callable(solve_transpose):
+            raise TypeError("WhitenedPreconditioner.solve_transpose must be callable")
         self.solve = solve
         self.solve_transpose = solve_transpose
 
@@ -1293,6 +1348,10 @@ class LevenbergMarquardt:
                 return transpose_fn(cotangent)[0]
 
             grad = JT(resid)
+            # Hook -> Fong-Saunders/scipy LSMR name mapping (kept standard in
+            # lsmr.py): iterative_tol becomes LSMR's atol (relative, scaled by
+            # normar0 = ||A'b||, i.e. operator-scaled) and iterative_atol becomes
+            # btol (absolute). Passed as lsmr_solve's atol/btol positionals below.
             lsmr_tol = jnp.asarray(hyper.iterative_tol, dtype=resid.dtype)
             lsmr_atol = jnp.asarray(hyper.iterative_atol, dtype=resid.dtype)
             sqrt_damping = jnp.sqrt(damping)
