@@ -115,6 +115,17 @@ def test_auto_never_materializes_m_by_m_for_tall_systems():
     assert (m, m) in rev_shapes
 
 
+def test_auto_resolution_breaks_square_tie_to_fwd():
+    # At n == m the pass counts are equal, so the tie goes to the cheaper
+    # forward-mode JVP columns; reverse rows are kept only for strictly fat
+    # systems (a shape probe cannot distinguish the modes at n == m, so the
+    # resolution itself is asserted).
+    solver = LevenbergMarquardt(lambda x, args, p: x - p)
+    assert solver._resolve_jacobian_mode(5, 5) == "fwd"
+    assert solver._resolve_jacobian_mode(6, 5) == "fwd"
+    assert solver._resolve_jacobian_mode(5, 6) == "rev"
+
+
 def test_has_aux_under_fwd_mode():
     A, b = _linear_problem(TALL_M, TALL_N, seed=3)
 

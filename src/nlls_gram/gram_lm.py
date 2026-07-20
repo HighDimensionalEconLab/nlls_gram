@@ -704,9 +704,11 @@ class LevenbergMarquardt:
     ``jacobian_mode`` controls how the dense solvers ("cholesky", "qr",
     "augmented_qr") and the dense implicit rules materialize ``J'``:
     ``"auto"`` (default) takes ``n`` forward-mode JVP columns when the system
-    is tall (``n < m``) and ``m`` reverse-mode VJP rows otherwise, so the
-    identity basis that is vmapped over is always the small side (an m x m
-    residual basis over a tall system was a compile-time memory blowup);
+    is tall or square (``n <= m``) and ``m`` reverse-mode VJP rows only when
+    strictly fat (``n > m``), so the identity basis that is vmapped over is
+    always the small side (an m x m residual basis over a tall system was a
+    compile-time memory blowup), and the square tie goes to the cheaper
+    JVP passes;
     ``"fwd"``/``"rev"`` force one mode. The matrix-free solvers ("cg",
     "lsmr") never materialize ``J`` and ignore the setting (rejected at
     construction when no dense path could consume it).
@@ -1211,13 +1213,16 @@ class LevenbergMarquardt:
 
     def _resolve_jacobian_mode(self, m, n):
         # Static (shape-driven) choice of dense Jacobian assembly: "auto"
-        # takes n forward-mode columns when the system is tall (n < m) and
-        # m reverse-mode rows otherwise, so the materialized basis is always
-        # the small side -- an m x m identity over a tall residual was the
-        # compile-time memory blowup of issue #23.
+        # takes n forward-mode columns when the system is tall or square
+        # (n <= m) and m reverse-mode rows only when strictly fat (n > m),
+        # so the materialized basis is always the small side -- an m x m
+        # identity over a tall residual was the compile-time memory blowup
+        # of issue #23. The square tie goes to forward mode: at equal pass
+        # counts a JVP is cheaper than a VJP (no transpose pass and a
+        # smaller constant factor).
         if self.jacobian_mode != "auto":
             return self.jacobian_mode
-        return "fwd" if n < m else "rev"
+        return "fwd" if n <= m else "rev"
 
     def _dense_resid_jt_aux(self, residual_flat, theta):
         # Materialize the residual and J' (shape (n, m)) for the dense

@@ -53,7 +53,8 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   The dense solvers (`cholesky`, `qr`, `augmented_qr`) and the dense implicit
   rules materialize `J'` by vmapping JVPs/VJPs over an identity basis. The
   default `"auto"` picks the small side: `n` forward-mode JVP columns when
-  the system is tall (`n < m`), `m` reverse-mode VJP rows otherwise (the
+  the system is tall or square (`n <= m`; the square tie goes to the cheaper
+  JVP passes), `m` reverse-mode VJP rows only when strictly fat (the
   historical behavior, and the right one in the package's usual `m << n`
   regime) — an `m × m` residual identity over a tall system is a
   compile-time memory blowup. Pass `"fwd"`/`"rev"` to force one mode. The

@@ -181,7 +181,7 @@ selector (the resolution is recorded in
   \(J_\theta P J_\theta^\top\), and uses a dense Cholesky solve. This is the
   historical rule and is still the explicit escape hatch. Its Jacobian
   assembly is now geometry-aware like the forward dense solvers: \(n\)
-  forward-mode columns when tall (\(n < m\)), \(m\) reverse-mode rows
+  forward-mode columns when tall or square (\(n \le m\)), \(m\) reverse-mode rows
   otherwise (see `jacobian_mode` in the
   [tuning guide](tuning_guide.md#solver-selection)). The implicit Gram
   has no `+ damping I` floor from the forward solve, but it is regularized by
