@@ -111,8 +111,8 @@ minimum-`M`-norm small-damping selection intact.
   preconditioned operator, callback-schedulable). Differentiating a forward
   `lsmr` `solve(...).x` uses a dense implicit rule by default
   (`implicit_solver="auto"` applies the shape rule); pass
-  `implicit_solver="gram_cg"` or `"normal_cg"` with an
-  `implicit_preconditioner` for a fully matrix-free derivative.
+  `implicit_solver="normal_cg"` (no preconditioner needed) or `"gram_cg"`
+  with an `implicit_preconditioner` for a fully matrix-free derivative.
 - The CG forms return an *approximate* step under their iteration budget.
   That is usually fine — LM's accept/reject absorbs inexactness — but see
   the scheduling pattern below. With the default `implicit_solver="auto"`,

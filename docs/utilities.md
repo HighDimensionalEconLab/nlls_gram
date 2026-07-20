@@ -310,9 +310,9 @@ with refinement — see the [Tuning Guide](tuning_guide.md).
 ## Identity Preconditioner
 
 `linear_solver="gram_cg"` requires a `dual_preconditioner`,
-`linear_solver="normal_cg"` a `normal_preconditioner`, and a cg-resolved
-implicit solve an `implicit_preconditioner` — running Krylov methods
-unpreconditioned should be a decision, not a default.
+`linear_solver="normal_cg"` a `normal_preconditioner`, and a
+`gram_cg`-resolved implicit solve an `implicit_preconditioner` — running
+Krylov methods unpreconditioned should be a decision, not a default.
 `identity_preconditioner()` is that decision made explicit and greppable:
 
 ```python
@@ -366,9 +366,12 @@ is safe.
 
 `dual_preconditioner`, `preconditioner_factory`, and `recycle` remain
 `gram_cg`-only — they live in residual space and cannot serve the
-parameter-space system. A `normal_cg`-resolved *implicit* solve takes its
-own explicit `implicit_preconditioner`, under the same range-preservation
-requirement at \(\lambda = 0\); see
+parameter-space system. A `normal_cg`-resolved *implicit* solve needs no
+preconditioner at all (its right-hand side lies in
+\(\operatorname{range}(B^\top)\), so unpreconditioned CG already selects
+the minimum-norm tangent); an optional `implicit_preconditioner` supplied
+there acts in the same parameter space under the same range-preservation
+requirement at `damping = 0` — see
 [Implicit AD](implicit_ad.md#the-implicit-preconditioner).
 
 ## Nyström Preconditioner for Neural-Network Least Squares
@@ -549,12 +552,15 @@ solvers behave as follows:
   block that stays full column rank for \(\lambda>0\).
 - **Implicit AD**: the padded rows make the *undamped* implicit systems
   singular *but consistent* — their `p`-derivative rows are identically
-  zero too — which is exactly the ridge regime of
-  [the implicit rules](implicit_ad.md#rank-deficiency-and-the-ridge). The
-  dense-resolved rules return the minimum-metric-norm tangent at the
-  documented O(`implicit_penalty`) bias (non-finite with
-  `implicit_penalty=0.0`), and a `normal_cg`-resolved implicit computes it
-  with no ridge in exact arithmetic. A `gram_cg`-resolved implicit is the
+  zero too — which is exactly the singular-but-consistent regime of
+  [the implicit rules](implicit_ad.md#rank-deficiency-and-the-ridge). A
+  `gram_cholesky`-resolved implicit returns the minimum-metric-norm tangent
+  at the documented O(`implicit_penalty`) ridge bias, a
+  `normal_cholesky`-resolved implicit computes it exactly through its
+  default spectral-filter pseudoinverse, and a `normal_cg`-resolved
+  implicit computes it with no ridge in exact arithmetic (with
+  `implicit_penalty=0.0` the dense rules fail loudly instead). A
+  `gram_cg`-resolved implicit is the
   fragile choice here — run-to-tolerance CG on the singular padded dual —
   and `pad_dual_preconditioner` divides the padded block by the live
   damping, so it is rejected at construction when passed as an
@@ -613,8 +619,9 @@ over the CG forms.
   normal operator `R⁻ᵀ(BᵀB + damping I)R⁻¹`). Differentiating a forward
   `solve(...).x` uses a dense implicit rule by default
   (`implicit_solver="auto"` applies the shape rule); set
-  `implicit_solver="gram_cg"` or `"normal_cg"` with an
-  `implicit_preconditioner` for a fully matrix-free derivative.
+  `implicit_solver="normal_cg"` (no preconditioner needed) or
+  `"gram_cg"` with an `implicit_preconditioner` for a fully matrix-free
+  derivative.
 
 The standalone [`lsmr`](#nlls_gram.lsmr) function (operator/transpose matvecs,
 `b`, `damp`) is exposed too, returning `(x, LSMRState)` with iteration count and

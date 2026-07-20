@@ -241,11 +241,13 @@ step still lies in \(\operatorname{range}(P J^\top)\), preserving the
 minimum-metric-norm structure — so approximations are safe. Nobody should
 run Krylov methods without thinking about preconditioning; to opt out
 explicitly, pass `identity_preconditioner()` for unpreconditioned CG. When
-the implicit solver resolves to a CG form (the default
+the implicit solver resolves to `gram_cg` (the default
 `implicit_solver="auto"` does exactly that when `linear_solver="gram_cg"`),
 an `implicit_preconditioner` is required as well —
 `identity_preconditioner()` works there too, or pass a dense
-`implicit_solver` for a dense implicit rule. See
+`implicit_solver` for a dense implicit rule. (A `normal_cg`-resolved
+implicit needs no preconditioner; see
+[Implicit AD](implicit_ad.md#the-implicit-preconditioner).) See
 [Utilities](utilities.md) for structural constructors
 (`sherman_morrison_preconditioner`, `woodbury_preconditioner`) and the
 randomized `nystrom_preconditioner`. Like `metric`, the preconditioner

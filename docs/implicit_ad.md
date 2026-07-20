@@ -168,22 +168,35 @@ The four forms:
   regularized by the relative ridge described
   [below](#rank-deficiency-and-the-ridge).
 - **`normal_cholesky`** assembles \(B^\top = S^\top J_\theta^\top\)
-  (\(n \times m\)), factors the \(n \times n\) normal matrix
-  \(B^\top B\) plus the same relative ridge, and maps back
-  \(\dot\theta = S\dot u\).
+  (\(n \times m\)) and solves the \(n \times n\) normal system
+  \(B^\top B\,\dot u = -B^\top J_p\dot p\), mapping back
+  \(\dot\theta = S\dot u\). By default it applies the exact
+  **pseudoinverse** of \(B^\top B\) through an `eigh` spectral filter —
+  `implicit_penalty` selects among three behaviors,
+  [described below](#rank-deficiency-and-the-ridge).
 - **`gram_cg`** applies \(y \mapsto J_\theta P J_\theta^\top y\)
   matrix-free using JAX JVP/VJP closures, then solves with CG wrapped in a
   symmetric `jax.lax.custom_linear_solve` — both JVP and VJP of
   `solve(...).x` stay matrix-free.
 - **`normal_cg`** applies \(\dot u \mapsto B^\top(B\dot u)\) matrix-free
-  the same way. Its right-hand side \(-B^\top(J_p\dot p)\) lies in
-  \(\operatorname{range}(B^\top)\) by construction, so CG from zero
-  converges to the minimum-norm \(\dot u\) — hence the
-  minimum-\(M\)-norm tangent — with no ridge, in exact arithmetic even when
-  \(B^\top B\) is singular. The final \(\dot\theta = S\dot u\) map declares
-  its exact transpose (`inv_sqrt_transpose`), so non-self-adjoint square
-  roots — a triangular Cholesky factor — differentiate correctly in
-  reverse mode.
+  through the same JVP/VJP closures. Its right-hand side
+  \(-B^\top(J_p\dot p)\) lies in \(\operatorname{range}(B^\top)\) by
+  construction, so CG from zero converges to the minimum-norm \(\dot u\) —
+  hence the minimum-\(M\)-norm tangent — with no ridge, in exact arithmetic
+  even when \(B^\top B\) is singular. Reverse mode is *not* the same
+  symmetric solve: a cotangent right-hand side \(S^\top\bar\theta\) has no
+  reason to lie in \(\operatorname{range}(B^\top)\), and CG on the singular
+  normal operator with an inconsistent right-hand side breaks down. The
+  unridged rule therefore declares an explicit transpose through the
+  push-through identity \(N^{+} = B^\top (BB^\top)^{+2} B\): two
+  *consistent* \(m\)-space dual CG solves (unpreconditioned — the
+  parameter-space hook does not apply there), with the trailing
+  \(B^\top\) annihilating dual-null rounding noise. The ridged path (an
+  explicitly positive `implicit_penalty`) is nonsingular and stays
+  symmetric. The final \(\dot\theta = S\dot u\) map likewise declares its
+  exact transpose (`inv_sqrt_transpose`), so non-self-adjoint square roots
+  — a triangular Cholesky factor — differentiate correctly in reverse
+  mode.
 
 The dense-resolved implicit rules inherit `linear_solve_dtype`: the undamped
 implicit system is the most conditioning-sensitive solve in the library, so
@@ -194,21 +207,22 @@ tangent still float32).
 
 ### The Implicit Preconditioner
 
-A cg-resolved implicit solve requires an `implicit_preconditioner` at
-construction, even if `solve(...).x` is never differentiated — and the
-default `implicit_solver="auto"` resolves to a CG form whenever the forward
-solver is one. The hook's *space* depends on the resolved form: under
-`gram_cg` it approximates the undamped residual-space
-\((J_\theta P J_\theta^\top)^{-1} v\) on \(m\)-vectors; under `normal_cg`
-it approximates the parameter-space \((B^\top B)^{-1} v\) on \(n\)-vectors,
-and on rank-deficient problems it must additionally preserve
-\(\operatorname{range}(B^\top)\) — the same structural requirement as the
+A `gram_cg`-resolved implicit solve requires an `implicit_preconditioner`
+at construction, even if `solve(...).x` is never differentiated — and the
+default `implicit_solver="auto"` resolves to `gram_cg` whenever the forward
+solver is `gram_cg`. There the hook approximates the undamped
+residual-space \((J_\theta P J_\theta^\top)^{-1} v\) on \(m\)-vectors, and
+a forward `preconditioner_factory`'s state at the solution serves as the
+default when no explicit hook is given. Under `normal_cg` the hook is
+**optional**: the tangent right-hand side lies in
+\(\operatorname{range}(B^\top)\), so unpreconditioned CG already selects
+the minimum-norm tangent. A hook supplied there acts in *parameter* space —
+an approximation of the undamped \((B^\top B)^{-1} v\) on \(n\)-vectors —
+and on rank-deficient problems it must preserve
+\(\operatorname{range}(B^\top)\), the same structural requirement as the
 forward
-[`normal_preconditioner`](utilities.md#the-normal-space-preconditioner-normal_cg).
-Under `gram_cg`, a forward `preconditioner_factory`'s state at the solution
-serves as the default when no explicit hook is given; under `normal_cg` the
-hook must be explicit — a dual-space factory can never serve the
-parameter-space system.
+[`normal_preconditioner`](utilities.md#the-normal-space-preconditioner-normal_cg);
+the dual-space factory can never serve this parameter-space system.
 
 The callback may take `(v)` or `(v, damping)`: a callable *requiring* the
 damping argument is called with an explicit zero damping (the implicit
@@ -238,26 +252,48 @@ linearized systems by construction: differentiating the root identity
 \(J_p\dot p \in \operatorname{range}(J_\theta)\) — redundant rows and
 collinear columns included. The four forms then behave as follows:
 
-- The **dense rules** (`gram_cholesky`, `normal_cholesky`) add a relative
-  Tikhonov ridge, `implicit_penalty * trace(·) I`, before factorization
-  (default: `implicit_penalty=None`, resolving to `1e-12` for a float64
-  solve and `1e-6` for float32, after any `linear_solve_dtype` promotion).
-  On a singular-but-consistent system — redundant residual rows at the
-  returned solution, e.g. a simulated trajectory that has settled onto its
-  steady state; or a rank-deficient tall Jacobian — the ridge tangent
-  converges to the minimum-norm tangent as the penalty shrinks, so the
-  default returns the min-norm tangent at a relative bias of
-  O(`implicit_penalty` · \(m\)) (Gram) or O(`implicit_penalty` · \(n\))
-  (normal) instead of a NaN. In the ridge → 0 limit `normal_cholesky` is
-  the exact Gauss-Newton sensitivity at full column rank (for a square
-  nonsingular Jacobian: \(-J_\theta^{-1}J_p\dot p\)). The default constants
-  are empirical: for near-duplicate float64 rows the factorization-noise
-  floor sits below `1e-14` and visible tangent bias above `~1e-6`, so the
-  default is orders of magnitude from both edges. The trade-off is
-  visibility: on a genuinely *inconsistent* singular system the ridge
-  returns a finite, penalty-inflated tangent where an unregularized rule
-  fails loudly. Pass `implicit_penalty=0.0` to restore the exact
-  unregularized contract (non-finite tangents on any singular dense solve).
+- **`gram_cholesky`** adds a relative Tikhonov ridge,
+  `implicit_penalty * trace(J P J') I`, before factorization (default:
+  `implicit_penalty=None`, resolving to `1e-12` for a float64 solve and
+  `1e-6` for float32, after any `linear_solve_dtype` promotion). On a
+  singular-but-consistent dual — redundant residual rows at the returned
+  solution, e.g. a simulated trajectory that has settled onto its steady
+  state — the ridge tangent converges to the minimum-norm tangent as the
+  penalty shrinks, so the default returns the min-norm tangent at an
+  O(`implicit_penalty` · \(m\)) relative bias instead of a NaN. A ridge is
+  compatible with min-norm accuracy here because the composition ends in
+  \(J_\theta^\top\), which annihilates dual-null factorization noise. The
+  default constants are empirical: for near-duplicate float64 rows the
+  factorization-noise floor sits below `1e-14` and visible tangent bias
+  above `~1e-6`, so the default is orders of magnitude from both edges.
+  The trade-off is visibility: on a genuinely *inconsistent* singular dual
+  the ridge returns a finite, penalty-inflated tangent where an
+  unregularized rule fails loudly. Pass `implicit_penalty=0.0` for the
+  exact unridged factorization (non-finite on any singular dual).
+- **`normal_cholesky`** treats `implicit_penalty` as a trio of behaviors,
+  because no ridge can serve as *its* default: this rule ends in \(S\),
+  with no \(J_\theta^\top\)-style cleanup, so a ridge \(\delta\) leaves an
+  error floor of order \(\mathrm{eps}/\delta + \delta\) along
+  \(\ker B\) — minimized at \(\sim\sqrt{\mathrm{eps}}\), provably short of
+  min-norm-tangent accuracy. The default `None` therefore applies the exact
+  **pseudoinverse** of \(B^\top B\) by an `eigh` spectral filter at the
+  standard \(n \cdot \mathrm{eps} \cdot \lambda_{\max}\) rank cutoff:
+  exact Gauss-Newton sensitivity at full column rank (square nonsingular:
+  \(-J_\theta^{-1}J_p\dot p\)), the minimum-\(M\)-norm tangent for
+  consistent rank-deficient systems, with no ridge bias in either. Genuine
+  eigenvalues below the cutoff are treated as rank-deficient — standard
+  pseudoinverse semantics. The filter sits inside a symmetric
+  `custom_linear_solve`, so higher-order AD re-applies the solve to new
+  right-hand sides and never differentiates `eigh` itself (whose
+  derivative rule breaks on exactly the repeated-zero spectra this path
+  exists for). An explicitly *positive* `implicit_penalty` opts into the
+  trace-scaled ridge `B'B + implicit_penalty * trace(B'B) I` —
+  O(`implicit_penalty` · \(n\)) bias, smooth in the spectrum for
+  higher-order AD on nearly-degenerate problems. An explicit `0.0` demands
+  the unridged Cholesky, guarded by a deterministic pivot-based rank check
+  that poisons the tangent to NaN on rank deficiency — without the guard
+  an exactly-zero pivot can round into a finite answer silently shifted
+  along \(\ker B\).
 - **`gram_cg`** ignores `implicit_penalty` entirely: its run-to-tolerance
   default produces non-finite derivatives on a singular dual (loud), while
   a small bounded `implicit_maxiter` returns a finite — and wrong —
@@ -265,11 +301,11 @@ collinear columns included. The four forms then behave as follows:
   exact preconditioners.
 - **`normal_cg`** is exact by default: no ridge, and its range-preserving
   Krylov iteration converges to the min-norm tangent on
-  singular-but-consistent systems anyway. A ridge is added only when
-  `implicit_penalty` is passed explicitly positive (its scale set by a
-  one-matvec Rayleigh-quotient estimate) — an opt-in stabilizer for
-  systems where floating-point drift, not rank, is the issue. The default
-  stays exact rather than silently biased.
+  singular-but-consistent systems anyway. A matrix-free ridge is added only
+  when `implicit_penalty` is passed explicitly positive (its scale set by
+  the right-hand side's Rayleigh quotient of \(B^\top B\)) — an opt-in
+  stabilizer for systems where floating-point drift, not rank, is the
+  issue. The default stays exact rather than silently biased.
 
 **Least-squares semantics on inconsistent systems.** When the returned
 point is a least-squares stationary point with nonzero residual rather than
@@ -281,7 +317,7 @@ an exact root, \(J_p\dot p\) need not lie in
 least-squares problem. That is a definition to be aware of, not an error.
 The Gram forms have no such fallback: their dual system is
 singular-inconsistent there, giving a ridge-inflated finite tangent
-(dense) or a loud failure (`gram_cg`).
+(`gram_cholesky`) or a loud failure (`gram_cg`).
 
 Self-adjointness of \(P\) is all the Gram forms need from `metric.solve`:
 the final \(P J_\theta^\top y\) application acts on tangent data, and its
@@ -369,9 +405,12 @@ $$
 
 For a pytree `p`, \(J_p^\top y\) means the JAX VJP of the residual with respect
 to the `p` argument only. The normal forms compute the identical cotangent
-by transposing the whitened map instead. Rank-deficient systems behave as in
-[the ridge section](#rank-deficiency-and-the-ridge) — the VJP transposes the
-same regularized (or exact) solve the JVP uses.
+by transposing the whitened map instead — for the unridged `normal_cg` rule
+through its declared push-through transpose, since a cotangent right-hand
+side need not lie in \(\operatorname{range}(B^\top)\). Rank-deficient
+systems behave as in [the ridge section](#rank-deficiency-and-the-ridge):
+the VJP applies the transpose of the same regularized, filtered, or exact
+solve the JVP uses.
 
 Example:
 
