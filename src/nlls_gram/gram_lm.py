@@ -696,8 +696,20 @@ class LevenbergMarquardt:
     (a Schur-complement factor is canonical). Its ``damp`` then regularizes in the
     ``R'R`` metric -- the step ``u = -(B'B + damping R'R)^{-1} B' r`` is a
     documented surrogate whose ``damping -> 0`` selection limit is ``R``-invariant.
-    Differentiating a forward ``lsmr`` solve uses the dense cholesky implicit rule
-    under ``implicit_solver="auto"``.
+    Differentiating a forward ``lsmr`` solve under ``implicit_solver="auto"``
+    follows the Jacobian geometry: the n-wide primal QR rule when tall
+    (``m > n``, materializing ``J'`` by n forward-mode columns), the dense
+    dual cholesky rule otherwise.
+
+    ``jacobian_mode`` controls how the dense solvers ("cholesky", "qr",
+    "augmented_qr") and the dense implicit rules materialize ``J'``:
+    ``"auto"`` (default) takes ``n`` forward-mode JVP columns when the system
+    is tall (``n < m``) and ``m`` reverse-mode VJP rows otherwise, so the
+    identity basis that is vmapped over is always the small side (an m x m
+    residual basis over a tall system was a compile-time memory blowup);
+    ``"fwd"``/``"rev"`` force one mode. The matrix-free solvers ("cg",
+    "lsmr") never materialize ``J`` and ignore the setting (rejected at
+    construction when no dense path could consume it).
 
     ``linear_solver="cg"`` requires ``dual_preconditioner(v, damping)``: a
     jit-traceable, linear, SPD approximation of
@@ -723,11 +735,24 @@ class LevenbergMarquardt:
     explicit ``implicit_preconditioner`` overrides it.
 
     ``solve(...).x`` has a custom implicit AD rule with respect to ``p``. By
-    default, ``implicit_solver="auto"`` uses a fully matrix-free CG implicit
-    solve when the forward solver is ``linear_solver="cg"``, and otherwise uses
-    the legacy dense Cholesky solve. Pass ``implicit_solver="cholesky"`` to
-    force the dense implicit rule, or ``implicit_solver="cg"`` to force the
-    matrix-free rule. A cg-resolved implicit solve likewise requires
+    default, ``implicit_solver="auto"`` follows the forward solver's
+    geometry: a fully matrix-free dual CG implicit solve when
+    ``linear_solver="cg"``; for the whitened solvers ("qr", "augmented_qr",
+    "lsmr") a trace-time shape dispatch -- the n-wide primal QR rule
+    (``"primal_qr"``) for a tall Jacobian (``m > n``), the dense dual
+    Cholesky rule otherwise; and the dense dual Cholesky rule for the dual
+    ``"cholesky"`` forward solver. The explicit choices are
+    ``"dual_cholesky"`` (the m x m residual-space Gram factorization),
+    ``"dual_cg"`` (matrix-free), ``"primal_qr"`` (augmented QR of the
+    whitened ``[B; sqrt(ridge) I]``, ``B = J S`` -- n-wide, no dual Gram and
+    no condition-squaring normal equations), and ``"primal_cholesky"`` (the
+    n x n whitened normal equations); ``"cholesky"`` and ``"cg"`` remain as
+    backward-compatible aliases of the dual names. Nonzero-residual implicit
+    differentiation deliberately keeps the package's Gauss-Newton contract in
+    every rule -- it linearizes the residual constraint at the returned
+    solution and never includes residual-weighted second derivatives of the
+    full stationarity condition ``J' r = 0``. A cg-resolved implicit solve
+    likewise requires
     ``implicit_preconditioner``, an approximation of the UNDAMPED
     ``(J P J')^{-1} v``, taking either ``(v)`` or ``(v, damping)`` -- a
     callable REQUIRING the damping argument is called with an explicit
@@ -736,9 +761,13 @@ class LevenbergMarquardt:
     ``pad_dual_preconditioner``, which divides by the live damping and is
     rejected here at construction.
 
-    ``implicit_penalty`` regularizes the DENSE implicit rule only (the cg
+    ``implicit_penalty`` regularizes the DENSE implicit rules only (the cg
     implicit rule ignores it): the implicit dual is factored as
-    ``J P J' + implicit_penalty * trace(J P J') I_m``. Redundant residual
+    ``J P J' + implicit_penalty * trace(J P J') I_m``, and the primal rules
+    use the same trace-scaled ridge on the whitened normal operator,
+    ``B'B + implicit_penalty * trace(B'B) I_n`` (``trace(B'B) =
+    trace(J P J')``, so the penalty means the same thing in both
+    geometries). Redundant residual
     rows at the returned solution -- e.g. a simulated trajectory settled onto
     its steady state -- make the undamped dual singular and the unregularized
     factorization non-finite; for such consistent systems the ridge returns
@@ -779,6 +808,7 @@ class LevenbergMarquardt:
         damping_increase=4.0,
         max_damping=None,
         linear_solver="cholesky",
+        jacobian_mode="auto",
         iterative_tol=0.0,
         iterative_atol=0.0,
         iterative_maxiter=8,
@@ -802,6 +832,8 @@ class LevenbergMarquardt:
         canonical_residual, residual_arity = canonicalize_residual(residual_fn)
         if linear_solver not in ("cholesky", "qr", "augmented_qr", "cg", "lsmr"):
             raise ValueError(f"unknown linear_solver: {linear_solver}")
+        if jacobian_mode not in ("auto", "fwd", "rev"):
+            raise ValueError(f"unknown jacobian_mode: {jacobian_mode}")
         if init_damping <= 0:
             raise ValueError("init_damping must be positive")
         if damping_decrease <= 0:
@@ -837,7 +869,19 @@ class LevenbergMarquardt:
                 raise ValueError('recycle requires linear_solver="cg"')
             if not isinstance(recycle, RecycleConfig):
                 raise TypeError("recycle must be a RecycleConfig or None")
-        if implicit_solver not in ("auto", "cholesky", "cg"):
+        # "cholesky" and "cg" are backward-compatible aliases for the
+        # geometry-explicit dual names.
+        canonical_implicit_solver = {
+            "cholesky": "dual_cholesky",
+            "cg": "dual_cg",
+        }.get(implicit_solver, implicit_solver)
+        if canonical_implicit_solver not in (
+            "auto",
+            "dual_cholesky",
+            "dual_cg",
+            "primal_qr",
+            "primal_cholesky",
+        ):
             raise ValueError(f"unknown implicit_solver: {implicit_solver}")
         if implicit_tol is not None and implicit_tol < 0:
             raise ValueError("implicit_tol must be nonnegative or None")
@@ -851,15 +895,34 @@ class LevenbergMarquardt:
             raise ValueError(
                 "implicit_maxiter must be set when both implicit tolerances are zero"
             )
-        resolved_implicit_solver = (
-            "cg"
-            if implicit_solver == "cg"
-            or (implicit_solver == "auto" and linear_solver == "cg")
-            else "cholesky"
-        )
-        if implicit_preconditioner is not None and resolved_implicit_solver != "cg":
+        # "auto" makes the implicit geometry follow the forward solver: a cg
+        # forward solve keeps the matrix-free dual cg rule; the whitened
+        # solvers ("qr", "augmented_qr", "lsmr") resolve by Jacobian geometry
+        # at trace time ("geometry": primal_qr for tall m > n, dual_cholesky
+        # otherwise); the dual "cholesky" forward solver keeps the dual
+        # cholesky rule.
+        if canonical_implicit_solver == "auto":
+            if linear_solver == "cg":
+                resolved_implicit_solver = "dual_cg"
+            elif linear_solver in ("qr", "augmented_qr", "lsmr"):
+                resolved_implicit_solver = "geometry"
+            else:
+                resolved_implicit_solver = "dual_cholesky"
+        else:
+            resolved_implicit_solver = canonical_implicit_solver
+        if (
+            jacobian_mode != "auto"
+            and linear_solver in ("cg", "lsmr")
+            and resolved_implicit_solver == "dual_cg"
+        ):
             raise ValueError(
-                'implicit_preconditioner requires implicit_solver="cg" '
+                "jacobian_mode controls dense Jacobian assembly, but neither "
+                f'linear_solver="{linear_solver}" nor the cg-resolved implicit '
+                "solver ever materializes the Jacobian"
+            )
+        if implicit_preconditioner is not None and resolved_implicit_solver != "dual_cg":
+            raise ValueError(
+                'implicit_preconditioner requires implicit_solver="cg"/"dual_cg" '
                 'or implicit_solver="auto" with linear_solver="cg"'
             )
         missing_dual_preconditioner = (
@@ -870,7 +933,7 @@ class LevenbergMarquardt:
         # A factory serves the implicit hook too (undamped apply at the solution),
         # so it satisfies the cg implicit requirement like an explicit one.
         missing_implicit_preconditioner = (
-            resolved_implicit_solver == "cg"
+            resolved_implicit_solver == "dual_cg"
             and implicit_preconditioner is None
             and preconditioner_factory is None
         )
@@ -900,11 +963,11 @@ class LevenbergMarquardt:
         if dual_solve_dtype is not None:
             if jnp.dtype(dual_solve_dtype) != jnp.dtype(jnp.float64):
                 raise ValueError("dual_solve_dtype must be None or jnp.float64")
-            if linear_solver != "cholesky" and resolved_implicit_solver != "cholesky":
+            if linear_solver != "cholesky" and resolved_implicit_solver == "dual_cg":
                 raise ValueError(
-                    "dual_solve_dtype promotes only the dense cholesky paths; "
-                    'it requires linear_solver="cholesky" or a '
-                    "cholesky-resolved implicit solver"
+                    "dual_solve_dtype promotes only the dense linear-algebra "
+                    'paths; it requires linear_solver="cholesky" or a '
+                    "dense-resolved implicit solver"
                 )
             if not jax.config.jax_enable_x64:
                 raise ValueError(
@@ -948,6 +1011,7 @@ class LevenbergMarquardt:
         self.damping_increase = damping_increase
         self.max_damping = max_damping
         self.linear_solver = linear_solver
+        self.jacobian_mode = jacobian_mode
         self.iterative_tol = iterative_tol
         self.iterative_atol = iterative_atol
         self.iterative_maxiter = iterative_maxiter
@@ -1004,6 +1068,7 @@ class LevenbergMarquardt:
                 damping_increase,
                 max_damping,
                 linear_solver,
+                jacobian_mode,
                 iterative_tol,
                 iterative_atol,
                 iterative_maxiter,
@@ -1116,6 +1181,37 @@ class LevenbergMarquardt:
             residual_norm=jnp.zeros((), dtype=dtype),
         )
 
+    def _resolve_jacobian_mode(self, m, n):
+        # Static (shape-driven) choice of dense Jacobian assembly: "auto"
+        # takes n forward-mode columns when the system is tall (n < m) and
+        # m reverse-mode rows otherwise, so the materialized basis is always
+        # the small side -- an m x m identity over a tall residual was the
+        # compile-time memory blowup of issue #23.
+        if self.jacobian_mode != "auto":
+            return self.jacobian_mode
+        return "fwd" if n < m else "rev"
+
+    def _dense_resid_jt_aux(self, residual_flat, theta):
+        # Materialize the residual and J' (shape (n, m)) for the dense
+        # solvers, choosing forward or reverse mode per _resolve_jacobian_mode.
+        if self.has_aux:
+            resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
+        else:
+            resid, jvp_fn = jax.linearize(residual_flat, theta)
+            aux = None
+        m = resid.shape[0]
+        n = theta.shape[0]
+        if self._resolve_jacobian_mode(m, n) == "fwd":
+            parameter_basis = jnp.eye(n, dtype=theta.dtype)
+            Jt = jax.vmap(jvp_fn)(parameter_basis)
+        else:
+            transpose_fn = jax.linear_transpose(jvp_fn, theta)
+            residual_basis = jnp.eye(m, dtype=resid.dtype)
+            Jt = jax.vmap(lambda cotangent: transpose_fn(cotangent)[0])(
+                residual_basis
+            ).T
+        return resid, Jt, aux
+
     def _residual_and_aux(self, x, args, p):
         if self.has_aux:
             value, aux = self.residual_fn(x, args, p)
@@ -1193,16 +1289,7 @@ class LevenbergMarquardt:
                 )
 
             def compute_resid_and_jt(_):
-                if self.has_aux:
-                    resid, pullback, aux = jax.vjp(residual_flat, theta, has_aux=True)
-                else:
-                    resid, pullback = jax.vjp(residual_flat, theta)
-                    aux = None
-                residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
-                Jt = jax.vmap(lambda cotangent: pullback(cotangent)[0])(
-                    residual_basis
-                ).T
-                return resid, Jt, aux
+                return self._dense_resid_jt_aux(residual_flat, theta)
 
             def reuse_resid_and_jt(_):
                 return lm_state.resid, lm_state.Jt, lm_state.aux
@@ -1214,11 +1301,7 @@ class LevenbergMarquardt:
                 operand=None,
             )
         else:
-            if self.has_aux:
-                resid, pullback, aux = jax.vjp(residual_flat, theta, has_aux=True)
-            else:
-                resid, pullback = jax.vjp(residual_flat, theta)
-                aux = None
+            resid, Jt, aux = self._dense_resid_jt_aux(residual_flat, theta)
         damping = jnp.asarray(lm_state.damping, dtype=resid.dtype)
         # Traced hyperparameters from the lm_state when present (resettable by
         # solve callbacks); the None fallback compiles to the same constants
@@ -1434,11 +1517,6 @@ class LevenbergMarquardt:
                 return self.metric_inv_sqrt(apply_Rinv(z))
 
         else:
-            if not self.cache_jacobian:
-                residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
-                Jt = jax.vmap(lambda cotangent: pullback(cotangent)[0])(
-                    residual_basis
-                ).T
             grad = Jt @ resid
 
             if self.linear_solver == "augmented_qr":
@@ -2081,9 +2159,29 @@ class LevenbergMarquardt:
     def _implicit_x_tangent_from_p(self, x, args, p, p_dot):
         if p is None:
             return jax.tree.map(_zero_tangent_leaf, x)
-        if self._resolved_implicit_solver == "cg":
+        rule = self._implicit_rule_at(x, args, p)
+        if rule == "dual_cg":
             return self._implicit_x_tangent_from_p_cg(x, args, p, p_dot)
+        if rule in ("primal_qr", "primal_cholesky"):
+            return self._implicit_x_tangent_from_p_primal(x, args, p, p_dot, rule)
         return self._implicit_x_tangent_from_p_cholesky(x, args, p, p_dot)
+
+    def _implicit_rule_at(self, x, args, p):
+        # The trace-time resolution of the "geometry" implicit selection:
+        # shapes are static, so the branch is a Python-level choice matched to
+        # the forward whitened solvers -- the n-wide primal QR rule for a tall
+        # Jacobian (m > n), the dual cholesky rule otherwise.
+        rule = self._resolved_implicit_solver
+        if rule != "geometry":
+            return rule
+        theta, _ = ravel_pytree(x)
+        m = jax.eval_shape(
+            lambda x_, args_, p_: self._residual_and_aux(x_, args_, p_)[0],
+            x,
+            args,
+            p,
+        ).shape[0]
+        return "primal_qr" if m > theta.size else "dual_cholesky"
 
     def _implicit_x_tangent_from_p_cholesky(self, x, args, p, p_dot):
         theta, unravel = ravel_pytree(x)
@@ -2092,9 +2190,17 @@ class LevenbergMarquardt:
             return self._residual_and_aux(unravel(theta_value), args, p)[0]
 
         residual, theta_jvp = jax.linearize(residual_from_theta, theta)
-        residual_basis = jnp.eye(residual.shape[0], dtype=residual.dtype)
-        theta_transpose = jax.linear_transpose(theta_jvp, theta)
-        Jt = jax.vmap(lambda cotangent: theta_transpose(cotangent)[0])(residual_basis).T
+        # Same geometry-aware assembly as the forward dense solvers: forward
+        # columns when tall, reverse rows when fat (issue #23).
+        if self._resolve_jacobian_mode(residual.shape[0], theta.shape[0]) == "fwd":
+            parameter_basis = jnp.eye(theta.shape[0], dtype=theta.dtype)
+            Jt = jax.vmap(theta_jvp)(parameter_basis)
+        else:
+            residual_basis = jnp.eye(residual.shape[0], dtype=residual.dtype)
+            theta_transpose = jax.linear_transpose(theta_jvp, theta)
+            Jt = jax.vmap(lambda cotangent: theta_transpose(cotangent)[0])(
+                residual_basis
+            ).T
 
         def residual_from_p(p_value):
             return self._residual_and_aux(x, args, p_value)[0]
@@ -2131,6 +2237,79 @@ class LevenbergMarquardt:
         dual_solution = jsp_linalg.cho_solve(factor, residual_p_dot.astype(dual_dtype))
         theta_dot = -gram_step_left @ dual_solution
         return unravel(theta_dot.astype(residual.dtype))
+
+    def _implicit_x_tangent_from_p_primal(self, x, args, p, p_dot, rule):
+        # Parameter-space Gauss-Newton implicit rule for tall full-column-rank
+        # systems: with S = M^{-1/2} and B = J S, the tangent is
+        # x_dot = S u with u = -argmin_u ||B u + r_p||^2, so the factorization
+        # stays n-wide -- no m x m identity, dual Gram, or condition-squaring
+        # normal equations ("primal_qr"; "primal_cholesky" trades the
+        # augmented QR for the n x n normal equations). Rank deficiency is
+        # handled by the same trace-scaled ridge as the dense dual rule:
+        # the system solved is (B'B + implicit_penalty * trace(B'B) I) u =
+        # -B' r_p, factored as an augmented QR of [B; sqrt(ridge) I].
+        theta, unravel = ravel_pytree(x)
+
+        def residual_from_theta(theta_value):
+            return self._residual_and_aux(unravel(theta_value), args, p)[0]
+
+        residual, theta_jvp = jax.linearize(residual_from_theta, theta)
+        n = theta.shape[0]
+        # Forward-mode columns over the n-wide parameter basis (issue #23's
+        # geometry) -- the rev alternative would rebuild the m x m identity
+        # this rule exists to avoid.
+        parameter_basis = jnp.eye(n, dtype=theta.dtype)
+        Jt = jax.vmap(theta_jvp)(parameter_basis)
+
+        def residual_from_p(p_value):
+            return self._residual_and_aux(x, args, p_value)[0]
+
+        residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
+        # dual_solve_dtype promotes this dense path exactly like the dual
+        # cholesky rule: J' cast wide before the metric application, the
+        # factorization and solves run wide, only the tangent is cast back.
+        dual_dtype = (
+            residual.dtype if self.dual_solve_dtype is None else self.dual_solve_dtype
+        )
+        transformed_Jt = self.metric_inv_sqrt_transpose(Jt.astype(dual_dtype))
+        penalty = self.implicit_penalty
+        if penalty is None:
+            penalty = 1e-12 if jnp.dtype(dual_dtype) == jnp.dtype(jnp.float64) else 1e-6
+        # trace(B'B) = ||B||_F^2 = trace(J P J'): the same relative ridge
+        # scale as the dual rule, so implicit_penalty means the same thing in
+        # both geometries. penalty = 0.0 restores the exact unregularized
+        # rule (non-finite tangents on a rank-deficient B, loudly).
+        ridge = penalty * jnp.sum(jnp.square(transformed_Jt))
+        rhs = -residual_p_dot.astype(dual_dtype)
+        if rule == "primal_qr":
+            augmented_matrix = jnp.concatenate(
+                (
+                    transformed_Jt.T,
+                    jnp.sqrt(ridge) * jnp.eye(n, dtype=dual_dtype),
+                ),
+                axis=0,
+            )
+            Q, R = jnp.linalg.qr(augmented_matrix, mode="reduced")
+            augmented_rhs = jnp.concatenate((rhs, jnp.zeros(n, dtype=dual_dtype)))
+            u = jsp_linalg.solve_triangular(R, Q.T @ augmented_rhs)
+        else:
+            normal_matrix = transformed_Jt @ transformed_Jt.T + ridge * jnp.eye(
+                n, dtype=dual_dtype
+            )
+            normal_factor = jsp_linalg.cho_factor(normal_matrix)
+            u = jsp_linalg.cho_solve(normal_factor, transformed_Jt @ rhs)
+        # The final S application acts on tangent data; declare its transpose
+        # to be S' (metric.inv_sqrt_transpose) through an identity
+        # custom_linear_solve, the same device the cg rule uses for P, so an
+        # iterative inv_sqrt callback is only ever evaluated, never
+        # transposed by JAX.
+        theta_dot = jax.lax.custom_linear_solve(
+            lambda v: v,
+            u.astype(residual.dtype),
+            solve=lambda _, b: self.metric_inv_sqrt(b),
+            transpose_solve=lambda _, b: self.metric_inv_sqrt_transpose(b),
+        )
+        return unravel(theta_dot)
 
     def _implicit_x_tangent_from_p_cg(self, x, args, p, p_dot):
         theta, unravel = ravel_pytree(x)
