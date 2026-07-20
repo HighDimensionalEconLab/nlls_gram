@@ -546,7 +546,8 @@ concentrated in the slow, selection-critical directions. LSMR works at
   is wrapped in `lax.custom_linear_solve` on the SPD normal operator
   `BᵀB + damping I`). Differentiating a forward `solve(...).x` under the default
   `implicit_solver="auto"` follows the Jacobian geometry: the n-wide `primal_qr`
-  implicit rule when tall (`m > n`), the dense `dual_cholesky` rule otherwise
+  implicit rule when tall or square (`m >= n`), the dense `dual_cholesky` rule
+  only when strictly fat (`m < n`)
   (see [Implicit AD](implicit_ad.md)); set `implicit_solver="cg"` (alias of
   `"dual_cg"`) with an `implicit_preconditioner` for a fully matrix-free
   derivative at very large `m`.

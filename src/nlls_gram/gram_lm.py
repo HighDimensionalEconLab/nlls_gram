@@ -697,9 +697,9 @@ class LevenbergMarquardt:
     ``R'R`` metric -- the step ``u = -(B'B + damping R'R)^{-1} B' r`` is a
     documented surrogate whose ``damping -> 0`` selection limit is ``R``-invariant.
     Differentiating a forward ``lsmr`` solve under ``implicit_solver="auto"``
-    follows the Jacobian geometry: the n-wide primal QR rule when tall
-    (``m > n``, materializing ``J'`` by n forward-mode columns), the dense
-    dual cholesky rule otherwise.
+    follows the Jacobian geometry: the n-wide primal QR rule when tall or
+    square (``m >= n``, materializing ``J'`` by n forward-mode columns), the
+    dense dual cholesky rule only when strictly fat (``m < n``).
 
     ``jacobian_mode`` controls how the dense solvers ("cholesky", "qr",
     "augmented_qr") and the dense implicit rules materialize ``J'``:
@@ -739,9 +739,11 @@ class LevenbergMarquardt:
     geometry: a fully matrix-free dual CG implicit solve when
     ``linear_solver="cg"``; for the whitened solvers ("qr", "augmented_qr",
     "lsmr") a trace-time shape dispatch -- the n-wide primal QR rule
-    (``"primal_qr"``) for a tall Jacobian (``m > n``), the dense dual
-    Cholesky rule otherwise; and the dense dual Cholesky rule for the dual
-    ``"cholesky"`` forward solver. The explicit choices are
+    (``"primal_qr"``) for a tall or square Jacobian (``m >= n``; the square
+    tie deliberately avoids the condition-squaring Gram assembly), the dense
+    dual Cholesky rule only when strictly fat (``m < n``); and the dense
+    dual Cholesky rule for the dual ``"cholesky"`` forward solver. The
+    explicit choices are
     ``"dual_cholesky"`` (the m x m residual-space Gram factorization),
     ``"dual_cg"`` (matrix-free), ``"primal_qr"`` (augmented QR of the
     whitened ``[B; sqrt(ridge) I]``, ``B = J S`` -- n-wide, no dual Gram and
@@ -898,9 +900,10 @@ class LevenbergMarquardt:
         # "auto" makes the implicit geometry follow the forward solver: a cg
         # forward solve keeps the matrix-free dual cg rule; the whitened
         # solvers ("qr", "augmented_qr", "lsmr") resolve by Jacobian geometry
-        # at trace time ("geometry": primal_qr for tall m > n, dual_cholesky
-        # otherwise); the dual "cholesky" forward solver keeps the dual
-        # cholesky rule.
+        # at trace time ("geometry": primal_qr for tall or square m >= n --
+        # the square tie avoids the condition-squaring Gram -- dual_cholesky
+        # only for strictly fat m < n); the dual "cholesky" forward solver
+        # keeps the dual cholesky rule.
         if canonical_implicit_solver == "auto":
             if linear_solver == "cg":
                 resolved_implicit_solver = "dual_cg"
@@ -2195,7 +2198,11 @@ class LevenbergMarquardt:
         # The trace-time resolution of the "geometry" implicit selection:
         # shapes are static, so the branch is a Python-level choice matched to
         # the forward whitened solvers -- the n-wide primal QR rule for a tall
-        # Jacobian (m > n), the dual cholesky rule otherwise.
+        # or square Jacobian (m >= n), the dual cholesky rule only when the
+        # dual system is strictly smaller (m < n). The tie goes to the primal
+        # rule: at m == n both factorizations are the same size, but the dual
+        # route assembles and factors the Gram J P J', squaring the condition
+        # number, while the QR factors the whitened Jacobian directly.
         rule = self._resolved_implicit_solver
         if rule != "geometry":
             return rule
@@ -2206,7 +2213,7 @@ class LevenbergMarquardt:
             args,
             p,
         ).shape[0]
-        return "primal_qr" if m > theta.size else "dual_cholesky"
+        return "primal_qr" if m >= theta.size else "dual_cholesky"
 
     def _implicit_x_tangent_from_p_cholesky(self, x, args, p, p_dot):
         theta, unravel = ravel_pytree(x)

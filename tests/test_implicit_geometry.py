@@ -175,6 +175,20 @@ def test_auto_implicit_solver_dispatch():
     )
     assert fat._implicit_rule_at(X0_FAT, None, P_FAT) == "dual_cholesky"
 
+    # The square tie (m == n) goes to the primal rule: same factorization
+    # width either way, but the dual route would assemble and factor the
+    # condition-squaring Gram.
+    def square_residual(x, args, p):
+        return A_TALL[:N, :] @ x - p
+
+    square = LevenbergMarquardt(
+        square_residual,
+        linear_solver="augmented_qr",
+        geodesic_acceleration=False,
+        cache_jacobian=False,
+    )
+    assert square._implicit_rule_at(X0, None, P0[:N]) == "primal_qr"
+
 
 def test_backward_compatible_implicit_solver_aliases():
     # "cholesky" is an alias of "dual_cholesky": identical construction and

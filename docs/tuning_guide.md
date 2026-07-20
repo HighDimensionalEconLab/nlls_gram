@@ -88,7 +88,7 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   bound on the normal-equations residual, measured on the preconditioned operator,
   callback-schedulable). Differentiating a forward `lsmr` `solve(...).x` under
   the default `implicit_solver="auto"` follows the Jacobian geometry: the
-  n-wide `primal_qr` implicit rule when tall (`m > n`), the dense
+  n-wide `primal_qr` implicit rule when tall or square (`m >= n`), the dense
   `dual_cholesky` rule otherwise (see
   [Implicit AD](implicit_ad.md#implicit-solver-geometries-dual-vs-primal-dense-vs-matrix-free));
   pass `implicit_solver="cg"` (alias of `"dual_cg"`) with an
@@ -161,7 +161,7 @@ float32 and `1e-10` in float64; these defaults target derivative accuracy, not
 cheap forward steps. Use `implicit_solver="dual_cholesky"` (alias
 `"cholesky"`) when you want the dense residual-space implicit rule,
 `"primal_qr"`/`"primal_cholesky"` for the n-wide parameter-space rules on
-tall (`m > n`) systems, or tune `implicit_tol`, `implicit_atol`,
+tall or square (`m >= n`) systems, or tune `implicit_tol`, `implicit_atol`,
 `implicit_maxiter`, and `implicit_preconditioner(v)` for a matrix-free
 derivative.
 

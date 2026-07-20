@@ -125,7 +125,7 @@ $$
 $$
 
 The **primal** rules work in whitened parameter space, matched to a tall
-(\(m > n\)) full-column-rank Jacobian, where the \(m\times m\) dual Gram is
+or square (\(m \ge n\)) full-column-rank Jacobian, where the \(m\times m\) dual Gram is
 structurally singular. With \(S = M^{-1/2}\) (so \(S S^\top = P\)) and
 \(B = J_\theta S \in \mathbb R^{m\times n}\), the Gauss-Newton tangent is
 
@@ -157,7 +157,11 @@ forward-mode JVP columns over the parameter identity basis — no \(m\times m\)
 residual identity is ever materialized. Like the whitened forward solvers,
 the primal rules apply the metric through its square-root callbacks
 `metric.inv_sqrt` / `metric.inv_sqrt_transpose` (the identity metric
-supplies them).
+supplies them). A custom metric must therefore provide both callbacks to use
+an explicit `"primal_qr"`/`"primal_cholesky"` — a solve-only metric is
+rejected at construction rather than silently whitening with the identity
+(the whitened forward solvers already require the same callbacks, so the
+`"auto"`-geometry path can never hit this).
 
 **One contract holds across all rules**: nonzero-residual implicit
 differentiation *intentionally* uses the Gauss-Newton linearization of the
@@ -206,7 +210,8 @@ selector (the resolution is recorded in
 - `implicit_solver="auto"` (the default) follows the forward solver's
   geometry: `linear_solver="cg"` resolves to `dual_cg`;
   `linear_solver="qr"`, `"augmented_qr"`, and `"lsmr"` resolve by Jacobian
-  shape at trace time (shapes are static) — `primal_qr` when \(m > n\),
+  shape at trace time (shapes are static) — `primal_qr` when \(m \ge n\)
+  (the square tie deliberately avoids the condition-squaring Gram assembly),
   `dual_cholesky` otherwise; and `linear_solver="cholesky"` resolves to
   `dual_cholesky`.
 

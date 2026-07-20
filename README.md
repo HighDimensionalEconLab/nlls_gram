@@ -121,7 +121,7 @@ the docs give the metric-minimum-norm formula and a minimal `jax.jvp` /
 `jax.vjp` example. With `linear_solver="cg"` the default implicit AD rule is
 matrix-free; pass `implicit_solver="cholesky"` (alias of `"dual_cholesky"`)
 to restore the dense rule. `implicit_solver="auto"` otherwise follows the
-forward solver's geometry — the n-wide `"primal_qr"` rule for tall (`m > n`)
+forward solver's geometry — the n-wide `"primal_qr"` rule for tall or square (`m >= n`)
 whitened solves, the dense dual Cholesky rule otherwise; the docs cover the
 full `dual_*`/`primal_*` vocabulary. The
 metric matters for underdetermined roots because it selects which tangent is
