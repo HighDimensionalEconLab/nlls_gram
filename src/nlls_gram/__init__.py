@@ -10,7 +10,9 @@ optional callback control; solve(multi_start=MultiStart(...)) retries failed
 solves from fresh initial conditions or races them in parallel under vmap,
 returning the single best result. With has_aux=True the residual returns
 (residual, aux) and the aux output is reported on LMInfo. An optional Metric
-defines a positive-definite parameter-space metric for LM damping.
+defines a positive-definite parameter-space metric for LM damping; a
+MetricFactory instead rebuilds that metric from the current iterate and
+residual aux every accepted step.
 The dense linear-solver choices include residual-space Cholesky, reduced QR,
 and direct augmented QR for small or rank-deficient systems. Two matrix-free
 solvers use only J/J' products: residual-space CG on the metric-damped dual
@@ -33,6 +35,7 @@ from nlls_gram.gram_lm import (
     LMSolveResult,
     LMState,
     LMStatus,
+    MetricFactory,
     MultiStart,
     MultiStartInfo,
     PreconditionerFactory,
@@ -78,6 +81,7 @@ __all__ = [
     "LMSolveContext",
     "LMSolveResult",
     "Metric",
+    "MetricFactory",
     "MultiStart",
     "MultiStartInfo",
     "DrawNNXModule",

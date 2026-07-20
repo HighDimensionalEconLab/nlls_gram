@@ -15,7 +15,9 @@ let \(S\) satisfy \(SS^\top=M^{-1}\).
 | `inv_sqrt_transpose(x)` | \(S^\top x\) |
 
 Fields left as `None` (and `metric=None` itself) default to the identity
-metric.
+metric. A fixed `Metric` closes over its data once, at construction; for a
+metric that depends on the current iterate or on residual aux outputs, see
+[Iterate-Dependent Metrics](#iterate-dependent-metrics-metricfactory) below.
 
 Shape requirements:
 
@@ -120,3 +122,86 @@ solve must run to convergence (a truncated CG is not even a linear function
 of its input; never cap `maxiter` as a cost control). See
 [Utilities](utilities.md#unified-shifted-block-metrics) for the shift's
 role and the exactness caveat.
+
+## Iterate-Dependent Metrics (MetricFactory)
+
+A fixed `Metric` freezes its data at construction. `MetricFactory` instead
+rebuilds the metric from the live solve, through a value-hashable
+`(prepare, build)` pair passed as `metric_factory=` (pass at most one of
+`metric` or `metric_factory`):
+
+- `prepare(x, args, p, aux) -> state` builds a fixed-shape pytree of arrays
+  from the current iterate `x` (the user pytree, not the raveled vector),
+  the residual `args`, `p`, and the residual aux evaluated at the same
+  linearization point (`None` when `has_aux=False`). It runs once per
+  accepted step inside the jitted loop; after a rejected step `x` did not
+  move, so the carried state is reused. Expensive setup — Gram assembly, a
+  dense Cholesky — belongs here, where it is cached.
+- `build(state) -> Metric` assembles the metric from the prepared state,
+  once per `update` and before the inner iterative loops, so builder-internal
+  setup (e.g. the tridiagonal Cholesky scan) runs once per step rather than
+  per cg/lsmr iteration. Any `Metric`-returning builder or composition works
+  directly.
+
+The canonical use is a factor the residual passes back through its aux
+output — the residual computes it primally, the Jacobian never
+differentiates it, and the metric consumes it:
+
+```python
+import jax.numpy as jnp
+
+from nlls_gram import LevenbergMarquardt, MetricFactory, metric_from_cholesky
+
+
+def residual(x, args, p):
+    value = economic_residual(x, args, p)
+    gram = kernel_gram(x["points"], p["kernel"])
+    L = jnp.linalg.cholesky(gram + p["eps"] * jnp.eye(gram.shape[0]))
+    return value, {"L": L}
+
+
+solver = LevenbergMarquardt(
+    residual,
+    has_aux=True,
+    metric_factory=MetricFactory(
+        prepare=lambda x, args, p, aux: aux["L"],
+        build=metric_from_cholesky,
+    ),
+)
+```
+
+`prepare` can equally compute from the iterate directly (no `has_aux`
+needed), and `build` can compose the structural constructors — a
+block-diagonal kernel-plus-ridge metric, a state-space Matérn metric on
+moving points, or `metric_with_compute_dtype` for a float64 metric state
+under a float32 residual:
+
+```python
+factory = MetricFactory(
+    prepare=lambda x, args, p, aux: jnp.sort(x["points"]),
+    build=lambda pts: metric_from_state_space(pts, h, Pinf, transition),
+)
+```
+
+Rules and semantics:
+
+- The built `Metric` obeys the same per-solver callback requirements and
+  shape contract as a fixed custom metric; validation runs when `build`
+  first executes (at trace time), not at construction.
+- The metric defines the subproblem, so `build`'s callbacks must stay exact
+  (unlike a preconditioner, which may approximate).
+- Within one `update`, the velocity, geodesic-acceleration, and norm
+  applications all use the same pre-step state.
+- A `solve` callback that replaces `x` or `args` invalidates the carried
+  state, and multi-start draws never inherit another start's state.
+- With `has_aux=True`, `jax.linearize(..., has_aux=True)` keeps aux primal:
+  an aux-only factorization costs one primal evaluation per linearization
+  and contributes nothing to the Jacobian's JVP/VJP passes — no
+  `stop_gradient` is needed.
+- Under implicit differentiation of `solve` with respect to `p`, the metric
+  is frozen at the returned solution: `prepare`/`build` run once at
+  `(result.x, result.args, result.p, result.aux)` and the state-dependence
+  is not differentiated. See
+  [Implicit differentiation](implicit_ad.md).
+- Like every jit-static hook, define the `(prepare, build)` pair once at
+  setup scope; a fresh closure per call keys a new compilation.

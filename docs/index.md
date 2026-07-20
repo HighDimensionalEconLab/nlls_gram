@@ -150,7 +150,11 @@ limits, the spectral-filter view, and the kernel/RKHS metric choices.
 A custom positive-definite parameter-space metric is passed as a single
 `metric=Metric(...)` argument. See [Metrics](metrics.md) for the `Metric`
 callback contract and validation rules, the `metric_from_cholesky` helper,
-and dense and matrix-free examples.
+and dense and matrix-free examples. For a metric that depends on the current
+iterate or on residual aux outputs, pass a
+`metric_factory=MetricFactory(prepare, build)` instead — the state is
+rebuilt once per accepted step and `build` returns a plain `Metric`
+([Iterate-Dependent Metrics](metrics.md#iterate-dependent-metrics-metricfactory)).
 
 ## Linear Solver Formulas
 
@@ -464,6 +468,8 @@ narrower and focuses on underdetermined LM with explicit parameter-space metrics
 ::: nlls_gram.LevenbergMarquardt
 
 ::: nlls_gram.Metric
+
+::: nlls_gram.MetricFactory
 
 ::: nlls_gram.metric_from_cholesky
 

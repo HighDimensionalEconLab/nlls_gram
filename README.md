@@ -148,6 +148,13 @@ structural constructors (`metric_from_tridiagonal_precision`,
 Matérn/state-space kernel Grams, `metric_from_diagonal`,
 `blockdiag_metric`) so common metrics need no callback plumbing.
 
+For a metric that depends on the current iterate or on residual aux outputs
+(`has_aux=True`), pass `metric_factory=MetricFactory(prepare, build)` instead
+of `metric`: `prepare(x, args, p, aux)` caches a state once per accepted step
+and `build(state)` returns a plain `Metric` — any of the constructors above
+slots in directly, e.g.
+`MetricFactory(prepare=lambda x, args, p, aux: aux["L"], build=metric_from_cholesky)`.
+
 ## Solvers
 
 - `linear_solver="cholesky"`: dense residual-space Gram solve, the default.

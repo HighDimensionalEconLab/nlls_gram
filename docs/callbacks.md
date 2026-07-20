@@ -304,7 +304,9 @@ result = solver.solve(
 
 (`dataclasses` here is the standard-library module.) This recipe composes
 with `cache_jacobian=True` without extra care: any action that changes the
-values of `x` or `args` invalidates the Jacobian cache automatically.
+values of `x` or `args` invalidates the Jacobian cache automatically — and
+likewise the `metric_factory` prepared state, which is rebuilt at the new
+point on the next update.
 
 ### Scheduled Inner-Solve Accuracy
 

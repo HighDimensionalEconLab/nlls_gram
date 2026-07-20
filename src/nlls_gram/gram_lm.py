@@ -98,7 +98,8 @@ class LMState:
     features that need them and stay ``None`` on the default path (compiled away
     at no cost). A ``solve`` callback that rebuilds ``lm_state`` must PRESERVE the
     fields it does not mean to change -- in particular the ``recycle`` basis and
-    the ``precond``/``precond_valid`` factory state, which carry across steps.
+    the ``precond``/``precond_valid`` and ``metric_state``/``metric_valid``
+    factory state, which carry across steps.
 
     Attributes:
         damping: ``()`` current LM damping ``lambda``.
@@ -121,6 +122,11 @@ class LMState:
         precond_valid: ``()`` bool -- the carried ``precond`` is still current
             because ``x`` has not moved since it was built (so it is reused, not
             rebuilt); ``None`` on the default path.
+        metric_state: ``metric_factory`` prepared state (the ``prepare``-built
+            pytree) at the current ``x``; ``None`` on the default path.
+        metric_valid: ``()`` bool -- the carried ``metric_state`` is still
+            current because ``x`` has not moved since it was built (so it is
+            reused, not rebuilt); ``None`` on the default path.
     """
 
     damping: jax.Array
@@ -132,6 +138,8 @@ class LMState:
     recycle: RecycleState | None = None
     precond: Any = None
     precond_valid: jax.Array | None = None
+    metric_state: Any = None
+    metric_valid: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -500,6 +508,87 @@ class WhitenedPreconditioner:
         )
 
 
+class MetricFactory:
+    """Iterate-aware metric: a value-hashable ``(prepare, build)`` pair.
+
+    Supplies a :class:`~nlls_gram.Metric` REBUILT from the current iterate every
+    accepted step, replacing the fixed ``metric``. Pass at most one of ``metric``
+    or ``metric_factory``. Use it when the metric depends on the current iterate
+    or on residual byproducts -- e.g. a kernel Gram factor over state points that
+    live in ``x``, or a factor the residual passes back through its aux output
+    (``has_aux=True``)::
+
+        def residual(x, args, p):
+            value = economic_residual(x, args, p)
+            gram = kernel_gram(x["points"], p["kernel"])
+            L = jnp.linalg.cholesky(gram + p["eps"] * jnp.eye(gram.shape[0]))
+            return value, {"L": L}
+
+        solver = LevenbergMarquardt(
+            residual,
+            has_aux=True,
+            metric_factory=MetricFactory(
+                prepare=lambda x, args, p, aux: aux["L"],
+                build=metric_from_cholesky,
+            ),
+        )
+
+    - ``prepare(x, args, p, aux) -> state`` builds a fixed-shape pytree of
+      arrays from the CURRENT solver iterate ``x`` (the user pytree, NOT the
+      raveled flat ``theta``), the residual ``args``, ``p``, and the residual
+      aux evaluated at the same linearization point (``None`` when
+      ``has_aux=False``). Runs inside the jitted loop as traced ops (no
+      recompile), once per accepted step: after a rejected step ``x`` did not
+      move, so the carried state is reused. Expensive setup (Gram assembly, a
+      dense Cholesky) belongs here, where it is cached.
+    - ``build(state) -> Metric`` assembles the metric from the prepared state:
+      any ``Metric``-returning builder (``metric_from_cholesky``,
+      ``metric_from_tridiagonal_precision``, ``blockdiag_metric``
+      compositions, ...) or hand-rolled unary callbacks closing over ``state``.
+      Called once per ``update`` BEFORE the iterative loops, so builder-internal
+      setup (e.g. a tridiagonal Cholesky scan) is loop-invariant -- computed
+      once per step, not per inner cg/lsmr iteration.
+
+    The built metric obeys the same rules as a fixed custom ``metric``: which
+    callbacks the linear solver requires, the shape contract, and exactness
+    (unlike a preconditioner, the metric defines the subproblem). Validation of
+    the required callbacks runs when ``build`` first executes (at trace time)
+    rather than at construction. Within one ``update`` the velocity,
+    geodesic-acceleration, and norm applications all use the same pre-step
+    state. A ``solve`` callback that replaces ``x`` or ``args`` invalidates the
+    carried state, and multi-start draws never inherit another start's state.
+
+    Under implicit differentiation of ``solve`` with respect to ``p``, the
+    metric is FROZEN at the returned solution: ``prepare``/``build`` run once at
+    ``(result.x, result.args, result.p, result.aux)`` and the state-dependence
+    is not differentiated -- the same contract as a fixed metric closing over
+    constants. The built metric must stay self-adjoint and positive definite
+    for that fixed state.
+
+    Value-hashable on ``(prepare, build)`` with jit's static-key semantics:
+    equal pairs share one compiled solve loop, so define the callables once at
+    setup scope; a fresh closure per call keys a new compile.
+    """
+
+    def __init__(self, prepare, build):
+        if not callable(prepare):
+            raise TypeError("MetricFactory.prepare must be callable")
+        if not callable(build):
+            raise TypeError("MetricFactory.build must be callable")
+        self.prepare = prepare
+        self.build = build
+
+    def __hash__(self):
+        return hash((self.prepare, self.build))
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, MetricFactory)
+            and self.prepare == other.prepare
+            and self.build == other.build
+        )
+
+
 def _tree_changed(new, old):
     new_leaves, new_treedef = jax.tree_util.tree_flatten(new)
     old_leaves, old_treedef = jax.tree_util.tree_flatten(old)
@@ -722,6 +811,16 @@ class LevenbergMarquardt:
     implicit preconditioner from the state at the converged solution unless an
     explicit ``implicit_preconditioner`` overrides it.
 
+    ``metric_factory`` (a ``MetricFactory``) is the iterate-aware alternative to
+    the fixed ``metric`` (pass at most one): ``prepare(x, args, p, aux)``
+    rebuilds the metric state from the current iterate and the residual aux once
+    per accepted step (a rejected step reuses the carried state), and
+    ``build(state)`` assembles a plain ``Metric`` from it once per ``update``.
+    The built metric follows the same per-solver callback requirements as a
+    fixed custom metric, validated at trace time; under implicit
+    differentiation it is frozen at the returned solution. See
+    :class:`MetricFactory`.
+
     ``solve(...).x`` has a custom implicit AD rule with respect to ``p``. By
     default, ``implicit_solver="auto"`` uses a fully matrix-free CG implicit
     solve when the forward solver is ``linear_solver="cg"``, and otherwise uses
@@ -793,6 +892,7 @@ class LevenbergMarquardt:
         implicit_penalty=None,
         dual_solve_dtype=None,
         metric=None,
+        metric_factory=None,
         has_aux=False,
         cache_jacobian=True,
         geodesic_acceleration=True,
@@ -912,6 +1012,11 @@ class LevenbergMarquardt:
                     'jax.config.update("jax_enable_x64", True) at startup '
                     "(explicitly float32 problem data stays float32)"
                 )
+        if metric_factory is not None:
+            if not isinstance(metric_factory, MetricFactory):
+                raise TypeError("metric_factory must be a MetricFactory or None")
+            if metric is not None:
+                raise ValueError("pass at most one of metric or metric_factory")
         if metric is None:
             metric = Metric()
         has_custom_metric = any(
@@ -969,6 +1074,7 @@ class LevenbergMarquardt:
         )
         self._resolved_implicit_solver = resolved_implicit_solver
         self.metric = metric
+        self.metric_factory = metric_factory
         # Only the dense cholesky path materializes J', so the flag is inert
         # for the other solvers.
         self.cache_jacobian = cache_jacobian and linear_solver == "cholesky"
@@ -1018,6 +1124,7 @@ class LevenbergMarquardt:
                 implicit_penalty,
                 self.dual_solve_dtype,
                 metric,
+                metric_factory,
                 has_aux,
                 self.cache_jacobian,
                 geodesic_acceleration,
@@ -1064,12 +1171,15 @@ class LevenbergMarquardt:
         damping = jnp.asarray(self.init_damping, dtype=residual.dtype)
         recycle = self._init_recycle_state(residual)
         precond, precond_valid = self._init_precond(x0, args, p)
+        metric_state, metric_valid = self._init_metric_state(x0, args, p, aux)
         if not self.cache_jacobian:
             return LMState(
                 damping,
                 recycle=recycle,
                 precond=precond,
                 precond_valid=precond_valid,
+                metric_state=metric_state,
+                metric_valid=metric_valid,
             )
         theta, _ = ravel_pytree(x0)
         return LMState(
@@ -1081,6 +1191,8 @@ class LevenbergMarquardt:
             recycle=recycle,
             precond=precond,
             precond_valid=precond_valid,
+            metric_state=metric_state,
+            metric_valid=metric_valid,
         )
 
     def _init_precond(self, x0, args, p):
@@ -1091,6 +1203,68 @@ class LevenbergMarquardt:
             return None, None
         state = jax.lax.stop_gradient(self.preconditioner_factory.prepare(x0, args, p))
         return state, jnp.asarray(True, dtype=jnp.bool_)
+
+    def _init_metric_state(self, x0, args, p, aux):
+        # Same lifecycle as _init_precond, but NOT stop-gradient'd: unlike a
+        # preconditioner, the metric defines the subproblem, so differentiating
+        # an update through init keeps the prepared state's dependence on
+        # (x0, args, p, aux).
+        if self.metric_factory is None:
+            return None, None
+        state = self.metric_factory.prepare(x0, args, p, aux)
+        return state, jnp.asarray(True, dtype=jnp.bool_)
+
+    def _metric_callbacks_from(self, metric):
+        # Trace-time validation and identity defaulting for a factory-built
+        # metric, matching the constructor rules for the fixed ``metric=`` path.
+        if not isinstance(metric, Metric):
+            raise TypeError(
+                "metric_factory.build must return a Metric; got "
+                f"{type(metric).__name__}"
+            )
+        has_custom = any(
+            cb is not None
+            for cb in (
+                metric.solve,
+                metric.norm,
+                metric.inv_sqrt,
+                metric.inv_sqrt_transpose,
+            )
+        )
+        if (
+            has_custom
+            and self.linear_solver in ("cholesky", "cg")
+            and metric.solve is None
+        ):
+            raise ValueError(
+                f'linear_solver="{self.linear_solver}" requires metric.solve on '
+                "the Metric returned by metric_factory.build"
+            )
+        if (
+            has_custom
+            and self.linear_solver in ("qr", "augmented_qr", "lsmr")
+            and (metric.inv_sqrt is None or metric.inv_sqrt_transpose is None)
+        ):
+            raise ValueError(
+                f'linear_solver="{self.linear_solver}" requires metric.inv_sqrt '
+                "and metric.inv_sqrt_transpose on the Metric returned by "
+                "metric_factory.build"
+            )
+        if has_custom and self.geodesic_acceleration and metric.norm is None:
+            raise ValueError(
+                "geodesic_acceleration (on by default) requires metric.norm on "
+                "the Metric returned by metric_factory.build; provide it or "
+                "pass geodesic_acceleration=False"
+            )
+        return (
+            (lambda v: v) if metric.solve is None else metric.solve,
+            (lambda v: jnp.linalg.norm(v)) if metric.norm is None else metric.norm,
+            (lambda v: v) if metric.inv_sqrt is None else metric.inv_sqrt,
+            (lambda v: v)
+            if metric.inv_sqrt_transpose is None
+            else metric.inv_sqrt_transpose,
+            metric.solve is not None,
+        )
 
     def _init_recycle_state(self, residual):
         # Cold recycle state sized from the dual dimension m = residual.size:
@@ -1231,6 +1405,39 @@ class LevenbergMarquardt:
         damping_decrease = jnp.asarray(hyper.damping_decrease, dtype=resid.dtype)
         damping_increase = jnp.asarray(hyper.damping_increase, dtype=resid.dtype)
 
+        # Iterate-aware metric: rebuild the prepared state from the pre-step x
+        # and this linearization's aux, or reuse the carried state when the
+        # previous step was rejected (x did not move) -- the precond_valid
+        # lax.cond pattern. build() runs once per update, before the iterative
+        # loops, so builder-internal setup (e.g. a tridiagonal Cholesky scan)
+        # is loop-invariant across the inner cg/lsmr iterations. The velocity,
+        # geodesic-acceleration, and norm applications below all share this
+        # one pre-step metric.
+        if self.metric_factory is not None:
+            if lm_state.metric_state is None:
+                raise ValueError(
+                    "metric_factory is set but the lm_state has no metric "
+                    "state; create the lm_state with init(x, args, p=p)"
+                )
+            metric_state = jax.lax.cond(
+                lm_state.metric_valid,
+                lambda _: lm_state.metric_state,
+                lambda _: self.metric_factory.prepare(x, args, p, aux),
+                operand=None,
+            )
+            (
+                metric_solve,
+                metric_norm,
+                metric_inv_sqrt,
+                metric_inv_sqrt_transpose,
+                _,
+            ) = self._metric_callbacks_from(self.metric_factory.build(metric_state))
+        else:
+            metric_solve = self.metric_solve
+            metric_norm = self.metric_norm
+            metric_inv_sqrt = self.metric_inv_sqrt
+            metric_inv_sqrt_transpose = self.metric_inv_sqrt_transpose
+
         # Recycled dual solutions + harvest, captured in call order by the cg
         # branch's solve_step when recycling is active; consumed below to build
         # the next RecycleState. Stays None for every non-recycled path.
@@ -1247,7 +1454,7 @@ class LevenbergMarquardt:
             cg_atol = jnp.asarray(hyper.iterative_atol, dtype=resid.dtype)
 
             def gram_matvec(cotangent):
-                return jvp_fn(self.metric_solve(JT(cotangent))) + damping * cotangent
+                return jvp_fn(metric_solve(JT(cotangent))) + damping * cotangent
 
             # θ-adaptive preconditioner: rebuild the state from the pre-step x
             # (this step's dual linearization point), or reuse the carried state
@@ -1321,7 +1528,7 @@ class LevenbergMarquardt:
                         harvest=is_velocity,
                     )
                     recycle_solves.append((dual_solution, harvest))
-                    return -self.metric_solve(JT(dual_solution))
+                    return -metric_solve(JT(dual_solution))
 
             else:
 
@@ -1334,7 +1541,7 @@ class LevenbergMarquardt:
                         maxiter=hyper.iterative_maxiter,
                         M=cg_preconditioner,
                     )
-                    return -self.metric_solve(JT(dual_solution))
+                    return -metric_solve(JT(dual_solution))
 
         elif self.linear_solver == "lsmr":
             # Matrix-free whitened damped LS: min_u ||r + B u||^2 + damping ||u||^2
@@ -1388,10 +1595,10 @@ class LevenbergMarquardt:
                     return w
 
             def A_matvec(z):  # A_r = B R^{-1}
-                return jvp_fn(self.metric_inv_sqrt(apply_Rinv(z)))
+                return jvp_fn(metric_inv_sqrt(apply_Rinv(z)))
 
             def At_matvec(w):  # A_r' = R^{-T} B'
-                return apply_RinvT(self.metric_inv_sqrt_transpose(JT(w)))
+                return apply_RinvT(metric_inv_sqrt_transpose(JT(w)))
 
             # N = A_r'A_r + damping I: the SPD normal operator custom_linear_solve
             # differentiates through (the implicit rule for the preconditioned
@@ -1431,7 +1638,7 @@ class LevenbergMarquardt:
                 z = jax.lax.custom_linear_solve(
                     N_matvec, c, solve=solve_N, transpose_solve=solve_N, symmetric=True
                 )
-                return self.metric_inv_sqrt(apply_Rinv(z))
+                return metric_inv_sqrt(apply_Rinv(z))
 
         else:
             if not self.cache_jacobian:
@@ -1442,7 +1649,7 @@ class LevenbergMarquardt:
             grad = Jt @ resid
 
             if self.linear_solver == "augmented_qr":
-                transformed_Jt = self.metric_inv_sqrt_transpose(Jt)
+                transformed_Jt = metric_inv_sqrt_transpose(Jt)
                 n = transformed_Jt.shape[0]
                 augmented_matrix = jnp.concatenate(
                     (
@@ -1461,11 +1668,11 @@ class LevenbergMarquardt:
                         R,
                         Q.T @ augmented_rhs,
                     )
-                    return self.metric_inv_sqrt(transformed_step)
+                    return metric_inv_sqrt(transformed_step)
 
             elif self.linear_solver == "qr":
                 # Whitened residual-dimension reduction followed by augmented QR.
-                transformed_Jt = self.metric_inv_sqrt_transpose(Jt)
+                transformed_Jt = metric_inv_sqrt_transpose(Jt)
                 if transformed_Jt.shape[0] >= transformed_Jt.shape[1]:
                     R = jnp.linalg.qr(transformed_Jt, mode="r")
                     basis_eye = jnp.eye(R.shape[0], dtype=resid.dtype)
@@ -1484,7 +1691,7 @@ class LevenbergMarquardt:
                             Qa.T @ augmented_rhs,
                         )
                         y = jsp_linalg.solve_triangular(R, z)
-                        return self.metric_inv_sqrt(transformed_Jt @ y)
+                        return metric_inv_sqrt(transformed_Jt @ y)
 
                 else:
                     Q, R = jnp.linalg.qr(transformed_Jt, mode="reduced")
@@ -1503,7 +1710,7 @@ class LevenbergMarquardt:
                             Ra,
                             Qa.T @ augmented_rhs,
                         )
-                        return self.metric_inv_sqrt(Q @ z)
+                        return metric_inv_sqrt(Q @ z)
 
             else:
                 # Damped Gram factorization: cholesky of J P J' + damping I.
@@ -1522,7 +1729,7 @@ class LevenbergMarquardt:
                     else self.dual_solve_dtype
                 )
                 transposed_jacobian = Jt.astype(dual_dtype)
-                gram_step_left = self.metric_solve(transposed_jacobian)
+                gram_step_left = metric_solve(transposed_jacobian)
                 linear_matrix = transposed_jacobian.T @ gram_step_left
                 linear_matrix = linear_matrix + jnp.asarray(
                     damping, dtype=dual_dtype
@@ -1561,8 +1768,8 @@ class LevenbergMarquardt:
             accelerated_step = velocity + 0.5 * acceleration
             acceleration_ratio = (
                 2.0
-                * self.metric_norm(acceleration)
-                / (self.metric_norm(velocity) + jnp.finfo(resid.dtype).eps)
+                * metric_norm(acceleration)
+                / (metric_norm(velocity) + jnp.finfo(resid.dtype).eps)
             )
             ratio_accepted = (
                 (geodesic_acceptance_ratio > zero)
@@ -1629,6 +1836,11 @@ class LevenbergMarquardt:
         if self.preconditioner_factory is not None:
             new_precond = precond_state
             new_precond_valid = ~improved
+        new_metric_state = lm_state.metric_state
+        new_metric_valid = lm_state.metric_valid
+        if self.metric_factory is not None:
+            new_metric_state = metric_state
+            new_metric_valid = ~improved
         # The input hyper (not the fallback) passes through so the loop carry
         # structure and dtypes are stable.
         if self.cache_jacobian:
@@ -1642,6 +1854,8 @@ class LevenbergMarquardt:
                 new_recycle,
                 new_precond,
                 new_precond_valid,
+                new_metric_state,
+                new_metric_valid,
             )
         else:
             new_lm_state = LMState(
@@ -1650,6 +1864,8 @@ class LevenbergMarquardt:
                 recycle=new_recycle,
                 precond=new_precond,
                 precond_valid=new_precond_valid,
+                metric_state=new_metric_state,
+                metric_valid=new_metric_valid,
             )
         return (
             unravel(theta_new),
@@ -1734,12 +1950,13 @@ class LevenbergMarquardt:
         if lm_state is None:
             # The loop recasts the damping and hyperparameter dtypes itself; the
             # Jacobian cache (cache_jacobian), the recycle state (sized from the
-            # residual), and the preconditioner state (built by prepare) need an
-            # eager init() for their shapes.
+            # residual), and the preconditioner/metric states (built by prepare)
+            # need an eager init() for their shapes.
             if (
                 self.cache_jacobian
                 or self.recycle is not None
                 or self.preconditioner_factory is not None
+                or self.metric_factory is not None
             ):
                 lm_state = self.init(x0, args, p=p)
             else:
@@ -2064,7 +2281,9 @@ class LevenbergMarquardt:
         # forward iterations. Everything except x, p, and aux -- histories,
         # counters, multi-start diagnostics -- is bookkeeping with zero
         # tangents.
-        x_dot = self._implicit_x_tangent_from_p(result.x, result.args, result.p, p_dot)
+        x_dot = self._implicit_x_tangent_from_p(
+            result.x, result.args, result.p, p_dot, result.aux
+        )
         zero_result = jax.tree.map(_zero_tangent_leaf, result)
         aux_dot = zero_result.aux
         if self.has_aux and result.p is not None:
@@ -2078,14 +2297,38 @@ class LevenbergMarquardt:
             aux_dot = jax.jvp(aux_at_solution, (result.x, result.p), (x_dot, p_dot))[1]
         return dataclasses.replace(zero_result, x=x_dot, p=p_dot, aux=aux_dot)
 
-    def _implicit_x_tangent_from_p(self, x, args, p, p_dot):
+    def _implicit_x_tangent_from_p(self, x, args, p, p_dot, aux):
         if p is None:
             return jax.tree.map(_zero_tangent_leaf, x)
-        if self._resolved_implicit_solver == "cg":
-            return self._implicit_x_tangent_from_p_cg(x, args, p, p_dot)
-        return self._implicit_x_tangent_from_p_cholesky(x, args, p, p_dot)
+        metric_inverse = self._metric_inverse
+        if self.metric_factory is not None:
+            # The metric is FROZEN at the returned solution: prepare/build once
+            # from (x, args, p, aux) -- x/args/p are the traced solution, so the
+            # state is traced data (never a closure constant) and repeated
+            # solves at different p do not recompile. Its state-dependence is
+            # not differentiated, the same contract as a fixed metric closing
+            # over constants.
+            solve_cb, _, inv_sqrt_cb, inv_sqrt_transpose_cb, has_solve = (
+                self._metric_callbacks_from(
+                    self.metric_factory.build(
+                        self.metric_factory.prepare(x, args, p, aux)
+                    )
+                )
+            )
+            if has_solve:
+                metric_inverse = solve_cb
+            else:
 
-    def _implicit_x_tangent_from_p_cholesky(self, x, args, p, p_dot):
+                def metric_inverse(v):
+                    return inv_sqrt_cb(inv_sqrt_transpose_cb(v))
+
+        if self._resolved_implicit_solver == "cg":
+            return self._implicit_x_tangent_from_p_cg(x, args, p, p_dot, metric_inverse)
+        return self._implicit_x_tangent_from_p_cholesky(
+            x, args, p, p_dot, metric_inverse
+        )
+
+    def _implicit_x_tangent_from_p_cholesky(self, x, args, p, p_dot, metric_inverse):
         theta, unravel = ravel_pytree(x)
 
         def residual_from_theta(theta_value):
@@ -2109,7 +2352,7 @@ class LevenbergMarquardt:
             residual.dtype if self.dual_solve_dtype is None else self.dual_solve_dtype
         )
         transposed_jacobian = Jt.astype(dual_dtype)
-        gram_step_left = self._metric_inverse(transposed_jacobian)
+        gram_step_left = metric_inverse(transposed_jacobian)
         gram = transposed_jacobian.T @ gram_step_left
         # Tikhonov ridge scaled by the trace: redundant residual rows at the
         # returned solution (e.g. a simulated trajectory settled onto its steady
@@ -2132,7 +2375,7 @@ class LevenbergMarquardt:
         theta_dot = -gram_step_left @ dual_solution
         return unravel(theta_dot.astype(residual.dtype))
 
-    def _implicit_x_tangent_from_p_cg(self, x, args, p, p_dot):
+    def _implicit_x_tangent_from_p_cg(self, x, args, p, p_dot, metric_inverse):
         theta, unravel = ravel_pytree(x)
 
         def residual_from_theta(theta_value):
@@ -2145,7 +2388,7 @@ class LevenbergMarquardt:
             return theta_transpose(cotangent)[0]
 
         def gram_matvec(cotangent):
-            return theta_jvp(self._metric_inverse(JT(cotangent)))
+            return theta_jvp(metric_inverse(JT(cotangent)))
 
         def residual_from_p(p_value):
             return self._residual_and_aux(x, args, p_value)[0]
@@ -2195,10 +2438,11 @@ class LevenbergMarquardt:
         # The final metric inverse acts on tangent data, so VJP transposes
         # it. An iterative metric solve (e.g. metric_from_shifted_matvec)
         # is not transposable by JAX -- its CG captures tol*|b| inside the
-        # linear solve's parameters -- but P is self-adjoint by contract,
-        # so declare the application as its own transpose: every rule of
-        # this custom_linear_solve routes through `solve` (the identity
-        # matvec contributes nothing), and with symmetric=True the
+        # linear solve's parameters -- but P is self-adjoint by contract
+        # (for a metric_factory metric: self-adjoint at the fixed prepared
+        # state), so declare the application as its own transpose: every
+        # rule of this custom_linear_solve routes through `solve` (the
+        # identity matvec contributes nothing), and with symmetric=True the
         # cotangent pass just EVALUATES metric.solve. custom_linear_solve
         # is used rather than jax.custom_derivatives.linear_call because
         # linear_call has no batching rule, which would break jax.vmap
@@ -2206,7 +2450,7 @@ class LevenbergMarquardt:
         theta_dot = -jax.lax.custom_linear_solve(
             lambda v: v,
             JT(dual_solution),
-            lambda _, rhs: self._metric_inverse(rhs),
+            lambda _, rhs: metric_inverse(rhs),
             symmetric=True,
         )
         return unravel(theta_dot)
@@ -2262,6 +2506,13 @@ class LevenbergMarquardt:
                     "dataclasses.replace(ctx.lm_state, ...) to preserve the "
                     "precond and precond_valid fields"
                 )
+            if self.metric_factory is not None and lm_state.metric_state is None:
+                raise ValueError(
+                    "metric_factory is set but the callback action returned an "
+                    "lm_state without the metric state; use "
+                    "dataclasses.replace(ctx.lm_state, ...) to preserve the "
+                    "metric_state and metric_valid fields"
+                )
             # Trace-time guard so the hyper contract fails identically with
             # and without jit (jit would reject the carry mismatch anyway).
             if previous_hyper is not None and (
@@ -2286,6 +2537,14 @@ class LevenbergMarquardt:
         if self.cache_jacobian and (action.x is not None or action.args is not None):
             lm_state = dataclasses.replace(
                 lm_state, jacobian_valid=lm_state.jacobian_valid & ~problem_changed
+            )
+        # A metric state prepared at the pre-action (x, args) no longer describes
+        # the subproblem once either changes; force a rebuild at the new point.
+        if self.metric_factory is not None and (
+            action.x is not None or action.args is not None
+        ):
+            lm_state = dataclasses.replace(
+                lm_state, metric_valid=lm_state.metric_valid & ~problem_changed
             )
         return action, x, lm_state, args, user_state, problem_changed
 
@@ -2615,7 +2874,7 @@ def _accept_converged(_, result):
 
 def _cold_lm_state(lm_state):
     # Drawn starts must not reuse a Jacobian cache, a deflation basis, or a
-    # preconditioner state built at another (x, args); damping and
+    # preconditioner/metric state built at another (x, args); damping and
     # hyperparameters stay inherited from the caller's initial state. Never
     # materializes fields from None -- the carry structure must match the
     # attempt-0 result.
@@ -2627,6 +2886,9 @@ def _cold_lm_state(lm_state):
         # update rebuilds prepare() at its own x before applying it.
         updates["precond"] = jax.tree.map(jnp.zeros_like, lm_state.precond)
         updates["precond_valid"] = jnp.zeros_like(lm_state.precond_valid)
+    if lm_state.metric_state is not None:
+        updates["metric_state"] = jax.tree.map(jnp.zeros_like, lm_state.metric_state)
+        updates["metric_valid"] = jnp.zeros_like(lm_state.metric_valid)
     if lm_state.recycle is not None:
         recycle = lm_state.recycle
         updates["recycle"] = RecycleState(

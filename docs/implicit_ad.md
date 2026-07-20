@@ -106,6 +106,15 @@ metric is supplied only through square-root callbacks, the same inverse metric i
 applied as \(P x = S S^\top x\) using `metric.inv_sqrt` and
 `metric.inv_sqrt_transpose`.
 
+With an iterate-dependent metric (`metric_factory=`), the metric is FROZEN at
+the returned solution: `prepare`/`build` run once at
+`(result.x, result.args, result.p, result.aux)` and the resulting \(P\) is
+applied exactly as a fixed metric would be. The state-dependence of the metric
+is deliberately not differentiated — the same contract as a fixed metric
+closing over constants, matching the forward selection role the metric plays.
+The built metric must stay self-adjoint and positive definite for that fixed
+state.
+
 ## Dense vs Matrix-Free Implicit Solve
 
 The implicit derivative always uses the same undamped residual-space system:
