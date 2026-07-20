@@ -25,24 +25,40 @@ Shape requirements:
 - `inv_sqrt` must support vectors `(n_params,)`; matrices
   `(n_params, n_residuals)` are additionally required for implicit
   differentiation when the metric has no `solve`.
-- `inv_sqrt_transpose` must support matrices `(n_params, n_residuals)` for QR.
+- `inv_sqrt_transpose` must support matrices `(n_params, n_residuals)` for
+  the dense whitened forms (`normal_cholesky`, `qr`, `augmented_qr`) and
+  their implicit rules; the matrix-free forms (`normal_cg`, `lsmr`) apply it
+  to vectors only.
 - `norm` only needs to support vectors `(n_params,)`.
 
-Validation rules:
+Validation rules — which callbacks a custom metric must supply depends on
+the *form* the solver works in:
 
-- For `linear_solver in {"cholesky", "cg"}`, a custom metric requires
-  `metric.solve`.
-- For `linear_solver in {"qr", "augmented_qr", "lsmr"}`, a custom metric requires
-  both `metric.inv_sqrt` and `metric.inv_sqrt_transpose`.
+| form (forward or resolved implicit) | requires |
+| --- | --- |
+| Gram: `gram_cholesky`, `gram_cg` | `solve` |
+| whitened: `normal_cholesky`, `normal_cg`, `qr`, `augmented_qr`, `lsmr` | `inv_sqrt` + `inv_sqrt_transpose` |
+| geodesic acceleration + custom metric | `norm` |
+
+- Concrete solver names validate eagerly at construction. `"auto"` defers
+  the check to trace time, when the concrete shapes resolve the form — the
+  same precedent as a `metric_factory`, whose built metric is validated
+  when `build` first runs. The resolved *implicit* form's requirements
+  apply too: a statically normal-resolved implicit solver with a fixed
+  metric lacking the square-root pair fails eagerly.
 - If geodesic acceleration is enabled (the default) and a custom metric is
   supplied, `metric.norm` is required — supply it or pass
   `geodesic_acceleration=False`.
 - The solver does not infer `norm`, `inv_sqrt`, or `inv_sqrt_transpose` from
   `solve`.
-- `solve` must accept and preserve the dtype it is handed. Normally that is
-  the residual dtype; with `dual_solve_dtype=jnp.float64` the dense cholesky
-  paths hand it float64 inputs and expect float64 back (jnp-composed
-  callbacks satisfy this automatically through standard promotion).
+- Every callback must accept and preserve the dtype it is handed. Normally
+  that is the residual dtype; with `linear_solve_dtype=jnp.float64` the
+  dense pipelines hand the callbacks float64 inputs and expect float64 back
+  (jnp-composed callbacks satisfy this automatically through standard
+  promotion). `metric_solve_dtype=jnp.float64` instead makes the solver
+  wrap the resolved metric so its callbacks *compute* in float64 whatever
+  dtype they are handed — see the
+  [precision knobs](index.md#precision-knobs).
 
 `norm` is separate because `solve` applies \(M^{-1}\), while the norm needs
 \(M\):
@@ -99,7 +115,7 @@ solver = LevenbergMarquardt(
 
 ## Matrix-Free Metric Example
 
-For CG, the metric only needs `solve` (and `norm` for geodesic
+For the Gram forms, the metric only needs `solve` (and `norm` for geodesic
 acceleration). `metric_from_shifted_matvec` builds \(M = A + \varepsilon I\)
 from a matvec alone, running an inner CG to a tight, dtype-aware tolerance:
 
@@ -109,12 +125,17 @@ from nlls_gram import LevenbergMarquardt, metric_from_shifted_matvec
 solver = LevenbergMarquardt(
     residual_fn,
     init_damping=1e-2,
-    linear_solver="cg",
+    linear_solver="gram_cg",
     metric=metric_from_shifted_matvec(kernel_matvec, eps),
     dual_preconditioner=identity_preconditioner(),
     implicit_preconditioner=identity_preconditioner(),
 )
 ```
+
+It has no matrix-free square root, so it serves the Gram forms only
+(`gram_cholesky`, `gram_cg`) — on a square-to-tall problem pin one of them
+explicitly, since the default `auto` would resolve to `normal_cholesky` and
+reject the metric at trace time.
 
 This changes the LM damping metric. It is not a preconditioner for the inner CG
 iteration; it changes the step being solved for — which is why the inner
@@ -201,7 +222,9 @@ Rules and semantics:
 - Under implicit differentiation of `solve` with respect to `p`, the metric
   is frozen at the returned solution: `prepare`/`build` run once at
   `(result.x, result.args, result.p, result.aux)` and the state-dependence
-  is not differentiated. See
-  [Implicit differentiation](implicit_ad.md).
+  is not differentiated. The freeze is a first-order statement — each
+  first-order implicit solve applies a frozen metric, while higher-order AD
+  differentiates the metric-dependent tangent field pointwise. See
+  [Implicit differentiation](implicit_ad.md#iterate-dependent-metrics-are-frozen-per-solve).
 - Like every jit-static hook, define the `(prepare, build)` pair once at
   setup scope; a fresh closure per call keys a new compilation.

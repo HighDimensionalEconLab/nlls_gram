@@ -158,62 +158,94 @@ rebuilt once per accepted step and `build` returns a plain `Metric`
 
 ## Linear Solver Formulas
 
-### Cholesky
+`linear_solver` selects among eight forms. Two families share the dense and
+matrix-free slots: the **Gram** forms work in residual space on the
+\(m \times m\) dual \(J P J^\top + \lambda I\), the **normal** forms in
+parameter space on the \(n \times n\) whitened system
+\(B^\top B + \lambda I\) with \(B = J S\), \(S S^\top = P\). For
+\(\lambda > 0\) the two families produce the *same step* (the push-through
+identity below); they differ in which dimension they factor or iterate in
+and in which metric callbacks they need.
 
-The default `linear_solver="cholesky"` materializes \(J^\top\), applies
+### Auto
+
+`linear_solver="auto"` (the default) resolves to one of the two dense forms
+at trace time, when the residual and parameter shapes are concrete:
+`gram_cholesky` when \(n > m\) (strictly more parameters than residuals),
+`normal_cholesky` otherwise. It factors the smaller of the two SPD systems.
+The rule keys on shape only — it never inspects numerical rank — and since
+both forms compute the same step, `auto` is a cost choice, not a semantics
+choice. The resolution is a plain Python branch during tracing: one compiled
+program per problem shape, no runtime branching.
+
+### Gram Cholesky
+
+`linear_solver="gram_cholesky"` materializes \(J^\top\), applies
 `metric.solve`, and factors the residual-space dual system
 
 $$
-(J P J^\top + \lambda I)y = r,
+(J P J^\top + \lambda I_m)y = r,
 \qquad s = -P J^\top y.
 $$
 
-This is usually the fastest dense path when \(m \ll n\).
+This is the fastest dense path when \(m \ll n\): the factorization is
+\(m \times m\) and \(n\) enters only through matvecs.
 
-Forming \(J P J^\top\) squares the condition number of the whitened
-Jacobian \(J S\) (with \(S S^\top = P\)), which makes this path
-float32-fragile for stiff duals (e.g. a metric weight injecting a
-\(1/\varepsilon\) spike into \(P\)). `dual_solve_dtype=jnp.float64`
-promotes just the dual pipeline — \(J^\top\) is cast wide *before* the
-metric solve, and the \(m \times m\) assembly, factorization, and
-triangular solves run in float64 — while the model, residual, and returned
-step stay float32. It applies to this branch and to the dense implicit-AD
-rule, and requires x64 support to be enabled (explicitly float32 data stays
-float32). `metric.solve` receives the promoted dtype and must return it:
-jnp-composed callbacks promote automatically, while an iterative callback
-(`metric_from_shifted_matvec`) then runs its inner CG in float64 with the
-float64 default tolerance, at callback-dependent cost. See the
-[Tuning Guide](tuning_guide.md) for when it beats enabling x64 globally.
+### Normal Cholesky
 
-### CG
-
-`linear_solver="cg"` uses the same residual-space dual system as Cholesky, but
-applies it matrix-free:
+`linear_solver="normal_cholesky"` materializes
+\(B^\top = S^\top J^\top\) via `metric.inv_sqrt_transpose` and factors the
+whitened normal system in parameter space:
 
 $$
-u \mapsto J P J^\top u + \lambda u.
+(B^\top B + \lambda I_n)u = -B^\top r,
+\qquad s = S u.
 $$
 
-It uses JAX linearization for JVPs/VJPs and `jax.scipy.sparse.linalg.cg`.
+The factorization is \(n \times n\), so this is the dense form for
+square-to-tall problems (\(m \ge n\)). For \(\lambda > 0\) the step is
+identical to the Gram form's by the push-through identity
+
+$$
+B^\top(B B^\top + \lambda I_m)^{-1} = (B^\top B + \lambda I_n)^{-1}B^\top,
+$$
+
+and its \(\lambda \to 0\) limit is the minimum-\(M\)-norm least-squares step
+\(s = -S(JS)^{+}r\) at every shape and rank — tall problems that are still
+rank-deficient along some directions (redundant rows, collinear columns)
+keep the minimum-norm selection. See
+[the pseudoinverse limit](gauss_newton.md#spectral-filter-view).
+
+### Gram CG
+
+`linear_solver="gram_cg"` applies the residual-space dual system matrix-free:
+
+$$
+y \mapsto J P J^\top y + \lambda y,
+$$
+
+using JAX linearization for JVPs/VJPs and `jax.scipy.sparse.linalg.cg`.
 The iterative solve defaults to a small fixed budget: `iterative_tol=0.0`,
 `iterative_atol=0.0`, and `iterative_maxiter=8`.
 With the default `implicit_solver="auto"`, differentiating `solve(...).x`
-also stays matrix-free for forward CG solves. Pass
-`implicit_solver="cholesky"` to restore the dense implicit AD rule.
+also stays matrix-free for forward `gram_cg` solves. Pass
+`implicit_solver="gram_cholesky"` (or `"normal_cholesky"`) to use a dense
+implicit rule instead.
 
-`linear_solver="cg"` requires a `dual_preconditioner(v, damping)` callback,
-applied as the CG preconditioner (for the geodesic-acceleration solve as
-well). It must be a jit-traceable, linear, SPD approximation of
+`linear_solver="gram_cg"` requires a `dual_preconditioner(v, damping)`
+callback, applied as the CG preconditioner (for the geodesic-acceleration
+solve as well). It must be a jit-traceable, linear, SPD approximation of
 \((J P J^\top + \lambda I)^{-1} v\). It never changes the subproblem being
 solved: at inner convergence the step is identical, and a budget-truncated
 step still lies in \(\operatorname{range}(P J^\top)\), preserving the
 minimum-metric-norm structure — so approximations are safe. Nobody should
 run Krylov methods without thinking about preconditioning; to opt out
 explicitly, pass `identity_preconditioner()` for unpreconditioned CG. When
-the implicit solver resolves to CG (the default `implicit_solver="auto"`
-does exactly that when `linear_solver="cg"`), an `implicit_preconditioner`
-is required as well — `identity_preconditioner()` works there too, or pass
-`implicit_solver="cholesky"` for the dense implicit rule. See
+the implicit solver resolves to a CG form (the default
+`implicit_solver="auto"` does exactly that when `linear_solver="gram_cg"`),
+an `implicit_preconditioner` is required as well —
+`identity_preconditioner()` works there too, or pass a dense
+`implicit_solver` for a dense implicit rule. See
 [Utilities](utilities.md) for structural constructors
 (`sherman_morrison_preconditioner`, `woodbury_preconditioner`) and the
 randomized `nystrom_preconditioner`. Like `metric`, the preconditioner
@@ -223,6 +255,31 @@ callback action can replace it — construct a new solver to change one. A
 pair stays static, but its *prepared state* (`precond`/`precond_valid`, rebuilt
 from the live iterate each accepted step) IS carried on `LMState`, so a `solve`
 callback that rebuilds `lm_state` must preserve those two fields.
+`dual_preconditioner`, `preconditioner_factory`, and `recycle` are
+`gram_cg`-only hooks — they live in residual space.
+
+### Normal CG
+
+`linear_solver="normal_cg"` applies the whitened normal system matrix-free:
+
+$$
+u \mapsto B^\top(B u) + \lambda u,
+\qquad B u = J(S u),\quad B^\top w = S^\top(J^\top w),
+$$
+
+with right-hand side \(-B^\top r\) and step \(s = S u\), through the same
+JVP/VJP closures and `jax.scipy.sparse.linalg.cg` machinery as `gram_cg` —
+but the Krylov iteration lives in the \(n\)-dimensional parameter space, so
+it is the matrix-free form for square-to-tall problems. It requires the
+metric's `inv_sqrt`/`inv_sqrt_transpose` and a
+`normal_preconditioner(v, damping)` callback: a jit-traceable, linear, SPD
+parameter-space approximation of \((B^\top B + \lambda I_n)^{-1}v\)
+(`identity_preconditioner()` is the explicit opt-out). One structural
+requirement has no Gram-side analogue: the preconditioner must map
+\(\operatorname{range}(B^\top)\) into itself, or the minimum-norm selection
+is silently lost on rank-deficient problems — see the
+[normal-space preconditioner](utilities.md#the-normal-space-preconditioner-normal_cg)
+for why, and for which constructions are safe.
 
 ### QR
 
@@ -238,9 +295,10 @@ The returned parameter step is mapped back with `metric.inv_sqrt`.
 
 The triangular solves require \(S^\top J^\top\) to have full column rank
 (equivalently, \(J\) full row rank): a rank-deficient Jacobian produces a
-non-finite step even though the damped subproblem remains well-posed. Use
-`cholesky` or `cg`, or the damped augmented solvers `augmented_qr` / `lsmr`
-(which stay full column rank for \(\lambda>0\)), for rank-deficient problems.
+non-finite step even though the damped subproblem remains well-posed. Every
+other solver handles rank deficiency — the Gram/normal forms through their
+damped SPD systems, `augmented_qr` / `lsmr` through the damping block that
+keeps the augmented matrix full column rank for \(\lambda>0\).
 
 ### Augmented QR
 
@@ -264,13 +322,19 @@ cheaper when its full-row-rank assumption holds.
 
 `linear_solver="lsmr"` solves that same whitened augmented system iteratively by
 LSMR bidiagonalization, using only \(J\)/\(J^\top\) matvecs — the matrix-free
-sibling of `augmented_qr`. Because it works on \(B = JS\) rather than the `cg`
-dual \(J M^{-1} J^\top + \lambda I\), whose condition number is the *square*, it
-keeps the step accurate at small \(\lambda\) where the squared dual solve hits
-its `eps·cond` floor. It requires the metric's `inv_sqrt`/`inv_sqrt_transpose`
-and accepts an optional `whitened_preconditioner` (a `WhitenedPreconditioner`
-parameter-space right-preconditioner `R⁻¹`) that clusters the LSMR spectrum when
-the whitened operator is itself ill-conditioned; it is detailed in the
+sibling of `augmented_qr`. Because it works on \(B = JS\) directly rather than
+on a Gram/normal system whose condition number is the *square* of
+\(\operatorname{cond}(B)\), it keeps the step accurate at small \(\lambda\)
+where the squared solves hit their `eps·cond` floor. It requires the metric's
+`inv_sqrt`/`inv_sqrt_transpose` and accepts an optional
+`whitened_preconditioner` (a `WhitenedPreconditioner` parameter-space
+right-preconditioner `R⁻¹`) that clusters the LSMR spectrum when the whitened
+operator is itself ill-conditioned. The damping row rides inside the
+preconditioned operator, so every \(\lambda>0\) subproblem is exactly the
+identity-damped whitened subproblem in \(u = R^{-1}z\): the preconditioner
+changes the iteration count, never the step being solved for, and the
+\(\lambda \to 0\) selection limit is minimum-\(M\)-norm for any \(R\). It is
+detailed in the
 [utilities guide](utilities.md#matrix-free-lsmr-whitened-subproblem).
 
 ## Minimal Example
@@ -346,8 +410,11 @@ residual and Jacobian are identical — only the damping changed. With
 rejected step's successor skips the residual evaluation and the
 `n_residuals` VJP passes, re-solving only the small damped system (roughly
 2x faster per rejected step; more when the residual is expensive relative to
-the Gram assembly). The flag only affects `linear_solver="cholesky"` — the
-matrix-free solvers never materialize a Jacobian, so it is ignored for them.
+the Gram assembly). The flag only affects the dense Gram/normal forms —
+`gram_cholesky`, `normal_cholesky`, and `auto`, which resolves to one of
+them; the carried `(n_params, n_residuals)` \(J^\top\) buffer serves both
+factorizations. The matrix-free solvers never materialize a Jacobian, so it
+is ignored for them.
 
 ```python
 solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
@@ -421,6 +488,47 @@ residual once and types the lm_state (and any Jacobian cache buffers) from the
 actual problem, so there is no dtype argument to get wrong — a float32
 problem stays float32 even with x64 enabled. `solve` likewise recasts the
 damping and tolerances to the residual dtype internally.
+
+### Precision Knobs
+
+Two constructor knobs promote a targeted slice of a float32 program to
+float64 without touching the model. Both accept `None` (the default) or
+`jnp.float64`, and both require x64 support to be enabled — they make
+float64 available to one pipeline; they never demote explicitly-float64
+data.
+
+- **`linear_solve_dtype=jnp.float64`** promotes the dense linear-solve
+  pipelines: the `gram_cholesky`/`normal_cholesky` forward factorizations
+  *and* the dense implicit-AD rules (the implicit solve inherits the knob,
+  so the undamped implicit system — the most conditioning-sensitive solve
+  in the library — is never silently less precise than the damped forward
+  one). The recipe: \(J^\top\) (or \(B^\top\)) is cast wide *before* the
+  metric application, the assembly, factorization, and triangular solves
+  run in float64, and only the returned step or tangent is cast back to the
+  residual dtype. The model, residual, and Jacobian VJP passes stay
+  float32. Forming a Gram or normal matrix squares
+  \(\operatorname{cond}(JS)\), which is exactly what makes those paths
+  float32-fragile for stiff systems (e.g. a metric weight injecting a
+  \(1/\varepsilon\) spike into \(P\)) — this knob is the targeted fix. It
+  requires a solver that has a dense pipeline to promote: forward
+  `auto`/`gram_cholesky`/`normal_cholesky`, or a dense-resolved
+  `implicit_solver`.
+- **`metric_solve_dtype=jnp.float64`** sets the dtype the resolved metric
+  callbacks *compute in*: the solver wraps the metric — a fixed `metric` or
+  a `metric_factory`'s built one, after `build` — with the
+  [`metric_with_compute_dtype`](utilities.md#compute-dtype-wrapper)
+  mechanics, so each callback upcasts its input, computes wide, and
+  restores the caller's dtype. `None` leaves the metric computing in
+  whatever dtype the consuming solve hands it (float64 under
+  `linear_solve_dtype`, the residual dtype otherwise). Kernel Gram
+  factorizations are routinely the worst-conditioned piece of the whole
+  pipeline, so this knob often earns `jnp.float64` even in
+  otherwise-float32 programs — see the
+  [Tuning Guide](tuning_guide.md#float64-a-la-carte). It requires a custom
+  metric or metric factory to wrap.
+
+See the [Tuning Guide](tuning_guide.md#float64-a-la-carte) for measured
+costs and for choosing between the knobs and full x64.
 
 `update` optimizes exactly the `x` pytree you pass. With Flax NNX, pass only
 the trainable state to the solver and merge it with frozen state inside

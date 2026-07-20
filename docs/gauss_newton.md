@@ -117,6 +117,27 @@ d_{\mathrm{eff}}(\lambda)
 = \sum_i \frac{\sigma_i^2}{\sigma_i^2 + \lambda}.
 $$
 
+**The pseudoinverse limit.** As \(\lambda \downarrow 0\) each filter factor
+converges to \(\sigma_i^{+}\) — \(1/\sigma_i\) where \(\sigma_i > 0\), and
+exactly \(0\) where \(\sigma_i = 0\) — so
+
+$$
+z_\lambda \to -(JS)^{+} r,
+\qquad
+s_\lambda \to -S\,(JS)^{+} r,
+$$
+
+the minimum-\(M\)-norm least-squares correction of the
+[rank-deficiency section](#rank-deficiency), with **no rank or shape
+assumption**: redundant rows and collinear columns are filtered out
+direction by direction, never inverted. The full-row-rank dual formula of
+the earlier sections is the special case where the linearized least-squares
+residual is zero. This primal limit is what every damped solver realizes as
+damping falls near interpolation; how *accurately* a solver tracks it at
+small \(\lambda\) is a conditioning question — the Gram and normal forms
+work at the squared condition number of \(JS\), `lsmr` at
+\(\operatorname{cond}(JS)\) itself.
+
 ## Whitened-Coordinate Equivalence
 
 Metric Gauss-Newton in raw coordinates is ordinary Gauss-Newton in whitened
@@ -133,9 +154,10 @@ and the ordinary minimum-Euclidean-norm Gauss-Newton step
 \(z\text{-step} = -J_z^\top (J_z J_z^\top)^{-1} r\) maps back to exactly
 \(s_{\mathrm{GN},M}\). Passing whitened variables to an ordinary LM solver is
 therefore equivalent to using the metric-aware solver in raw variables; the
-metric-aware Gram solver lets you stay in raw variables with the same
-geometry. (This is precisely the substitution the `qr` path makes,
-with \(S = L^{-\top}\).)
+metric-aware solver lets you stay in raw variables with the same
+geometry. (This is precisely the substitution the whitened paths —
+`normal_cholesky`, `normal_cg`, `qr`, `augmented_qr`, `lsmr` — make, with
+\(S = L^{-\top}\).)
 
 ## Rank Deficiency
 

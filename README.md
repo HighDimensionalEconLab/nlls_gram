@@ -14,10 +14,11 @@ larger than the number of residuals.
 `LevenbergMarquardt` minimizes a user residual taking
 `(x)`, `(x, args)`, or `(x, args, p)`, always in that order. The unknown `x`
 may be any JAX pytree; internally it
-is flattened with `jax.flatten_util.ravel_pytree`. The default dense solver
-uses the residual-space Gram system, with QR, CG, and matrix-free LSMR
-alternatives. Use `update(...)` for a single LM step or `solve(...)` for an
-internally jitted loop.
+is flattened with `jax.flatten_util.ravel_pytree`. The default solver picks
+the smaller dense factorization from the problem shape — the residual-space
+Gram system or the whitened normal system — with QR, CG, and matrix-free
+LSMR alternatives. Use `update(...)` for a single LM step or `solve(...)`
+for an internally jitted loop.
 
 ## Problem
 
@@ -118,11 +119,13 @@ resampling, and per-step history recording; the docs have a cookbook.
 
 `solve(...).x` also supports custom implicit JVP/VJP with respect to `p`;
 the docs give the metric-minimum-norm formula and a minimal `jax.jvp` /
-`jax.vjp` example. With `linear_solver="cg"` the default implicit AD rule is
-matrix-free; pass `implicit_solver="cholesky"` to restore the dense rule. The
-metric matters for underdetermined roots because it selects which tangent is
-the minimum-norm solution. The per-step `update(...)` interface does not
-define the implicit AD rule.
+`jax.vjp` example. The default `implicit_solver="auto"` matches the forward
+form — matrix-free under the CG forms, dense otherwise — and every form is
+independently swappable (an `lsmr` forward solve with
+`implicit_solver="normal_cg"` is fully matrix-free end to end). The metric
+matters for underdetermined roots because it selects which tangent is the
+minimum-norm solution. The per-step `update(...)` interface does not define
+the implicit AD rule.
 
 ## Metric Example
 
@@ -157,15 +160,22 @@ slots in directly, e.g.
 
 ## Solvers
 
-- `linear_solver="cholesky"`: dense residual-space Gram solve, the default.
+- `linear_solver="auto"` (the default): resolves at trace time to the
+  smaller dense factorization — `gram_cholesky` when `n > m`,
+  `normal_cholesky` otherwise. A shape rule, and safely so: the two forms
+  compute the same step.
+- `linear_solver="gram_cholesky"`: dense `m × m` residual-space Gram solve.
+- `linear_solver="normal_cholesky"`: dense `n × n` whitened normal solve;
+  its small-damping limit is the minimum-metric-norm least-squares step at
+  every shape and rank.
 - `linear_solver="qr"`: dense QR solve of the whitened-step problem (requires
   a full-row-rank Jacobian).
 - `linear_solver="augmented_qr"`: direct augmented QR in parameter space;
   robust to rank-deficient Jacobians when damping is positive and best suited
   to small systems.
-- `linear_solver="cg"`: matrix-free residual-space CG. A `dual_preconditioner`
-  is required (e.g. `sherman_morrison_preconditioner`, or the randomized
-  `nystrom_preconditioner` for neural-network duals; pass
+- `linear_solver="gram_cg"`: matrix-free residual-space CG. A
+  `dual_preconditioner` is required (e.g. `sherman_morrison_preconditioner`,
+  or the randomized `nystrom_preconditioner` for neural-network duals; pass
   `identity_preconditioner()` to run unpreconditioned CG explicitly);
   `implicit_solver="auto"` keeps `solve(...).x` matrix-free under AD and
   requires `implicit_preconditioner` the same way — at construction, even
@@ -174,17 +184,24 @@ slots in directly, e.g.
   apply)` instead — a θ-adaptive preconditioner rebuilt from the live iterate
   each step — and `recycle=RecycleConfig(rank=k)` to carry a deflation basis
   across steps, recycling each solve's Krylov subspace into the next.
+- `linear_solver="normal_cg"`: matrix-free CG on the whitened normal system,
+  iterating in parameter space — the matrix-free form for square-to-tall
+  problems. A `normal_preconditioner` is required; on rank-deficient
+  problems it must preserve `range(Bᵀ)` or the minimum-norm selection is
+  lost (`identity_preconditioner()` always qualifies — the docs give the
+  full requirement).
 - `linear_solver="lsmr"`: matrix-free LSMR on the whitened augmented system,
   the iterative sibling of `augmented_qr`, using only J/Jᵀ products. It works
-  on the whitened Jacobian rather than its squared dual, so it stays accurate
-  at small damping where the Gram-based solves hit their `eps·cond` floor. An
-  optional `whitened_preconditioner=WhitenedPreconditioner(solve,
-  solve_transpose)` right-preconditions the operator to cluster its spectrum;
-  its scalar damping then regularizes in the `RᵀR` metric — a documented
-  surrogate whose `damping → 0` minimum-metric-norm limit is unchanged.
+  on the whitened Jacobian rather than a squared Gram/normal operator, so it
+  stays accurate at small damping where those solves hit their `eps·cond`
+  floor. An optional
+  `whitened_preconditioner=WhitenedPreconditioner(solve, solve_transpose)`
+  right-preconditions the operator to cluster its spectrum; every damped
+  subproblem stays exactly the identity-damped whitened one, so the
+  preconditioner changes iteration counts, never the step.
 
-All five solve the same metric-damped linearized subproblem up to the accuracy
-of the chosen linear solver.
+All eight solve the same metric-damped linearized subproblem up to the
+accuracy of the chosen linear solver.
 
 ## Docs and Alternatives
 

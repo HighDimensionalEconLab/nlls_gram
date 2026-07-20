@@ -13,9 +13,11 @@ solver = LevenbergMarquardt(residual_fn)
 result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
 ```
 
-- **`linear_solver="cholesky"` (the default) is the best first choice for
-  small-to-medium `m`** — it factors the small `m × m` Gram system, so `n`
-  only enters through matvecs.
+- **`linear_solver="auto"` (the default) picks the smaller dense
+  factorization from the problem shape** — the `m × m` residual-space Gram
+  system when `n > m`, the `n × n` whitened normal system otherwise. The two
+  produce the same step, so the default is a cost decision, never a
+  semantics decision.
 - **Geodesic acceleration is on by default** — it costs one extra
   directional derivative per step (plus one residual evaluation when the
   acceptance gate passes), the accept/reject test makes it safe, and on
@@ -31,20 +33,51 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
 
 ## Solver Selection
 
+Shape first. The Gram and normal forms are the same method assembled in
+different spaces — the `m × m` residual-space dual `J P J' + damping I`
+versus the `n × n` whitened normal system `B'B + damping I` (`B = J S`) —
+and they produce identical steps at any positive damping. So the first
+question is only which of `m` and `n` is smaller, and `auto` (the default)
+answers it: `gram_cholesky` when `n > m` strictly, else `normal_cholesky`,
+resolved at trace time from the concrete shapes. The rule reads shapes, not
+numerical rank — and it does not need to: rank-deficient problems
+(redundant rows, collinear columns — tall interpolation problems always
+have some) are handled by every form except `qr`, with the
+minimum-`M`-norm small-damping selection intact.
+
 | situation | use |
 | --- | --- |
-| `m` up to a few thousand | `cholesky` (default) |
-| `m × n` Jacobian too big to materialize, or very large `m` | `cg` |
-| large/matrix-free and the dual is ill-conditioned at small damping | `lsmr` |
+| dense factorization affordable on the smaller of `m`, `n` | `auto` (default) — `gram_cholesky` if `n > m`, else `normal_cholesky` |
+| Jacobian too big to materialize, `n > m` | `gram_cg` |
+| Jacobian too big to materialize, `m ≥ n` | `normal_cg` |
+| matrix-free and ill-conditioned at small damping | `lsmr` |
 | ill-conditioned metric, moderate `m`, full-row-rank `J` | `qr` |
-| small system with possibly rank-deficient `J` | `augmented_qr` |
+| small system, rank-deficient `J`, direct factorization wanted | `augmented_qr` |
 
-- **Avoid `qr` when massively overparameterized.** It does not use the Gram
-  form: it factors the whitened `n × m` matrix, so cost scales with `n`
-  (measured 8-16x slower than `cholesky` at `n=8192, m=1024`), and it
-  requires full row rank — rank-deficient Jacobians produce non-finite steps.
-  Its advantage is conditioning (it avoids squaring the condition number);
-  reach for it only when that is the binding constraint.
+- **Cross-shape use is legitimate — the hooks decide.** The forms compute
+  the same step, so picking against the shape rule is purely a cost/hook
+  trade. `dual_preconditioner`, `preconditioner_factory`, and `recycle` are
+  `gram_cg`-only (they live in residual space); a strong dual
+  preconditioner or a carried deflation basis can justify `gram_cg` on a
+  squarish problem. `normal_cg` is the way to precondition in *parameter*
+  space, and the whitened forms swap `metric.solve` for
+  `metric.inv_sqrt`/`inv_sqrt_transpose` — pick the form whose callbacks
+  your metric can supply exactly.
+- **`iterative_maxiter` budgets a different Krylov per form**: an
+  `m`-dimensional space under `gram_cg`, an `n`-dimensional one under
+  `normal_cg`. Re-tune it when switching forms; a budget tuned for a small
+  dual can be far too small for a large parameter space.
+- **`normal_cg`'s preconditioner has a structural requirement**: it must map
+  `range(B')` into itself, or the minimum-norm selection is silently lost on
+  rank-deficient problems — an arbitrary SPD approximation of the inverse
+  does not qualify. `identity_preconditioner()` always does. See the
+  [normal-space preconditioner](utilities.md#the-normal-space-preconditioner-normal_cg).
+- **Avoid `qr` when massively overparameterized.** It does not use a
+  Gram/normal form: it factors the whitened `n × m` matrix, so cost scales
+  with `n` (measured 8-16x slower than `gram_cholesky` at `n=8192, m=1024`),
+  and it requires full row rank — rank-deficient Jacobians produce
+  non-finite steps. Its advantage is conditioning (it avoids squaring the
+  condition number); reach for it only when that is the binding constraint.
 - **Use `augmented_qr` for small systems when rank robustness matters.** It
   directly factors `[J S; sqrt(damping) I]`, whose damping block guarantees
   full column rank, but its width is the parameter count. That is attractive
@@ -53,60 +86,76 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   same whitened damped subproblem `min_u ||r + B u||² + damping ||u||²`
   (`B = J S`, `S = metric.inv_sqrt`, step `s = S u`) by
   [LSMR](https://web.stanford.edu/group/SOL/software/lsmr/) bidiagonalization
-  using only `J`/`Jᵀ` matvecs — no materialized Jacobian, no QR. Its payoff over
-  `cg` is conditioning: the `cg` dual operator `J M⁻¹ Jᵀ + damping I` has the
-  **square** of the whitened operator's condition number, so at small damping
-  (`~1e10` in the motivating case) `eps·cond` puts an accuracy floor on the step
-  that even dense direct solves hit, and CG truncation concentrates in the slow,
-  selection-critical eigendirections. `lsmr` works at `cond(B) ~ sqrt` of that,
-  restoring certifiable endgame accuracy. Reach for it when a matrix-free solve
-  is required *and* the dual is ill-conditioned near the solution; when the dual
-  is well-conditioned (or a good `dual_preconditioner` exists), `cg` is cheaper
-  per step. `lsmr` requires the metric's `inv_sqrt`/`inv_sqrt_transpose` (the
-  identity metric supplies them); `recycle`/`dual_preconditioner`/
-  `preconditioner_factory` are `cg`-only. When the whitened operator itself is
-  badly conditioned (`cond(B)` still large — e.g. `~1e8`, where plain LSMR needs
-  thousands of endgame iterations), pass a `whitened_preconditioner` (a
-  `WhitenedPreconditioner`): a parameter-space right-preconditioner `R⁻¹` running
-  LSMR on `B R⁻¹` to cluster the spectrum and cut the endgame count to the tens (a
-  Schur-complement factor is canonical). Its `damp` then regularizes in the `RᵀR`
-  metric, so the step is the surrogate `u = -(BᵀB + λ RᵀR)⁻¹ Bᵀ r` — admissible
-  because LM guards on the true `||r||` and the `λ → 0` selection limit is
-  `R`-invariant. Its stopping maps the same
-  `iterative_tol`/`iterative_atol`/`iterative_maxiter` hooks (relative/absolute
-  bound on the normal-equations residual, measured on the preconditioned operator,
-  callback-schedulable). Differentiating a forward `lsmr` `solve(...).x` uses the
-  dense cholesky implicit rule by default (`implicit_solver="auto"`); pass
-  `implicit_solver="cg"` with an `implicit_preconditioner` for a matrix-free
-  derivative at very large `m`.
-- `cg` returns an *approximate* step under its iteration budget. That is
-  usually fine — LM's accept/reject absorbs inexactness — but see the
-  scheduling pattern below. With the default `implicit_solver="auto"`,
-  differentiating a forward CG `solve(...).x` also uses matrix-free CG instead
-  of materializing \(J^\top\).
-- `cholesky`/`cg` square the condition number (they factor `J P J'`). If the
-  Gram system is ill-conditioned or implicit derivatives must be accurate,
-  reach for float64 — it fixes more numerical trouble than any damping
-  adjustment. Two grades: `dual_solve_dtype=jnp.float64` promotes only the
-  dense dual pipeline (cholesky forward branch + dense implicit rule) while
-  the model stays float32 — measured ~1.4x per cholesky update at
-  `m=100, n=2000` for a *trivial* residual (an upper bound: real residual
-  and Jacobian costs dominate and stay float32), recovering the float64
-  dual answer to ~1e-6 on a 1e-7-spike metric where plain float32 is ~5%
-  wrong. Enabling `jax_enable_x64` globally remains the full fix when the
-  model itself needs it (and is still required — it is what makes float64
-  arrays available; explicitly float32 data stays float32). Choosing
-  between the grades: the flag's win is proportional to how much of the
-  step is model evaluation (residual + the m VJP Jacobian passes, which
-  stay float32) versus dual algebra (the promoted n·m² assembly); when the
-  dual algebra IS the step — trivial residuals, dense-metric-dominated
-  updates — the flag costs about the same wall time as full x64 and its
-  remaining win is halved model memory and the unchanged float32 contract.
-  One cost surprise to know about: with an iterative metric
-  (`metric_from_shifted_matvec`) the flag runs the metric's inner CG in
-  float64 at the tighter float64 default tolerance. The flag does not touch
-  the CG solver paths — there the remedies remain preconditioning and,
-  when the attainable-residual floor binds, full x64.
+  using only `J`/`Jᵀ` matvecs — no materialized Jacobian, no QR. Its payoff
+  over the CG forms is conditioning: both Gram and normal operators carry
+  the **square** of the whitened operator's condition number, so at small
+  damping (`~1e10` in the motivating case) `eps·cond` puts an accuracy floor
+  on the step that even dense direct solves hit, and CG truncation
+  concentrates in the slow, selection-critical eigendirections. `lsmr` works
+  at `cond(B) ~ sqrt` of that, restoring certifiable endgame accuracy. Reach
+  for it when a matrix-free solve is required *and* the system is
+  ill-conditioned near the solution; when it is well-conditioned (or a good
+  preconditioner exists), the CG forms are cheaper per step. `lsmr` requires
+  the metric's `inv_sqrt`/`inv_sqrt_transpose` (the identity metric supplies
+  them). When the whitened operator itself is badly conditioned (`cond(B)`
+  still large — e.g. `~1e8`, where plain LSMR needs thousands of endgame
+  iterations), pass a `whitened_preconditioner` (a `WhitenedPreconditioner`):
+  a parameter-space right-preconditioner `R⁻¹` running LSMR on `B R⁻¹` to
+  cluster the spectrum and cut the endgame count to the tens (a
+  Schur-complement factor is canonical). The damping row rides inside the
+  preconditioned operator, so every subproblem is exactly the `I`-damped one
+  in `u = R⁻¹ z`: `R` changes the iteration count, never the step, and the
+  `damping → 0` selection limit is minimum-`M`-norm for any `R`. Stopping
+  maps the same `iterative_tol`/`iterative_atol`/`iterative_maxiter` hooks
+  (relative/absolute bound on the normal-equations residual, measured on the
+  preconditioned operator, callback-schedulable). Differentiating a forward
+  `lsmr` `solve(...).x` uses a dense implicit rule by default
+  (`implicit_solver="auto"` applies the shape rule); pass
+  `implicit_solver="gram_cg"` or `"normal_cg"` with an
+  `implicit_preconditioner` for a fully matrix-free derivative.
+- The CG forms return an *approximate* step under their iteration budget.
+  That is usually fine — LM's accept/reject absorbs inexactness — but see
+  the scheduling pattern below. With the default `implicit_solver="auto"`,
+  differentiating a forward `gram_cg`/`normal_cg` `solve(...).x` uses the
+  matching matrix-free CG rule instead of materializing \(J^\top\).
+
+## Float64 à la Carte
+
+The Gram and normal forms square the condition number (they factor
+`J P J'` or `B'B`). If that system is ill-conditioned or implicit
+derivatives must be accurate, reach for float64 — it fixes more numerical
+trouble than any damping adjustment. Three grades, from narrowest to
+widest:
+
+- **`metric_solve_dtype=jnp.float64`** promotes only the resolved metric
+  callbacks (fixed or factory-built), via the
+  [`metric_with_compute_dtype`](utilities.md#compute-dtype-wrapper)
+  mechanics. Kernel Gram factorizations are routinely the worst-conditioned
+  piece of the whole pipeline, so this knob often earns float64 even in
+  otherwise-float32 programs — it is the right first move when the metric,
+  not the solver algebra, is the fragile part.
+- **`linear_solve_dtype=jnp.float64`** promotes the dense linear-solve
+  pipelines: the `gram_cholesky`/`normal_cholesky` forward factorizations
+  and the dense implicit rules, while the model stays float32 — measured
+  ~1.4x per `gram_cholesky` update at `m=100, n=2000` for a *trivial*
+  residual (an upper bound: real residual and Jacobian costs dominate and
+  stay float32), recovering the float64 answer to ~1e-6 on a 1e-7-spike
+  metric where plain float32 is ~5% wrong.
+- **`jax_enable_x64`** globally remains the full fix when the model itself
+  needs it — and is still required for either knob: it is what makes
+  float64 arrays available (explicitly float32 data stays float32).
+
+Choosing between the grades: the knobs' win is proportional to how much of
+the step is model evaluation (residual + the `m` VJP Jacobian passes, which
+stay float32) versus promoted algebra; when the promoted algebra IS the
+step — trivial residuals, dense-metric-dominated updates — the knobs cost
+about the same wall time as full x64 and their remaining win is halved
+model memory and the unchanged float32 contract. One cost surprise to know
+about: a float64 metric with an iterative solve
+(`metric_from_shifted_matvec`) runs its inner CG in float64 at the tighter
+float64 default tolerance. Neither knob touches the CG solver paths — there
+the remedies remain preconditioning and, when the attainable-residual floor
+binds, full x64.
 
 ## Damping
 
@@ -136,15 +185,16 @@ exactly then). Three patterns, in order of preference:
    single solve call, so implicit AD applies; see the
    [cookbook recipe](callbacks.md#scheduled-inner-solve-accuracy). All of
    `LMHyperparams` is resettable this way.
-3. **Stage two solvers**: coarse `cg` solve, then a `cholesky` endgame
-   warm-started with `result.x` and `result.lm_state`. The implicit
+3. **Stage two solvers**: a coarse CG-form solve, then a dense endgame
+   (`auto`) warm-started with `result.x` and `result.lm_state`. The implicit
    derivative is unaffected (it is defined at the returned solution only).
 
 Forward iterative tolerances and implicit AD tolerances are separate. The
-implicit CG rule uses `implicit_tol=None` by default, which means `1e-6` in
+implicit CG rules use `implicit_tol=None` by default, which means `1e-6` in
 float32 and `1e-10` in float64; these defaults target derivative accuracy, not
-cheap forward steps. Use `implicit_solver="cholesky"` when you want the old
-dense implicit rule, or tune `implicit_tol`, `implicit_atol`,
+cheap forward steps. Pass a dense `implicit_solver`
+(`"gram_cholesky"`/`"normal_cholesky"`) when you want a dense implicit rule
+under an iterative forward solver, or tune `implicit_tol`, `implicit_atol`,
 `implicit_maxiter`, and `implicit_preconditioner(v)` for a matrix-free
 derivative.
 
@@ -180,7 +230,7 @@ preconditioner from the state at the solution.
 When a frozen first-level `dual_preconditioner` plateaus above the accuracy bar
 — it clusters most of the dual spectrum but leaves a handful of slow modes that
 the fixed budget cannot resolve — carry a **deflation basis** across LM steps.
-Pass `recycle=RecycleConfig(rank=k)` (requires `linear_solver="cg"`). The
+Pass `recycle=RecycleConfig(rank=k)` (requires `linear_solver="gram_cg"`). The
 first-level `P` is unchanged; a second-level basis `U` is harvested from each
 step's CG iterations (an eigCG-style thick restart) and recycled into the next
 step's two-level preconditioner `M_defl(r) = P(r) + U E^{-1}(U'r)`, plus a
@@ -246,7 +296,7 @@ the step count.
 | symptom | likely cause | remedy |
 | --- | --- | --- |
 | `status == NONFINITE` at step 0 | bad initial point or data | check `residual_fn(x0, ...)` directly |
-| `qr` gives non-finite steps; other solvers fine | rank-deficient Jacobian | use the damped augmented `augmented_qr` / `lsmr`, or `cholesky` / `cg` |
+| `qr` gives non-finite steps; other solvers fine | rank-deficient Jacobian | any other solver: the damped Gram/normal forms (`auto`), or `augmented_qr` / `lsmr` |
 | `MAX_STEPS` but loss small and flat | converged without a stopping rule | set `gtol`/`xtol` |
 | damping grows without bound (float32 `inf`) | rejection storm | `max_damping`, or check residual scaling |
 | every `solve` call recompiles | residual/callback/metric object rebuilt per call (solvers compare by configuration, but their pieces key by identity) | define the pieces once at setup scope |
@@ -276,7 +326,7 @@ matrix-free representation, a harder inner solve. In practice the inner CG cost 
 dominated by the smooth-kernel spectrum, not the worst-case bound: the
 shift clusters the spectral tail, and measured float64 iteration counts
 (~32 at n=1000 for Matérn-5/2) are flat in `eps` from 1e-2 to 1e-8. Two
-budget notes for `linear_solver="cg"` with a matrix-free metric: total
+budget notes for `linear_solver="gram_cg"` with a matrix-free metric: total
 kernel matvecs = outer CG iterations x inner CG iterations, so the inner
 tolerance is the dominant cost knob; and large LM damping hides metric
 conditioning (the dual operator is G + lambda*I), so problems can look
