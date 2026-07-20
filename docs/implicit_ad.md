@@ -106,9 +106,17 @@ metric is supplied only through square-root callbacks, the same inverse metric i
 applied as \(P x = S S^\top x\) using `metric.inv_sqrt` and
 `metric.inv_sqrt_transpose`.
 
-## Dense vs Matrix-Free Implicit Solve
+## Implicit Solver Geometries: Dual vs Primal, Dense vs Matrix-Free
 
-The implicit derivative always uses the same undamped residual-space system:
+Every implicit rule linearizes the same undamped residual constraint at the
+returned solution,
+
+$$
+J_\theta \dot\theta = -J_p\dot p,
+$$
+
+and the rules differ only in which *geometry* factors it. The **dual** rules
+work in residual space:
 
 $$
 (J_\theta P J_\theta^\top)y = J_p\dot p,
@@ -116,11 +124,62 @@ $$
 \dot\theta = -P J_\theta^\top y.
 $$
 
-The solver exposes two concrete implicit solvers plus an automatic selector:
+The **primal** rules work in whitened parameter space, matched to a tall
+(\(m > n\)) full-column-rank Jacobian, where the \(m\times m\) dual Gram is
+structurally singular. With \(S = M^{-1/2}\) (so \(S S^\top = P\)) and
+\(B = J_\theta S \in \mathbb R^{m\times n}\), the Gauss-Newton tangent is
 
-- `implicit_solver="cholesky"` materializes \(J_\theta^\top\), assembles
+$$
+\dot\theta = S\,u_p,
+\qquad
+u_p
+= \arg\min_u \|B u + J_p\dot p\|^2 + \rho\,\|u\|^2
+= -(B^\top B + \rho I_n)^{-1} B^\top J_p\dot p,
+$$
+
+with the relative ridge
+\(\rho = \) `implicit_penalty` \(\cdot\ \operatorname{trace}(B^\top B)\).
+Because \(\operatorname{trace}(B^\top B) = \operatorname{trace}(J_\theta P
+J_\theta^\top)\), `implicit_penalty` means the *same relative ridge* in both
+geometries. `primal_qr` never forms \(B^\top B\): it takes the reduced QR of
+the augmented matrix
+\(\begin{bmatrix} B \\ \sqrt{\rho}\, I_n \end{bmatrix} = QR\) and solves
+
+$$
+R\,u_p = -Q^\top \begin{bmatrix} J_p\dot p \\ 0 \end{bmatrix},
+\qquad
+\dot\theta = S\,u_p,
+$$
+
+so it avoids **both** the \(m\times m\) dual Gram **and** the
+condition-squaring normal equations. \(B\) is assembled by \(n\)
+forward-mode JVP columns over the parameter identity basis — no \(m\times m\)
+residual identity is ever materialized. Like the whitened forward solvers,
+the primal rules apply the metric through its square-root callbacks
+`metric.inv_sqrt` / `metric.inv_sqrt_transpose` (the identity metric
+supplies them).
+
+**One contract holds across all rules**: nonzero-residual implicit
+differentiation *intentionally* uses the Gauss-Newton linearization of the
+residual constraint \(r(\theta^\star, a, p) = 0\) at the returned solution —
+it does not differentiate the full least-squares stationarity condition
+\(J_\theta^\top r = 0\), so no residual-weighted second-derivative terms
+ever appear. At an exact root the two coincide; at a nonzero-residual
+solution the Gauss-Newton tangent is the documented answer, consistent with
+the forward solver's Gauss-Newton contract.
+
+The solver exposes four concrete implicit solvers plus an automatic
+selector (the resolution is recorded in
+`solver._resolved_implicit_solver`):
+
+- `implicit_solver="dual_cholesky"` (backward-compatible alias:
+  `"cholesky"`) materializes \(J_\theta^\top\), assembles
   \(J_\theta P J_\theta^\top\), and uses a dense Cholesky solve. This is the
-  historical rule and is still the explicit escape hatch. The implicit Gram
+  historical rule and is still the explicit escape hatch. Its Jacobian
+  assembly is now geometry-aware like the forward dense solvers: \(n\)
+  forward-mode columns when tall (\(n < m\)), \(m\) reverse-mode rows
+  otherwise (see `jacobian_mode` in the
+  [tuning guide](tuning_guide.md#solver-selection)). The implicit Gram
   has no `+ damping I` floor from the forward solve, but it is regularized by
   a small **relative ridge**, `+ implicit_penalty * trace(J P J') I`
   (default: `1e-12`/`1e-6` for a float64/float32 dual solve; see below) —
@@ -130,12 +189,26 @@ The solver exposes two concrete implicit solvers plus an automatic selector:
   for a float32 model (measured on a \(10^{-7}\)-weight spike metric: a
   float32 implicit tangent wrong by ~5% — and its VJP by ~40% — becomes
   accurate to ~\(10^{-7}\), with the returned tangent still float32).
-- `implicit_solver="cg"` applies \(y \mapsto J_\theta P J_\theta^\top y\)
+- `implicit_solver="dual_cg"` (alias: `"cg"`) applies
+  \(y \mapsto J_\theta P J_\theta^\top y\)
   matrix-free using JAX JVP/VJP closures, then solves with CG wrapped in
   `jax.lax.custom_linear_solve(..., symmetric=True)`. This makes both JVP and
   VJP of `solve(...).x` matrix-free.
-- `implicit_solver="auto"` chooses the matrix-free CG rule only when
-  `linear_solver="cg"`; otherwise it uses the dense Cholesky rule.
+- `implicit_solver="primal_qr"` is the tall-system rule above: the
+  augmented QR of \([B; \sqrt{\rho} I_n]\), \(n\)-wide throughout. It honors
+  `dual_solve_dtype` promotion exactly like the dense dual rule (wide
+  factorization and solves, tangent cast back).
+- `implicit_solver="primal_cholesky"` computes the same tangent through the
+  \(n\times n\) whitened normal equations \(B^\top B + \rho I_n\) —
+  cheaper than the QR, but it re-introduces the condition-number squaring
+  the QR avoids. It is the documented normal-equations trade-off for small,
+  well-conditioned \(B\).
+- `implicit_solver="auto"` (the default) follows the forward solver's
+  geometry: `linear_solver="cg"` resolves to `dual_cg`;
+  `linear_solver="qr"`, `"augmented_qr"`, and `"lsmr"` resolve by Jacobian
+  shape at trace time (shapes are static) — `primal_qr` when \(m > n\),
+  `dual_cholesky` otherwise; and `linear_solver="cholesky"` resolves to
+  `dual_cholesky`.
 
 A cg-resolved implicit solve requires an explicit `implicit_preconditioner`
 — an approximation of the undamped \((J_\theta P J_\theta^\top)^{-1} v\) —
@@ -151,26 +224,30 @@ unchanged — so `identity_preconditioner()`,
 is `pad_dual_preconditioner`, which divides by the live damping and is
 rejected at construction (implicit AD on padded problems is singular
 anyway). Pass `identity_preconditioner()` to run the implicit CG
-unpreconditioned, or `implicit_solver="cholesky"` to use the dense rule
+unpreconditioned, or `implicit_solver="dual_cholesky"` to use the dense rule
 instead. The forward `dual_preconditioner` is never reused implicitly: it
 approximates the damped operator, and the implicit system is undamped —
 reusing one is an explicit choice (pass the same callable to both
 arguments).
 
-The matrix-free rule has the same mathematical contract as the dense rule:
-\(J_\theta P J_\theta^\top\) must be nonsingular, so \(J_\theta\) must have
-full row rank under the chosen metric. The operator is assumed symmetric
+The matrix-free rule has the same mathematical contract as the dense dual
+rule: \(J_\theta P J_\theta^\top\) must be nonsingular, so \(J_\theta\) must
+have full row rank under the chosen metric (the primal rules dually need
+full *column* rank, the natural condition for a tall system). The operator
+is assumed symmetric
 positive definite; the metric inverse \(P\) must be linear, self-adjoint, and
 positive definite in parameter space, and any `implicit_preconditioner` must be
 linear, self-adjoint, and positive definite for the residual-space operator.
-The two rules treat rank deficiency differently. The **cg rule** is
+The rules treat rank deficiency differently. The **dual_cg rule** is
 intentionally not damped, because damping would change the
 minimum-\(M\)-norm derivative: its run-to-tolerance default produces
 non-finite derivatives on a singular system (loud), while a small bounded
 `implicit_maxiter` returns a finite — and wrong — derivative with no
 diagnostic, so reserve the bounded-budget mode for exact preconditioners.
-The **dense rule** instead adds a relative Tikhonov ridge,
-`implicit_penalty * trace(J P J') I`, before factorization. Redundant
+The **dense rules** — `dual_cholesky` and both primal rules — instead add
+the relative Tikhonov ridge before factorization:
+`implicit_penalty * trace(J P J') I` on the dual Gram, the equal-scale
+`implicit_penalty * trace(B'B) I` on the whitened normal operator. Redundant
 residual rows at the returned solution — e.g. a simulated trajectory that
 has settled onto its steady state, so late-horizon rows repeat — make the
 undamped dual singular *but consistent*, and for such systems the ridge
@@ -185,14 +262,18 @@ of magnitude from both edges. The trade-off is visibility: on a genuinely *incon
 dual the ridge returns a finite, penalty-inflated tangent where the
 unregularized rule failed loudly. Pass `implicit_penalty=0.0` to restore
 the exact unregularized contract (non-finite tangents on any singular
-dual). The cg implicit rule ignores `implicit_penalty` entirely.
+dual). The dual_cg implicit rule ignores `implicit_penalty` entirely.
 
-Self-adjointness of \(P\) is all the rule needs from `metric.solve`: the
+Self-adjointness of \(P\) is all the dual rules need from `metric.solve`: the
 final \(P J_\theta^\top y\) application acts on tangent data, and its
 transpose in the VJP is declared to be \(P\) itself
 (a symmetric `jax.lax.custom_linear_solve`, which also batches under
 `jax.vmap`), so `metric.solve` is only ever
-*evaluated*, never transposed. That is what lets an iterative metric solve —
+*evaluated*, never transposed. The primal rules use the same device for
+\(S\): the final \(S u_p\) application is wrapped in an identity
+`jax.lax.custom_linear_solve` whose transpose solve is declared to be
+`metric.inv_sqrt_transpose`, so `metric.inv_sqrt` is likewise only ever
+evaluated. That is what lets an iterative metric callback —
 [`metric_from_shifted_matvec`](utilities.md#unified-shifted-block-metrics),
 or any hand-written CG-based `Metric.solve` — participate in both JVP and
 VJP even though transposing through JAX's CG is unsupported.
@@ -208,7 +289,8 @@ Accuracy is controlled separately from the forward iterative solve:
 - `implicit_atol=0.0` and `implicit_maxiter=None` are passed to JAX CG.
   `None` leaves the iteration budget to JAX's CG policy.
 - `implicit_preconditioner` is the preconditioner for the undamped implicit
-  dual system, required whenever the implicit solver resolves to cg. It is
+  dual system, required whenever the implicit solver resolves to `dual_cg`.
+  It is
   deliberately a separate argument from `dual_preconditioner`, because the
   forward callback approximates the damped system and reuse should be a
   decision, not a default. Reusing one is now just passing the same

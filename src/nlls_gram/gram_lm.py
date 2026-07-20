@@ -910,17 +910,27 @@ class LevenbergMarquardt:
                 resolved_implicit_solver = "dual_cholesky"
         else:
             resolved_implicit_solver = canonical_implicit_solver
+        # jacobian_mode is consumed by the dense forward solvers and by the
+        # dual cholesky implicit rule ("geometry" may resolve to it); the
+        # matrix-free forward solvers never materialize J and the primal
+        # implicit rules hard-code forward-mode columns, so a forced mode
+        # that nothing could ever read is a construction error, not a
+        # silent no-op.
         if (
             jacobian_mode != "auto"
             and linear_solver in ("cg", "lsmr")
-            and resolved_implicit_solver == "dual_cg"
+            and resolved_implicit_solver in ("dual_cg", "primal_qr", "primal_cholesky")
         ):
             raise ValueError(
                 "jacobian_mode controls dense Jacobian assembly, but neither "
-                f'linear_solver="{linear_solver}" nor the cg-resolved implicit '
-                "solver ever materializes the Jacobian"
+                f'linear_solver="{linear_solver}" nor the '
+                f'"{resolved_implicit_solver}"-resolved implicit solver ever '
+                "consumes it (the primal rules always use forward-mode columns)"
             )
-        if implicit_preconditioner is not None and resolved_implicit_solver != "dual_cg":
+        if (
+            implicit_preconditioner is not None
+            and resolved_implicit_solver != "dual_cg"
+        ):
             raise ValueError(
                 'implicit_preconditioner requires implicit_solver="cg"/"dual_cg" '
                 'or implicit_solver="auto" with linear_solver="cg"'
@@ -998,6 +1008,21 @@ class LevenbergMarquardt:
                     f'linear_solver="{linear_solver}" with a custom metric requires '
                     "metric.inv_sqrt and metric.inv_sqrt_transpose"
                 )
+        # The primal implicit rules whiten with S = metric.inv_sqrt; a custom
+        # metric supplying only solve would silently degrade S to the
+        # identity there (wrong tangents on rank-deficient problems, where
+        # the metric is part of the answer). The "geometry" resolution is
+        # covered by the forward-solver check above -- it only arises for
+        # the whitened forward solvers.
+        if (
+            has_custom_metric
+            and resolved_implicit_solver in ("primal_qr", "primal_cholesky")
+            and (metric.inv_sqrt is None or metric.inv_sqrt_transpose is None)
+        ):
+            raise ValueError(
+                f'implicit_solver="{implicit_solver}" with a custom metric '
+                "requires metric.inv_sqrt and metric.inv_sqrt_transpose"
+            )
         if has_custom_metric and geodesic_acceleration and metric.norm is None:
             raise ValueError(
                 "geodesic_acceleration (on by default) with a custom metric "
@@ -2279,13 +2304,17 @@ class LevenbergMarquardt:
         # scale as the dual rule, so implicit_penalty means the same thing in
         # both geometries. penalty = 0.0 restores the exact unregularized
         # rule (non-finite tangents on a rank-deficient B, loudly).
-        ridge = penalty * jnp.sum(jnp.square(transformed_Jt))
         rhs = -residual_p_dot.astype(dual_dtype)
         if rule == "primal_qr":
+            # sqrt(ridge) factored as sqrt(penalty) * ||B||_F with the sqrt
+            # taken on the static penalty: jnp.sqrt(ridge) at ridge == 0
+            # (penalty = 0.0) has an infinite derivative, which would NaN
+            # second-order differentiation even on a full-rank problem.
+            ridge_sqrt = penalty**0.5 * jnp.linalg.norm(transformed_Jt)
             augmented_matrix = jnp.concatenate(
                 (
                     transformed_Jt.T,
-                    jnp.sqrt(ridge) * jnp.eye(n, dtype=dual_dtype),
+                    ridge_sqrt * jnp.eye(n, dtype=dual_dtype),
                 ),
                 axis=0,
             )
@@ -2293,6 +2322,7 @@ class LevenbergMarquardt:
             augmented_rhs = jnp.concatenate((rhs, jnp.zeros(n, dtype=dual_dtype)))
             u = jsp_linalg.solve_triangular(R, Q.T @ augmented_rhs)
         else:
+            ridge = penalty * jnp.sum(jnp.square(transformed_Jt))
             normal_matrix = transformed_Jt @ transformed_Jt.T + ridge * jnp.eye(
                 n, dtype=dual_dtype
             )
@@ -2302,14 +2332,17 @@ class LevenbergMarquardt:
         # to be S' (metric.inv_sqrt_transpose) through an identity
         # custom_linear_solve, the same device the cg rule uses for P, so an
         # iterative inv_sqrt callback is only ever evaluated, never
-        # transposed by JAX.
+        # transposed by JAX. Like the dual rule, the metric callback receives
+        # the (possibly promoted) wide dtype and only the returned tangent is
+        # cast back -- casting before S would let a dtype-promoting callback
+        # desynchronize the tangent dtype from the primal.
         theta_dot = jax.lax.custom_linear_solve(
             lambda v: v,
-            u.astype(residual.dtype),
+            u,
             solve=lambda _, b: self.metric_inv_sqrt(b),
             transpose_solve=lambda _, b: self.metric_inv_sqrt_transpose(b),
         )
-        return unravel(theta_dot)
+        return unravel(theta_dot.astype(residual.dtype))
 
     def _implicit_x_tangent_from_p_cg(self, x, args, p, p_dot):
         theta, unravel = ravel_pytree(x)

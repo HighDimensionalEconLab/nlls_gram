@@ -119,7 +119,11 @@ resampling, and per-step history recording; the docs have a cookbook.
 `solve(...).x` also supports custom implicit JVP/VJP with respect to `p`;
 the docs give the metric-minimum-norm formula and a minimal `jax.jvp` /
 `jax.vjp` example. With `linear_solver="cg"` the default implicit AD rule is
-matrix-free; pass `implicit_solver="cholesky"` to restore the dense rule. The
+matrix-free; pass `implicit_solver="cholesky"` (alias of `"dual_cholesky"`)
+to restore the dense rule. `implicit_solver="auto"` otherwise follows the
+forward solver's geometry — the n-wide `"primal_qr"` rule for tall (`m > n`)
+whitened solves, the dense dual Cholesky rule otherwise; the docs cover the
+full `dual_*`/`primal_*` vocabulary. The
 metric matters for underdetermined roots because it selects which tangent is
 the minimum-norm solution. The per-step `update(...)` interface does not
 define the implicit AD rule.

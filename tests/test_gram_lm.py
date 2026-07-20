@@ -291,7 +291,7 @@ def test_implicit_solver_options_must_be_valid():
 def test_dual_solve_dtype_validation():
     with pytest.raises(ValueError, match="None or jnp.float64"):
         LevenbergMarquardt(residual_fn, dual_solve_dtype=jnp.float32)
-    with pytest.raises(ValueError, match="dense cholesky paths"):
+    with pytest.raises(ValueError, match="dense linear-algebra paths"):
         LevenbergMarquardt(
             residual_fn,
             linear_solver="cg",

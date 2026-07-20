@@ -49,6 +49,17 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   directly factors `[J S; sqrt(damping) I]`, whose damping block guarantees
   full column rank, but its width is the parameter count. That is attractive
   for DAE algebraic roots and expensive when `n` is large.
+- **`jacobian_mode` controls how the dense solvers assemble the Jacobian.**
+  The dense solvers (`cholesky`, `qr`, `augmented_qr`) and the dense implicit
+  rules materialize `J'` by vmapping JVPs/VJPs over an identity basis. The
+  default `"auto"` picks the small side: `n` forward-mode JVP columns when
+  the system is tall (`n < m`), `m` reverse-mode VJP rows otherwise (the
+  historical behavior, and the right one in the package's usual `m << n`
+  regime) — an `m × m` residual identity over a tall system is a
+  compile-time memory blowup. Pass `"fwd"`/`"rev"` to force one mode. The
+  matrix-free solvers (`cg`, `lsmr`) never materialize `J` and reject a
+  non-`"auto"` setting at construction when no dense path (forward or
+  implicit) could consume it.
 - **Use `lsmr` as the matrix-free sibling of `augmented_qr`.** It solves the
   same whitened damped subproblem `min_u ||r + B u||² + damping ||u||²`
   (`B = J S`, `S = metric.inv_sqrt`, step `s = S u`) by
@@ -75,10 +86,13 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   `R`-invariant. Its stopping maps the same
   `iterative_tol`/`iterative_atol`/`iterative_maxiter` hooks (relative/absolute
   bound on the normal-equations residual, measured on the preconditioned operator,
-  callback-schedulable). Differentiating a forward `lsmr` `solve(...).x` uses the
-  dense cholesky implicit rule by default (`implicit_solver="auto"`); pass
-  `implicit_solver="cg"` with an `implicit_preconditioner` for a matrix-free
-  derivative at very large `m`.
+  callback-schedulable). Differentiating a forward `lsmr` `solve(...).x` under
+  the default `implicit_solver="auto"` follows the Jacobian geometry: the
+  n-wide `primal_qr` implicit rule when tall (`m > n`), the dense
+  `dual_cholesky` rule otherwise (see
+  [Implicit AD](implicit_ad.md#implicit-solver-geometries-dual-vs-primal-dense-vs-matrix-free));
+  pass `implicit_solver="cg"` (alias of `"dual_cg"`) with an
+  `implicit_preconditioner` for a matrix-free derivative at very large `m`.
 - `cg` returns an *approximate* step under its iteration budget. That is
   usually fine — LM's accept/reject absorbs inexactness — but see the
   scheduling pattern below. With the default `implicit_solver="auto"`,
@@ -88,7 +102,8 @@ result = solver.solve(x0, args, max_steps=500, atol=..., gtol=...)
   Gram system is ill-conditioned or implicit derivatives must be accurate,
   reach for float64 — it fixes more numerical trouble than any damping
   adjustment. Two grades: `dual_solve_dtype=jnp.float64` promotes only the
-  dense dual pipeline (cholesky forward branch + dense implicit rule) while
+  dense pipeline (cholesky forward branch + the dense implicit rules,
+  dual and primal) while
   the model stays float32 — measured ~1.4x per cholesky update at
   `m=100, n=2000` for a *trivial* residual (an upper bound: real residual
   and Jacobian costs dominate and stay float32), recovering the float64
@@ -143,8 +158,10 @@ exactly then). Three patterns, in order of preference:
 Forward iterative tolerances and implicit AD tolerances are separate. The
 implicit CG rule uses `implicit_tol=None` by default, which means `1e-6` in
 float32 and `1e-10` in float64; these defaults target derivative accuracy, not
-cheap forward steps. Use `implicit_solver="cholesky"` when you want the old
-dense implicit rule, or tune `implicit_tol`, `implicit_atol`,
+cheap forward steps. Use `implicit_solver="dual_cholesky"` (alias
+`"cholesky"`) when you want the dense residual-space implicit rule,
+`"primal_qr"`/`"primal_cholesky"` for the n-wide parameter-space rules on
+tall (`m > n`) systems, or tune `implicit_tol`, `implicit_atol`,
 `implicit_maxiter`, and `implicit_preconditioner(v)` for a matrix-free
 derivative.
 
@@ -215,7 +232,7 @@ preconditioner every step, closing the terminal gap a frozen `P` cannot.
   `None` cannot be switched on), and the *values* of `x0`/`args`/`p`.
   The one exception is `max_steps` with `save_steps=True`: the history
   buffer's shape depends on it, so each distinct value then retraces.
-- **Recompiles per value (static):** `linear_solver`,
+- **Recompiles per value (static):** `linear_solver`, `jacobian_mode`,
   `implicit_solver`, the `implicit_*` accuracy knobs,
   `geodesic_acceleration`, `cache_jacobian`, `has_aux`, the `Metric`
   callbacks, `dual_preconditioner`, `preconditioner_factory`,

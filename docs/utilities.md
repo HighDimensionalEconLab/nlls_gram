@@ -544,10 +544,12 @@ concentrated in the slow, selection-critical directions. LSMR works at
   and are rejected loudly for `lsmr`.
 - **Differentiation**: reverse-AD through `update` works (the whitened solution
   is wrapped in `lax.custom_linear_solve` on the SPD normal operator
-  `BᵀB + damping I`). Differentiating a forward `solve(...).x` uses the dense
-  cholesky implicit rule by default (`implicit_solver="auto"` → cholesky, since
-  `lsmr` is not `cg`); set `implicit_solver="cg"` with an `implicit_preconditioner`
-  for a fully matrix-free derivative at very large `m`.
+  `BᵀB + damping I`). Differentiating a forward `solve(...).x` under the default
+  `implicit_solver="auto"` follows the Jacobian geometry: the n-wide `primal_qr`
+  implicit rule when tall (`m > n`), the dense `dual_cholesky` rule otherwise
+  (see [Implicit AD](implicit_ad.md)); set `implicit_solver="cg"` (alias of
+  `"dual_cg"`) with an `implicit_preconditioner` for a fully matrix-free
+  derivative at very large `m`.
 
 The standalone [`lsmr`](#nlls_gram.lsmr) function (operator/transpose matvecs,
 `b`, `damp`) is exposed too, returning `(x, LSMRState)` with iteration count and
