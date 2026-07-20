@@ -1,7 +1,9 @@
 import jax
 import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
+import pytest
 
-from nlls_gram import LevenbergMarquardt, LMStatus
+from nlls_gram import LevenbergMarquardt, LMStatus, metric_from_cholesky
 
 
 def augmented_qr_solver(residual, *, has_aux=False):
@@ -13,6 +15,41 @@ def augmented_qr_solver(residual, *, has_aux=False):
         cache_jacobian=False,
         has_aux=has_aux,
     )
+
+
+@pytest.mark.parametrize("use_metric", [False, True], ids=["identity", "cholesky"])
+def test_qr_tall_branch_step_matches_closed_form(use_metric):
+    # m = 3 > n = 2 takes the qr solver's tall sub-branch (the reduced QR of
+    # the n x m whitened transpose); the step must equal the damped whitened
+    # normal solution theta0 - S (B'B + lam I)^{-1} B' r with B = J S.
+    A = jnp.array([[1.0, 0.5], [0.3, 2.0], [-1.0, 1.0]])
+    b = jnp.array([1.0, -2.0, 0.5])
+    L = jnp.array([[1.3, 0.0], [0.5, 0.8]])
+    lam = 1e-2
+
+    def residual(theta, args, p):
+        return A @ theta - b
+
+    solver = LevenbergMarquardt(
+        residual,
+        init_damping=lam,
+        linear_solver="qr",
+        metric=metric_from_cholesky(L) if use_metric else None,
+        geodesic_acceleration=False,
+    )
+    theta0 = jnp.array([0.4, -0.3])
+    theta1, _, info = solver.update(theta0, solver.init(theta0))
+
+    S = (
+        jsp_linalg.solve_triangular(L.T, jnp.eye(2), lower=False)
+        if use_metric
+        else jnp.eye(2)
+    )
+    B = A @ S
+    r0 = A @ theta0 - b
+    u = jnp.linalg.solve(B.T @ B + lam * jnp.eye(2), -(B.T @ r0))
+    assert bool(info.accepted)
+    assert jnp.allclose(theta1, theta0 + S @ u, atol=1e-5)
 
 
 def test_nonlinear_algebraic_root_matches_closed_form():

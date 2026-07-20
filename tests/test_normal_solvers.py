@@ -1036,8 +1036,11 @@ def test_implicit_shape_auto_resolves_by_solution_shape():
 
 
 def test_implicit_penalty_zero_fails_loudly_on_rank_deficient_normal_cholesky():
-    # Same loud-failure contract as the gram dual: the default trace-scaled
-    # ridge resolves the singular undamped N = B'B, an explicit 0.0 does not.
+    # implicit_penalty trio on the singular undamped N = B'B: the default None
+    # takes the spectral-filter pseudoinverse (exact min-norm tangent), an
+    # explicit positive value factors the trace-scaled ridge (finite, O(penalty)
+    # bias), and 0.0 is the unridged solve whose rank guard poisons the tangent
+    # to NaN rather than returning a quiet pseudo-solution.
     def residual(theta, _, p):
         return A_RD @ theta - p * B_RD
 
@@ -1055,7 +1058,11 @@ def test_implicit_penalty_zero_fails_loudly_on_rank_deficient_normal_cholesky():
             (jnp.asarray(0.5),),
         )[1]
 
+    expected = 0.5 * min_m_norm_root(A_RD, B_RD)
     default_tangent = tangent(None)
     assert bool(jnp.all(jnp.isfinite(default_tangent)))
-    assert jnp.allclose(default_tangent, 0.5 * min_m_norm_root(A_RD, B_RD), atol=2e-3)
+    assert jnp.allclose(default_tangent, expected, atol=2e-3)
+    ridged_tangent = tangent(1e-4)
+    assert bool(jnp.all(jnp.isfinite(ridged_tangent)))
+    assert jnp.allclose(ridged_tangent, expected, atol=5e-3)
     assert not bool(jnp.all(jnp.isfinite(tangent(0.0))))

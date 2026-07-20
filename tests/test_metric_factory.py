@@ -50,13 +50,29 @@ def solver_kwargs_for(linear_solver):
             "dual_preconditioner": identity_preconditioner(),
             "implicit_preconditioner": identity_preconditioner(),
         }
+    if linear_solver == "normal_cg":
+        return {
+            "iterative_tol": 1e-7,
+            "iterative_maxiter": 30,
+            "normal_preconditioner": identity_preconditioner(),
+            "implicit_preconditioner": identity_preconditioner(),
+        }
     if linear_solver == "lsmr":
         return {"iterative_tol": 1e-10, "iterative_maxiter": 50}
     return {}
 
 
 @pytest.mark.parametrize(
-    "linear_solver", ["gram_cholesky", "gram_cg", "qr", "augmented_qr", "lsmr"]
+    "linear_solver",
+    [
+        "gram_cholesky",
+        "gram_cg",
+        "normal_cholesky",
+        "normal_cg",
+        "qr",
+        "augmented_qr",
+        "lsmr",
+    ],
 )
 @pytest.mark.parametrize("geodesic_acceleration", [False, True])
 def test_factory_update_matches_static_metric_at_same_point(
@@ -129,7 +145,16 @@ def test_factory_cholesky_step_matches_closed_form_underdetermined():
 
 
 @pytest.mark.parametrize(
-    "linear_solver", ["gram_cholesky", "gram_cg", "qr", "augmented_qr", "lsmr"]
+    "linear_solver",
+    [
+        "gram_cholesky",
+        "gram_cg",
+        "normal_cholesky",
+        "normal_cg",
+        "qr",
+        "augmented_qr",
+        "lsmr",
+    ],
 )
 def test_factory_full_solve_converges(linear_solver):
     solver = LevenbergMarquardt(
@@ -279,7 +304,9 @@ def test_jacobian_assembly_does_not_differentiate_aux():
     assert bool(jnp.isfinite(result.x["a"]))
 
 
-@pytest.mark.parametrize("implicit_solver", ["gram_cholesky", "gram_cg"])
+@pytest.mark.parametrize(
+    "implicit_solver", ["gram_cholesky", "gram_cg", "normal_cholesky", "normal_cg"]
+)
 def test_implicit_jvp_freezes_metric_at_solution(implicit_solver):
     # Underdetermined linear residual with a p-dependent metric read from aux:
     # the solve returns the min-M(p)-norm solution, and the implicit tangent
@@ -301,9 +328,11 @@ def test_implicit_jvp_freezes_metric_at_solution(implicit_solver):
         geodesic_acceleration=False,
         implicit_solver=implicit_solver,
         implicit_preconditioner=(
-            identity_preconditioner() if implicit_solver == "gram_cg" else None
+            identity_preconditioner()
+            if implicit_solver in ("gram_cg", "normal_cg")
+            else None
         ),
-        implicit_maxiter=30 if implicit_solver == "gram_cg" else None,
+        implicit_maxiter=30 if implicit_solver in ("gram_cg", "normal_cg") else None,
     )
 
     def solved_x(p):
@@ -472,6 +501,11 @@ def test_constructor_rejects_non_factory_and_non_callable_hooks():
             "gram_cholesky",
             lambda w: Metric(inv_sqrt=lambda v: v, inv_sqrt_transpose=lambda v: v),
             "requires metric.solve",
+        ),
+        (
+            "normal_cholesky",
+            lambda w: Metric(solve=lambda v: v / w),
+            "requires metric.inv_sqrt",
         ),
         (
             "lsmr",

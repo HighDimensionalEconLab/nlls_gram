@@ -452,6 +452,194 @@ assert abs(cotangent_promoted - cotangent_reference) / abs(cotangent_reference) 
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_linear_solve_dtype_normal_forms_and_metric_solve_dtype_jaxpr():
+    # The normal-form twin of the promoted-dual test. A metric spike does NOT
+    # stress this form (the graded B'B factors its huge pivot first, stably),
+    # so the float32 fragility is driven the way it actually arises: columns
+    # with cond(A) ~ 1e3 square to cond(B'B) ~ 1e6, and the solution's
+    # small-singular-direction components lose eps32 * cond^2 ~ O(0.1) while
+    # linear_solve_dtype=jnp.float64 recovers the float64 reference on the
+    # SAME float32-representable data, with float32 outputs. Then the jaxpr
+    # policy: float64 problems stay f32-free through the normal forward and
+    # implicit paths, and metric_solve_dtype injects f64 casts into an
+    # otherwise-f32 update.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import (
+    LevenbergMarquardt,
+    identity_preconditioner,
+    metric_from_cholesky,
+)
+
+m, n = 12, 4
+U, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(0), (m, n)))
+V, _ = jnp.linalg.qr(jax.random.normal(jax.random.PRNGKey(1), (n, n)))
+A32 = ((U * jnp.logspace(0.0, -3.0, n)) @ V.T).astype(jnp.float32)
+b32 = (A32.astype(jnp.float64) @ jnp.arange(1.0, n + 1.0)).astype(jnp.float32)
+A64, b64 = A32.astype(jnp.float64), b32.astype(jnp.float64)
+
+
+def make(matrix, target, solve_dtype):
+    def residual(theta, _, p):
+        return matrix @ theta - p * target
+
+    return LevenbergMarquardt(
+        residual,
+        init_damping=1e-8,
+        linear_solver="normal_cholesky",
+        geodesic_acceleration=False,
+        linear_solve_dtype=solve_dtype,
+    )
+
+
+plain32 = make(A32, b32, None)
+promoted = make(A32, b32, jnp.float64)
+reference = make(A64, b64, None)
+p32, p64 = jnp.float32(1.0), jnp.float64(1.0)
+t032, t064 = jnp.zeros(n, jnp.float32), jnp.zeros(n, jnp.float64)
+
+
+def rel(value, ref):
+    difference = value.astype(jnp.float64) - ref
+    return float(jnp.linalg.norm(difference) / jnp.linalg.norm(ref))
+
+
+x_plain = plain32.update(t032, plain32.init(t032, p=p32), p=p32)[0]
+x_promoted = promoted.update(t032, promoted.init(t032, p=p32), p=p32)[0]
+x_reference = reference.update(t064, reference.init(t064, p=p64), p=p64)[0]
+assert x_promoted.dtype == jnp.float32
+assert rel(x_promoted, x_reference) < 1e-6, rel(x_promoted, x_reference)
+assert rel(x_plain, x_reference) > 1e-3, rel(x_plain, x_reference)
+
+
+def tangent(solver, theta0, p_value):
+    return jax.jvp(
+        lambda q: solver.solve(theta0, p=q, max_steps=80, atol=0.0, gtol=1e-5).x,
+        (p_value,),
+        (jnp.ones((), p_value.dtype),),
+    )[1]
+
+
+t_promoted = tangent(promoted, t032, p32)
+t_reference = tangent(reference, t064, p64)
+assert t_promoted.dtype == jnp.float32
+assert rel(t_promoted, t_reference) < 1e-6, rel(t_promoted, t_reference)
+# The default spectral-filter (eigh) implicit is sturdier in float32 than the
+# forward Cholesky, so its degradation is milder -- measured ~6e-4 here.
+assert rel(tangent(plain32, t032, p32), t_reference) > 1e-4
+
+
+# jaxpr policy on float64 data: no f32 anywhere through the normal forward
+# paths or the normal-resolved implicit tangents.
+def residual64(theta, _, p):
+    return A64 @ theta - p * b64
+
+
+normal_dense = LevenbergMarquardt(
+    residual64,
+    init_damping=1e-3,
+    linear_solver="normal_cholesky",
+    geodesic_acceleration=False,
+)
+state64 = normal_dense.init(t064, p=p64)
+jaxpr = str(
+    jax.make_jaxpr(lambda th, s, q: normal_dense.update(th, s, p=q))(
+        t064, state64, p64
+    )
+)
+assert "f32" not in jaxpr, jaxpr
+
+normal_cg = LevenbergMarquardt(
+    residual64,
+    init_damping=1e-3,
+    linear_solver="normal_cg",
+    normal_preconditioner=identity_preconditioner(),
+    implicit_preconditioner=identity_preconditioner(),
+    iterative_tol=1e-10,
+    iterative_maxiter=30,
+    geodesic_acceleration=False,
+)
+state_cg = normal_cg.init(t064, p=p64)
+jaxpr = str(
+    jax.make_jaxpr(lambda th, s, q: normal_cg.update(th, s, p=q))(
+        t064, state_cg, p64
+    )
+)
+assert "f32" not in jaxpr, jaxpr
+
+for solver in (normal_dense, normal_cg):
+    jaxpr = str(jax.make_jaxpr(lambda q: tangent(solver, t064, q))(p64))
+    assert "f32" not in jaxpr, jaxpr
+
+implicit_normal_cg = LevenbergMarquardt(
+    residual64,
+    init_damping=1e-3,
+    linear_solver="normal_cholesky",
+    implicit_solver="normal_cg",
+    implicit_preconditioner=identity_preconditioner(),
+    implicit_maxiter=30,
+    geodesic_acceleration=False,
+)
+jaxpr = str(jax.make_jaxpr(lambda q: tangent(implicit_normal_cg, t064, q))(p64))
+assert "f32" not in jaxpr, jaxpr
+
+
+# metric_solve_dtype on a float32 problem: the update jaxpr gains f64 casts
+# around the metric callbacks (absent without the knob) while every output
+# stays float32.
+L32 = jnp.array([[1.3, 0.0], [0.5, 0.8]], dtype=jnp.float32)
+A_t32 = jnp.array([[1.0, 0.5], [0.3, 2.0], [-1.0, 1.0]], dtype=jnp.float32)
+b_t32 = jnp.array([1.0, -2.0, 0.5], dtype=jnp.float32)
+t02 = jnp.zeros(2, jnp.float32)
+
+
+def residual32(theta, _, p):
+    return A_t32 @ theta - p * b_t32
+
+
+def make_metric_solver(solve_dtype):
+    return LevenbergMarquardt(
+        residual32,
+        init_damping=1e-3,
+        linear_solver="normal_cholesky",
+        metric=metric_from_cholesky(L32),
+        metric_solve_dtype=solve_dtype,
+        geodesic_acceleration=False,
+    )
+
+
+wide_metric = make_metric_solver(jnp.float64)
+plain_metric = make_metric_solver(None)
+state32 = wide_metric.init(t02, p=jnp.float32(1.0))
+jaxpr_wide = str(
+    jax.make_jaxpr(lambda th, s, q: wide_metric.update(th, s, p=q))(
+        t02, state32, jnp.float32(1.0)
+    )
+)
+jaxpr_plain = str(
+    jax.make_jaxpr(lambda th, s, q: plain_metric.update(th, s, p=q))(
+        t02, plain_metric.init(t02, p=jnp.float32(1.0)), jnp.float32(1.0)
+    )
+)
+assert "f64" in jaxpr_wide, jaxpr_wide
+assert "f64" not in jaxpr_plain, jaxpr_plain
+x1, state1, info1 = wide_metric.update(t02, state32, p=jnp.float32(1.0))
+assert x1.dtype == jnp.float32
+assert state1.damping.dtype == jnp.float32
+assert info1.loss.dtype == jnp.float32
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_augmented_qr_float64_and_dtype_policy():
     script = r"""
 import jax
