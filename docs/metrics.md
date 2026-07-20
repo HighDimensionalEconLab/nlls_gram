@@ -222,9 +222,10 @@ Rules and semantics:
 - Under implicit differentiation of `solve` with respect to `p`, the metric
   is frozen at the returned solution: `prepare`/`build` run once at
   `(result.x, result.args, result.p, result.aux)` and the state-dependence
-  is not differentiated. The freeze is a first-order statement — each
-  first-order implicit solve applies a frozen metric, while higher-order AD
-  differentiates the metric-dependent tangent field pointwise. See
+  is not differentiated. The freeze is a first-order statement — and
+  higher-order AD through a factory-built metric's state dependence is
+  unsupported in the implicit rules; take higher-order derivatives of
+  `solve` only with a fixed metric. See
   [Implicit differentiation](implicit_ad.md#iterate-dependent-metrics-are-frozen-per-solve).
 - Like every jit-static hook, define the `(prepare, build)` pair once at
   setup scope; a fresh closure per call keys a new compilation.

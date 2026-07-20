@@ -332,9 +332,11 @@ where the squared solves hit their `eps·cond` floor. It requires the metric's
 `whitened_preconditioner` (a `WhitenedPreconditioner` parameter-space
 right-preconditioner `R⁻¹`) that clusters the LSMR spectrum when the whitened
 operator is itself ill-conditioned. The damping row rides inside the
-preconditioned operator, so every \(\lambda>0\) subproblem is exactly the
-identity-damped whitened subproblem in \(u = R^{-1}z\): the preconditioner
-changes the iteration count, never the step being solved for, and the
+preconditioned operator, so the *posed* subproblem is exactly the
+identity-damped whitened subproblem in \(u = R^{-1}z\) for every
+\(\lambda>0\): at inner convergence the step is independent of \(R\)
+(budget-truncated iterates can still differ across \(R\) — the
+preconditioner changes the iteration path, not the subproblem), and the
 \(\lambda \to 0\) selection limit is minimum-\(M\)-norm for any \(R\). It is
 detailed in the
 [utilities guide](utilities.md#matrix-free-lsmr-whitened-subproblem).

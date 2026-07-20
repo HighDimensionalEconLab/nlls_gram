@@ -358,7 +358,8 @@ so nothing fails loudly. An arbitrary SPD approximation of the inverse does
 **not** have this property, and rank deficiency is the package's home turf
 (tall interpolation problems always carry redundant rows or collinear
 columns). Safe constructions: the identity; polynomials in the operator
-itself; an exact \((B^\top B + \tau I)^{-1}\) at a fixed shift; any \(C\)
+itself; an exact \((B^\top B + \tau I)^{-1}\) at a fixed shift
+\(\tau > 0\); any \(C\)
 that commutes with the orthogonal projector onto
 \(\operatorname{range}(B^\top)\). On full-column-rank problems
 (\(\operatorname{rank} B = n\)) the condition is vacuous and any SPD \(C\)
@@ -558,8 +559,10 @@ solvers behave as follows:
   at the documented O(`implicit_penalty`) ridge bias, a
   `normal_cholesky`-resolved implicit computes it exactly through its
   default spectral-filter pseudoinverse, and a `normal_cg`-resolved
-  implicit computes it with no ridge in exact arithmetic (with
-  `implicit_penalty=0.0` the dense rules fail loudly instead). A
+  implicit computes it with no ridge in exact arithmetic — on its default
+  unridged path, with the inner CG run to convergence, and either
+  unpreconditioned or with a range-preserving `implicit_preconditioner`
+  (with `implicit_penalty=0.0` the dense rules fail loudly instead). A
   `gram_cg`-resolved implicit is the
   fragile choice here — run-to-tolerance CG on the singular padded dual —
   and `pad_dual_preconditioner` divides the padded block by the live
@@ -601,11 +604,12 @@ over the CG forms.
   and un-preconditions the final iterate, `u = R⁻¹ z`. Because the damping
   row is `sqrt(damping)·R⁻¹z` — not `sqrt(damping)·z` — the least-squares
   problem in `z` is exactly `min ||B u + r||² + damping ||u||²` over
-  `u = R⁻¹ z`: **every `damping > 0` subproblem is the identity-damped
-  whitened subproblem**, so at inner convergence the step is identical to
-  plain LSMR's, `R` changes the iteration count and nothing else, and the
-  `damping → 0` selection limit is the minimum-metric-norm step for *any*
-  `R`. A good `R` (a Schur-complement factor of the parameter-space normal
+  `u = R⁻¹ z`: **every `damping > 0` *posed* subproblem is the
+  identity-damped whitened subproblem**, so at inner convergence the step
+  is identical to plain LSMR's and the `damping → 0` selection limit is the
+  minimum-metric-norm step for *any* `R`. `R` changes the iteration path,
+  not the subproblem — a budget-truncated (unconverged) iterate can still
+  depend on `R`. A good `R` (a Schur-complement factor of the parameter-space normal
   operator is canonical) clusters the spectrum of `B R⁻¹` and cuts the
   endgame iteration count by orders of magnitude — an ill-conditioned
   whitened operator can need thousands of plain iterations versus tens

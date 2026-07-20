@@ -197,8 +197,8 @@ slots in directly, e.g.
   floor. An optional
   `whitened_preconditioner=WhitenedPreconditioner(solve, solve_transpose)`
   right-preconditions the operator to cluster its spectrum; every damped
-  subproblem stays exactly the identity-damped whitened one, so the
-  preconditioner changes iteration counts, never the step.
+  posed subproblem stays exactly the identity-damped whitened one, so the
+  preconditioner changes the iteration path, never the converged step.
 
 All eight solve the same metric-damped linearized subproblem up to the
 accuracy of the chosen linear solver.

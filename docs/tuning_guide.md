@@ -103,9 +103,11 @@ minimum-`M`-norm small-damping selection intact.
   a parameter-space right-preconditioner `R⁻¹` running LSMR on `B R⁻¹` to
   cluster the spectrum and cut the endgame count to the tens (a
   Schur-complement factor is canonical). The damping row rides inside the
-  preconditioned operator, so every subproblem is exactly the `I`-damped one
-  in `u = R⁻¹ z`: `R` changes the iteration count, never the step, and the
-  `damping → 0` selection limit is minimum-`M`-norm for any `R`. Stopping
+  preconditioned operator, so the posed subproblem is exactly the `I`-damped
+  one in `u = R⁻¹ z`: `R` changes the iteration path, never the step being
+  solved for (a budget-truncated iterate can still depend on `R`; a
+  converged one cannot), and the `damping → 0` selection limit is
+  minimum-`M`-norm for any `R`. Stopping
   maps the same `iterative_tol`/`iterative_atol`/`iterative_maxiter` hooks
   (relative/absolute bound on the normal-equations residual, measured on the
   preconditioned operator, callback-schedulable). Differentiating a forward

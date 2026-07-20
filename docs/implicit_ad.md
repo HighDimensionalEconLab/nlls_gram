@@ -128,14 +128,18 @@ closing over constants, matching the forward selection role the metric plays.
 The built metric must stay self-adjoint and positive definite for that fixed
 state.
 
-The freeze is a **first-order** statement, not an all-orders one. Each
-first-order implicit solve applies the metric frozen at *its* solution, but
-the tangent field \(p \mapsto \dot\theta(p)\) so defined uses, at every
-\(p\), the metric rebuilt at that point's solution. Higher-order AD —
-`jax.hessian` through `solve`, or differentiating a computed tangent again —
-differentiates this pointwise metric-dependent tangent field, so second
-derivatives do see the metric's state-dependence: through the tangent field,
-not through any single frozen solve.
+The freeze is a **first-order** statement. Each first-order implicit solve
+applies the metric frozen at *its* solution — the verified contract
+(first-order forward and reverse mode, fixed or factory-built metric). The
+tangent field \(p \mapsto \dot\theta(p)\) so defined uses, at every \(p\),
+the metric rebuilt at that point's solution — but **higher-order AD through
+a factory-built metric's state dependence is unsupported in the implicit
+rules**: the metric wrappers inside the tangent solve cannot see the
+solve-side parameters, so second derivatives do not account for the
+metric's point dependence. Take higher-order derivatives of `solve` only
+with a fixed metric, where the declared solves re-apply correctly (subject
+to the spectral-filter caveat in
+[the ridge section](#rank-deficiency-and-the-ridge)).
 
 ## The Four Implicit Forms
 
@@ -197,6 +201,16 @@ The four forms:
   exact transpose (`inv_sqrt_transpose`), so non-self-adjoint square roots
   — a triangular Cholesky factor — differentiate correctly in reverse
   mode.
+
+Both CG forms assume the inner solve **converges**.
+`jax.lax.custom_linear_solve` transposes the declared solve as an exact
+linear map, but a truncated or early-stopped CG (a small bounded
+`implicit_maxiter`) is not a linear function of its right-hand side — its
+declared transpose then no longer matches what was computed, and
+derivatives are silently inaccurate on top of the truncation error itself.
+Run the implicit CG solves to tolerance (the default
+`implicit_maxiter=None`), and treat a bounded budget as valid only with a
+preconditioner exact enough to converge within it.
 
 The dense-resolved implicit rules inherit `linear_solve_dtype`: the undamped
 implicit system is the most conditioning-sensitive solve in the library, so
@@ -286,7 +300,10 @@ collinear columns included. The four forms then behave as follows:
   `custom_linear_solve`, so higher-order AD re-applies the solve to new
   right-hand sides and never differentiates `eigh` itself (whose
   derivative rule breaks on exactly the repeated-zero spectra this path
-  exists for). An explicitly *positive* `implicit_penalty` opts into the
+  exists for). That re-application drops the derivative of the range
+  projector, which rotates when the active subspace moves with the
+  differentiation point — higher-order derivatives through the filtered
+  solve are exact only while the active subspace is locally constant. An explicitly *positive* `implicit_penalty` opts into the
   trace-scaled ridge `B'B + implicit_penalty * trace(B'B) I` —
   O(`implicit_penalty` · \(n\)) bias, smooth in the spectrum for
   higher-order AD on nearly-degenerate problems. An explicit `0.0` demands
@@ -307,15 +324,22 @@ collinear columns included. The four forms then behave as follows:
   stabilizer for systems where floating-point drift, not rank, is the
   issue. The default stays exact rather than silently biased.
 
-**Least-squares semantics on inconsistent systems.** When the returned
+**Gauss–Newton semantics on inconsistent systems.** When the returned
 point is a least-squares stationary point with nonzero residual rather than
 an exact root, \(J_p\dot p\) need not lie in
 \(\operatorname{range}(J_\theta)\). The normal equations
 \(B^\top B\dot u = -B^\top J_p\dot p\) are consistent regardless (any
-\(B^\top\)-image is), so the normal forms return the minimum-\(M\)-norm
-**least-squares** sensitivity — the tangent of the frozen-Gauss-Newton
-least-squares problem. That is a definition to be aware of, not an error.
-The Gram forms have no such fallback: their dual system is
+\(B^\top\)-image is), so the normal forms return a finite answer: the
+minimum-\(M\)-norm **Gauss–Newton sensitivity of the linearized system**.
+That is *not* the exact optimizer sensitivity — the exact derivative of a
+nonzero-residual stationary point carries residual-weighted
+second-derivative (curvature) terms that the frozen-Jacobian system drops.
+A one-line counterexample: \(r(x, p) = (x - p,\ x^2 - 1)\) at the
+stationary point \(x = 0.5\), \(p = -0.25\) has exact sensitivity
+\(dx/dp = 2\), while the Gauss–Newton normal system gives \(0.5\). The
+implicit rules are exact at interpolating (zero-residual) roots — the
+package's target — and Gauss–Newton approximations away from them. The
+Gram forms don't even get that far: their dual system is
 singular-inconsistent there, giving a ridge-inflated finite tangent
 (`gram_cholesky`) or a loud failure (`gram_cg`).
 
