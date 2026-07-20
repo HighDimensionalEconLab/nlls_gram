@@ -1,4 +1,4 @@
-"""Dual-preconditioner helpers for the ``linear_solver="cg"`` path.
+"""Dual-preconditioner helpers for the ``linear_solver="gram_cg"`` path.
 
 A ``dual_preconditioner(v, damping)`` callback supplies an approximation of
 ``(J M^{-1} J' + damping I)^{-1} v`` on residual-space vectors. Unlike
@@ -15,7 +15,8 @@ import jax.scipy.linalg as jsp_linalg
 def identity_preconditioner():
     """The identity map as an explicit "no preconditioner" choice.
 
-    ``linear_solver="cg"`` requires ``dual_preconditioner``, and a cg-resolved
+    ``linear_solver="gram_cg"`` requires ``dual_preconditioner``, and a
+    cg-resolved
     implicit solve requires ``implicit_preconditioner`` -- nobody should run
     Krylov methods without thinking about preconditioning, so opting out is an
     explicit, greppable decision rather than a silent default. The returned

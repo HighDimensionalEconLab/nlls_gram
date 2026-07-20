@@ -359,22 +359,22 @@ def metric_from_shifted_matvec(
     ``tol`` can usefully be tightened (~1e-10 is reachable in float64 only
     when that condition number is ~1e4 or better). ``maxiter=None`` runs to
     tolerance -- a truncated CG is not a linear function of its right-hand
-    side, which breaks the linear-operator assumptions of the ``cg``
-    linear_solver, so do not cap it as a cost control. ``preconditioner``
+    side, which breaks the linear-operator assumptions of the cg-form
+    linear_solvers, so do not cap it as a cost control. ``preconditioner``
     is forwarded to the inner CG (its ``M`` argument). A matrix right-hand
     side is solved as one stacked CG call (same spectrum, batched matvecs).
 
     Because the inner CG is built on ``lax.custom_linear_solve`` with a
     symmetric operator, ``solve`` composes with ``jax.jvp``/``jax.vjp``/
-    ``jax.grad`` — including both implicit-AD rules (dense and
-    ``implicit_solver="cg"``) and differentiating ``update`` through the
-    ``cg`` path — and with values the matvec closes over; ``matvec`` itself
+    ``jax.grad`` — including the dense and cg-form implicit-AD rules and
+    differentiating ``update`` through the ``gram_cg`` path — and with
+    values the matvec closes over; ``matvec`` itself
     only needs to be linear. (Closure-value differentiation holds for
     direct ``Metric`` use and through ``update``; the LM ``solve()``
     entry point supports differentiation with respect to ``p`` only — its
     implicit rule is a ``jax.custom_jvp``, which cannot close over active
     tracers.) Raw ``jax.linear_transpose`` of ``solve`` is not supported by
-    JAX's CG; the solver never applies it to ``metric.solve`` (the cg
+    JAX's CG; the solver never applies it to ``metric.solve`` (the gram_cg
     implicit rule declares the application self-adjoint instead of
     transposing it).
     """

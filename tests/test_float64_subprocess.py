@@ -108,7 +108,7 @@ theta = jnp.asarray([0.0, 0.0], dtype=jnp.float64)
 solver = LevenbergMarquardt(
     linear_residual,
     init_damping=1e-2,
-    linear_solver="cg",
+    linear_solver="gram_cg",
     iterative_tol=1e-10,
     iterative_maxiter=20,
     dual_preconditioner=identity_preconditioner(),
@@ -197,7 +197,7 @@ assert pre32(jnp.ones(n_dual, jnp.float32), jnp.float32(0.5)).dtype == jnp.float
 solver = LevenbergMarquardt(
     linear_residual,
     init_damping=1e-2,
-    linear_solver="cg",
+    linear_solver="gram_cg",
     iterative_tol=1e-10,
     iterative_maxiter=20,
     dual_preconditioner=nystrom_preconditioner(
@@ -281,10 +281,10 @@ assert "f32" not in jaxpr, jaxpr
     assert result.returncode == 0, result.stderr + result.stdout
 
 
-def test_dual_solve_dtype_promotes_dense_dual_solve():
+def test_linear_solve_dtype_promotes_dense_dual_solve():
     # A 1e-7 metric weight injects a 1/eps spike into the dual, driving
     # cond(J P J') ~ 1e7: the float32 cholesky paths lose the step and the
-    # implicit derivative, while dual_solve_dtype=jnp.float64 recovers the
+    # implicit derivative, while linear_solve_dtype=jnp.float64 recovers the
     # float64 reference on the SAME float32-representable data to ~1e-6,
     # with every output still float32.
     script = r"""
@@ -312,7 +312,7 @@ def make(matrix, target, weights, dual_dtype):
         init_damping=1e-3,
         metric=metric_from_diagonal(weights),
         geodesic_acceleration=False,
-        dual_solve_dtype=dual_dtype,
+        linear_solve_dtype=dual_dtype,
     )
 
 
@@ -384,7 +384,7 @@ qr_dense_implicit = LevenbergMarquardt(
     lambda theta, _, p: A32 @ theta - p * b32,
     linear_solver="qr",
     geodesic_acceleration=False,
-    dual_solve_dtype=jnp.float64,
+    linear_solve_dtype=jnp.float64,
 )
 qr_tangent = tangent(qr_dense_implicit, t032, p32)
 assert qr_tangent.dtype == jnp.float32
@@ -404,7 +404,7 @@ def make_geodesic(matrix, target, weights, dual_dtype):
         metric=metric_from_diagonal(weights),
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=10.0,
-        dual_solve_dtype=dual_dtype,
+        linear_solve_dtype=dual_dtype,
     )
 
 
@@ -470,6 +470,7 @@ def residual(z, args, p):
 solver = LevenbergMarquardt(
     residual,
     linear_solver="augmented_qr",
+    implicit_solver="gram_cholesky",
     geodesic_acceleration=False,
     cache_jacobian=False,
 )
@@ -879,7 +880,7 @@ def solved_x_cg_implicit(p_value):
         init_damping=1e-6,
         metric=matvec_composite(1e-12),
         geodesic_acceleration=False,
-        implicit_solver="cg",
+        implicit_solver="gram_cg",
         implicit_tol=1e-12,
         implicit_preconditioner=identity_preconditioner(),
     )
@@ -977,7 +978,7 @@ def residual_fn(x, args, p):
 
 
 x0 = jnp.zeros(3)
-solver = LevenbergMarquardt(residual_fn)
+solver = LevenbergMarquardt(residual_fn, implicit_solver="gram_cholesky")
 
 
 def sum_x_star(target):
@@ -1242,7 +1243,7 @@ def residual(theta):
 
 solver = LevenbergMarquardt(
     residual,
-    linear_solver="cg",
+    linear_solver="gram_cg",
     iterative_maxiter=30,
     iterative_tol=1e-10,
     dual_preconditioner=identity_preconditioner(),

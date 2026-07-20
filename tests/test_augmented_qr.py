@@ -8,6 +8,7 @@ def augmented_qr_solver(residual, *, has_aux=False):
     return LevenbergMarquardt(
         residual,
         linear_solver="augmented_qr",
+        implicit_solver="gram_cholesky",
         geodesic_acceleration=False,
         cache_jacobian=False,
         has_aux=has_aux,

@@ -43,7 +43,7 @@ DIAG_FACTORY = MetricFactory(
 
 
 def solver_kwargs_for(linear_solver):
-    if linear_solver == "cg":
+    if linear_solver == "gram_cg":
         return {
             "iterative_tol": 1e-7,
             "iterative_maxiter": 30,
@@ -56,7 +56,7 @@ def solver_kwargs_for(linear_solver):
 
 
 @pytest.mark.parametrize(
-    "linear_solver", ["cholesky", "cg", "qr", "augmented_qr", "lsmr"]
+    "linear_solver", ["gram_cholesky", "gram_cg", "qr", "augmented_qr", "lsmr"]
 )
 @pytest.mark.parametrize("geodesic_acceleration", [False, True])
 def test_factory_update_matches_static_metric_at_same_point(
@@ -129,7 +129,7 @@ def test_factory_cholesky_step_matches_closed_form_underdetermined():
 
 
 @pytest.mark.parametrize(
-    "linear_solver", ["cholesky", "cg", "qr", "augmented_qr", "lsmr"]
+    "linear_solver", ["gram_cholesky", "gram_cg", "qr", "augmented_qr", "lsmr"]
 )
 def test_factory_full_solve_converges(linear_solver):
     solver = LevenbergMarquardt(
@@ -279,7 +279,7 @@ def test_jacobian_assembly_does_not_differentiate_aux():
     assert bool(jnp.isfinite(result.x["a"]))
 
 
-@pytest.mark.parametrize("implicit_solver", ["cholesky", "cg"])
+@pytest.mark.parametrize("implicit_solver", ["gram_cholesky", "gram_cg"])
 def test_implicit_jvp_freezes_metric_at_solution(implicit_solver):
     # Underdetermined linear residual with a p-dependent metric read from aux:
     # the solve returns the min-M(p)-norm solution, and the implicit tangent
@@ -301,9 +301,9 @@ def test_implicit_jvp_freezes_metric_at_solution(implicit_solver):
         geodesic_acceleration=False,
         implicit_solver=implicit_solver,
         implicit_preconditioner=(
-            identity_preconditioner() if implicit_solver == "cg" else None
+            identity_preconditioner() if implicit_solver == "gram_cg" else None
         ),
-        implicit_maxiter=30 if implicit_solver == "cg" else None,
+        implicit_maxiter=30 if implicit_solver == "gram_cg" else None,
     )
 
     def solved_x(p):
@@ -469,7 +469,7 @@ def test_constructor_rejects_non_factory_and_non_callable_hooks():
     "linear_solver,build,match",
     [
         (
-            "cholesky",
+            "gram_cholesky",
             lambda w: Metric(inv_sqrt=lambda v: v, inv_sqrt_transpose=lambda v: v),
             "requires metric.solve",
         ),
@@ -502,6 +502,7 @@ def test_build_requiring_norm_under_geodesic_and_non_metric_output():
     solver = LevenbergMarquardt(
         exp_residual_aux,
         has_aux=True,
+        linear_solver="gram_cholesky",
         metric_factory=no_norm,
         geodesic_acceleration=True,
     )

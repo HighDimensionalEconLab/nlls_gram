@@ -656,7 +656,9 @@ def test_mv2020_style_draw_resamples_args(parallel):
         new_args = jax.lax.cond(ctx.step == 1, fresh, lambda _: ctx.args, None)
         return LMSolveAction(args=new_args)
 
-    solver = LevenbergMarquardt(residual, init_damping=1e-2)
+    solver = LevenbergMarquardt(
+        residual, init_damping=1e-2, implicit_solver="gram_cholesky"
+    )
     args0 = {"data": jnp.array([1.0, -2.0, 0.5]), "key": jax.random.key(22)}
     x0 = jnp.array([jnp.nan, jnp.nan, jnp.nan])  # forces one retry
     p = jnp.asarray(2.0)

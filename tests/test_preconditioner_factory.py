@@ -51,7 +51,7 @@ def test_factory_requires_cg():
     factory = PreconditionerFactory(lambda *a: jnp.zeros(()), lambda *a: a[1])
     with pytest.raises(ValueError, match="preconditioner_factory requires"):
         LevenbergMarquardt(
-            lambda x: x, linear_solver="cholesky", preconditioner_factory=factory
+            lambda x: x, linear_solver="gram_cholesky", preconditioner_factory=factory
         )
 
 
@@ -60,7 +60,7 @@ def test_factory_and_dual_preconditioner_mutually_exclusive():
     with pytest.raises(ValueError, match="exactly one"):
         LevenbergMarquardt(
             lambda x: x,
-            linear_solver="cg",
+            linear_solver="gram_cg",
             dual_preconditioner=identity_preconditioner(),
             implicit_preconditioner=identity_preconditioner(),
             preconditioner_factory=factory,
@@ -73,7 +73,7 @@ def test_factory_satisfies_cg_and_implicit_requirements():
     residual, x0, prepare, apply = rotating_problem()
     solver = LevenbergMarquardt(
         residual,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_maxiter=4,
     )
@@ -85,7 +85,7 @@ def test_factory_hashing_shares_compilation():
     # cache; a different apply is a different compiled program.
     residual, x0, prepare, apply = rotating_problem()
     other_apply = lambda state, v, damping: v / (state + damping)  # noqa: E731
-    common = dict(linear_solver="cg", iterative_maxiter=4)
+    common = dict(linear_solver="gram_cg", iterative_maxiter=4)
     a = LevenbergMarquardt(
         residual, preconditioner_factory=PreconditionerFactory(prepare, apply), **common
     )
@@ -108,7 +108,7 @@ def test_init_builds_precond_state():
     residual, x0, prepare, apply = rotating_problem()
     solver = LevenbergMarquardt(
         residual,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_maxiter=4,
     )
@@ -122,7 +122,7 @@ def test_update_without_init_state_raises():
     residual, x0, prepare, apply = rotating_problem()
     solver = LevenbergMarquardt(
         residual,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_maxiter=4,
     )
@@ -152,7 +152,7 @@ def test_factory_matches_frozen_when_theta_independent():
 
     common = dict(
         init_damping=1e-2,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         implicit_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=40,
@@ -191,7 +191,7 @@ def test_factory_converges_where_frozen_stalls():
 
     common = dict(
         init_damping=1e-3,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         geodesic_acceleration=False,
         implicit_preconditioner=identity_preconditioner(),
         iterative_maxiter=2,
@@ -223,7 +223,7 @@ def test_rejected_step_reuses_carried_precond_state():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_maxiter=4,
     )
@@ -252,7 +252,7 @@ def test_update_jits():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_maxiter=4,
     )
@@ -274,7 +274,7 @@ def test_factory_composes_with_recycle():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         geodesic_acceleration=False,
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         recycle=RecycleConfig(rank=3),
@@ -296,7 +296,7 @@ def test_factory_multi_start_vmap():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         geodesic_acceleration=False,
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_maxiter=4,
@@ -323,7 +323,7 @@ def test_multi_start_cold_resets_precond():
     residual, x0, prepare, apply = rotating_problem()
     solver = LevenbergMarquardt(
         residual,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_maxiter=4,
     )
@@ -358,7 +358,7 @@ def test_factory_update_reverse_ad_matches_cholesky():
     factory = LevenbergMarquardt(
         residual_data,
         init_damping=1e-2,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_tol=1e-9,
         iterative_maxiter=60,
@@ -405,10 +405,10 @@ def test_factory_implicit_p_derivative_matches_cholesky():
     # both the dense cholesky rule and an explicit identity implicit_preconditioner.
     residual_p, x0, prepare, apply, p = target_problem()
     common = dict(init_damping=1e-3, geodesic_acceleration=False)
-    cholesky = LevenbergMarquardt(residual_p, **common)
+    cholesky = LevenbergMarquardt(residual_p, linear_solver="gram_cholesky", **common)
     factory = LevenbergMarquardt(
         residual_p,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_tol=1e-12,
         iterative_maxiter=40,
@@ -416,7 +416,7 @@ def test_factory_implicit_p_derivative_matches_cholesky():
     )
     explicit = LevenbergMarquardt(
         residual_p,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
         implicit_preconditioner=identity_preconditioner(),
         iterative_tol=1e-12,
@@ -459,7 +459,7 @@ def test_factory_implicit_p_derivative_no_recompile_across_p():
         residual_p,
         init_damping=1e-3,
         geodesic_acceleration=False,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_tol=1e-12,
         iterative_maxiter=30,
@@ -488,7 +488,7 @@ def test_callback_dropping_precond_raises():
     residual, x0, prepare, apply = rotating_problem()
     solver = LevenbergMarquardt(
         residual,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         preconditioner_factory=PreconditionerFactory(prepare, apply),
         iterative_maxiter=4,
     )
@@ -532,7 +532,7 @@ def test_factory_float64_subprocess():
         solver = LevenbergMarquardt(
             residual,
             init_damping=1e-3,
-            linear_solver="cg",
+            linear_solver="gram_cg",
             geodesic_acceleration=False,
             preconditioner_factory=PreconditionerFactory(prepare, apply),
             iterative_maxiter=2,
