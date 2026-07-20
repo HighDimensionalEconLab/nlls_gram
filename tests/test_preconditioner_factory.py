@@ -34,7 +34,7 @@ def rotating_problem(n=12):
     def residual(x):
         return jnp.exp(A @ x) - target
 
-    def prepare(x, args, p):
+    def prepare(x, args, p, aux):
         d = jnp.exp(A @ x)
         return d * d  # exact diag(J J') at the current x
 
@@ -115,7 +115,7 @@ def test_init_builds_precond_state():
     state = solver.init(x0)
     assert state.precond is not None
     assert bool(state.precond_valid)
-    assert jnp.array_equal(state.precond, prepare(x0, None, None))
+    assert jnp.array_equal(state.precond, prepare(x0, None, None, None))
 
 
 def test_update_without_init_state_raises():
@@ -141,7 +141,7 @@ def test_factory_matches_frozen_when_theta_independent():
     x = {"a": 1.0, "b": 0.0}
     weights = 1.0 + jnp.arange(20, dtype=jnp.float32) / 10.0
 
-    def prepare(x, args, p):
+    def prepare(x, args, p, aux):
         return weights  # ignores x -> a constant preconditioner
 
     def apply(state, v, damping):
@@ -184,7 +184,7 @@ def test_factory_matches_frozen_when_theta_independent():
 
 def test_factory_converges_where_frozen_stalls():
     residual, x0, prepare, apply = rotating_problem()
-    diag0 = prepare(x0, None, None)
+    diag0 = prepare(x0, None, None, None)
 
     def frozen(v, damping):
         return v / (diag0 + damping)  # exact diagonal, frozen at x0
@@ -228,7 +228,7 @@ def test_rejected_step_reuses_carried_precond_state():
         iterative_maxiter=4,
     )
     state = solver.init(x0)
-    correct = prepare(x0, None, None)
+    correct = prepare(x0, None, None, None)
     wrong = correct * 1000.0 + 1.0
 
     reuse_in = dataclasses.replace(
@@ -346,7 +346,7 @@ def test_factory_update_reverse_ad_matches_cholesky():
     def residual_data(x, args, p):
         return x["a"] * jnp.exp(x["b"] * ts) - args
 
-    def prepare(x, args, p):
+    def prepare(x, args, p, aux):
         e = jnp.exp(x["b"] * ts)
         return e**2 + (x["a"] * ts * e) ** 2  # exact diag(J J') at x
 
@@ -386,7 +386,7 @@ def target_problem(n=12):
     def residual_p(x, args, p):
         return jnp.exp(A @ x) - p
 
-    def prepare(x, args, p):
+    def prepare(x, args, p, aux):
         d = jnp.exp(A @ x)
         return d * d
 
@@ -448,7 +448,7 @@ def test_factory_implicit_p_derivative_no_recompile_across_p():
     def residual_p(x, args, q):
         return jnp.exp(A @ x) - q
 
-    def prepare(x, args, q):
+    def prepare(x, args, q, aux):
         d = jnp.exp(A @ x)
         return d * d
 
@@ -521,7 +521,7 @@ def test_factory_float64_subprocess():
         def residual(x):
             return jnp.exp(A @ x) - target
 
-        def prepare(x, args, p):
+        def prepare(x, args, p, aux):
             d = jnp.exp(A @ x)
             return d * d
 

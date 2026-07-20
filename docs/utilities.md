@@ -404,14 +404,14 @@ close as LM drifts \(x\). When it does not — the Jacobian rotates enough that 
 preconditioner built at \(x_0\) decays into an ineffective approximation once
 \(x\) moves, and the inner CG stalls or breaks down — pass a
 `PreconditionerFactory(prepare, apply)` instead of `dual_preconditioner` (pass
-exactly one of the two for `linear_solver="cg"`). Its `prepare(x, args, p)`
+exactly one of the two for `linear_solver="cg"`). Its `prepare(x, args, p, aux)`
 rebuilds the preconditioner state from the **current** iterate, inside the
 jitted loop as traced ops with no recompiles:
 
 ```python
 from nlls_gram import LevenbergMarquardt, PreconditionerFactory
 
-def prepare(x, args, p):
+def prepare(x, args, p, aux):
     # model-structured build from the CURRENT iterate x (the user pytree,
     # not the raveled theta); return any fixed-shape pytree of arrays
     d = jnp.exp(A @ x)
@@ -428,9 +428,11 @@ solver = LevenbergMarquardt(
 )
 ```
 
-- `prepare(x, args, p) -> state` receives the **user pytree** `x` (model
-  structure intact), the residual `args`, and `p`, and returns a fixed-shape
-  pytree of arrays.
+- `prepare(x, args, p, aux) -> state` receives the **user pytree** `x` (model
+  structure intact), the residual `args`, `p`, and the residual aux evaluated
+  at the same linearization point (`None` when `has_aux=False`) — the same
+  signature as `MetricFactory.prepare` — and returns a fixed-shape pytree of
+  arrays.
 - `apply(state, v, damping) -> vector` is the per-iteration apply: an SPD,
   linear-in-`v` approximation of \((J M^{-1} J^\top + \lambda I)^{-1} v\). It
   must stay well-defined at `damping = 0`, because the cg-resolved implicit

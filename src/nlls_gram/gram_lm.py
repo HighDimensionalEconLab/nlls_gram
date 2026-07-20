@@ -394,7 +394,7 @@ class PreconditionerFactory:
     ineffective (breakdown-inducing) approximation downstream, while one rebuilt
     from the live iterate keeps the inner CG converging::
 
-        def prepare(x, args, p):
+        def prepare(x, args, p, aux):
             # model-structured build from the CURRENT iterate x
             return diag  # any fixed-shape pytree of arrays
 
@@ -408,12 +408,14 @@ class PreconditionerFactory:
             iterative_maxiter=...,
         )
 
-    - ``prepare(x, args, p) -> state`` builds a fixed-shape pytree of arrays from
-      the CURRENT solver iterate ``x`` (the user pytree, NOT the raveled flat
+    - ``prepare(x, args, p, aux) -> state`` builds a fixed-shape pytree of arrays
+      from the CURRENT solver iterate ``x`` (the user pytree, NOT the raveled flat
       ``theta`` — model-structured access is the point), the residual ``args``,
-      and ``p``. Runs inside the jitted loop as traced ops (no recompile), once
-      per accepted step: after a rejected step ``x`` did not move, so the carried
-      state is reused and only the live ``damping`` changes.
+      ``p``, and the residual aux evaluated at the same linearization point
+      (``None`` when ``has_aux=False``) — the same signature as
+      ``MetricFactory.prepare``. Runs inside the jitted loop as traced ops (no
+      recompile), once per accepted step: after a rejected step ``x`` did not
+      move, so the carried state is reused and only the live ``damping`` changes.
     - ``apply(state, v, damping) -> vector`` is the per-iteration apply: an SPD,
       linear-in-``v`` approximation of ``(J M^{-1} J' + damping I)^{-1} v``. It
       must stay well-defined at ``damping = 0``, since the cg-resolved implicit
@@ -800,7 +802,7 @@ class LevenbergMarquardt:
 
     ``preconditioner_factory`` (a ``PreconditionerFactory``) is the θ-adaptive
     alternative to the frozen ``dual_preconditioner``: exactly one of the two is
-    required for ``linear_solver="cg"``. Its ``prepare(x, args, p)`` rebuilds the
+    required for ``linear_solver="cg"``. Its ``prepare(x, args, p, aux)`` rebuilds the
     preconditioner state from the CURRENT iterate inside the jitted loop (once
     per accepted step; a rejected step reuses the carried state since ``x`` did
     not move), and ``apply(state, v, damping)`` is the per-iteration apply. Reach
@@ -1170,7 +1172,7 @@ class LevenbergMarquardt:
         residual, aux = self._residual_and_aux(x0, args, p)
         damping = jnp.asarray(self.init_damping, dtype=residual.dtype)
         recycle = self._init_recycle_state(residual)
-        precond, precond_valid = self._init_precond(x0, args, p)
+        precond, precond_valid = self._init_precond(x0, args, p, aux)
         metric_state, metric_valid = self._init_metric_state(x0, args, p, aux)
         if not self.cache_jacobian:
             return LMState(
@@ -1195,13 +1197,15 @@ class LevenbergMarquardt:
             metric_valid=metric_valid,
         )
 
-    def _init_precond(self, x0, args, p):
+    def _init_precond(self, x0, args, p, aux):
         # State built at x0 and valid there: the first update reuses it (x has
         # not moved yet), so init pays the one build and the first step does not
         # rebuild. None for the default path.
         if self.preconditioner_factory is None:
             return None, None
-        state = jax.lax.stop_gradient(self.preconditioner_factory.prepare(x0, args, p))
+        state = jax.lax.stop_gradient(
+            self.preconditioner_factory.prepare(x0, args, p, aux)
+        )
         return state, jnp.asarray(True, dtype=jnp.bool_)
 
     def _init_metric_state(self, x0, args, p, aux):
@@ -1473,7 +1477,7 @@ class LevenbergMarquardt:
                     lm_state.precond_valid,
                     lambda _: lm_state.precond,
                     lambda _: jax.lax.stop_gradient(
-                        self.preconditioner_factory.prepare(x, args, p)
+                        self.preconditioner_factory.prepare(x, args, p, aux)
                     ),
                     operand=None,
                 )
@@ -2323,7 +2327,9 @@ class LevenbergMarquardt:
                     return inv_sqrt_cb(inv_sqrt_transpose_cb(v))
 
         if self._resolved_implicit_solver == "cg":
-            return self._implicit_x_tangent_from_p_cg(x, args, p, p_dot, metric_inverse)
+            return self._implicit_x_tangent_from_p_cg(
+                x, args, p, p_dot, metric_inverse, aux
+            )
         return self._implicit_x_tangent_from_p_cholesky(
             x, args, p, p_dot, metric_inverse
         )
@@ -2375,7 +2381,7 @@ class LevenbergMarquardt:
         theta_dot = -gram_step_left @ dual_solution
         return unravel(theta_dot.astype(residual.dtype))
 
-    def _implicit_x_tangent_from_p_cg(self, x, args, p, p_dot, metric_inverse):
+    def _implicit_x_tangent_from_p_cg(self, x, args, p, p_dot, metric_inverse, aux):
         theta, unravel = ravel_pytree(x)
 
         def residual_from_theta(theta_value):
@@ -2406,7 +2412,7 @@ class LevenbergMarquardt:
             cg_preconditioner = self.implicit_preconditioner
         elif self.preconditioner_factory is not None:
             precond_state = jax.lax.stop_gradient(
-                self.preconditioner_factory.prepare(x, args, p)
+                self.preconditioner_factory.prepare(x, args, p, aux)
             )
             zero_damping = jnp.zeros((), dtype=residual.dtype)
 

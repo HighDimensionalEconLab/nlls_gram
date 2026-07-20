@@ -169,7 +169,7 @@ decays into an ineffective approximation — the inner CG stalls or breaks down
 several steps in, while rebuilding from the current iterate would keep it
 converging — pass a
 [`PreconditionerFactory(prepare, apply)`](utilities.md#iterate-adaptive-preconditioner-factory)
-instead of `dual_preconditioner`. Its `prepare(x, args, p)` rebuilds the
+instead of `dual_preconditioner`. Its `prepare(x, args, p, aux)` rebuilds the
 preconditioner state from the current iterate inside the jitted loop (once per
 accepted step; a rejected step reuses the carried state), so keep `prepare`
 cheap. It composes with recycling and seeds the implicit derivative's
