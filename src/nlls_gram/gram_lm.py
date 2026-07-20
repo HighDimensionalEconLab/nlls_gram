@@ -906,7 +906,16 @@ class LevenbergMarquardt:
     differentiation it is frozen at the returned solution WITHIN each
     first-order implicit solve -- the tangent treats the metric as constant,
     while higher-order AD differentiates the resulting pointwise
-    metric-dependent tangent field. See :class:`MetricFactory`.
+    metric-dependent tangent field. One shared limitation of the cg-resolved
+    implicit rules: they apply the frozen metric (``P`` under gram_cg, ``S``
+    under normal_cg) through identity-matvec ``custom_linear_solve``
+    wrappers whose declared solves are opaque to AD, so an identity matvec
+    exposes no parameters to differentiate -- first-order reverse mode with
+    a fixed metric is correct (and jit/vmap exercised), but higher-order
+    derivatives THROUGH a factory-built metric's state dependence inside
+    those applications are not propagated and can fail loudly rather than
+    silently. Use the dense implicit forms when that dependence must be
+    differentiated. See :class:`MetricFactory`.
 
     ``solve(...).x`` has a custom implicit AD rule with respect to ``p``,
     relinearized at the returned solution in one of the same four forms --
@@ -950,16 +959,33 @@ class LevenbergMarquardt:
       ``n * eps * lambda_max`` rank cutoff -- exact Gauss-Newton sensitivity
       at full column rank (square nonsingular: ``-J^{-1} J_p p_dot``), the
       minimum-``M``-norm tangent for consistent rank-deficient systems, with
-      no ridge bias in either. An explicitly positive value opts into the
-      trace-scaled ridge ``B'B + implicit_penalty * trace(B'B) I_n``
+      no ridge bias in either. The cutoff is a NUMERICAL rank threshold,
+      not an algebraic certificate: an ill-conditioned but genuinely
+      full-rank spectrum whose smallest eigenvalue falls under
+      ``n * eps * lambda_max`` (float32 ``diag(1, eps)``) has that direction
+      silently treated as rank-deficient -- promote with
+      ``linear_solve_dtype`` or set an explicit penalty when tiny
+      eigenvalues are real. Higher-order AD re-solves the differentiated
+      equation through the frozen filter, which omits the derivative of the
+      range projector: second derivatives are exact only while the active
+      subspace does not rotate with ``p``; on rank-deficient problems whose
+      range moves, they carry a first-order-only guarantee. An explicitly
+      positive value opts into the trace-scaled ridge
+      ``B'B + implicit_penalty * trace(B'B) I_n``
       (O(``implicit_penalty * n``) bias, smooth in the spectrum for
       higher-order AD on nearly-degenerate problems).
     - normal_cg: an explicitly positive value adds a matrix-free ridge
-      scaled by the rhs Rayleigh quotient of ``B'B``.
+      scaled by a Rayleigh quotient of ``B'B`` over a fixed deterministic
+      probe vector, keeping the tangent map linear in ``p_dot`` and the
+      ridge alive on a zero tangent.
 
     In every form ``0.0`` demands the exact unregularized solve, which fails
     loudly (non-finite tangents) on a singular operator rather than silently
-    selecting a particular solution.
+    selecting a particular solution; the normal_cholesky guard enforcing
+    that shares the numerical-rank caveat above (a cho pivot is not a rank
+    certificate either, so a genuinely tiny pivot is poisoned the same way).
+    A solution with ``J = 0`` zeroes every trace-scaled ridge itself and
+    fails just as loudly at any penalty.
 
     ``linear_solve_dtype=jnp.float64`` promotes the dense linear-solve
     pipelines -- the forward ``gram_cholesky``/``normal_cholesky`` (and
@@ -2931,16 +2957,22 @@ class LevenbergMarquardt:
         # silently biased one).
         rhs = Bt_matvec(residual_p_dot)
         # An explicitly positive implicit_penalty opts into a ridge; trace(N)
-        # is unavailable matrix-free, so its scale is the rhs Rayleigh
-        # quotient of N (one extra matvec), stop_gradient'ed as pure
-        # conditioning data.
+        # is unavailable matrix-free, so its scale is a Rayleigh quotient of
+        # N (one extra matvec) over a FIXED normalized probe vector -- never
+        # the rhs, whose direction would make this tangent map nonlinear in
+        # p_dot and zero the ridge on a zero tangent. A deterministic
+        # jax.random draw is almost surely outside ker(B), where a
+        # constant-vector probe can sit for centered models;
+        # stop_gradient'ed as pure conditioning data.
         ridge = None
         penalty = self.implicit_penalty
         if penalty is not None and penalty > 0:
-            rhs_norm_sq = jnp.vdot(rhs, rhs)
+            probe = jax.random.normal(
+                jax.random.key(0), (theta.shape[0],), dtype=residual.dtype
+            )
+            probe = probe / jnp.linalg.norm(probe)
             rayleigh = jax.lax.stop_gradient(
-                jnp.vdot(rhs, Bt_matvec(B_matvec(rhs)))
-                / jnp.maximum(rhs_norm_sq, jnp.finfo(residual.dtype).tiny)
+                jnp.vdot(probe, Bt_matvec(B_matvec(probe)))
             )
             ridge = penalty * rayleigh
 

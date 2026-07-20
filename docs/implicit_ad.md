@@ -320,7 +320,8 @@ collinear columns included. The four forms then behave as follows:
   Krylov iteration converges to the min-norm tangent on
   singular-but-consistent systems anyway. A matrix-free ridge is added only
   when `implicit_penalty` is passed explicitly positive (its scale set by
-  the right-hand side's Rayleigh quotient of \(B^\top B\)) — an opt-in
+  a Rayleigh quotient of \(B^\top B\) over a fixed deterministic probe
+  vector, so the tangent map stays linear in the seed) — an opt-in
   stabilizer for systems where floating-point drift, not rank, is the
   issue. The default stays exact rather than silently biased.
 
