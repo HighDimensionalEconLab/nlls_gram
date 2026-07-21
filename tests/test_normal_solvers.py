@@ -10,6 +10,7 @@ import pytest
 
 from nlls_gram import (
     LevenbergMarquardt,
+    Metric,
     PreconditionerFactory,
     RecycleConfig,
     WhitenedPreconditioner,
@@ -1298,3 +1299,77 @@ def test_dense_trio_on_wide_rank_deficient_fixture():
     )
 
     assert bool(jnp.all(jnp.isnan(tangent(0.0))))
+
+
+def test_dense_reverse_mode_through_opaque_inv_sqrt():
+    # A metric whose inv_sqrt is forward-correct but NOT reverse-differentiable
+    # (a lax.while_loop) with an explicit inv_sqrt_transpose: the dense AD
+    # rule's final -S step declares that transpose, so jax.grad routes reverse
+    # mode through inv_sqrt_transpose. A bare -inv_sqrt(...) would instead try
+    # to reverse-differentiate the while_loop and raise (Codex counterexample).
+    L = jnp.array([[2.0, 0.0], [1.0, 3.0]], dtype=jnp.float32)
+
+    def opaque_inv_sqrt(v):
+        def body(carry):
+            i, _ = carry
+            return i + 1, jsp_linalg.solve_triangular(L.T, v, lower=False)
+
+        _, out = jax.lax.while_loop(lambda c: c[0] < 1, body, (0, jnp.zeros_like(v)))
+        return out
+
+    def inv_sqrt_transpose(w):
+        return jsp_linalg.solve_triangular(L, w, lower=True)
+
+    opaque_metric = Metric(
+        inv_sqrt=opaque_inv_sqrt, inv_sqrt_transpose=inv_sqrt_transpose
+    )
+
+    A = jnp.array([[1.0, 0.5], [0.5, 2.0], [1.0, 1.0]], dtype=jnp.float32)
+
+    def residual(theta, _, p):
+        return A @ theta - p
+
+    def scalar_of(metric):
+        solver = LevenbergMarquardt(
+            residual,
+            init_damping=1e-3,
+            ad_solver="dense",
+            metric=metric,
+            geodesic_acceleration=False,
+        )
+        return lambda p: jnp.sum(
+            solver.solve(jnp.zeros(2), p=p, max_steps=60, atol=1e-6).x ** 2
+        )
+
+    p0 = jnp.array([1.0, 2.0, 0.5], dtype=jnp.float32)
+    grad_opaque = jax.grad(scalar_of(opaque_metric))(p0)
+    assert bool(jnp.all(jnp.isfinite(grad_opaque)))
+    # metric_from_cholesky(L) is the differentiable-inv_sqrt twin (same S, S').
+    grad_reference = jax.grad(scalar_of(metric_from_cholesky(L)))(p0)
+    assert jnp.allclose(grad_opaque, grad_reference, atol=1e-4)
+
+
+def test_dense_zero_penalty_rank_guard_catches_exact_singularity():
+    # Codex counterexample: B with column 2 == -3 * column 1 is exactly rank 1,
+    # but unpivoted-QR |R_ii| diagonals do not flag it. The svdvals(R) guard
+    # must poison the 0.0 tangent to NaN, not return a finite null-space-
+    # inflated tangent.
+    A = jnp.array([[2.0, -6.0], [7.0, -21.0]], dtype=jnp.float32)
+
+    def residual(theta, _, p):
+        return A @ theta - p
+
+    solver = LevenbergMarquardt(
+        residual,
+        init_damping=1e-3,
+        ad_solver="dense",
+        ad_solver_penalty=0.0,
+        geodesic_acceleration=False,
+    )
+    p0 = A @ jnp.array([1.0, 0.0], dtype=jnp.float32)  # in range(A): solve converges
+    tangent = jax.jvp(
+        lambda p: solver.solve(jnp.zeros(2), p=p, max_steps=40, atol=1e-6).x,
+        (p0,),
+        (jnp.array([1.0, 0.0], dtype=jnp.float32),),
+    )[1]
+    assert bool(jnp.all(jnp.isnan(tangent)))

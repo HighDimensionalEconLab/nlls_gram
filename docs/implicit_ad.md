@@ -143,15 +143,17 @@ The freeze is a **first-order** statement. Each first-order implicit solve
 applies the metric frozen at *its* solution — the verified contract
 (first-order forward and reverse mode, fixed or factory-built metric). The
 tangent field \(p \mapsto \dot\theta(p)\) so defined uses, at every \(p\),
-the metric rebuilt at that point's solution. The **`dense`** rule applies
-the built metric through plain traced ops, so its state dependence *is*
-differentiated at higher order — use `ad_solver="dense"` when that
-dependence must itself be differentiated (subject to the spectral-filter
-caveat in [the ridge section](#rank-deficiency-and-the-ridge)). The
-**cg-resolved** rules cannot: their identity-matvec `custom_linear_solve`
-wrappers hide the metric inside an opaque `solve`, so second derivatives
-through `gram_cg`/`normal_cg` do not account for the metric's point
-dependence.
+the metric rebuilt at that point's solution. But **higher-order AD through
+a factory-built metric's state dependence is unsupported in every AD rule**:
+the dense and cg-resolved rules alike apply the frozen metric through
+identity-matvec `custom_linear_solve` wrappers whose declared solves are
+opaque to AD, so second derivatives do not account for the metric's point
+dependence. Take higher-order derivatives of `solve` only with a fixed
+metric (subject also to the spectral-filter caveat in
+[the ridge section](#rank-deficiency-and-the-ridge)). Those same wrappers
+declare each metric's transpose explicitly, so first-order reverse mode is
+correct even when `inv_sqrt` is not reverse-differentiable but
+`inv_sqrt_transpose` is supplied.
 
 ## The AD Solver
 

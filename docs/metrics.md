@@ -228,11 +228,11 @@ Rules and semantics:
 - Under implicit differentiation of `solve` with respect to `p`, the metric
   is frozen at the returned solution: `prepare`/`build` run once at
   `(result.x, result.args, result.p, result.aux)` and the state-dependence
-  is not differentiated. The freeze is a first-order statement: the `dense`
-  rule still propagates the metric's state dependence at higher order (plain
-  traced ops), while the cg-resolved rules cannot (their opaque solve
-  wrappers hide it) — so for higher-order derivatives through a factory
-  metric use `ad_solver="dense"`. See
+  is not differentiated. The freeze is a first-order statement — higher-order
+  AD through a factory-built metric's state dependence is unsupported in every
+  AD rule (dense and cg-resolved alike apply the metric through opaque solve
+  wrappers), so take higher-order derivatives of `solve` only with a fixed
+  metric. See
   [Implicit differentiation](implicit_ad.md#iterate-dependent-metrics-are-frozen-per-solve).
 - Like every jit-static hook, define the `(prepare, build)` pair once at
   setup scope; a fresh closure per call keys a new compilation.

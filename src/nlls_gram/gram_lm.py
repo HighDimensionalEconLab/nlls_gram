@@ -924,16 +924,17 @@ class LevenbergMarquardt:
     differentiation it is frozen at the returned solution WITHIN each
     first-order AD solve -- the tangent treats the metric as constant,
     while higher-order AD differentiates the resulting pointwise
-    metric-dependent tangent field. One shared limitation of the cg-resolved
-    AD rules: they apply the frozen metric (``P`` under gram_cg, ``S``
-    under normal_cg) through identity-matvec ``custom_linear_solve``
+    metric-dependent tangent field. One shared limitation of all three AD
+    rules: they apply the frozen metric (``S`` in the dense and normal_cg
+    rules, ``P`` under gram_cg) through identity-matvec ``custom_linear_solve``
     wrappers whose declared solves are opaque to AD, so an identity matvec
-    exposes no parameters to differentiate -- first-order reverse mode with
-    a fixed metric is correct (and jit/vmap exercised), but higher-order
-    derivatives THROUGH a factory-built metric's state dependence inside
-    those applications are not propagated and can fail loudly rather than
-    silently. Use ``ad_solver="dense"`` when that dependence must be
-    differentiated. See :class:`MetricFactory`.
+    exposes no parameters to differentiate. This makes first-order reverse
+    mode correct for any legal metric -- including a non-reverse-
+    differentiable ``inv_sqrt`` that supplies ``inv_sqrt_transpose`` (jit/vmap
+    exercised) -- but higher-order derivatives THROUGH a factory-built
+    metric's state dependence inside those applications are not propagated.
+    Take higher-order derivatives of ``solve`` with a fixed metric. See
+    :class:`MetricFactory`.
 
     ``solve(...).x`` has a custom implicit AD rule with respect to ``p``,
     relinearized at the returned solution. ``ad_solver`` in ``{"auto",
@@ -1012,10 +1013,11 @@ class LevenbergMarquardt:
 
     Under ``"dense"``, ``0.0`` demands the exact unregularized solve: it
     QR-factors ``B`` from its small side and poisons the tangent to NaN when
-    any ``|R_ii|`` falls under the rank cutoff (a triangular pivot is not a
-    rank certificate either, so a genuinely tiny pivot is poisoned the same
-    way -- the numerical-rank caveat above), rather than silently selecting a
-    particular solution on a rank-deficient ``B``. Under ``normal_cg``, ``0.0``
+    the smallest singular value of the small ``R`` factor (equal to ``B``'s)
+    falls under the ``max(m, n) * eps * sigma_max`` cutoff -- an actual
+    numerical-rank test, not the unpivoted ``|R_ii|`` diagonals, which are
+    not a rank certificate -- rather than silently selecting a particular
+    solution on a rank-deficient ``B``. Under ``normal_cg``, ``0.0``
     is just the default no-ridge solve -- unpreconditioned CG from zero still
     reaches the exact minimum-``M``-norm tangent on consistent systems and
     fails to converge only when the system is inconsistent. A solution with
@@ -2806,16 +2808,17 @@ class LevenbergMarquardt:
             # 0.0 demands the exact unregularized solve: QR-factor B from its
             # small side (R'R = B'B when m >= n, R'R = BB' when fat, with the
             # push-through composition u = B'(BB')^{-1} c) and poison the
-            # tangent when any |R_ii| falls under the rank cutoff. R comes
-            # from orthogonal transforms of B itself, so the guard certifies
-            # numerical rank at cond(B) -- but a triangular pivot is still a
-            # threshold, not an algebraic certificate. Without the guard an
-            # exactly singular R can round into a finite particular solution,
-            # silently wrong for inconsistent systems; loud contract instead.
+            # tangent when B is numerically rank-deficient. The rank test is
+            # the smallest singular value of the small k x k R factor (whose
+            # singular values are exactly B's), not |R_ii|: unpivoted-QR
+            # diagonals are not a rank certificate and can miss an exactly
+            # rank-deficient B. Without the guard a singular solve rounds into a
+            # finite particular solution, silently wrong for inconsistent
+            # systems; the loud contract poisons it to NaN instead.
             small_side = whitened_jacobian_t.T if m >= n else whitened_jacobian_t
             _, r_factor = jnp.linalg.qr(small_side)
-            r_diagonal = jnp.abs(jnp.diagonal(r_factor))
-            singular = jnp.any(~(r_diagonal > rank_dim * eps * jnp.max(r_diagonal)))
+            r_sigma = jnp.linalg.svd(r_factor, compute_uv=False)
+            singular = r_sigma[-1] <= rank_dim * eps * r_sigma[0]
             if m >= n:
                 half = jsp_linalg.solve_triangular(r_factor.T, rhs, lower=True)
                 whitened_tangent = jsp_linalg.solve_triangular(
@@ -2856,7 +2859,20 @@ class LevenbergMarquardt:
                 half = jsp_linalg.solve_triangular(r_factor.T, dual_rhs, lower=True)
                 dual_solution = jsp_linalg.solve_triangular(r_factor, half, lower=False)
                 whitened_tangent = whitened_jacobian_t @ dual_solution
-        theta_dot = -inv_sqrt(whitened_tangent)
+        # The final -S u step routes through an identity-matvec
+        # custom_linear_solve declaring the explicit S transpose (S is not
+        # self-adjoint), so a metric whose inv_sqrt is not reverse-
+        # differentiable (e.g. iterative) but supplies inv_sqrt_transpose still
+        # differentiates in reverse mode -- the paired-callback contract. The
+        # wrapper is opaque to AD, so a factory-built metric's state dependence
+        # is not seen at higher order; take higher-order derivatives of solve
+        # with a fixed metric.
+        theta_dot = -jax.lax.custom_linear_solve(
+            lambda v: v,
+            whitened_tangent,
+            lambda _, b: inv_sqrt(b),
+            transpose_solve=lambda _, b: inv_sqrt_transpose(b),
+        )
         return unravel(theta_dot.astype(residual.dtype))
 
     def _ad_tangent_gram_cg(self, x, args, p, p_dot, metric_inverse, aux):
