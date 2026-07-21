@@ -262,27 +262,32 @@ def test_ad_solver_options_must_be_valid():
         LevenbergMarquardt(residual_fn, ad_solver_atol=-1.0)
     with pytest.raises(ValueError, match="ad_solver_maxiter must be positive or None"):
         LevenbergMarquardt(residual_fn, ad_solver_maxiter=0)
-    with pytest.raises(ValueError, match="ad_solver_penalty must be nonnegative"):
-        LevenbergMarquardt(residual_fn, ad_solver_penalty=-1e-8)
+    with pytest.raises(ValueError, match="requires a positive"):
+        LevenbergMarquardt(
+            residual_fn,
+            ad_solver="augmented_qr",
+            ad_solver_penalty=-1e-8,
+        )
     # The zero-tolerance guard is a cg stopping control: it fires only for a
-    # cg-resolved ad_solver, not for the shape-independent dense rule.
+    # CG stopping controls apply only to an explicitly selected CG method.
     with pytest.raises(ValueError, match="ad_solver_maxiter must be set"):
         LevenbergMarquardt(
             residual_fn,
             linear_solver="gram_cg",
             dual_preconditioner=identity_preconditioner(),
+            ad_solver="gram_cg",
             ad_solver_preconditioner=identity_preconditioner(),
             ad_solver_tol=0.0,
             ad_solver_atol=0.0,
             ad_solver_maxiter=None,
         )
-    # A positive ridge is meaningless for a gram_cg-resolved AD solve.
-    with pytest.raises(ValueError, match="positive ad_solver_penalty"):
+    with pytest.raises(ValueError, match="accepted only"):
         LevenbergMarquardt(
             residual_fn,
             linear_solver="gram_cg",
             dual_preconditioner=identity_preconditioner(),
             ad_solver_preconditioner=identity_preconditioner(),
+            ad_solver="gram_cg",
             ad_solver_penalty=1e-6,
         )
     with pytest.raises(ValueError, match="ad_solver_preconditioner"):
@@ -320,6 +325,7 @@ def test_linear_solve_dtype_validation():
             iterative_tol=1e-7,
             iterative_maxiter=20,
             dual_preconditioner=identity_preconditioner(),
+            ad_solver="gram_cg",
             ad_solver_preconditioner=identity_preconditioner(),
             linear_solve_dtype=jnp.float64,
         )
@@ -1537,7 +1543,7 @@ def test_vmap_over_solve_tolerances():
     assert int(batched.steps[1]) > int(batched.steps[0])
 
 
-def test_dense_ad_solver_penalty_handles_singular_dual_from_redundant_rows():
+def test_svd_and_augmented_qr_handle_redundant_rows_explicitly():
     # Two identical residual rows: the undamped implicit dual J J' is singular
     # (rank 1) everywhere, but the system is consistent and x*(p) is smooth
     # with minimum-norm derivative d x* / d target = w / ||w||^2 from x0 = 0.
@@ -1555,17 +1561,19 @@ def test_dense_ad_solver_penalty_handles_singular_dual_from_redundant_rows():
     def sum_x_star(solver, p):
         return jnp.sum(solver.solve(x0, p=p, max_steps=50).x)
 
-    regularized = LevenbergMarquardt(duplicated_rows_residual)
-    vjp_grad = jax.jacobian(lambda p: sum_x_star(regularized, p))(p)["target"]
+    svd = LevenbergMarquardt(duplicated_rows_residual, ad_solver="svd")
+    vjp_grad = jax.jacobian(lambda p: sum_x_star(svd, p))(p)["target"]
     assert jnp.allclose(vjp_grad, expected, rtol=1e-4)
-    _, jvp_grad = jax.jvp(
-        lambda t: sum_x_star(regularized, {"target": t}), (1.0,), (1.0,)
-    )
+    _, jvp_grad = jax.jvp(lambda t: sum_x_star(svd, {"target": t}), (1.0,), (1.0,))
     assert jnp.allclose(jvp_grad, expected, rtol=1e-4)
 
     # An explicit (larger) penalty is plumbed through and still resolves the
     # singular dual; the bias grows with the penalty but stays O(penalty * m).
-    blunt = LevenbergMarquardt(duplicated_rows_residual, ad_solver_penalty=1e-4)
+    blunt = LevenbergMarquardt(
+        duplicated_rows_residual,
+        ad_solver="augmented_qr",
+        ad_solver_penalty=1e-4,
+    )
     blunt_grad = jax.jacobian(lambda p: sum_x_star(blunt, p))(p)["target"]
     assert jnp.isfinite(blunt_grad)
     assert jnp.allclose(blunt_grad, expected, rtol=1e-3)
@@ -1622,7 +1630,7 @@ def test_implicit_cg_jvp_and_vjp_match_cholesky_with_metric():
             metric=metric_from_cholesky(L),
             geodesic_acceleration=False,
         )
-        dense_implicit = LevenbergMarquardt(residual, ad_solver="dense", **common)
+        dense_implicit = LevenbergMarquardt(residual, ad_solver="svd", **common)
         cg_implicit = LevenbergMarquardt(
             residual,
             ad_solver="gram_cg",
@@ -2045,8 +2053,8 @@ def test_equal_settings_solvers_share_the_compiled_solve_loop():
     # loop -- a collision here would silently reuse a loop with the wrong AD
     # or assembly behavior, the exact failure this package guards against.
     assert a != build(jacobian_mode="rev")
-    assert a != build(ad_solver_penalty=1e-6)
-    assert a != build(ad_solver="dense")
+    assert a != build(ad_solver="augmented_qr", ad_solver_penalty=1e-6)
+    assert a != build(ad_solver="svd")
 
 
 @pytest.mark.parametrize("cache_jacobian", [False, True])
@@ -3020,28 +3028,35 @@ def test_cg_requires_dual_preconditioner():
             linear_solver="gram_cg",
             ad_solver_preconditioner=identity_preconditioner(),
         )
-    # Both callbacks missing reports both remedies in one error.
-    with pytest.raises(ValueError, match="and the gram_cg-resolved"):
+    with pytest.raises(ValueError, match="dual_preconditioner or"):
         LevenbergMarquardt(residual_fn, linear_solver="gram_cg")
 
 
 def test_implicit_cg_requires_preconditioner():
     with pytest.raises(ValueError, match="ad_solver_preconditioner"):
         LevenbergMarquardt(residual_fn, ad_solver="gram_cg")
-    # ad_solver="auto" resolves to cg when linear_solver="gram_cg", so the
-    # default auto still requires the implicit callback.
+
+    # Auto resolves to gram_cg only after a non-square shape is traced.
+    def residual(theta, _, p):
+        return jnp.array([theta[0] - p, 2.0 * theta[0] - 2.0 * p])
+
+    auto = LevenbergMarquardt(
+        residual,
+        linear_solver="gram_cg",
+        dual_preconditioner=identity_preconditioner(),
+    )
     with pytest.raises(ValueError, match="ad_solver_preconditioner"):
-        LevenbergMarquardt(
-            residual_fn,
-            linear_solver="gram_cg",
-            dual_preconditioner=identity_preconditioner(),
+        jax.jvp(
+            lambda p: auto.solve(jnp.zeros(1), p=p, max_steps=20).x,
+            (jnp.asarray(1.0),),
+            (jnp.asarray(1.0),),
         )
-    # The dense implicit rule is the other escape hatch.
+    # An explicit factorized method is the other escape hatch.
     LevenbergMarquardt(
         residual_fn,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        ad_solver="dense",
+        ad_solver="svd",
     )
 
 
@@ -4216,11 +4231,12 @@ def test_metric_from_shifted_matvec_validation_and_solver_requirements():
     metric = metric_from_shifted_matvec(lambda x: 2.0 * x, 1.0)
     with pytest.raises(ValueError, match="inv_sqrt"):
         LevenbergMarquardt(residual_fn, linear_solver="qr", metric=metric)
-    # The dense AD rule whitens, so a solve-only metric is rejected unless
-    # the AD solve is pinned to gram_cg (whose metric.solve requirement this
-    # metric satisfies).
+    # A whitening AD rule rejects a solve-only metric. Auto cannot decide at
+    # construction: a square residual selects direct, which does not use the
+    # metric, while a nonsquare residual selects a whitening rule at trace time.
     with pytest.raises(ValueError, match="inv_sqrt"):
-        LevenbergMarquardt(residual_fn, metric=metric)
+        LevenbergMarquardt(residual_fn, metric=metric, ad_solver="svd")
+    LevenbergMarquardt(residual_fn, metric=metric)
     LevenbergMarquardt(
         residual_fn,
         linear_solver="gram_cg",
@@ -4332,7 +4348,7 @@ def test_shifted_metric_step_matches_closed_form_across_solvers(
         else {}
     )
     if metric.inv_sqrt is None:
-        # A solve-only metric cannot serve the dense AD rule (it whitens):
+        # A solve-only metric cannot serve the SVD AD method (it whitens):
         # pin the gram_cg AD solve.
         preconditioner_kwargs["ad_solver"] = "gram_cg"
         preconditioner_kwargs.setdefault(
@@ -4391,7 +4407,7 @@ def test_shifted_metric_implicit_jvp_and_vjp_match_dense():
             else {}
         )
         if metric.inv_sqrt is None:
-            # Solve-only composite: the dense AD rule whitens, so pin the
+            # Solve-only composite: SVD/QR whiten, so pin the
             # gram_cg AD solve (metric.solve serves it exactly).
             preconditioner_kwargs["ad_solver"] = "gram_cg"
             preconditioner_kwargs.setdefault(
@@ -4899,9 +4915,8 @@ def test_padded_zero_residual_qr_is_rank_deficient():
 
 def test_padded_zero_residual_implicit_ad_is_singular_by_design():
     # Padded rows are zero Jacobian rows, so the UNDAMPED implicit dual
-    # J P J' is singular. With ad_solver_penalty=0.0 the dense rule keeps the
-    # loud unregularized contract (non-finite tangent); the default eps *
-    # trace ridge resolves the padding -- a consistent singularity -- to the
+    # J P J' is singular. QR keeps the loud unregularized contract
+    # (non-finite tangent); SVD resolves the padding to the
     # minimum-metric-norm tangent of the unpadded formulation, with no
     # padding-aware special casing.
     A = jax.random.normal(jax.random.PRNGKey(59), (3, 8))
@@ -4917,10 +4932,13 @@ def test_padded_zero_residual_implicit_ad_is_singular_by_design():
         residual_padded,
         init_damping=1e-2,
         geodesic_acceleration=False,
-        ad_solver_penalty=0.0,
+        ad_solver="qr",
     )
     padded_default = LevenbergMarquardt(
-        residual_padded, init_damping=1e-2, geodesic_acceleration=False
+        residual_padded,
+        init_damping=1e-2,
+        geodesic_acceleration=False,
+        ad_solver="svd",
     )
 
     def solved_x(solver, p):
@@ -4935,7 +4953,7 @@ def test_padded_zero_residual_implicit_ad_is_singular_by_design():
     assert bool(jnp.all(jnp.isfinite(x_padded)))
     assert jnp.allclose(x_padded, x_plain, atol=1e-4)
     assert not bool(jnp.all(jnp.isfinite(x_dot)))
-    # The default ridge recovers the unpadded implicit tangent.
+    # The SVD pseudoinverse recovers the unpadded implicit tangent.
     _, x_dot_default = jax.jvp(lambda p: solved_x(padded_default, p), (p0,), (p_dot,))
     assert bool(jnp.all(jnp.isfinite(x_dot_default)))
     assert jnp.allclose(x_dot_default, x_plain_dot, atol=1e-4)
@@ -4991,9 +5009,9 @@ def test_implicit_cg_with_shifted_matvec_metric_matches_dense():
     p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
     x_bar = jnp.linspace(-1.0, 1.0, n + k)
     _, dense_dot = jax.jvp(
-        lambda q: solved_x(dense, "gram_cholesky", "dense", q), (p,), (p_dot,)
+        lambda q: solved_x(dense, "gram_cholesky", "svd", q), (p,), (p_dot,)
     )
-    _, dense_pull = jax.vjp(lambda q: solved_x(dense, "gram_cholesky", "dense", q), p)
+    _, dense_pull = jax.vjp(lambda q: solved_x(dense, "gram_cholesky", "svd", q), p)
 
     # cg implicit rule with the matvec metric, under both forward solvers
     # (cholesky forward + cg implicit is the forced-"gram_cg" combination).
@@ -5054,10 +5072,7 @@ def test_implicit_cg_woodbury_preconditioner_with_shifted_metric():
 
     p, p_dot = jnp.asarray(1.0), jnp.asarray(1.0)
     _, dense_dot = jax.jvp(
-        # ad_solver_penalty=0.0: the spiked metric puts 1/eps into the dual
-        # trace, so the trace-scaled default ridge would bias this exact
-        # dense reference.
-        lambda q: solved_x({"ad_solver": "dense", "ad_solver_penalty": 0.0}, q),
+        lambda q: solved_x({"ad_solver": "qr"}, q),
         (p,),
         (p_dot,),
     )
@@ -5129,7 +5144,7 @@ def test_implicit_cg_vmap_and_hessian_match_dense():
         lambda q: jax.jvp(lambda r: solved_x(composite, "gram_cg", r), (q,), (one,))
     )(ps)
     _, dots_dense = jax.vmap(
-        lambda q: jax.jvp(lambda r: solved_x(dense, "dense", r), (q,), (one,))
+        lambda q: jax.jvp(lambda r: solved_x(dense, "svd", r), (q,), (one,))
     )(ps)
     assert jnp.allclose(dots_cg, dots_dense, atol=1e-4)
 
@@ -5137,7 +5152,7 @@ def test_implicit_cg_vmap_and_hessian_match_dense():
         return jnp.sum(solved_x(composite, "gram_cg", q) ** 2)
 
     def loss_dense(q):
-        return jnp.sum(solved_x(dense, "dense", q) ** 2)
+        return jnp.sum(solved_x(dense, "svd", q) ** 2)
 
     assert jnp.allclose(
         jax.vmap(jax.grad(loss_cg))(ps), jax.vmap(jax.grad(loss_dense))(ps), atol=1e-3
@@ -5151,13 +5166,13 @@ def test_implicit_cg_vmap_and_hessian_match_dense():
 
 def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
     # J P J' singular with an INCONSISTENT tangent right-hand side: the
-    # unregularized dense rule (ad_solver_penalty=0.0) hits the QR rank guard,
+    # unregularized QR hits the rank guard,
     # and the cg rule's run-to-tolerance default diverges to non-finite as
     # well. Only a small bounded ad_solver_maxiter (the exact-preconditioner
     # budget mode) returns a finite -- and wrong -- derivative, which is why
     # that mode is reserved for exact preconditioners. (No ridge can make an
-    # inconsistent dual meaningful; the default ridge would return a finite,
-    # penalty-inflated tangent here, which is the documented trade-off.)
+    # inconsistent dual meaningful; an explicitly regularized method would
+    # return a finite, penalty-inflated tangent here.)
     A = jnp.array(
         [
             [1.0, 0.0, 0.0, 0.0, 0.0],
@@ -5183,7 +5198,6 @@ def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
             ad_solver=ad_solver,
             ad_solver_tol=1e-8,
             ad_solver_maxiter=ad_solver_maxiter,
-            ad_solver_penalty=0.0,
             iterative_tol=1e-8,
             iterative_maxiter=100,
             geodesic_acceleration=False,
@@ -5197,7 +5211,7 @@ def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
         p_dot = jnp.array([1.0, 0.0, 0.0])
         return jax.jvp(solved_x, (p0,), (p_dot,))[1]
 
-    assert not bool(jnp.all(jnp.isfinite(x_dot("dense", None))))
+    assert not bool(jnp.all(jnp.isfinite(x_dot("qr", None))))
     assert not bool(jnp.all(jnp.isfinite(x_dot("gram_cg", None))))
     assert bool(jnp.all(jnp.isfinite(x_dot("gram_cg", 1))))
 

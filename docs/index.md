@@ -230,9 +230,10 @@ $$
 using JAX linearization for JVPs/VJPs and `jax.scipy.sparse.linalg.cg`.
 The iterative solve defaults to a small fixed budget: `iterative_tol=0.0`,
 `iterative_atol=0.0`, and `iterative_maxiter=8`.
-With the default `ad_solver="auto"`, differentiating `solve(...).x`
-also stays matrix-free for forward `gram_cg` solves. Pass
-`ad_solver="dense"` to use the dense AD rule instead.
+With the default `ad_solver="auto"`, differentiating a nonsquare
+`solve(...).x` also stays matrix-free for forward `gram_cg` solves; a square
+system resolves to `direct`. Pass `ad_solver="svd"` to use the robust
+assembled pseudoinverse instead.
 
 `linear_solver="gram_cg"` requires a `dual_preconditioner(v, damping)`
 callback, applied as the CG preconditioner (for the geodesic-acceleration
@@ -244,10 +245,11 @@ minimum-metric-norm structure — so approximations are safe. Nobody should
 run Krylov methods without thinking about preconditioning; to opt out
 explicitly, pass `identity_preconditioner()` for unpreconditioned CG. When
 the AD solver resolves to `gram_cg` (the default
-`ad_solver="auto"` does exactly that when `linear_solver="gram_cg"`),
+`ad_solver="auto"` does exactly that for a nonsquare
+`linear_solver="gram_cg"` system),
 an `ad_solver_preconditioner` is required as well —
 `identity_preconditioner()` works there too, or pass
-`ad_solver="dense"` for the dense AD rule. (A `normal_cg`-resolved
+`ad_solver="svd"` for the assembled SVD rule. (A `normal_cg`-resolved
 AD solve needs no preconditioner; see
 [Implicit AD](implicit_ad.md#the-ad-solver-preconditioner).) See
 [Utilities](utilities.md) for structural constructors
@@ -465,8 +467,8 @@ pytree `p`: derivatives of `result.x` (and, with `has_aux=True`, of
 `result.aux`) are defined by the residual equation at the returned solution
 rather than by differentiating through the LM iterations. See
 [Implicit Differentiation](implicit_ad.md) for the math, the role of the
-metric in selecting the minimum-norm tangent, the `ad_solver` forms (one
-dense rule and two matrix-free CG rules), and worked examples.
+metric in selecting the minimum-norm tangent, the explicit direct, SVD, QR,
+and matrix-free `ad_solver` methods, and worked examples.
 
 ## Geodesic Acceleration
 
@@ -514,7 +516,7 @@ data.
 
 - **`linear_solve_dtype=jnp.float64`** promotes the dense linear-solve
   pipelines: the `gram_cholesky`/`normal_cholesky` forward factorizations
-  *and* the dense implicit-AD rules (the implicit solve inherits the knob,
+  *and* the assembled direct/SVD/QR implicit-AD methods (the implicit solve inherits the knob,
   so the undamped implicit system — the most conditioning-sensitive solve
   in the library — is never silently less precise than the damped forward
   one). The recipe: \(J^\top\) (or \(B^\top\)) is cast wide *before* the
@@ -526,8 +528,8 @@ data.
   float32-fragile for stiff systems (e.g. a metric weight injecting a
   \(1/\varepsilon\) spike into \(P\)) — this knob is the targeted fix. It
   requires a solver that has a dense pipeline to promote: forward
-  `auto`/`gram_cholesky`/`normal_cholesky`, or a `dense`-resolved
-  `ad_solver`.
+  `auto`/`gram_cholesky`/`normal_cholesky`, or an assembled `ad_solver`
+  (`direct`, `svd`, `qr`, or `augmented_qr`).
 - **`metric_solve_dtype=jnp.float64`** sets the dtype the resolved metric
   callbacks *compute in*: the solver wraps the metric — a fixed `metric` or
   a `metric_factory`'s built one, after `build` — with the

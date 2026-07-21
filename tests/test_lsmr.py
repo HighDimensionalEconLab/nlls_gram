@@ -371,8 +371,9 @@ def test_lsmr_implicit_p_derivative_matches_analytic():
         iterative_tol=1e-10,
         iterative_maxiter=60,
     )
-    assert lsmr_solver._resolved_ad_solver == "dense"
     p = jnp.asarray(1.7)
+    assert lsmr_solver._resolved_ad_solver == "auto"
+    assert lsmr_solver._ad_solver_at(jnp.zeros(()), None, p) == "svd"
     j_analytic = jnp.sum(ts) / jnp.sum(ts**2)
 
     def solved(solver, q):
@@ -672,18 +673,18 @@ def test_chained_solve_derivative_is_final_phase_implicit_rule():
     def residual(x, args, p):
         return A @ x + 0.1 * jnp.tanh(x) - p
 
-    phase1 = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver="dense")
+    phase1 = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver="svd")
     phase2 = LevenbergMarquardt(
         residual,
         linear_solver="lsmr",
-        ad_solver="dense",
+        ad_solver="svd",
         init_damping=1e-10,
         iterative_tol=1e-13,
         iterative_atol=1e-13,
         iterative_maxiter=200,
         geodesic_acceleration=False,
     )
-    reference = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver="dense")
+    reference = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver="svd")
 
     def chained(p):
         plateau = phase1.solve(jnp.zeros(n), p=p, max_steps=2, atol=0.0)

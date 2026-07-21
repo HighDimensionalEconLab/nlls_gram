@@ -355,7 +355,7 @@ t_reference = tangent(reference, t064, p64)
 assert t_promoted.dtype == jnp.float32
 assert rel(t_promoted, t_reference) < 1e-6, rel(t_promoted, t_reference)
 # Unlike the forward step (whose float32 cholesky forms B'B and pays the
-# squared-assembly floor, > 1e-3 above), the dense AD rule factors B itself:
+# squared-assembly floor, > 1e-3 above), the SVD AD method factors B itself:
 # the UNPROMOTED float32 tangent already tracks the float64 reference on
 # this cond ~ 1e3 fixture (measured 3.9e-7), so promotion is a no-op here.
 assert rel(tangent(plain32, t032, p32), t_reference) < 1e-5
@@ -663,7 +663,7 @@ def residual(z, args, p):
 solver = LevenbergMarquardt(
     residual,
     linear_solver="augmented_qr",
-    ad_solver="dense",
+    ad_solver="svd",
     geodesic_acceleration=False,
     cache_jacobian=False,
 )
@@ -1004,12 +1004,11 @@ def dense_composite(eps):
 
 
 def solved_x(metric, p):
-    # ad_solver_penalty=0.0: the eps-shifted metric spikes the dual trace by
-    # 1/eps, so a trace-scaled ridge would perturb this exact-limit check.
-    # A solve-only (matvec) composite cannot serve the dense AD rule, which
-    # whitens: pin the gram_cg AD solve at a matching tight tolerance.
+    # Use the exact QR rule for a dense metric so a trace-scaled ridge cannot
+    # perturb this limit check. A solve-only (matvec) composite cannot whiten,
+    # so pin its AD rule to gram_cg at a matching tight tolerance.
     ad_kwargs = (
-        {}
+        {"ad_solver": "qr"}
         if metric.inv_sqrt is not None
         else {
             "ad_solver": "gram_cg",
@@ -1022,7 +1021,6 @@ def solved_x(metric, p):
         init_damping=1e-6,
         metric=metric,
         geodesic_acceleration=False,
-        ad_solver_penalty=0.0,
         **ad_kwargs,
     )
     return solver.solve(jnp.zeros(n + k), p=p, max_steps=200, atol=1e-12).x
@@ -1160,11 +1158,12 @@ for line in jaxpr.splitlines():
     assert result.returncode == 0, result.stderr + result.stdout
 
 
-def test_float64_dense_ad_solver_penalty_near_duplicate_rows():
+def test_float64_svd_ad_solver_near_duplicate_rows():
     # The growth-model pathology: a converged simulation duplicates its
     # late-horizon states to ~1e-13, so the float64 undamped implicit dual has
     # eigenvalues far below the factorization noise floor and the unregularized
-    # dense rule goes non-finite. The default ridge must return the min-norm
+    # unregularized factorization goes non-finite. The SVD pseudoinverse returns
+    # the minimum-norm
     # tangent d sum(x*)/d target = sum(w)/||w||^2 (exact in the duplicate
     # limit) to high accuracy.
     script = r"""
@@ -1183,7 +1182,7 @@ def residual_fn(x, args, p):
 
 
 x0 = jnp.zeros(3)
-solver = LevenbergMarquardt(residual_fn, ad_solver="dense")
+solver = LevenbergMarquardt(residual_fn, ad_solver="svd")
 
 
 def sum_x_star(target):

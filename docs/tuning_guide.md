@@ -44,9 +44,9 @@ numerical rank — and it does not need to: rank-deficient problems
 (redundant rows, collinear columns — tall interpolation problems always
 have some) are handled by every form except `qr`, with the
 minimum-`M`-norm small-damping selection intact. The flip also never
-changes derivative semantics: every non-CG forward resolves to the one
-shape-independent dense AD rule, so the implicit tangent is the same
-whichever forward form the shapes select.
+changes derivative semantics: AD dispatch uses the traced system shape and an
+explicit `ad_solver`, not the primal factorization. The default uses `direct`
+for square systems and `svd` for other non-CG systems.
 
 | situation | use |
 | --- | --- |
@@ -114,20 +114,21 @@ whichever forward form the shapes select.
   maps the same `iterative_tol`/`iterative_atol`/`iterative_maxiter` hooks
   (relative/absolute bound on the normal-equations residual, measured on the
   preconditioned operator, callback-schedulable). Differentiating a forward
-  `lsmr` `solve(...).x` uses the dense AD rule by default
+  `lsmr` `solve(...).x` uses `direct` for a square system and `svd` otherwise
   (`ad_solver="auto"`); pass
   `ad_solver="normal_cg"` (no preconditioner needed) or `"gram_cg"`
   with an `ad_solver_preconditioner` for a fully matrix-free derivative.
 - The CG forms return an *approximate* step under their iteration budget.
   That is usually fine — LM's accept/reject absorbs inexactness — but see
   the scheduling pattern below. With the default `ad_solver="auto"`,
-  differentiating a forward `gram_cg`/`normal_cg` `solve(...).x` uses the
-  matching matrix-free CG rule instead of materializing \(J^\top\).
+  differentiating a nonsquare forward `gram_cg`/`normal_cg` `solve(...).x`
+  uses the matching matrix-free CG rule instead of materializing \(J^\top\).
+  A square system resolves to `direct` first.
 
 ## Jacobian Assembly (`jacobian_mode`)
 
 The dense forward solvers (`auto`, `gram_cholesky`, `normal_cholesky`,
-`qr`, `augmented_qr`) and the dense AD rule materialize the Jacobian;
+`qr`, `augmented_qr`) and the direct/SVD/QR AD methods materialize the Jacobian;
 `jacobian_mode` controls from which side. `"auto"` (the default) vmaps the
 identity basis over the **small** dimension: `n` forward-mode JVP columns
 when the system is tall or square (`n <= m`), `m` reverse-mode VJP rows
@@ -144,7 +145,7 @@ than silently ignored.
 ## Float64 à la Carte
 
 The Gram and normal forward forms square the condition number (they factor
-`J P J'` or `B'B`; the dense AD rule works from the SVD of `B` at
+`J P J'` or `B'B`; the SVD and QR AD methods work from `B` at
 `cond(B)`, but classifying singular values near the rank cutoff still
 benefits from precision). If that system is ill-conditioned or implicit
 derivatives must be accurate, reach for float64 — it fixes more numerical
@@ -160,7 +161,7 @@ widest:
   not the solver algebra, is the fragile part.
 - **`linear_solve_dtype=jnp.float64`** promotes the dense linear-solve
   pipelines: the `gram_cholesky`/`normal_cholesky` forward factorizations
-  and the dense AD rule, while the model stays float32 — measured
+  and the assembled direct/SVD/QR AD methods, while the model stays float32 — measured
   ~1.4x per `gram_cholesky` update at `m=100, n=2000` for a *trivial*
   residual (an upper bound: real residual and Jacobian costs dominate and
   stay float32), recovering the float64 answer to ~1e-6 on a 1e-7-spike
@@ -216,8 +217,8 @@ exactly then). Three patterns, in order of preference:
 Forward iterative tolerances and AD tolerances are separate. The
 CG-based AD rules use `ad_solver_tol=None` by default, which means `1e-6` in
 float32 and `1e-10` in float64; these defaults target derivative accuracy, not
-cheap forward steps. Pass `ad_solver="dense"`
-when you want the dense AD rule
+cheap forward steps. Pass `ad_solver="svd"`
+when you want the robust assembled pseudoinverse
 under a matrix-free forward solver, or tune `ad_solver_tol`, `ad_solver_atol`,
 `ad_solver_maxiter`, and `ad_solver_preconditioner(v)` for a matrix-free
 derivative.

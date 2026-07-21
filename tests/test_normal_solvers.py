@@ -85,7 +85,7 @@ def ad_kwargs(ad_solver):
     return {}
 
 
-AD_FORMS = ["dense", "gram_cg", "normal_cg"]
+AD_FORMS = ["svd", "gram_cg", "normal_cg"]
 
 
 # --- normal_cholesky closed-form steps ---------------------------------------
@@ -499,7 +499,7 @@ def test_ad_solver_preconditioner_requires_cg_resolved_implicit():
         LevenbergMarquardt(
             exp_residual,
             linear_solver="normal_cholesky",
-            ad_solver="dense",
+            ad_solver="svd",
             ad_solver_preconditioner=identity_preconditioner(),
         )
 
@@ -1007,16 +1007,16 @@ def test_implicit_normal_cg_reverse_grad_nondiagonal_metric_matches_closed_form(
     P = jnp.linalg.inv(L3 @ L3.T)
     direction = P @ a / (a @ P @ a)
     p = jnp.asarray(2.0)
-    grad_dense = jax.grad(lambda q: solved_dot_w(make_solver("dense"), q))(p)
+    grad_svd = jax.grad(lambda q: solved_dot_w(make_solver("svd"), q))(p)
     grad_cg = jax.grad(lambda q: solved_dot_w(make_solver("normal_cg"), q))(p)
 
     # Measured 3e-8 float32 for both forms.
-    assert jnp.allclose(grad_dense, w @ direction, atol=1e-6)
+    assert jnp.allclose(grad_svd, w @ direction, atol=1e-6)
     assert jnp.allclose(grad_cg, w @ direction, atol=1e-6)
 
 
-def test_dense_ad_under_lsmr_produces_min_norm_tangent_at_both_shapes():
-    # A matrix-free forward (lsmr) uses the shape-independent dense AD rule:
+def test_svd_ad_under_lsmr_produces_min_norm_tangent_at_both_shapes():
+    # A matrix-free forward (lsmr) uses SVD AD on non-square systems:
     # the wide and the tall problem both must produce the min-norm tangent
     # through the same rule (the small-side factorization is a cost choice,
     # never a semantic one).
@@ -1062,19 +1062,19 @@ def make_ridged_normal_cg_solver():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        ad_solver="normal_cg",
+        ad_solver="regularized_normal_cg",
         ad_solver_penalty=1e-4,
         ad_solver_preconditioner=identity_preconditioner(),
         ad_solver_maxiter=50,
         geodesic_acceleration=False,
     )
     # The three ridge guards below pin the normal_cg Rayleigh-probe ridge; a
-    # silent reroute to the dense rule would void them.
-    assert solver._resolved_ad_solver == "normal_cg"
+    # silent reroute to a different method would void them.
+    assert solver._resolved_ad_solver == "regularized_normal_cg"
     return solver
 
 
-def test_ad_solver_penalty_positive_normal_cg_tangent_is_linear():
+def test_regularized_normal_cg_tangent_is_linear():
     # The explicit-positive normal_cg ridge is scaled by a Rayleigh quotient
     # over a FIXED probe, not the rhs: an rhs-scaled ridge makes the tangent
     # map T(p_dot) affine-but-not-linear, breaking T(a) + T(b) = T(a + b) and
@@ -1096,7 +1096,7 @@ def test_ad_solver_penalty_positive_normal_cg_tangent_is_linear():
     assert jnp.allclose(t_b, 0.5 * min_m_norm_root(A_RD, B_RD), atol=5e-3)
 
 
-def test_ad_solver_penalty_positive_normal_cg_vjp_runs_and_is_finite():
+def test_regularized_normal_cg_vjp_runs_and_is_finite():
     # Reverse mode transposes the tangent map; the rhs-scaled ridge was not
     # linear, so this vjp used to raise NotImplementedError.
     solver = make_ridged_normal_cg_solver()
@@ -1109,7 +1109,7 @@ def test_ad_solver_penalty_positive_normal_cg_vjp_runs_and_is_finite():
     assert jnp.allclose(grad, min_m_norm_root(A_RD, B_RD) @ w, atol=5e-3)
 
 
-def test_ad_solver_penalty_positive_normal_cg_zero_seed_gives_zero_tangent():
+def test_regularized_normal_cg_zero_seed_gives_zero_tangent():
     # A zero p_dot must map to an exactly-zero tangent even with the ridge
     # live (the fixed-probe scale is seed-independent, the rhs is zero).
     solver = make_ridged_normal_cg_solver()
@@ -1122,8 +1122,8 @@ def test_ad_solver_penalty_positive_normal_cg_zero_seed_gives_zero_tangent():
 
 
 def test_default_implicit_tangent_has_no_ridge_bias_float64():
-    # Guard-rail over all three AD forms: ad_solver_penalty=None must be the
-    # EXACT min-norm tangent (SVD-of-B spectral filter / unridged CG).
+    # Guard-rail over all three unregularized AD forms: the tangent must be the
+    # exact min-norm tangent (SVD-of-B spectral filter / unridged CG).
     # Measured error is ~4e-15 at float64; any hidden default ridge (a 1e-12
     # trace-scaled one biases ~1e-11) fails the 1e-12 bound.
     script = r"""
@@ -1167,7 +1167,7 @@ cg_kwargs = dict(
     ad_solver_maxiter=100,
 )
 for form, kwargs in (
-    ("dense", {}),
+    ("svd", {}),
     ("gram_cg", cg_kwargs),
     ("normal_cg", cg_kwargs),
 ):
@@ -1183,20 +1183,15 @@ for form, kwargs in (
     assert result.returncode == 0, result.stderr + result.stdout
 
 
-def test_ad_solver_penalty_trio_on_rank_deficient_dense():
-    # The one shape-independent dense rule on the singular tall fixture:
-    # default None takes the SVD-of-B spectral-filter pseudoinverse (min-norm
-    # tangent), an explicit positive value solves the small-side augmented QR
-    # [B; sqrt(penalty * trace) I] (finite, O(penalty) bias), and 0.0 is the
-    # plain QR whose |R_ii| rank guard poisons the tangent to NaN.
+def test_explicit_factorizations_on_rank_deficient_tall_system():
     def residual(theta, _, p):
         return A_RD @ theta - p * B_RD
 
-    def tangent(ad_solver_penalty):
+    def tangent(ad_solver, ad_solver_penalty=None):
         solver = LevenbergMarquardt(
             residual,
             init_damping=1e-3,
-            ad_solver="dense",
+            ad_solver=ad_solver,
             ad_solver_penalty=ad_solver_penalty,
             geodesic_acceleration=False,
         )
@@ -1207,11 +1202,11 @@ def test_ad_solver_penalty_trio_on_rank_deficient_dense():
         )[1]
 
     expected = 0.5 * min_m_norm_root(A_RD, B_RD)
-    default_tangent = tangent(None)
+    default_tangent = tangent("svd")
     assert bool(jnp.all(jnp.isfinite(default_tangent)))
     # Measured 1.8e-7 float32: the filter default carries no ridge bias.
     assert jnp.allclose(default_tangent, expected, atol=2e-6)
-    ridged_tangent = tangent(1e-4)
+    ridged_tangent = tangent("augmented_qr", 1e-4)
     assert bool(jnp.all(jnp.isfinite(ridged_tangent)))
     # O(penalty) bias against the min-norm tangent, but tight (measured
     # 2.9e-5) against the float64 analytic ridge it claims to solve.
@@ -1224,10 +1219,10 @@ def test_ad_solver_penalty_trio_on_rank_deficient_dense():
     assert np.allclose(
         np.asarray(ridged_tangent, np.float64), analytic_ridged, atol=3e-4
     )
-    assert bool(jnp.all(jnp.isnan(tangent(0.0))))
+    assert bool(jnp.all(jnp.isnan(tangent("qr"))))
 
 
-def test_dense_penalty_zero_nan_is_the_guard_not_roundoff_on_inconsistent_rhs():
+def test_qr_nan_is_the_guard_not_roundoff_on_inconsistent_rhs():
     # The integer-valued A_RD is EXACTLY rank-deficient, yet a factorization
     # can round it through to a finite solve -- which on this INCONSISTENT
     # system (c outside range(A_RD), so the tangent rhs leaves the dual's
@@ -1241,8 +1236,7 @@ def test_dense_penalty_zero_nan_is_the_guard_not_roundoff_on_inconsistent_rhs():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        ad_solver="dense",
-        ad_solver_penalty=0.0,
+        ad_solver="qr",
         geodesic_acceleration=False,
     )
     _, t = jax.jvp(
@@ -1253,8 +1247,8 @@ def test_dense_penalty_zero_nan_is_the_guard_not_roundoff_on_inconsistent_rhs():
     assert bool(jnp.all(jnp.isnan(t)))
 
 
-def test_dense_trio_on_wide_rank_deficient_fixture():
-    # The FAT side of the one dense rule (m = 3 < n = 4, rank 2: the
+def test_explicit_factorizations_on_wide_rank_deficient_fixture():
+    # The fat-side factorization (m = 3 < n = 4, rank 2) runs on the dual:
     # small-side factorization runs on the dual and pushes through, but the
     # semantics must match the tall side): default None is the exact min-norm
     # tangent, an explicit penalty matches the analytic ridge exactly --
@@ -1266,11 +1260,11 @@ def test_dense_trio_on_wide_rank_deficient_fixture():
     def residual(theta, _, p):
         return A_W @ theta - p * b_w
 
-    def tangent(ad_solver_penalty):
+    def tangent(ad_solver, ad_solver_penalty=None):
         solver = LevenbergMarquardt(
             residual,
             init_damping=1e-3,
-            ad_solver="dense",
+            ad_solver=ad_solver,
             ad_solver_penalty=ad_solver_penalty,
             geodesic_acceleration=False,
         )
@@ -1280,7 +1274,7 @@ def test_dense_trio_on_wide_rank_deficient_fixture():
             (jnp.asarray(0.5),),
         )[1]
 
-    default_tangent = tangent(None)
+    default_tangent = tangent("svd")
     assert bool(jnp.all(jnp.isfinite(default_tangent)))
     # Measured 6e-7 float32 against the exact min-norm tangent.
     assert jnp.allclose(default_tangent, 0.5 * min_m_norm_root(A_W, b_w), atol=5e-6)
@@ -1291,19 +1285,19 @@ def test_dense_trio_on_wide_rank_deficient_fixture():
         G64 + delta * np.trace(G64) * np.eye(4),
         np.asarray(A_W, np.float64).T @ np.asarray(b_w, np.float64),
     )
-    ridged_tangent = tangent(delta)
+    ridged_tangent = tangent("augmented_qr", delta)
     assert bool(jnp.all(jnp.isfinite(ridged_tangent)))
     # Measured 5.7e-8 float32 against the float64 analytic ridge.
     assert np.allclose(
         np.asarray(ridged_tangent, np.float64), analytic_ridged, atol=1e-6
     )
 
-    assert bool(jnp.all(jnp.isnan(tangent(0.0))))
+    assert bool(jnp.all(jnp.isnan(tangent("qr"))))
 
 
-def test_dense_reverse_mode_through_opaque_inv_sqrt():
+def test_svd_reverse_mode_through_opaque_inv_sqrt():
     # A metric whose inv_sqrt is forward-correct but NOT reverse-differentiable
-    # (a lax.while_loop) with an explicit inv_sqrt_transpose: the dense AD
+    # (a lax.while_loop) with an explicit inv_sqrt_transpose: the SVD AD
     # rule's final -S step declares that transpose, so jax.grad routes reverse
     # mode through inv_sqrt_transpose. A bare -inv_sqrt(...) would instead try
     # to reverse-differentiate the while_loop and raise (Codex counterexample).
@@ -1333,7 +1327,7 @@ def test_dense_reverse_mode_through_opaque_inv_sqrt():
         solver = LevenbergMarquardt(
             residual,
             init_damping=1e-3,
-            ad_solver="dense",
+            ad_solver="svd",
             metric=metric,
             geodesic_acceleration=False,
         )
@@ -1349,7 +1343,7 @@ def test_dense_reverse_mode_through_opaque_inv_sqrt():
     assert jnp.allclose(grad_opaque, grad_reference, atol=1e-4)
 
 
-def test_dense_zero_penalty_rank_guard_catches_exact_singularity():
+def test_qr_rank_guard_catches_exact_singularity():
     # Codex counterexample: B with column 2 == -3 * column 1 is exactly rank 1,
     # but unpivoted-QR |R_ii| diagonals do not flag it. The svdvals(R) guard
     # must poison the 0.0 tangent to NaN, not return a finite null-space-
@@ -1362,8 +1356,7 @@ def test_dense_zero_penalty_rank_guard_catches_exact_singularity():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        ad_solver="dense",
-        ad_solver_penalty=0.0,
+        ad_solver="qr",
         geodesic_acceleration=False,
     )
     p0 = A @ jnp.array([1.0, 0.0], dtype=jnp.float32)  # in range(A): solve converges

@@ -304,7 +304,7 @@ def test_jacobian_assembly_does_not_differentiate_aux():
     assert bool(jnp.isfinite(result.x["a"]))
 
 
-@pytest.mark.parametrize("ad_solver", ["dense", "gram_cg", "normal_cg"])
+@pytest.mark.parametrize("ad_solver", ["svd", "gram_cg", "normal_cg"])
 def test_implicit_jvp_freezes_metric_at_solution(ad_solver):
     # Underdetermined linear residual with a p-dependent metric read from aux:
     # the solve returns the min-M(p)-norm solution, and the implicit tangent

@@ -613,6 +613,50 @@ def _zero_tangent_leaf(leaf):
     return jnp.zeros_like(leaf)
 
 
+def _broadcast_leading_condition(condition, leaf):
+    """Broadcast a scalar or leading-batch condition over an array leaf."""
+    condition = jnp.asarray(condition, dtype=jnp.bool_)
+    leaf_ndim = jnp.ndim(leaf)
+    if condition.ndim < leaf_ndim:
+        condition = jnp.reshape(
+            condition, condition.shape + (1,) * (leaf_ndim - condition.ndim)
+        )
+    return condition
+
+
+def _where_tree(condition, on_true, on_false):
+    """Select matching pytrees, treating ``condition`` axes as leading axes."""
+
+    def select(true_leaf, false_leaf):
+        if true_leaf is None:
+            return None
+        return jnp.where(
+            _broadcast_leading_condition(condition, true_leaf),
+            true_leaf,
+            false_leaf,
+        )
+
+    return jax.tree.map(select, on_true, on_false)
+
+
+def _mask_tangent_tree(condition, tangent):
+    """Keep tangent leaves where condition holds and zero them elsewhere."""
+
+    def mask(leaf):
+        if leaf is None:
+            return None
+        array = jnp.asarray(leaf)
+        if array.dtype == jax.dtypes.float0:
+            return leaf
+        return jnp.where(
+            _broadcast_leading_condition(condition, array),
+            array,
+            jnp.zeros_like(array),
+        )
+
+    return jax.tree.map(mask, tangent)
+
+
 class _IdentityKey:
     """Static-key stand-in comparing by object identity (for unhashable values)."""
 
@@ -756,7 +800,7 @@ def _validate_metric_requirements(
 ):
     # The shared requirement matrix for a custom metric: the gram forms factor
     # through metric.solve (P = M^{-1}); the normal/whitened forms -- and the
-    # dense AD rule, which whitens -- are built from the whitening pair
+    # whitened AD rules -- are built from the whitening pair
     # S = inv_sqrt, S' = inv_sqrt_transpose; the geodesic correction measures
     # its acceptance ratio in metric.norm (form-independent). "auto" (and
     # solver=None, for the gram_cg AD rule with its S S' fallback) skips the
@@ -777,9 +821,10 @@ def _validate_metric_requirements(
             f'{keyword}="{solver}" with a custom metric requires metric.solve{source}'
         )
     if solver in (
-        "dense",
+        "svd",
         "normal_cholesky",
         "normal_cg",
+        "regularized_normal_cg",
         "qr",
         "augmented_qr",
         "lsmr",
@@ -860,12 +905,13 @@ class LevenbergMarquardt:
     every ``damping > 0`` subproblem exactly ``I``-damped in ``u = R^{-1} z``,
     so the step is ``u = -(B'B + damping I)^{-1} B' r`` and the
     ``damping -> 0`` selection limit is the minimum-metric-norm step for ANY
-    ``R``. Differentiating a forward ``lsmr`` solve uses the dense AD rule
-    under ``ad_solver="auto"``.
+    ``R``. For a nonsquare problem, differentiating a forward ``lsmr`` solve
+    uses the SVD AD rule under ``ad_solver="auto"``; a square problem uses
+    the direct solve described below.
 
     ``jacobian_mode`` controls how the dense paths -- the cholesky forms
     (directly or via ``linear_solver="auto"``), ``qr``, ``augmented_qr``, and
-    the dense AD rule -- materialize ``J'``: ``"auto"`` (the
+    the direct/SVD/QR AD rules -- materialize ``J'``: ``"auto"`` (the
     default) takes ``n`` forward-mode JVP columns when the system is tall or
     square (``n <= m``) and ``m`` reverse-mode VJP rows only when strictly
     fat (``n > m``), so the identity basis that is vmapped over is always
@@ -873,7 +919,7 @@ class LevenbergMarquardt:
     compile-time memory blowup), with the square tie going to the cheaper
     JVP passes; ``"fwd"``/``"rev"`` force one mode. The matrix-free solvers
     (``gram_cg``, ``normal_cg``, ``lsmr``) never materialize ``J``, so a
-    forced mode that no dense forward path or dense-resolved AD rule could
+    forced mode that no dense forward path or dense AD method could
     consume is rejected at construction rather than silently ignored.
 
     ``linear_solver="gram_cg"`` requires ``dual_preconditioner(v, damping)``: a
@@ -924,9 +970,10 @@ class LevenbergMarquardt:
     differentiation it is frozen at the returned solution WITHIN each
     first-order AD solve -- the tangent treats the metric as constant,
     while higher-order AD differentiates the resulting pointwise
-    metric-dependent tangent field. One shared limitation of all three AD
-    rules: they apply the frozen metric (``S`` in the dense and normal_cg
-    rules, ``P`` under gram_cg) through identity-matvec ``custom_linear_solve``
+    metric-dependent tangent field. One shared limitation of the metric-aware
+    AD methods (all methods except ``direct``): they apply the frozen metric
+    (``S`` in the whitening and normal-CG methods, ``P`` under gram-CG) through
+    identity-matvec ``custom_linear_solve``
     wrappers whose declared solves are opaque to AD, so an identity matvec
     exposes no parameters to differentiate. This makes first-order reverse
     mode correct for any legal metric -- including a non-reverse-
@@ -937,96 +984,74 @@ class LevenbergMarquardt:
     :class:`MetricFactory`.
 
     ``solve(...).x`` has a custom implicit AD rule with respect to ``p``,
-    relinearized at the returned solution. ``ad_solver`` in ``{"auto",
-    "dense", "gram_cg", "normal_cg"}`` picks the algebra of that tangent
-    solve, always independently swappable from the forward solver (e.g. a
-    matrix-free ``lsmr`` forward with a ``normal_cg`` AD solve stays fully
-    matrix-free). ``"dense"`` is one shape-independent rule, not two: by
-    the push-through identity the filtered, ridged, and unregularized
-    tangents agree between the ``m x m`` dual and the ``n x n`` normal
-    compositions, so there is nothing to choose -- the rule factors the
-    whitened Jacobian from its small side (see ``jacobian_mode``) and
-    needs the metric's ``inv_sqrt``/``inv_sqrt_transpose`` pair; a
-    solve-only metric (e.g. ``metric_from_shifted_matvec``) must pair with
-    ``ad_solver="gram_cg"``. Resolution of ``"auto"``: a cg forward keeps
-    its space (``gram_cg`` -> ``gram_cg``, ``normal_cg`` -> ``normal_cg``);
-    every other forward uses ``"dense"``. A gram_cg-resolved AD solve
-    requires ``ad_solver_preconditioner``, an approximation of the UNDAMPED
-    ``(J P J')^{-1} v``, taking either ``(v)`` or ``(v, damping)`` -- a
-    callable REQUIRING the damping argument is called with an explicit
-    zero, and one where it has a default passes through unchanged, so
-    every shipped dual helper serves both hooks directly except
-    ``pad_dual_preconditioner``, which divides by the live damping and is
-    rejected here at construction. Under a normal_cg-resolved AD solve the
-    same hook acts in PARAMETER space -- an approximation of the undamped
-    ``(B'B)^{-1} v``, never served by the dual-space
-    ``preconditioner_factory`` -- and is optional: the tangent rhs lies in
-    ``range(B')``, so unpreconditioned CG already selects the minimum-norm
-    tangent, and a supplied hook must preserve ``range(B')`` exactly like
+    relinearized at the returned solution. ``ad_solver`` explicitly selects
+    one method from ``{"direct", "svd", "qr", "augmented_qr", "gram_cg",
+    "normal_cg", "regularized_normal_cg"}``, independently of the forward
+    solver. ``"direct"`` solves the general square equation
+    ``J theta_dot = -J_p p_dot`` with ``jnp.linalg.solve``. The root is unique,
+    so this method intentionally does not apply the parameter metric; it
+    rejects nonsquare systems. ``"svd"``, ``"qr"``, and ``"augmented_qr"``
+    factor the whitened Jacobian from its small side (see ``jacobian_mode``)
+    and need the metric's ``inv_sqrt``/``inv_sqrt_transpose`` pair. A
+    solve-only metric (for example ``metric_from_shifted_matvec``) must pair
+    with ``ad_solver="direct"`` on a square system or ``"gram_cg"``.
+
+    ``"auto"`` resolves from traced shapes before inspecting the forward
+    solver: every square system uses ``"direct"``. For a nonsquare system a
+    ``gram_cg`` or ``normal_cg`` forward keeps its corresponding Krylov space;
+    every other forward uses ``"svd"``. Thus an ``lsmr`` forward with an
+    explicit ``normal_cg`` AD solve stays fully matrix-free, while a square
+    algebraic root gets the inexpensive direct solve even when its forward
+    solver is CG.
+
+    A ``gram_cg`` AD solve requires ``ad_solver_preconditioner``, an
+    approximation of the UNDAMPED ``(J P J')^{-1} v``, taking either ``(v)``
+    or ``(v, damping)``. A callable requiring the damping argument is called
+    with an explicit zero. Every shipped dual helper serves both hooks directly
+    except ``pad_dual_preconditioner``, which divides by live damping and is
+    rejected here. Under ``normal_cg`` or ``regularized_normal_cg`` the same
+    hook acts in parameter space -- an approximation of ``(B'B)^{-1} v``,
+    never served by the dual-space ``preconditioner_factory`` -- and is
+    optional. Its action must preserve ``range(B')`` exactly like
     ``normal_preconditioner``. ``ad_solver_tol``/``ad_solver_atol``/
-    ``ad_solver_maxiter`` are the cg-resolved stopping controls.
+    ``ad_solver_maxiter`` are the CG stopping controls.
 
-    ``ad_solver_penalty`` selects how a singular AD system is handled.
-    The default never regularizes, anywhere in the package:
+    The dense methods have deliberately separate numerical contracts:
 
-    - Default ``None``, ``ad_solver="dense"``: the exact spectral-filter
-      pseudoinverse of the whitened normal operator ``B'B``, with the
-      singular values taken from an SVD of ``B`` itself -- never from the
-      formed ``B'B``, whose assembly squares the condition number -- at
-      the standard ``max(m, n) * eps * sigma_max`` rank cutoff. That is
-      the exact Gauss-Newton sensitivity at full rank (square nonsingular:
-      ``-J^{-1} J_p p_dot``) and the exact minimum-``M``-norm tangent for
-      consistent rank-deficient systems (redundant residual rows at the
-      returned solution -- e.g. a simulated trajectory settled onto its
-      steady state -- or collinear columns), with no ridge bias in either,
-      at ``eps * cond(B)`` accuracy. The cutoff is a NUMERICAL rank
-      threshold, not an algebraic certificate: an ill-conditioned but
-      genuinely full-rank ``B`` whose smallest singular value falls under
-      ``max(m, n) * eps * sigma_max`` (float32 ``diag(1, eps)``) has that
-      direction silently treated as rank-deficient -- promote with
-      ``linear_solve_dtype`` or set an explicit penalty when tiny singular
-      values are real. Higher-order AD re-solves the differentiated
-      equation through the frozen filter, which omits the derivative of
-      the range projector: second derivatives are exact only while the
-      active subspace does not rotate with ``p``; on rank-deficient
-      problems whose range moves, they carry a first-order-only guarantee.
-    - Explicitly positive, ``"dense"``: a trace-scaled Tikhonov ridge
-      ``B'B + ad_solver_penalty * trace(B'B) I``, solved through a QR
-      factorization of the augmented stack ``[B; sqrt(ridge) I]`` from the
-      small side -- ``B'B`` is again never formed, so the ridged tangent
-      also holds ``eps * cond`` accuracy instead of the squared-assembly
-      floor. Minimum-``M``-norm tangent for consistent systems with an
-      O(``ad_solver_penalty * dim``) relative bias, smooth for
-      higher-order AD on nearly-degenerate problems;
-      ``ad_solver_penalty=1e-12`` (float64 solves) / ``1e-6`` (float32)
-      restores the magnitude of the historical default ridge.
-    - Explicitly positive, ``normal_cg``: a matrix-free ridge scaled by a
-      Rayleigh quotient of ``B'B`` over a fixed deterministic probe vector,
-      keeping the tangent map linear in ``p_dot`` and the ridge alive on a
-      zero tangent.
+    - ``ad_solver="svd"`` computes the spectral-filter pseudoinverse of
+      ``B'B``, taking singular values from an SVD of ``B`` itself at the
+      standard ``max(m, n) * eps * sigma_max`` cutoff. It gives the exact
+      full-rank sensitivity and minimum-``M``-norm tangent for a consistent
+      rank-deficient system, without ridge bias and at ``eps * cond(B)``
+      accuracy. The cutoff is numerical: promote with ``linear_solve_dtype``
+      when genuinely meaningful singular values fall below it. On a
+      rank-deficient problem whose active subspace rotates with ``p``, higher
+      derivatives carry only a first-order guarantee because the range
+      projector is frozen.
+    - ``ad_solver="qr"`` computes the exact unregularized tangent through a
+      reduced QR factorization. It applies the same numerical-rank cutoff to
+      the small ``R`` factor and returns a NaN tangent when the Jacobian is
+      numerically rank deficient instead of silently selecting a solution.
+    - ``ad_solver="augmented_qr"`` applies the trace-scaled Tikhonov ridge
+      ``B'B + ad_solver_penalty * trace(B'B) I`` through a QR factorization
+      of ``[B; sqrt(ridge) I]`` from the small side. It has
+      O(``ad_solver_penalty * dim``) relative bias on consistent systems and
+      stays smooth on nearly degenerate problems.
+    - ``ad_solver="regularized_normal_cg"`` applies a matrix-free ridge scaled
+      by a Rayleigh quotient of ``B'B`` over a fixed deterministic probe,
+      keeping the tangent linear in ``p_dot`` and the ridge alive at zero
+      tangent.
 
-    A ``gram_cg``-resolved AD solve has no ridge to select: it always runs
-    to tolerance and fails loudly (non-finite tangents) on a singular dual,
-    so an explicit positive ``ad_solver_penalty`` there is rejected at
-    construction rather than silently ignored (``0.0`` is the exact/loud
-    solve it does natively and stays legal).
-
-    Under ``"dense"``, ``0.0`` demands the exact unregularized solve: it
-    QR-factors ``B`` from its small side and poisons the tangent to NaN when
-    the smallest singular value of the small ``R`` factor (equal to ``B``'s)
-    falls under the ``max(m, n) * eps * sigma_max`` cutoff -- an actual
-    numerical-rank test, not the unpivoted ``|R_ii|`` diagonals, which are
-    not a rank certificate -- rather than silently selecting a particular
-    solution on a rank-deficient ``B``. Under ``normal_cg``, ``0.0``
-    is just the default no-ridge solve -- unpreconditioned CG from zero still
-    reaches the exact minimum-``M``-norm tangent on consistent systems and
-    fails to converge only when the system is inconsistent. A solution with
-    ``J = 0`` zeroes every trace-scaled ridge itself and fails just as loudly
-    at any penalty.
+    ``ad_solver_penalty`` is required and positive only for
+    ``"augmented_qr"`` and ``"regularized_normal_cg"``. Passing it with any
+    other method is an error; the penalty never changes which algorithm runs.
+    ``gram_cg`` and ``normal_cg`` are unregularized and run to tolerance. A
+    zero Jacobian also zeroes the trace-scaled ``augmented_qr`` ridge and still
+    fails loudly.
 
     ``linear_solve_dtype=jnp.float64`` promotes the dense linear-solve
     pipelines -- the forward ``gram_cholesky``/``normal_cholesky`` (and
-    ``auto``) branches and the dense AD rule -- to float64: ``J'`` is
+    ``auto``) branches and the direct/SVD/QR AD methods -- to float64: ``J'`` is
     cast wide before the metric application, the assembly, factorization, and
     triangular solves run wide, and only the returned step/tangent is cast
     back, so the model, residual, and every output stay at the residual
@@ -1152,7 +1177,9 @@ class LevenbergMarquardt:
                 raise ValueError('recycle requires linear_solver="gram_cg"')
             if not isinstance(recycle, RecycleConfig):
                 raise TypeError("recycle must be a RecycleConfig or None")
-        if ad_solver not in ("auto", "dense", "gram_cg", "normal_cg"):
+        dense_ad_solvers = ("direct", "svd", "qr", "augmented_qr")
+        cg_ad_solvers = ("gram_cg", "normal_cg", "regularized_normal_cg")
+        if ad_solver not in ("auto", *dense_ad_solvers, *cg_ad_solvers):
             raise ValueError(f"unknown ad_solver: {ad_solver}")
         if ad_solver_tol is not None and ad_solver_tol < 0:
             raise ValueError("ad_solver_tol must be nonnegative or None")
@@ -1160,19 +1187,22 @@ class LevenbergMarquardt:
             raise ValueError("ad_solver_atol must be nonnegative")
         if ad_solver_maxiter is not None and ad_solver_maxiter <= 0:
             raise ValueError("ad_solver_maxiter must be positive or None")
-        if ad_solver_penalty is not None and ad_solver_penalty < 0:
-            raise ValueError("ad_solver_penalty must be nonnegative or None")
-        # AD-solver resolution: an explicit choice wins; "auto" keeps a cg
-        # forward in its own space and sends every other forward to the one
-        # shape-independent dense rule.
-        if ad_solver != "auto":
-            resolved_ad_solver = ad_solver
-        elif linear_solver in ("gram_cg", "normal_cg"):
-            resolved_ad_solver = linear_solver
-        else:
-            resolved_ad_solver = "dense"
+        if ad_solver in ("augmented_qr", "regularized_normal_cg"):
+            if ad_solver_penalty is None or ad_solver_penalty <= 0:
+                raise ValueError(
+                    f'ad_solver="{ad_solver}" requires a positive ad_solver_penalty'
+                )
+        elif ad_solver_penalty is not None:
+            raise ValueError(
+                "ad_solver_penalty is accepted only with "
+                'ad_solver="augmented_qr" or "regularized_normal_cg"'
+            )
+        # Explicit methods resolve at construction. Auto stays unresolved until
+        # tracing, where static residual/parameter shapes select direct for a
+        # square system before considering the forward solver family.
+        resolved_ad_solver = ad_solver
         if (
-            resolved_ad_solver in ("gram_cg", "normal_cg")
+            resolved_ad_solver in cg_ad_solvers
             and ad_solver_tol == 0
             and ad_solver_atol == 0
             and ad_solver_maxiter is None
@@ -1180,44 +1210,35 @@ class LevenbergMarquardt:
             raise ValueError(
                 "ad_solver_maxiter must be set when both ad_solver tolerances are zero"
             )
-        # ad_solver_penalty is the dense/normal_cg ridge knob; a gram_cg-resolved
-        # AD solve has no ridge (it runs to tolerance and fails loudly on a
-        # singular dual). A positive penalty there requests regularization the
-        # rule cannot apply, so it is a construction error rather than a
-        # silently ignored argument; 0.0 is the exact/loud solve gram_cg does
-        # natively and stays legal.
-        if (
-            ad_solver_penalty is not None
-            and ad_solver_penalty > 0
-            and resolved_ad_solver == "gram_cg"
-        ):
-            raise ValueError(
-                'a positive ad_solver_penalty applies to ad_solver="dense" and '
-                '"normal_cg" only; a gram_cg-resolved ad_solver has no ridge'
-            )
         # jacobian_mode is consumed by the dense forward paths (the cholesky
-        # forms directly or via "auto", qr, augmented_qr) and by the dense AD
-        # rule. The matrix-free solvers never materialize J, so a forced mode
+        # forms directly or via "auto", qr, augmented_qr) and by the assembled
+        # AD methods. The matrix-free solvers never materialize J, so a forced mode
         # that nothing could ever read is a construction error, not a silent
         # no-op.
         if (
             jacobian_mode != "auto"
             and linear_solver in ("gram_cg", "normal_cg", "lsmr")
-            and resolved_ad_solver != "dense"
+            and resolved_ad_solver not in ("auto", *dense_ad_solvers)
         ):
             raise ValueError(
                 "jacobian_mode controls dense Jacobian assembly, but neither "
                 f'linear_solver="{linear_solver}" nor the '
                 f'"{resolved_ad_solver}"-resolved ad_solver ever consumes it'
             )
-        if ad_solver_preconditioner is not None and resolved_ad_solver not in (
+        auto_may_use_cg = ad_solver == "auto" and linear_solver in (
             "gram_cg",
             "normal_cg",
+        )
+        if (
+            ad_solver_preconditioner is not None
+            and resolved_ad_solver not in cg_ad_solvers
+            and not auto_may_use_cg
         ):
             raise ValueError(
                 "ad_solver_preconditioner requires a cg-resolved ad_solver: "
-                'ad_solver="gram_cg" or "normal_cg", or "auto" alongside a cg '
-                "forward solver"
+                'ad_solver="gram_cg", "normal_cg", or '
+                '"regularized_normal_cg", or "auto" alongside a cg forward '
+                "solver"
             )
         missing_dual_preconditioner = (
             linear_solver == "gram_cg"
@@ -1242,7 +1263,7 @@ class LevenbergMarquardt:
                 "preconditioner_factory), and the gram_cg-resolved ad_solver "
                 "requires ad_solver_preconditioner; pass "
                 "identity_preconditioner() for either to run unpreconditioned "
-                'CG, or ad_solver="dense" for the dense AD rule'
+                "CG, or use a dense AD solver"
             )
         if missing_dual_preconditioner:
             raise ValueError(
@@ -1253,26 +1274,21 @@ class LevenbergMarquardt:
         if missing_ad_preconditioner:
             raise ValueError(
                 'ad_solver="gram_cg" requires ad_solver_preconditioner '
-                '(ad_solver="auto" follows a gram_cg forward solver); '
                 "pass identity_preconditioner() to run unpreconditioned CG, "
-                'or ad_solver="dense" for the dense AD rule'
+                "or use a dense AD solver"
             )
         if linear_solve_dtype is not None:
             if jnp.dtype(linear_solve_dtype) != jnp.dtype(jnp.float64):
                 raise ValueError("linear_solve_dtype must be None or jnp.float64")
-            if (
-                linear_solver
-                not in (
-                    "auto",
-                    "gram_cholesky",
-                    "normal_cholesky",
-                )
-                and resolved_ad_solver != "dense"
-            ):
+            if linear_solver not in (
+                "auto",
+                "gram_cholesky",
+                "normal_cholesky",
+            ) and resolved_ad_solver not in ("auto", *dense_ad_solvers):
                 raise ValueError(
                     "linear_solve_dtype promotes only the dense linear-solve "
                     "pipelines; it requires a gram_cholesky, normal_cholesky, "
-                    "or auto forward solver, or a dense-resolved ad_solver"
+                    "or auto forward solver, or a dense AD solver"
                 )
             if not jax.config.jax_enable_x64:
                 raise ValueError(
@@ -1303,7 +1319,13 @@ class LevenbergMarquardt:
             _validate_metric_requirements(
                 metric, linear_solver, geodesic_acceleration, ""
             )
-            if resolved_ad_solver in ("dense", "normal_cg"):
+            if resolved_ad_solver in (
+                "svd",
+                "qr",
+                "augmented_qr",
+                "normal_cg",
+                "regularized_normal_cg",
+            ):
                 _validate_metric_requirements(
                     metric,
                     resolved_ad_solver,
@@ -2292,6 +2314,7 @@ class LevenbergMarquardt:
         user_state=None,
         save_steps=False,
         multi_start=None,
+        failure_ad_reference=None,
         jit=True,
     ):
         """Run repeated LM updates until a stopping rule fires.
@@ -2327,8 +2350,19 @@ class LevenbergMarquardt:
         respect to ``p`` flow through the selected solution only, via the
         same implicit rule as a plain solve. With ``multi_start=None``
         nothing changes.
+
+        ``failure_ad_reference=(x_ref, args_ref, p_ref)`` optionally supplies a
+        domain-safe point for implicit AD when the returned status is not
+        ``LMStatus.CONVERGED``. It must match the structures, shapes, and
+        dtypes of ``(x0, args, p)``. The primal result is never replaced. A
+        failed lane receives a zero tangent, linearized at the reference so a
+        nonfinite failed iterate cannot poison successful lanes under
+        ``vmap``/VJP. The reference itself is differentiation-inert. Callers
+        are responsible for choosing a point where the residual and any
+        metric factory are well-defined.
         """
         self._check_residual_args(args, p)
+        _check_failure_ad_reference(x0, args, p, failure_ad_reference)
         if max_steps <= 0:
             raise ValueError("max_steps must be positive")
         # Tolerances are traced data inside the loop, so vmapped/traced values
@@ -2386,7 +2420,17 @@ class LevenbergMarquardt:
 
             @jax.custom_jvp
             def solve_multi_start_with_ad_p(
-                x, lm_state, args, p, user_state, key, max_steps, atol, gtol, xtol
+                x,
+                lm_state,
+                args,
+                p,
+                user_state,
+                key,
+                max_steps,
+                atol,
+                gtol,
+                xtol,
+                failure_ad_reference,
             ):
                 return self._multi_start_impl(
                     x,
@@ -2412,7 +2456,7 @@ class LevenbergMarquardt:
             def solve_multi_start_with_ad_p_jvp(primals, tangents):
                 p_dot = tangents[3]
                 result = solve_multi_start_with_ad_p(*primals)
-                return result, self._ad_result_tangent(result, p_dot)
+                return result, self._ad_result_tangent(result, p_dot, primals[-1])
 
             return solve_multi_start_with_ad_p(
                 x0,
@@ -2425,11 +2469,21 @@ class LevenbergMarquardt:
                 atol,
                 gtol,
                 xtol,
+                failure_ad_reference,
             )
 
         @jax.custom_jvp
         def solve_with_ad_p(
-            x, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
+            x,
+            lm_state,
+            args,
+            p,
+            user_state,
+            max_steps,
+            atol,
+            gtol,
+            xtol,
+            failure_ad_reference,
         ):
             return self._solve_impl(
                 x,
@@ -2450,10 +2504,19 @@ class LevenbergMarquardt:
         def solve_with_ad_p_jvp(primals, tangents):
             p_dot = tangents[3]
             result = solve_with_ad_p(*primals)
-            return result, self._ad_result_tangent(result, p_dot)
+            return result, self._ad_result_tangent(result, p_dot, primals[-1])
 
         return solve_with_ad_p(
-            x0, lm_state, args, p, user_state, max_steps, atol, gtol, xtol
+            x0,
+            lm_state,
+            args,
+            p,
+            user_state,
+            max_steps,
+            atol,
+            gtol,
+            xtol,
+            failure_ad_reference,
         )
 
     def _solve_impl(
@@ -2667,32 +2730,96 @@ class LevenbergMarquardt:
         )
         return dataclasses.replace(best, multi_start=info)
 
-    def _ad_result_tangent(self, result, p_dot):
+    def _ad_result_tangent(self, result, p_dot, failure_ad_reference=None):
         # The tangent is a pure function of the returned solution: relinearize
         # the residual at (result.x, result.args, result.p), never reusing the
         # forward iterations. Everything except x, p, and aux -- histories,
         # counters, multi-start diagnostics -- is bookkeeping with zero
         # tangents.
-        x_dot = self._ad_x_tangent_from_p(
-            result.x, result.args, result.p, p_dot, result.aux
+        ad_x, ad_args, ad_p, ad_aux = (
+            result.x,
+            result.args,
+            result.p,
+            result.aux,
         )
+        ad_p_dot = p_dot
+        converged = None
+        if failure_ad_reference is not None:
+            x_ref, args_ref, p_ref = failure_ad_reference
+            converged = result.status == LMStatus.CONVERGED
+            ad_x = _where_tree(converged, result.x, x_ref)
+            ad_args = _where_tree(converged, result.args, args_ref)
+            ad_p = _where_tree(converged, result.p, p_ref)
+            ad_p_dot = _mask_tangent_tree(converged, p_dot)
+            if self.has_aux:
+                # A metric factory may consume aux, so rebuild it at the same
+                # safe point used to linearize the residual rather than
+                # forwarding a nonfinite failed result.aux.
+                ad_aux = self._residual_and_aux(ad_x, ad_args, ad_p)[1]
+
+        x_dot = self._ad_x_tangent_from_p(ad_x, ad_args, ad_p, ad_p_dot, ad_aux)
         zero_result = jax.tree.map(_zero_tangent_leaf, result)
+        if converged is not None:
+            x_dot = _where_tree(converged, x_dot, zero_result.x)
         aux_dot = zero_result.aux
-        if self.has_aux and result.p is not None:
+        if self.has_aux and ad_p is not None:
             # aux depends on p directly and through the solution x*(p);
             # linearize the aux map at the returned solution with args
             # fixed (the same point where the primal result.aux is
             # evaluated) to account for both paths.
             def aux_at_solution(x_value, p_value):
-                return self.residual_fn(x_value, result.args, p_value)[1]
+                return self.residual_fn(x_value, ad_args, p_value)[1]
 
-            aux_dot = jax.jvp(aux_at_solution, (result.x, result.p), (x_dot, p_dot))[1]
+            aux_dot = jax.jvp(aux_at_solution, (ad_x, ad_p), (x_dot, ad_p_dot))[1]
+            if converged is not None:
+                aux_dot = _where_tree(converged, aux_dot, zero_result.aux)
         return dataclasses.replace(zero_result, x=x_dot, p=p_dot, aux=aux_dot)
+
+    def _ad_solver_at(self, x, args, p):
+        if self.ad_solver != "auto":
+            return self.ad_solver
+        theta, _ = ravel_pytree(x)
+        residual_shape = jax.eval_shape(
+            lambda x_value, args_value, p_value: self._residual_and_aux(
+                x_value, args_value, p_value
+            )[0],
+            x,
+            args,
+            p,
+        ).shape
+        if residual_shape[0] == theta.size:
+            return "direct"
+        if self.linear_solver == "gram_cg":
+            return "gram_cg"
+        if self.linear_solver == "normal_cg":
+            return "normal_cg"
+        return "svd"
 
     def _ad_x_tangent_from_p(self, x, args, p, p_dot, aux):
         if p is None:
             return jax.tree.map(_zero_tangent_leaf, x)
-        resolved = self._resolved_ad_solver
+        resolved = self._ad_solver_at(x, args, p)
+        if resolved == "direct":
+            return self._ad_tangent_direct(x, args, p, p_dot)
+        if (
+            resolved in ("gram_cg", "normal_cg", "regularized_normal_cg")
+            and self.ad_solver_tol == 0
+            and self.ad_solver_atol == 0
+            and self.ad_solver_maxiter is None
+        ):
+            raise ValueError(
+                "ad_solver_maxiter must be set when both ad_solver tolerances are zero"
+            )
+        if (
+            resolved == "gram_cg"
+            and self.ad_solver_preconditioner is None
+            and self.preconditioner_factory is None
+        ):
+            raise ValueError(
+                'auto-resolved ad_solver="gram_cg" requires '
+                "ad_solver_preconditioner; pass identity_preconditioner() "
+                "to run unpreconditioned CG or select another ad_solver"
+            )
         if self.metric_factory is not None:
             # The metric is FROZEN at the returned solution: prepare/build once
             # from (x, args, p, aux) -- x/args/p are the traced solution, so the
@@ -2708,10 +2835,8 @@ class LevenbergMarquardt:
                 built_metric = metric_with_compute_dtype(
                     built_metric, self.metric_solve_dtype
                 )
-            # Validation keys on the RESOLVED ad_solver. The dense rule and
-            # normal_cg genuinely need the whitening pair; gram_cg accepts any
-            # callback subset (metric.solve, else the exact S S' fallback), so
-            # it validates under the check-skipping None.
+            # Gram CG accepts either metric.solve or the whitening pair; the
+            # remaining non-direct methods require the whitening pair.
             solve_cb, _, inv_sqrt_cb, inv_sqrt_transpose_cb, has_solve = (
                 self._metric_callbacks_from(
                     built_metric,
@@ -2720,6 +2845,14 @@ class LevenbergMarquardt:
                 )
             )
         else:
+            if self._has_custom_metric and resolved != "gram_cg":
+                _validate_metric_requirements(
+                    self.metric,
+                    resolved,
+                    False,
+                    "",
+                    keyword="ad_solver",
+                )
             solve_cb = self.metric_solve
             inv_sqrt_cb = self.metric_inv_sqrt
             inv_sqrt_transpose_cb = self.metric_inv_sqrt_transpose
@@ -2728,8 +2861,20 @@ class LevenbergMarquardt:
             return self._ad_tangent_normal_cg(
                 x, args, p, p_dot, inv_sqrt_cb, inv_sqrt_transpose_cb
             )
-        if resolved == "dense":
-            return self._ad_tangent_dense(
+        if resolved == "regularized_normal_cg":
+            return self._ad_tangent_regularized_normal_cg(
+                x, args, p, p_dot, inv_sqrt_cb, inv_sqrt_transpose_cb
+            )
+        if resolved == "svd":
+            return self._ad_tangent_svd(
+                x, args, p, p_dot, inv_sqrt_cb, inv_sqrt_transpose_cb
+            )
+        if resolved == "qr":
+            return self._ad_tangent_qr(
+                x, args, p, p_dot, inv_sqrt_cb, inv_sqrt_transpose_cb
+            )
+        if resolved == "augmented_qr":
+            return self._ad_tangent_augmented_qr(
                 x, args, p, p_dot, inv_sqrt_cb, inv_sqrt_transpose_cb
             )
         if has_solve:
@@ -2741,7 +2886,7 @@ class LevenbergMarquardt:
 
         return self._ad_tangent_gram_cg(x, args, p, p_dot, metric_inverse, aux)
 
-    def _ad_tangent_dense(self, x, args, p, p_dot, inv_sqrt, inv_sqrt_transpose):
+    def _ad_dense_linearization(self, x, args, p, p_dot):
         theta, unravel = ravel_pytree(x)
 
         def residual_from_theta(theta_value):
@@ -2754,126 +2899,140 @@ class LevenbergMarquardt:
             return self._residual_and_aux(x, args, p_value)[0]
 
         residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
-        # ONE dense rule for every shape. By the push-through identity
-        # (B'B + d I)^{-1} B' = B' (BB' + d I)^{-1} (any d >= 0, pseudoinverse
-        # limit included, with the same trace-scaled d since
-        # trace(B'B) = trace(BB')), the m x m dual and n x n normal
-        # compositions agree exactly, so the rule only picks which SMALL side
-        # to factor -- never what tangent is computed. The undamped AD system
-        # has no + damping I floor, so it benefits most from
-        # linear_solve_dtype promotion; same recipe as the forward dense
-        # branches (J' promoted before the whitening application, wide
-        # factor/solves, only the tangent cast back to the residual dtype).
         ad_dtype = (
             residual.dtype
             if self.linear_solve_dtype is None
             else self.linear_solve_dtype
         )
-        whitened_jacobian_t = inv_sqrt_transpose(Jt.astype(ad_dtype))
-        n, m = whitened_jacobian_t.shape
-        eps = jnp.asarray(np.finfo(jnp.dtype(ad_dtype)).eps, dtype=ad_dtype)
-        rank_dim = max(n, m)
-        rhs = whitened_jacobian_t @ residual_p_dot.astype(ad_dtype)
-        penalty = self.ad_solver_penalty
-        if penalty is None:
-            # Default: apply (B'B)^+ by a spectral filter with the singular
-            # values taken from an SVD of B' itself -- never from the formed
-            # B'B, whose assembly rounds away every sigma below
-            # sqrt(eps) * sigma_max -- at the standard
-            # max(m, n) * eps * sigma_max numerical-rank cutoff. Redundant
-            # residual rows or collinear columns at the returned solution
-            # make B rank-deficient; for such consistent systems
-            # -S (B'B)^+ B' (r_p p_dot) is the exact minimum-M-norm tangent
-            # with no ridge bias, at eps * cond(B) accuracy. Inside a
-            # symmetric custom_linear_solve so higher-order AD re-applies
-            # the frozen filter and never differentiates svd, whose
-            # derivative rule breaks on the degenerate spectra this path
-            # exists for (the re-applied filter omits the range projector's
-            # rotation: second derivatives are exact only while the active
-            # subspace does not rotate with p).
-            left, sigma, _ = jnp.linalg.svd(whitened_jacobian_t, full_matrices=False)
-            cutoff = rank_dim * eps * sigma[0]
-            inverse_sigma_sq = jnp.where(sigma > cutoff, 1.0 / sigma**2, 0.0)
+        return theta, unravel, residual, Jt, residual_p_dot, ad_dtype
 
-            def pinv_solve(_, rhs_value):
-                return left @ (inverse_sigma_sq * (left.T @ rhs_value))
-
-            whitened_tangent = jax.lax.custom_linear_solve(
-                lambda v: whitened_jacobian_t @ (whitened_jacobian_t.T @ v),
-                rhs,
-                pinv_solve,
-                symmetric=True,
+    def _ad_tangent_direct(self, x, args, p, p_dot):
+        theta, unravel, residual, Jt, residual_p_dot, ad_dtype = (
+            self._ad_dense_linearization(x, args, p, p_dot)
+        )
+        if Jt.shape[0] != Jt.shape[1]:
+            raise ValueError(
+                'ad_solver="direct" requires a square residual Jacobian; '
+                f"got {residual.shape[0]} residuals and {theta.shape[0]} parameters"
             )
-        elif penalty == 0:
-            # 0.0 demands the exact unregularized solve: QR-factor B from its
-            # small side (R'R = B'B when m >= n, R'R = BB' when fat, with the
-            # push-through composition u = B'(BB')^{-1} c) and poison the
-            # tangent when B is numerically rank-deficient. The rank test is
-            # the smallest singular value of the small k x k R factor (whose
-            # singular values are exactly B's), not |R_ii|: unpivoted-QR
-            # diagonals are not a rank certificate and can miss an exactly
-            # rank-deficient B. Without the guard a singular solve rounds into a
-            # finite particular solution, silently wrong for inconsistent
-            # systems; the loud contract poisons it to NaN instead.
-            small_side = whitened_jacobian_t.T if m >= n else whitened_jacobian_t
-            _, r_factor = jnp.linalg.qr(small_side)
-            r_sigma = jnp.linalg.svd(r_factor, compute_uv=False)
-            singular = r_sigma[-1] <= rank_dim * eps * r_sigma[0]
-            if m >= n:
-                half = jsp_linalg.solve_triangular(r_factor.T, rhs, lower=True)
-                whitened_tangent = jsp_linalg.solve_triangular(
-                    r_factor, half, lower=False
-                )
-            else:
-                dual_rhs = residual_p_dot.astype(ad_dtype)
-                half = jsp_linalg.solve_triangular(r_factor.T, dual_rhs, lower=True)
-                dual_solution = jsp_linalg.solve_triangular(r_factor, half, lower=False)
-                whitened_tangent = whitened_jacobian_t @ dual_solution
-            whitened_tangent = jnp.where(singular, jnp.nan, whitened_tangent)
-        else:
-            # An explicit ad_solver_penalty opts into the trace-scaled
-            # Tikhonov ridge B'B + penalty * trace(B'B) I, solved through a
-            # QR factorization of the augmented stack [B; sqrt(ridge) I]
-            # from the small side (fat systems stack [B'; sqrt(ridge) I] and
-            # push through) -- B'B is never formed, so the ridged tangent
-            # avoids the squared-assembly floor and its solve conditioning
-            # is bounded by the ridge itself. Minimum-M-norm tangent for
-            # consistent systems with an O(penalty * dim) relative bias,
-            # smooth for higher-order AD on nearly-degenerate problems.
-            ridge = jnp.sqrt(penalty * jnp.sum(whitened_jacobian_t**2))
-            if m >= n:
-                stack = jnp.concatenate(
-                    [whitened_jacobian_t.T, ridge * jnp.eye(n, dtype=ad_dtype)]
-                )
-                _, r_factor = jnp.linalg.qr(stack)
-                half = jsp_linalg.solve_triangular(r_factor.T, rhs, lower=True)
-                whitened_tangent = jsp_linalg.solve_triangular(
-                    r_factor, half, lower=False
-                )
-            else:
-                stack = jnp.concatenate(
-                    [whitened_jacobian_t, ridge * jnp.eye(m, dtype=ad_dtype)]
-                )
-                _, r_factor = jnp.linalg.qr(stack)
-                dual_rhs = residual_p_dot.astype(ad_dtype)
-                half = jsp_linalg.solve_triangular(r_factor.T, dual_rhs, lower=True)
-                dual_solution = jsp_linalg.solve_triangular(r_factor, half, lower=False)
-                whitened_tangent = whitened_jacobian_t @ dual_solution
-        # The final -S u step routes through an identity-matvec
-        # custom_linear_solve declaring the explicit S transpose (S is not
-        # self-adjoint), so a metric whose inv_sqrt is not reverse-
-        # differentiable (e.g. iterative) but supplies inv_sqrt_transpose still
-        # differentiates in reverse mode -- the paired-callback contract. The
-        # wrapper is opaque to AD, so a factory-built metric's state dependence
-        # is not seen at higher order; take higher-order derivatives of solve
-        # with a fixed metric.
+        theta_dot = jnp.linalg.solve(
+            Jt.T.astype(ad_dtype), -residual_p_dot.astype(ad_dtype)
+        )
+        return unravel(theta_dot.astype(residual.dtype))
+
+    def _ad_whitened_linearization(self, x, args, p, p_dot, inv_sqrt_transpose):
+        theta, unravel, residual, Jt, residual_p_dot, ad_dtype = (
+            self._ad_dense_linearization(x, args, p, p_dot)
+        )
+        whitened_jacobian_t = inv_sqrt_transpose(Jt.astype(ad_dtype))
+        return (
+            theta,
+            unravel,
+            residual,
+            residual_p_dot,
+            ad_dtype,
+            whitened_jacobian_t,
+        )
+
+    def _unwhiten_ad_tangent(
+        self, whitened_tangent, inv_sqrt, inv_sqrt_transpose, unravel, dtype
+    ):
         theta_dot = -jax.lax.custom_linear_solve(
             lambda v: v,
             whitened_tangent,
             lambda _, b: inv_sqrt(b),
             transpose_solve=lambda _, b: inv_sqrt_transpose(b),
         )
-        return unravel(theta_dot.astype(residual.dtype))
+        return unravel(theta_dot.astype(dtype))
+
+    def _ad_tangent_svd(self, x, args, p, p_dot, inv_sqrt, inv_sqrt_transpose):
+        _, unravel, residual, residual_p_dot, ad_dtype, whitened_jacobian_t = (
+            self._ad_whitened_linearization(x, args, p, p_dot, inv_sqrt_transpose)
+        )
+        n, m = whitened_jacobian_t.shape
+        eps = jnp.asarray(np.finfo(jnp.dtype(ad_dtype)).eps, dtype=ad_dtype)
+        rank_dim = max(n, m)
+        rhs = whitened_jacobian_t @ residual_p_dot.astype(ad_dtype)
+        left, sigma, _ = jnp.linalg.svd(whitened_jacobian_t, full_matrices=False)
+        cutoff = rank_dim * eps * sigma[0]
+        inverse_sigma_sq = jnp.where(sigma > cutoff, 1.0 / sigma**2, 0.0)
+
+        def pinv_solve(_, rhs_value):
+            return left @ (inverse_sigma_sq * (left.T @ rhs_value))
+
+        whitened_tangent = jax.lax.custom_linear_solve(
+            lambda v: whitened_jacobian_t @ (whitened_jacobian_t.T @ v),
+            rhs,
+            pinv_solve,
+            symmetric=True,
+        )
+        return self._unwhiten_ad_tangent(
+            whitened_tangent,
+            inv_sqrt,
+            inv_sqrt_transpose,
+            unravel,
+            residual.dtype,
+        )
+
+    def _ad_tangent_qr(self, x, args, p, p_dot, inv_sqrt, inv_sqrt_transpose):
+        _, unravel, residual, residual_p_dot, ad_dtype, whitened_jacobian_t = (
+            self._ad_whitened_linearization(x, args, p, p_dot, inv_sqrt_transpose)
+        )
+        n, m = whitened_jacobian_t.shape
+        eps = jnp.asarray(np.finfo(jnp.dtype(ad_dtype)).eps, dtype=ad_dtype)
+        rank_dim = max(n, m)
+        rhs = whitened_jacobian_t @ residual_p_dot.astype(ad_dtype)
+        small_side = whitened_jacobian_t.T if m >= n else whitened_jacobian_t
+        _, r_factor = jnp.linalg.qr(small_side)
+        r_sigma = jnp.linalg.svd(r_factor, compute_uv=False)
+        singular = r_sigma[-1] <= rank_dim * eps * r_sigma[0]
+        if m >= n:
+            half = jsp_linalg.solve_triangular(r_factor.T, rhs, lower=True)
+            whitened_tangent = jsp_linalg.solve_triangular(r_factor, half, lower=False)
+        else:
+            dual_rhs = residual_p_dot.astype(ad_dtype)
+            half = jsp_linalg.solve_triangular(r_factor.T, dual_rhs, lower=True)
+            dual_solution = jsp_linalg.solve_triangular(r_factor, half, lower=False)
+            whitened_tangent = whitened_jacobian_t @ dual_solution
+        whitened_tangent = jnp.where(singular, jnp.nan, whitened_tangent)
+        return self._unwhiten_ad_tangent(
+            whitened_tangent,
+            inv_sqrt,
+            inv_sqrt_transpose,
+            unravel,
+            residual.dtype,
+        )
+
+    def _ad_tangent_augmented_qr(self, x, args, p, p_dot, inv_sqrt, inv_sqrt_transpose):
+        _, unravel, residual, residual_p_dot, ad_dtype, whitened_jacobian_t = (
+            self._ad_whitened_linearization(x, args, p, p_dot, inv_sqrt_transpose)
+        )
+        n, m = whitened_jacobian_t.shape
+        rhs = whitened_jacobian_t @ residual_p_dot.astype(ad_dtype)
+        ridge = jnp.sqrt(self.ad_solver_penalty * jnp.sum(whitened_jacobian_t**2))
+        if m >= n:
+            stack = jnp.concatenate(
+                [whitened_jacobian_t.T, ridge * jnp.eye(n, dtype=ad_dtype)]
+            )
+            _, r_factor = jnp.linalg.qr(stack)
+            half = jsp_linalg.solve_triangular(r_factor.T, rhs, lower=True)
+            whitened_tangent = jsp_linalg.solve_triangular(r_factor, half, lower=False)
+        else:
+            stack = jnp.concatenate(
+                [whitened_jacobian_t, ridge * jnp.eye(m, dtype=ad_dtype)]
+            )
+            _, r_factor = jnp.linalg.qr(stack)
+            dual_rhs = residual_p_dot.astype(ad_dtype)
+            half = jsp_linalg.solve_triangular(r_factor.T, dual_rhs, lower=True)
+            dual_solution = jsp_linalg.solve_triangular(r_factor, half, lower=False)
+            whitened_tangent = whitened_jacobian_t @ dual_solution
+        return self._unwhiten_ad_tangent(
+            whitened_tangent,
+            inv_sqrt,
+            inv_sqrt_transpose,
+            unravel,
+            residual.dtype,
+        )
 
     def _ad_tangent_gram_cg(self, x, args, p, p_dot, metric_inverse, aux):
         theta, unravel = ravel_pytree(x)
@@ -2956,6 +3115,40 @@ class LevenbergMarquardt:
         return unravel(theta_dot)
 
     def _ad_tangent_normal_cg(self, x, args, p, p_dot, inv_sqrt, inv_sqrt_transpose):
+        return self._ad_tangent_normal_cg_impl(
+            x,
+            args,
+            p,
+            p_dot,
+            inv_sqrt,
+            inv_sqrt_transpose,
+            ridge_penalty=None,
+        )
+
+    def _ad_tangent_regularized_normal_cg(
+        self, x, args, p, p_dot, inv_sqrt, inv_sqrt_transpose
+    ):
+        return self._ad_tangent_normal_cg_impl(
+            x,
+            args,
+            p,
+            p_dot,
+            inv_sqrt,
+            inv_sqrt_transpose,
+            ridge_penalty=self.ad_solver_penalty,
+        )
+
+    def _ad_tangent_normal_cg_impl(
+        self,
+        x,
+        args,
+        p,
+        p_dot,
+        inv_sqrt,
+        inv_sqrt_transpose,
+        *,
+        ridge_penalty,
+    ):
         theta, unravel = ravel_pytree(x)
 
         def residual_from_theta(theta_value):
@@ -2984,8 +3177,8 @@ class LevenbergMarquardt:
         # divergent CG shows up as a non-finite or huge tangent, never a
         # silently biased one).
         rhs = Bt_matvec(residual_p_dot)
-        # An explicitly positive ad_solver_penalty opts into a ridge; trace(N)
-        # is unavailable matrix-free, so its scale is a Rayleigh quotient of
+        # regularized_normal_cg supplies a positive ridge_penalty explicitly.
+        # trace(N) is unavailable matrix-free, so its scale is a Rayleigh quotient of
         # N (one extra matvec) over a FIXED normalized probe vector -- never
         # the rhs, whose direction would make this tangent map nonlinear in
         # p_dot and zero the ridge on a zero tangent. A deterministic
@@ -2993,8 +3186,7 @@ class LevenbergMarquardt:
         # constant-vector probe can sit for centered models;
         # stop_gradient'ed as pure conditioning data.
         ridge = None
-        penalty = self.ad_solver_penalty
-        if penalty is not None and penalty > 0:
+        if ridge_penalty is not None:
             probe = jax.random.normal(
                 jax.random.key(0), (theta.shape[0],), dtype=residual.dtype
             )
@@ -3002,7 +3194,7 @@ class LevenbergMarquardt:
             rayleigh = jax.lax.stop_gradient(
                 jnp.vdot(probe, Bt_matvec(B_matvec(probe)))
             )
-            ridge = penalty * rayleigh
+            ridge = ridge_penalty * rayleigh
 
         def normal_matvec(u):
             product = Bt_matvec(B_matvec(u))
@@ -3565,6 +3757,11 @@ def _type_spec(tree):
     return treedef, specs
 
 
+def _shape_dtype_spec(tree):
+    treedef, specs = _type_spec(tree)
+    return treedef, [(shape, dtype) for shape, dtype, _ in specs]
+
+
 def _check_drawn_types(x, args, drawn):
     # Works on concrete draws and on jax.eval_shape outputs alike; a mismatch
     # would otherwise surface as an inscrutable while_loop/vmap error.
@@ -3573,6 +3770,25 @@ def _check_drawn_types(x, args, drawn):
             "multi_start.draw must return (x, args) matching the structure, "
             f"shapes, and dtypes of its inputs; expected {_type_spec((x, args))}, "
             f"got {_type_spec(drawn)}"
+        )
+
+
+def _check_failure_ad_reference(x, args, p, reference):
+    if reference is None:
+        return
+    if not isinstance(reference, tuple) or len(reference) != 3:
+        raise ValueError(
+            "failure_ad_reference must be a tuple (x_ref, args_ref, p_ref)"
+        )
+    # Unlike a while-loop carry, the reference is only selected into a safe
+    # AD evaluation point. JAX weak typing therefore need not match: where
+    # canonicalizes a weak scalar reference to the real input's aval.
+    expected = _shape_dtype_spec((x, args, p))
+    actual = _shape_dtype_spec(reference)
+    if actual != expected:
+        raise ValueError(
+            "failure_ad_reference must match the structure, shapes, and dtypes "
+            f"of (x0, args, p); expected {expected}, got {actual}"
         )
 
 

@@ -1,4 +1,4 @@
-# The dense AD rule on tall systems (issue #22) and the jacobian_mode
+# The factorized AD rules on tall systems (issue #22) and the jacobian_mode
 # assembly geometry it relies on (issue #23). The workhorse is a
 # tall (m > n) linear least-squares residual A x - (b + p) with a nonzero
 # residual at the solution, where the Gauss-Newton implicit tangent has the
@@ -94,7 +94,7 @@ def test_metric_whitened_tall_tangent_is_metric_independent():
     # unique (J'J)^{-1} J' p_dot regardless of the metric.
     metric = metric_from_diagonal(jnp.asarray([0.5, 2.0, 4.0], dtype=jnp.float32))
     solver = tall_solver(metric=metric)
-    assert solver._resolved_ad_solver == "dense"
+    assert solver._ad_solver_at(X0, None, P0) == "svd"
     _, x_dot = jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))
     # Measured 6e-8 float32.
     assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=1e-6)
@@ -103,7 +103,7 @@ def test_metric_whitened_tall_tangent_is_metric_independent():
 # Rank-deficient tall system: parameter column 2 duplicates column 1, so
 # B = J is column-rank-deficient. The disjoint one-hot columns are exact in
 # float arithmetic, so the undamped normal matrix is exactly singular and the
-# ad_solver_penalty=0.0 rank guard poisons the tangent to NaN.
+# unregularized QR rank guard poisons the tangent to NaN.
 _A_RANK_DEFICIENT = jnp.zeros((M, N), dtype=jnp.float32)
 _A_RANK_DEFICIENT = _A_RANK_DEFICIENT.at[0, 0].set(2.0)
 _A_RANK_DEFICIENT = _A_RANK_DEFICIENT.at[1, 1].set(3.0)
@@ -114,13 +114,14 @@ def rank_deficient_residual(x, args, p):
     return _A_RANK_DEFICIENT @ x - (B_TALL + p)
 
 
-def test_rank_deficient_tall_penalty_regularizes_and_zero_penalty_fails_loudly():
-    def tangent(penalty):
+def test_rank_deficient_tall_algorithms_have_explicit_rank_contracts():
+    def tangent(ad_solver, penalty=None):
         solver = LevenbergMarquardt(
             rank_deficient_residual,
             linear_solver="augmented_qr",
             geodesic_acceleration=False,
             cache_jacobian=False,
+            ad_solver=ad_solver,
             ad_solver_penalty=penalty,
         )
 
@@ -132,7 +133,7 @@ def test_rank_deficient_tall_penalty_regularizes_and_zero_penalty_fails_loudly()
     # Default None: the spectral-filter pseudoinverse returns the exact
     # minimum-norm tangent, which splits evenly across the duplicated
     # parameters -- no ridge, no bias.
-    filtered = tangent(None)
+    filtered = tangent("svd")
     assert bool(jnp.all(jnp.isfinite(filtered)))
     assert jnp.allclose(filtered[1], filtered[2], atol=1e-5)
 
@@ -154,7 +155,7 @@ def test_rank_deficient_tall_penalty_regularizes_and_zero_penalty_fails_loudly()
         )
 
     for penalty, tolerance in ((1e-4, 3e-4), (1e-5, 5e-3)):
-        regularized = tangent(penalty)
+        regularized = tangent("augmented_qr", penalty)
         assert bool(jnp.all(jnp.isfinite(regularized)))
         reference = analytic_ridged(penalty)
         relative = np.linalg.norm(
@@ -162,35 +163,34 @@ def test_rank_deficient_tall_penalty_regularizes_and_zero_penalty_fails_loudly()
         ) / np.linalg.norm(reference)
         assert relative < tolerance, (penalty, relative)
 
-    unregularized = tangent(0.0)
+    unregularized = tangent("qr")
     assert not bool(jnp.all(jnp.isfinite(unregularized)))
 
 
-def test_dense_zero_penalty_success_path_on_full_rank_tall_and_square():
-    # The m >= n ad_solver_penalty=0.0 SUCCESS path: on a full-column-rank
+def test_qr_success_path_on_full_rank_tall_and_square():
+    # The m >= n QR SUCCESS path: on a full-column-rank
     # system the plain small-side QR is nonsingular and returns the exact
     # Gauss-Newton tangent, rather than the rank-guard NaN the singular case
     # produces. (Previously only the FAT branch had value coverage at 0.0.)
-    def dense_tangent(p_dot, **overrides):
+    def qr_tangent(p_dot, **overrides):
         solver = LevenbergMarquardt(
             tall_residual,
             linear_solver="augmented_qr",
             geodesic_acceleration=False,
             cache_jacobian=False,
-            ad_solver="dense",
-            ad_solver_penalty=0.0,
+            ad_solver="qr",
             **overrides,
         )
         return jax.jvp(solved_x_fn(solver), (P0,), (p_dot,))[1]
 
-    x_dot = dense_tangent(P_DOT)
+    x_dot = qr_tangent(P_DOT)
     assert bool(jnp.all(jnp.isfinite(x_dot)))
     assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
 
     # A non-identity metric leaves the full-column-rank tangent unchanged but
     # exercises the inv_sqrt composition inside the 0.0 branch.
     metric = metric_from_diagonal(jnp.array([1.0, 4.0, 0.25], dtype=jnp.float32))
-    x_dot_metric = dense_tangent(P_DOT, metric=metric)
+    x_dot_metric = qr_tangent(P_DOT, metric=metric)
     assert jnp.allclose(x_dot_metric, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
 
     # jvp/vjp dot-product identity on the linear tangent map T(p_dot) = x_dot.
@@ -199,8 +199,7 @@ def test_dense_zero_penalty_success_path_on_full_rank_tall_and_square():
         linear_solver="augmented_qr",
         geodesic_acceleration=False,
         cache_jacobian=False,
-        ad_solver="dense",
-        ad_solver_penalty=0.0,
+        ad_solver="qr",
     )
     solved_x = solved_x_fn(solver)
     _, vjp_fn = jax.vjp(solved_x, P0)
@@ -221,8 +220,7 @@ def test_dense_zero_penalty_success_path_on_full_rank_tall_and_square():
         linear_solver="augmented_qr",
         geodesic_acceleration=False,
         cache_jacobian=False,
-        ad_solver="dense",
-        ad_solver_penalty=0.0,
+        ad_solver="qr",
     )
     p0 = jnp.asarray(sq_rng.normal(size=(N,)), dtype=jnp.float32)
     p_dot = jnp.asarray(sq_rng.normal(size=(N,)), dtype=jnp.float32)
@@ -234,8 +232,8 @@ def test_dense_zero_penalty_success_path_on_full_rank_tall_and_square():
     assert jnp.allclose(sq_tangent, jnp.linalg.solve(A_sq, p_dot), atol=2e-5)
 
 
-def test_ridged_dense_tangent_accuracy_scales_with_cond_b():
-    # Regression for the cond(B)-not-cond(B)^2 contract of the ridged dense
+def test_augmented_qr_tangent_accuracy_scales_with_cond_b():
+    # Regression for the cond(B)-not-cond(B)^2 contract of augmented QR:
     # rule: at cond(B) ~ 1e3 and penalty 1e-6 a normal-equations Cholesky
     # loses eps32 * cond^2 ~ 0.1 of the tangent, while the small-side
     # augmented QR [B; sqrt(penalty * trace) I] keeps the float32 error at
@@ -256,6 +254,7 @@ def test_ridged_dense_tangent_accuracy_scales_with_cond_b():
         linear_solver="augmented_qr",
         geodesic_acceleration=False,
         cache_jacobian=False,
+        ad_solver="augmented_qr",
         ad_solver_penalty=penalty,
     )
     x_dot = jax.jvp(
@@ -279,8 +278,8 @@ def test_ridged_dense_tangent_accuracy_scales_with_cond_b():
 
 
 def test_auto_ad_solver_dispatch():
-    # linear_solver="auto" is itself a non-cg forward, so its AD resolves dense.
-    assert LevenbergMarquardt(tall_residual)._resolved_ad_solver == "dense"
+    auto_solver = LevenbergMarquardt(tall_residual)
+    assert auto_solver._ad_solver_at(X0, None, P0) == "svd"
 
     cg_solver = LevenbergMarquardt(
         tall_residual,
@@ -288,16 +287,16 @@ def test_auto_ad_solver_dispatch():
         dual_preconditioner=identity_preconditioner(),
         ad_solver_preconditioner=identity_preconditioner(),
     )
-    assert cg_solver._resolved_ad_solver == "gram_cg"
+    assert cg_solver._ad_solver_at(X0, None, P0) == "gram_cg"
 
-    # Every non-cg forward uses the one shape-independent dense rule.
+    # Every non-cg forward uses SVD on this non-square problem.
     for linear_solver in ("qr", "augmented_qr", "lsmr"):
         whitened = LevenbergMarquardt(tall_residual, linear_solver=linear_solver)
-        assert whitened._resolved_ad_solver == "dense"
+        assert whitened._ad_solver_at(X0, None, P0) == "svd"
 
     for form, resolved in (
-        ("gram_cholesky", "dense"),
-        ("normal_cholesky", "dense"),
+        ("gram_cholesky", "svd"),
+        ("normal_cholesky", "svd"),
         ("normal_cg", "normal_cg"),
     ):
         kwargs = (
@@ -306,11 +305,11 @@ def test_auto_ad_solver_dispatch():
             else {}
         )
         follows = LevenbergMarquardt(tall_residual, linear_solver=form, **kwargs)
-        assert follows._resolved_ad_solver == resolved
+        assert follows._ad_solver_at(X0, None, P0) == resolved
 
 
-def test_dense_ad_tangent_is_invariant_across_jacobian_mode():
-    # The dense AD rule assembles B via _assemble_jt, which picks fwd/rev by
+def test_svd_ad_tangent_is_invariant_across_jacobian_mode():
+    # The SVD AD rule assembles B via _assemble_jt, which picks fwd/rev by
     # shape; a forced mode must change only cost, never the tangent (guards a
     # transposed-axis / (m, n) arg-order flip that a green suite would miss).
     def tangent(jacobian_mode):
@@ -320,7 +319,7 @@ def test_dense_ad_tangent_is_invariant_across_jacobian_mode():
             jacobian_mode=jacobian_mode,
             geodesic_acceleration=False,
             cache_jacobian=False,
-            ad_solver="dense",
+            ad_solver="svd",
         )
         return jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))[1]
 
@@ -379,16 +378,17 @@ def stacked_residual(x, args, p):
     return jnp.concatenate([top, top]) - p
 
 
-def test_stacked_residual_ridged_dense_tangent_matches_analytic():
+def test_stacked_residual_augmented_qr_tangent_matches_analytic():
     # An explicit ad_solver_penalty is the trace-scaled ridge on B'B
     # (trace(J P J') = trace(B'B), so the ridge means the same thing in
-    # either push-through composition of the dense rule); the O(penalty * m)
+    # either push-through composition of the augmented-QR rule); the O(penalty * m)
     # bias stays below the analytic tolerance.
     solver = LevenbergMarquardt(
         stacked_residual,
         linear_solver="augmented_qr",
         geodesic_acceleration=False,
         cache_jacobian=False,
+        ad_solver="augmented_qr",
         ad_solver_penalty=1e-4,
     )
 
@@ -409,15 +409,15 @@ def test_stacked_residual_ridged_dense_tangent_matches_analytic():
     assert jnp.allclose(ridged, expected, atol=5e-3)
 
 
-def test_dense_default_tangent_on_inconsistent_tall_matches_analytic():
+def test_svd_tangent_on_inconsistent_tall_matches_analytic():
     # -S (B'B)^+ B' (r_p p_dot) = -S B^+ (r_p p_dot): the default
     # spectral-filter pseudoinverse computes the Gauss-Newton tangent even
     # when the residual at the solution is nonzero (the rhs B'(r_p p_dot)
     # always lies in range(B'B), so the filtered solve is exact).
-    solver = tall_solver(ad_solver="dense")
-    dense_tangent = jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))[1]
+    solver = tall_solver(ad_solver="svd")
+    svd_tangent = jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))[1]
     # Measured 2.2e-7 float32.
-    assert jnp.allclose(dense_tangent, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
+    assert jnp.allclose(svd_tangent, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
 
 
 def test_lsmr_forward_with_auto_implicit_matches_analytic_tangent():
@@ -429,7 +429,7 @@ def test_lsmr_forward_with_auto_implicit_matches_analytic_tangent():
         geodesic_acceleration=False,
         cache_jacobian=False,
     )
-    assert solver._resolved_ad_solver == "dense"
+    assert solver._ad_solver_at(X0, None, P0) == "svd"
 
     def solved_x(p):
         return solver.solve(X0, p=p, max_steps=100, gtol=1e-5).x

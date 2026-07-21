@@ -122,13 +122,15 @@ resampling, and per-step history recording; the docs have a cookbook.
 
 `solve(...).x` also supports custom implicit JVP/VJP with respect to `p`;
 the docs give the metric-minimum-norm formula and a minimal `jax.jvp` /
-`jax.vjp` example. The default `ad_solver="auto"` stays matrix-free under
-the CG forward forms and uses the one dense AD rule otherwise — and every
-form is independently swappable (an `lsmr` forward solve with
+`jax.vjp` example. The default `ad_solver="auto"` uses a direct solve for
+every square system, preserves the forward CG space for nonsquare CG systems,
+and uses SVD otherwise. Every method is independently swappable (an `lsmr` forward solve with
 `ad_solver="normal_cg"` is fully matrix-free end to end). The metric
 matters for underdetermined roots because it selects which tangent is the
 minimum-norm solution. The per-step `update(...)` interface does not define
-the implicit AD rule.
+the implicit AD rule. Batched domain-restricted problems can provide
+`failure_ad_reference=(x_ref, args_ref, p_ref)` to keep non-converged lanes'
+JVP/VJP contributions at zero without changing their primal results.
 
 ## Metric Example
 
@@ -180,9 +182,10 @@ slots in directly, e.g.
   `dual_preconditioner` is required (e.g. `sherman_morrison_preconditioner`,
   or the randomized `nystrom_preconditioner` for neural-network duals; pass
   `identity_preconditioner()` to run unpreconditioned CG explicitly);
-  `ad_solver="auto"` keeps `solve(...).x` matrix-free under AD and
-  requires `ad_solver_preconditioner` the same way — at construction, even
-  if the solve is never differentiated. When the dual operator rotates as LM
+  on a nonsquare system `ad_solver="auto"` keeps `solve(...).x` matrix-free
+  under AD and requires `ad_solver_preconditioner` when the differentiated
+  solve is traced (an explicit `ad_solver="gram_cg"` validates it eagerly).
+  When the dual operator rotates as LM
   drifts `x`, pass `preconditioner_factory=PreconditionerFactory(prepare,
   apply)` instead — a θ-adaptive preconditioner rebuilt from the live iterate
   each step — and `recycle=RecycleConfig(rank=k)` to carry a deflation basis

@@ -111,10 +111,10 @@ def pad_dual_preconditioner(base_preconditioner, n_real):
     this uses the live ``damping`` argument, and because the padded block
     divides by it, the returned callback serves only the damped forward
     solve -- never the ``ad_solver_preconditioner`` hook. Relatedly, padded
-    rows make the undamped dual ``J P J'`` singular; the default dense AD
-    rule handles this exactly (its spectral filter computes the
-    minimum-metric-norm tangent, which equals the unpadded one), while an
-    explicit ``ad_solver_penalty=0.0`` fails loudly there.
+    rows make the undamped dual ``J P J'`` singular; ``ad_solver="svd"``
+    handles this exactly (its spectral filter computes the minimum-metric-norm
+    tangent, which equals the unpadded one), while ``ad_solver="qr"`` fails
+    loudly there.
     """
 
     if not isinstance(n_real, int) or isinstance(n_real, bool) or n_real <= 0:

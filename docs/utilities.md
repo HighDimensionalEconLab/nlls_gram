@@ -169,8 +169,8 @@ with the Gram forms (`gram_cholesky`, `gram_cg`) and is rejected for the
 whitened forms (`normal_cholesky`, `normal_cg`, `qr`, `augmented_qr`,
 `lsmr`), which all require `inv_sqrt`, at construction — on a
 square-to-tall problem pin a Gram form explicitly, since the default `auto`
-would resolve to `normal_cholesky`. The dense AD rule also requires the
-square-root pair, so pair a solve-only metric with
+would resolve to `normal_cholesky`. The SVD and QR AD methods also require the
+square-root pair, so pair a nonsquare solve-only metric with
 `ad_solver="gram_cg"` — the whole pipeline — forward solve, JVP, and
 VJP — then runs matrix-free (see [Implicit AD](implicit_ad.md)). This is the one
 constructor that meets the
@@ -556,14 +556,12 @@ solvers behave as follows:
   singular *but consistent* — their `p`-derivative rows are identically
   zero too — which is exactly the singular-but-consistent regime of
   [the implicit rules](implicit_ad.md#rank-deficiency-and-the-ridge). The
-  dense AD rule computes the minimum-metric-norm tangent exactly
-  through its default spectral-filter pseudoinverse, and a
-  `normal_cg`-resolved AD solve computes it with no ridge in exact
+  `svd` computes the minimum-metric-norm tangent through its spectral-filter
+  pseudoinverse, and a `normal_cg` AD solve computes it with no ridge in exact
   arithmetic — on its default unridged path, with the inner CG run to
   convergence, and either unpreconditioned or with a range-preserving
-  `ad_solver_preconditioner` (an opt-in `ad_solver_penalty` ridge biases at
-  the documented order; `0.0` here is that same exact unridged solve — the
-  loud rank guard is the `dense` rule's behavior, not `normal_cg`'s). A
+  `ad_solver_preconditioner`. `regularized_normal_cg` is the separate biased
+  method; the loud rank guard belongs to `qr`, not `normal_cg`. A
   `gram_cg`-resolved AD solve is the
   fragile choice here — run-to-tolerance CG on the singular padded dual —
   and `pad_dual_preconditioner` divides the padded block by the live
@@ -622,7 +620,7 @@ over the CG forms.
 - **Differentiation**: reverse-AD through `update` works (the whitened
   solution is wrapped in `lax.custom_linear_solve` on the SPD preconditioned
   normal operator `R⁻ᵀ(BᵀB + damping I)R⁻¹`). Differentiating a forward
-  `solve(...).x` uses the dense AD rule by default
+  `solve(...).x` uses `direct` for a square system and `svd` otherwise
   (`ad_solver="auto"`); set
   `ad_solver="normal_cg"` (no preconditioner needed) or
   `"gram_cg"` with an `ad_solver_preconditioner` for a fully matrix-free
