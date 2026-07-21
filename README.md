@@ -8,16 +8,20 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX pytrees, aimed
-at underdetermined or interpolating problems where the number of parameters is
-larger than the number of residuals.
+at solving systems of equations (i.e., interpolation). The core use cases are
+underdetermined systems — more parameters than residuals — where LM is solved
+in its Gram form, and square or redundant tall nonlinear systems where
+regularization is needed to select among the interpolating solutions, with the
+selection controlled by a user-chosen metric.
 
 `LevenbergMarquardt` minimizes a user residual taking
 `(x)`, `(x, args)`, or `(x, args, p)`, always in that order. The unknown `x`
 may be any JAX pytree; internally it
-is flattened with `jax.flatten_util.ravel_pytree`. The default dense solver
-uses the residual-space Gram system, with QR, CG, and matrix-free LSMR
-alternatives. Use `update(...)` for a single LM step or `solve(...)` for an
-internally jitted loop.
+is flattened with `jax.flatten_util.ravel_pytree`. The default solver picks
+the smaller dense factorization from the problem shape — the residual-space
+Gram system or the whitened normal system — with QR, CG, and matrix-free
+LSMR alternatives. Use `update(...)` for a single LM step or `solve(...)`
+for an internally jitted loop.
 
 ## Problem
 
@@ -118,15 +122,22 @@ resampling, and per-step history recording; the docs have a cookbook.
 
 `solve(...).x` also supports custom implicit JVP/VJP with respect to `p`;
 the docs give the metric-minimum-norm formula and a minimal `jax.jvp` /
-`jax.vjp` example. With `linear_solver="cg"` the default implicit AD rule is
-matrix-free; pass `implicit_solver="cholesky"` (alias of `"dual_cholesky"`)
-to restore the dense rule. `implicit_solver="auto"` otherwise follows the
-forward solver's geometry — the n-wide `"primal_qr"` rule for tall or square (`m >= n`)
-whitened solves, the dense dual Cholesky rule otherwise; the docs cover the
-full `dual_*`/`primal_*` vocabulary. The
-metric matters for underdetermined roots because it selects which tangent is
-the minimum-norm solution. The per-step `update(...)` interface does not
-define the implicit AD rule.
+`jax.vjp` example. The default `ad_solver="auto"` uses a direct solve for
+every square system, preserves the forward CG space for nonsquare CG systems,
+and uses SVD otherwise. Every method is independently swappable (an `lsmr` forward solve with
+`ad_solver="normal_cg"` is fully matrix-free end to end). The metric
+matters for underdetermined roots because it selects which tangent is the
+minimum-norm solution. The per-step `update(...)` interface does not define
+the implicit AD rule. By default, both `CONVERGED` and `MAX_STEPS` results are
+usable: fixed-step solves retain their implicit derivative while the status
+still reports `MAX_STEPS`. Pass `max_steps_is_success=False` for strict
+failure semantics. A failed solve keeps its primal result and diagnostics but
+contributes exactly zero through `result.x` and `result.aux`; `result.p`
+remains an identity pass-through. Its linear tangent program is evaluated
+safely at differentiation-inert copies of the caller's original
+`(x0, args, p)`, so those initial inputs must be JVP-safe for the residual,
+aux map, and any metric or preconditioner factory used by the selected AD
+method. This also keeps mixed successful/failed `vmap` lanes finite.
 
 ## Metric Example
 
@@ -152,36 +163,60 @@ structural constructors (`metric_from_tridiagonal_precision`,
 Matérn/state-space kernel Grams, `metric_from_diagonal`,
 `blockdiag_metric`) so common metrics need no callback plumbing.
 
+For a metric that depends on the current iterate or on residual aux outputs
+(`has_aux=True`), pass `metric_factory=MetricFactory(prepare, build)` instead
+of `metric`: `prepare(x, args, p, aux)` caches a state once per accepted step
+and `build(state)` returns a plain `Metric` — any of the constructors above
+slots in directly, e.g.
+`MetricFactory(prepare=lambda x, args, p, aux: aux["L"], build=metric_from_cholesky)`.
+
 ## Solvers
 
-- `linear_solver="cholesky"`: dense residual-space Gram solve, the default.
+- `linear_solver="auto"` (the default): resolves at trace time to the
+  smaller dense factorization — `gram_cholesky` when `n > m`,
+  `normal_cholesky` otherwise. A shape rule, and safely so: the two forms
+  compute the same step.
+- `linear_solver="gram_cholesky"`: dense `m × m` residual-space Gram solve.
+- `linear_solver="normal_cholesky"`: dense `n × n` whitened normal solve;
+  its small-damping limit is the minimum-metric-norm least-squares step at
+  every shape and rank.
 - `linear_solver="qr"`: dense QR solve of the whitened-step problem (requires
   a full-row-rank Jacobian).
 - `linear_solver="augmented_qr"`: direct augmented QR in parameter space;
   robust to rank-deficient Jacobians when damping is positive and best suited
   to small systems.
-- `linear_solver="cg"`: matrix-free residual-space CG. A `dual_preconditioner`
-  is required (e.g. `sherman_morrison_preconditioner`, or the randomized
-  `nystrom_preconditioner` for neural-network duals; pass
+- `linear_solver="gram_cg"`: matrix-free residual-space CG. A
+  `dual_preconditioner` is required (e.g. `sherman_morrison_preconditioner`,
+  or the randomized `nystrom_preconditioner` for neural-network duals; pass
   `identity_preconditioner()` to run unpreconditioned CG explicitly);
-  `implicit_solver="auto"` keeps `solve(...).x` matrix-free under AD and
-  requires `implicit_preconditioner` the same way — at construction, even
-  if the solve is never differentiated. When the dual operator rotates as LM
+  on a nonsquare system `ad_solver="auto"` keeps `solve(...).x` matrix-free
+  under AD and requires `ad_solver_preconditioner` when the differentiated
+  solve is traced (an explicit `ad_solver="gram_cg"` validates it eagerly).
+  When the dual operator rotates as LM
   drifts `x`, pass `preconditioner_factory=PreconditionerFactory(prepare,
   apply)` instead — a θ-adaptive preconditioner rebuilt from the live iterate
   each step — and `recycle=RecycleConfig(rank=k)` to carry a deflation basis
   across steps, recycling each solve's Krylov subspace into the next.
+- `linear_solver="normal_cg"`: matrix-free CG on the whitened normal system,
+  iterating in parameter space — the matrix-free form for square-to-tall
+  problems. A `normal_preconditioner` is required; on rank-deficient
+  problems it must preserve `range(Bᵀ)` or the minimum-norm selection is
+  lost (`identity_preconditioner()` always qualifies — the docs give the
+  full requirement).
 - `linear_solver="lsmr"`: matrix-free LSMR on the whitened augmented system,
   the iterative sibling of `augmented_qr`, using only J/Jᵀ products. It works
-  on the whitened Jacobian rather than its squared dual, so it stays accurate
-  at small damping where the Gram-based solves hit their `eps·cond` floor. An
-  optional `whitened_preconditioner=WhitenedPreconditioner(solve,
-  solve_transpose)` right-preconditions the operator to cluster its spectrum;
-  its scalar damping then regularizes in the `RᵀR` metric — a documented
-  surrogate whose `damping → 0` minimum-metric-norm limit is unchanged.
+  on the whitened Jacobian rather than a squared Gram/normal operator, so it
+  stays accurate at small damping where those solves hit their `eps·cond`
+  floor. An optional
+  `whitened_preconditioner=WhitenedPreconditioner(solve, solve_transpose)`
+  right-preconditions the operator to cluster its spectrum; every damped
+  posed subproblem stays exactly the identity-damped whitened one, so the
+  preconditioner changes the iteration path, never the converged step.
 
-All five solve the same metric-damped linearized subproblem up to the accuracy
-of the chosen linear solver.
+All eight solve the same metric-damped linearized subproblem up to the
+accuracy of the chosen linear solver. The dense paths materialize the
+Jacobian from its small side (`jacobian_mode="auto"`; `"fwd"`/`"rev"`
+force one AD mode), so tall systems never build an `m × m` residual basis.
 
 ## Docs and Alternatives
 

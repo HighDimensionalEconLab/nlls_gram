@@ -40,14 +40,14 @@ def _make_large_interpolation_problem(
         "init_damping": 1e-2,
         "linear_solver": linear_solver,
     }
-    if linear_solver == "cg":
+    if linear_solver == "gram_cg":
         solver_kwargs.update(
             {
                 "iterative_tol": 0.0,
                 "iterative_atol": 0.0,
                 "iterative_maxiter": ITERATIVE_MAXITER,
                 "dual_preconditioner": identity_preconditioner(),
-                "implicit_preconditioner": identity_preconditioner(),
+                "ad_solver_preconditioner": identity_preconditioner(),
             }
         )
 
@@ -78,9 +78,9 @@ def _make_large_interpolation_problem(
 @pytest.mark.parametrize(
     "linear_solver",
     [
-        "cholesky",
+        "gram_cholesky",
         "qr",
-        "cg",
+        "gram_cg",
     ],
 )
 @pytest.mark.parametrize("geodesic_acceleration", [False, True])

@@ -27,18 +27,18 @@ pytestmark = pytest.mark.skipif(
 # Matrix-free params (cg with an explicit identity preconditioner, plain lsmr)
 # ride alongside the dense ones; they auto-skip without a GPU like the rest.
 _MATRIX_FREE_GPU_KWARGS = {
-    "cg": {
+    "gram_cg": {
         "iterative_tol": 1e-7,
         "iterative_maxiter": 10,
         "dual_preconditioner": identity_preconditioner(),
-        "implicit_preconditioner": identity_preconditioner(),
+        "ad_solver_preconditioner": identity_preconditioner(),
     },
     "lsmr": {"iterative_tol": 1e-8, "iterative_maxiter": 10},
 }
 
 
 @pytest.mark.parametrize(
-    "linear_solver", ["cholesky", "qr", "augmented_qr", "cg", "lsmr"]
+    "linear_solver", ["gram_cholesky", "qr", "augmented_qr", "gram_cg", "lsmr"]
 )
 def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
     def residual(theta, target, p):
@@ -76,7 +76,7 @@ def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
 
 
 @pytest.mark.parametrize(
-    "linear_solver", ["cholesky", "qr", "augmented_qr", "cg", "lsmr"]
+    "linear_solver", ["gram_cholesky", "qr", "augmented_qr", "gram_cg", "lsmr"]
 )
 def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
     def residual(theta, target, p):

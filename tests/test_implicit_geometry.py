@@ -1,10 +1,8 @@
-"""Geometry-aware implicit solvers (issue #22) and the jacobian_mode assembly
-geometry they rely on (issue #23).
-
-The workhorse problem is a tall (m > n) linear least-squares residual
-``A x - (b + p)`` with a nonzero residual at the solution, where the implicit
-tangent has the closed form ``x_dot = (A'A)^{-1} A' p_dot``.
-"""
+# The factorized AD rules on tall systems (issue #22) and the jacobian_mode
+# assembly geometry it relies on (issue #23). The workhorse is a
+# tall (m > n) linear least-squares residual A x - (b + p) with a nonzero
+# residual at the solution, where the Gauss-Newton implicit tangent has the
+# closed form x_dot = (A'A)^{-1} A' p_dot.
 
 import jax
 import jax.numpy as jnp
@@ -65,8 +63,9 @@ def test_tall_augmented_qr_jvp_matches_analytic_and_finite_differences():
 
     solved_x = solved_x_fn(solver)
     x, x_dot = jax.jvp(solved_x, (P0,), (P_DOT,))
-    assert jnp.allclose(x, analytic_tangent(A_TALL, B_TALL + P0), atol=1e-3)
-    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=1e-3)
+    # Measured 1.8e-7 (x) and 2.2e-7 (x_dot) float32 under the SVD/QR rule.
+    assert jnp.allclose(x, analytic_tangent(A_TALL, B_TALL + P0), atol=1e-4)
+    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
 
     # Central finite differences: the problem is linear in p, so a large step
     # has zero truncation error and only solver noise divided by 2 * eps.
@@ -83,26 +82,28 @@ def test_tall_vjp_jvp_dot_product_transpose_identity():
     _, x_dot = jax.jvp(solved_x, (P0,), (P_DOT,))
     _, pullback = jax.vjp(solved_x, P0)
     (p_bar,) = pullback(X_BAR)
+    # Measured 3.7e-6 relative float32.
     assert jnp.allclose(
-        jnp.vdot(X_BAR, x_dot), jnp.vdot(p_bar, P_DOT), rtol=1e-3, atol=1e-4
+        jnp.vdot(X_BAR, x_dot), jnp.vdot(p_bar, P_DOT), rtol=5e-5, atol=1e-6
     )
 
 
 def test_metric_whitened_tall_tangent_is_metric_independent():
-    # A nonidentity diagonal metric changes the whitened B = J S the primal
-    # rule factors, but for a full-column-rank tall system the tangent is the
+    # A nonidentity diagonal metric changes the whitened B = J S the normal
+    # form factors, but for a full-column-rank tall system the tangent is the
     # unique (J'J)^{-1} J' p_dot regardless of the metric.
     metric = metric_from_diagonal(jnp.asarray([0.5, 2.0, 4.0], dtype=jnp.float32))
     solver = tall_solver(metric=metric)
-    assert solver._implicit_rule_at(X0, None, P0) == "primal_qr"
+    assert solver._ad_solver_at(X0, None, P0) == "svd"
     _, x_dot = jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))
-    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=1e-3)
+    # Measured 6e-8 float32.
+    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=1e-6)
 
 
 # Rank-deficient tall system: parameter column 2 duplicates column 1, so
 # B = J is column-rank-deficient. The disjoint one-hot columns are exact in
-# float arithmetic, so the unregularized QR pivot is exactly zero and the
-# implicit_penalty=0.0 failure is non-finite rather than merely huge.
+# float arithmetic, so the undamped normal matrix is exactly singular and the
+# unregularized QR rank guard poisons the tangent to NaN.
 _A_RANK_DEFICIENT = jnp.zeros((M, N), dtype=jnp.float32)
 _A_RANK_DEFICIENT = _A_RANK_DEFICIENT.at[0, 0].set(2.0)
 _A_RANK_DEFICIENT = _A_RANK_DEFICIENT.at[1, 1].set(3.0)
@@ -113,14 +114,15 @@ def rank_deficient_residual(x, args, p):
     return _A_RANK_DEFICIENT @ x - (B_TALL + p)
 
 
-def test_rank_deficient_tall_penalty_regularizes_and_zero_penalty_fails_loudly():
-    def tangent(penalty):
+def test_rank_deficient_tall_algorithms_have_explicit_rank_contracts():
+    def tangent(ad_solver, penalty=None):
         solver = LevenbergMarquardt(
             rank_deficient_residual,
             linear_solver="augmented_qr",
             geodesic_acceleration=False,
             cache_jacobian=False,
-            implicit_penalty=penalty,
+            ad_solver=ad_solver,
+            ad_solver_penalty=penalty,
         )
 
         def solved_x(p):
@@ -128,96 +130,202 @@ def test_rank_deficient_tall_penalty_regularizes_and_zero_penalty_fails_loudly()
 
         return jax.jvp(solved_x, (P0,), (P_DOT,))[1]
 
-    regularized = tangent(1e-6)
-    assert bool(jnp.all(jnp.isfinite(regularized)))
-    # The trace-scaled ridge returns the minimum-norm tangent, which splits
-    # evenly across the duplicated parameters.
-    assert jnp.allclose(regularized[1], regularized[2], atol=1e-4)
+    # Default None: the spectral-filter pseudoinverse returns the exact
+    # minimum-norm tangent, which splits evenly across the duplicated
+    # parameters -- no ridge, no bias.
+    filtered = tangent("svd")
+    assert bool(jnp.all(jnp.isfinite(filtered)))
+    assert jnp.allclose(filtered[1], filtered[2], atol=1e-5)
 
-    unregularized = tangent(0.0)
+    # The opt-in ridge solves the augmented QR [B; sqrt(penalty * trace) I];
+    # check it against the float64 analytic ridged solution. Resolving an
+    # EXACTLY duplicated column pair against the ridge pivot is a cancellation
+    # at eps32 * sigma_max^2 / (penalty * trace) regardless of factorization
+    # (measured: 5.6e-5 relative at penalty 1e-4, 1.3e-3 at 1e-5, 4.8e-2 at
+    # 1e-6), so this fixture floors near penalty 1e-5 in float32; the
+    # cond(B)-not-cond(B)^2 accuracy of the path itself is pinned on a
+    # generic fixture by test_ridged_dense_tangent_accuracy_scales_with_cond_b.
+    A64 = np.asarray(_A_RANK_DEFICIENT, np.float64)
+    G64 = A64.T @ A64
+    p_dot64 = np.asarray(P_DOT, np.float64)
+
+    def analytic_ridged(penalty):
+        return np.linalg.solve(
+            G64 + penalty * np.trace(G64) * np.eye(N), A64.T @ p_dot64
+        )
+
+    for penalty, tolerance in ((1e-4, 3e-4), (1e-5, 5e-3)):
+        regularized = tangent("augmented_qr", penalty)
+        assert bool(jnp.all(jnp.isfinite(regularized)))
+        reference = analytic_ridged(penalty)
+        relative = np.linalg.norm(
+            np.asarray(regularized, np.float64) - reference
+        ) / np.linalg.norm(reference)
+        assert relative < tolerance, (penalty, relative)
+
+    unregularized = tangent("qr")
     assert not bool(jnp.all(jnp.isfinite(unregularized)))
 
 
-A_FAT = jnp.asarray(_rng.normal(size=(2, 4)), dtype=jnp.float32)
-P_FAT = jnp.asarray(_rng.normal(size=(2,)), dtype=jnp.float32)
-P_FAT_DOT = jnp.asarray(_rng.normal(size=(2,)), dtype=jnp.float32)
-X0_FAT = jnp.zeros(4, dtype=jnp.float32)
+def test_qr_success_path_on_full_rank_tall_and_square():
+    # The m >= n QR SUCCESS path: on a full-column-rank
+    # system the plain small-side QR is nonsingular and returns the exact
+    # Gauss-Newton tangent, rather than the rank-guard NaN the singular case
+    # produces. (Previously only the FAT branch had value coverage at 0.0.)
+    def qr_tangent(p_dot, **overrides):
+        solver = LevenbergMarquardt(
+            tall_residual,
+            linear_solver="augmented_qr",
+            geodesic_acceleration=False,
+            cache_jacobian=False,
+            ad_solver="qr",
+            **overrides,
+        )
+        return jax.jvp(solved_x_fn(solver), (P0,), (p_dot,))[1]
 
+    x_dot = qr_tangent(P_DOT)
+    assert bool(jnp.all(jnp.isfinite(x_dot)))
+    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
 
-def fat_residual(x, args, p):
-    return A_FAT @ x - p
+    # A non-identity metric leaves the full-column-rank tangent unchanged but
+    # exercises the inv_sqrt composition inside the 0.0 branch.
+    metric = metric_from_diagonal(jnp.array([1.0, 4.0, 0.25], dtype=jnp.float32))
+    x_dot_metric = qr_tangent(P_DOT, metric=metric)
+    assert jnp.allclose(x_dot_metric, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
 
-
-def test_auto_implicit_solver_dispatch():
-    cg_solver = LevenbergMarquardt(
+    # jvp/vjp dot-product identity on the linear tangent map T(p_dot) = x_dot.
+    solver = LevenbergMarquardt(
         tall_residual,
-        linear_solver="cg",
-        dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
-    )
-    assert cg_solver._resolved_implicit_solver == "dual_cg"
-
-    for linear_solver in ("qr", "augmented_qr", "lsmr"):
-        whitened = LevenbergMarquardt(tall_residual, linear_solver=linear_solver)
-        assert whitened._resolved_implicit_solver == "geometry"
-
-    dense = LevenbergMarquardt(tall_residual, linear_solver="cholesky")
-    assert dense._resolved_implicit_solver == "dual_cholesky"
-
-    # The "geometry" selection resolves per problem shape at trace time.
-    tall = tall_solver()
-    assert tall._implicit_rule_at(X0, None, P0) == "primal_qr"
-    fat = LevenbergMarquardt(
-        fat_residual,
         linear_solver="augmented_qr",
         geodesic_acceleration=False,
         cache_jacobian=False,
+        ad_solver="qr",
     )
-    assert fat._implicit_rule_at(X0_FAT, None, P_FAT) == "dual_cholesky"
+    solved_x = solved_x_fn(solver)
+    _, vjp_fn = jax.vjp(solved_x, P0)
+    lhs = jnp.vdot(X_BAR, jax.jvp(solved_x, (P0,), (P_DOT,))[1])
+    rhs = jnp.vdot(vjp_fn(X_BAR)[0], P_DOT)
+    assert jnp.allclose(lhs, rhs, atol=2e-5)
 
-    # The square tie (m == n) goes to the primal rule: same factorization
-    # width either way, but the dual route would assemble and factor the
-    # condition-squaring Gram.
+    # Square nonsingular: the same 0.0 path gives dx/dp = A^{-1} p_dot.
+    sq_rng = np.random.default_rng(7)
+    A_sq = jnp.asarray(sq_rng.normal(size=(N, N)), dtype=jnp.float32)
+    b_sq = jnp.asarray(sq_rng.normal(size=(N,)), dtype=jnp.float32)
+
     def square_residual(x, args, p):
-        return A_TALL[:N, :] @ x - p
+        return A_sq @ x - (b_sq + p)
 
-    square = LevenbergMarquardt(
+    square_solver = LevenbergMarquardt(
         square_residual,
         linear_solver="augmented_qr",
         geodesic_acceleration=False,
         cache_jacobian=False,
+        ad_solver="qr",
     )
-    assert square._implicit_rule_at(X0, None, P0[:N]) == "primal_qr"
+    p0 = jnp.asarray(sq_rng.normal(size=(N,)), dtype=jnp.float32)
+    p_dot = jnp.asarray(sq_rng.normal(size=(N,)), dtype=jnp.float32)
+    sq_tangent = jax.jvp(
+        lambda p: square_solver.solve(X0, p=p, max_steps=100, gtol=1e-6).x,
+        (p0,),
+        (p_dot,),
+    )[1]
+    assert jnp.allclose(sq_tangent, jnp.linalg.solve(A_sq, p_dot), atol=2e-5)
 
 
-def test_backward_compatible_implicit_solver_aliases():
-    # "cholesky" is an alias of "dual_cholesky": identical construction and
-    # bitwise-identical tangents.
-    def dual_tangent(implicit_solver):
-        solver = tall_solver(implicit_solver=implicit_solver)
+def test_augmented_qr_tangent_accuracy_scales_with_cond_b():
+    # Regression for the cond(B)-not-cond(B)^2 contract of augmented QR:
+    # rule: at cond(B) ~ 1e3 and penalty 1e-6 a normal-equations Cholesky
+    # loses eps32 * cond^2 ~ 0.1 of the tangent, while the small-side
+    # augmented QR [B; sqrt(penalty * trace) I] keeps the float32 error at
+    # the eps32 * cond level -- measured 2.2e-6 relative against the float64
+    # analytic ridge.
+    m, n, penalty = 12, 4, 1e-6
+    U, _ = jnp.linalg.qr(jax.random.normal(jax.random.key(0), (m, n)))
+    V, _ = jnp.linalg.qr(jax.random.normal(jax.random.key(1), (n, n)))
+    A = ((U * jnp.logspace(0.0, -3.0, n)) @ V.T).astype(jnp.float32)
+    b = jax.random.normal(jax.random.key(2), (m,), dtype=jnp.float32)
+    p_dot = jax.random.normal(jax.random.key(3), (m,), dtype=jnp.float32)
+
+    def residual(x, args, p):
+        return A @ x - (b + p)
+
+    solver = LevenbergMarquardt(
+        residual,
+        linear_solver="augmented_qr",
+        geodesic_acceleration=False,
+        cache_jacobian=False,
+        ad_solver="augmented_qr",
+        ad_solver_penalty=penalty,
+    )
+    x_dot = jax.jvp(
+        lambda p: (
+            solver.solve(jnp.zeros(n, jnp.float32), p=p, max_steps=100, gtol=1e-5).x
+        ),
+        (jnp.zeros(m, jnp.float32),),
+        (p_dot,),
+    )[1]
+
+    A64 = np.asarray(A, np.float64)
+    G64 = A64.T @ A64
+    expected = np.linalg.solve(
+        G64 + penalty * np.trace(G64) * np.eye(n),
+        A64.T @ np.asarray(p_dot, np.float64),
+    )
+    relative = np.linalg.norm(
+        np.asarray(x_dot, np.float64) - expected
+    ) / np.linalg.norm(expected)
+    assert relative < 2e-5, relative
+
+
+def test_auto_ad_solver_dispatch():
+    auto_solver = LevenbergMarquardt(tall_residual)
+    assert auto_solver._ad_solver_at(X0, None, P0) == "svd"
+
+    cg_solver = LevenbergMarquardt(
+        tall_residual,
+        linear_solver="gram_cg",
+        dual_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
+    )
+    assert cg_solver._ad_solver_at(X0, None, P0) == "gram_cg"
+
+    # Every non-cg forward uses SVD on this non-square problem.
+    for linear_solver in ("qr", "augmented_qr", "lsmr"):
+        whitened = LevenbergMarquardt(tall_residual, linear_solver=linear_solver)
+        assert whitened._ad_solver_at(X0, None, P0) == "svd"
+
+    for form, resolved in (
+        ("gram_cholesky", "svd"),
+        ("normal_cholesky", "svd"),
+        ("normal_cg", "normal_cg"),
+    ):
+        kwargs = (
+            {"normal_preconditioner": identity_preconditioner()}
+            if form == "normal_cg"
+            else {}
+        )
+        follows = LevenbergMarquardt(tall_residual, linear_solver=form, **kwargs)
+        assert follows._ad_solver_at(X0, None, P0) == resolved
+
+
+def test_svd_ad_tangent_is_invariant_across_jacobian_mode():
+    # The SVD AD rule assembles B via _assemble_jt, which picks fwd/rev by
+    # shape; a forced mode must change only cost, never the tangent (guards a
+    # transposed-axis / (m, n) arg-order flip that a green suite would miss).
+    def tangent(jacobian_mode):
+        solver = LevenbergMarquardt(
+            tall_residual,
+            linear_solver="augmented_qr",
+            jacobian_mode=jacobian_mode,
+            geodesic_acceleration=False,
+            cache_jacobian=False,
+            ad_solver="svd",
+        )
         return jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))[1]
 
-    alias = dual_tangent("cholesky")
-    explicit = dual_tangent("dual_cholesky")
-    assert bool(jnp.array_equal(alias, explicit))
-    assert bool(jnp.all(jnp.isfinite(alias)))
-
-    # "cg" still constructs and differentiates (on a fat system, where the
-    # dual J J' is nonsingular); the tangent is the minimum-norm
-    # A'(A A')^{-1} p_dot.
-    cg_solver = LevenbergMarquardt(
-        fat_residual,
-        implicit_solver="cg",
-        implicit_preconditioner=identity_preconditioner(),
-        geodesic_acceleration=False,
-    )
-
-    def solved_fat_x(p):
-        return cg_solver.solve(X0_FAT, p=p, max_steps=100, atol=1e-6).x
-
-    _, x_dot = jax.jvp(solved_fat_x, (P_FAT,), (P_FAT_DOT,))
-    expected = A_FAT.T @ jnp.linalg.solve(A_FAT @ A_FAT.T, P_FAT_DOT)
-    assert jnp.allclose(x_dot, expected, atol=1e-3)
+    reference = analytic_tangent(A_TALL, P_DOT)
+    for jacobian_mode in ("auto", "fwd", "rev"):
+        assert jnp.allclose(tangent(jacobian_mode), reference, atol=2e-6)
 
 
 def _iter_jaxprs(jaxpr):
@@ -270,52 +378,46 @@ def stacked_residual(x, args, p):
     return jnp.concatenate([top, top]) - p
 
 
-def test_near_zero_residual_dual_and_primal_tangents_agree():
-    # The trace-scaled ridge means the same thing in both geometries; an
-    # explicit 1e-4 penalty keeps the float32 factorization of the singular
-    # dual (condition ~ 1/penalty) well above its noise floor while the
-    # O(penalty * m) tangent bias stays below the analytic tolerance.
-    def tangent(implicit_solver):
-        solver = LevenbergMarquardt(
-            stacked_residual,
-            linear_solver="augmented_qr",
-            geodesic_acceleration=False,
-            cache_jacobian=False,
-            implicit_solver=implicit_solver,
-            implicit_penalty=1e-4,
-        )
+def test_stacked_residual_augmented_qr_tangent_matches_analytic():
+    # An explicit ad_solver_penalty is the trace-scaled ridge on B'B
+    # (trace(J P J') = trace(B'B), so the ridge means the same thing in
+    # either push-through composition of the augmented-QR rule); the O(penalty * m)
+    # bias stays below the analytic tolerance.
+    solver = LevenbergMarquardt(
+        stacked_residual,
+        linear_solver="augmented_qr",
+        geodesic_acceleration=False,
+        cache_jacobian=False,
+        ad_solver="augmented_qr",
+        ad_solver_penalty=1e-4,
+    )
 
-        def solved_x(p):
-            return solver.solve(
-                jnp.zeros(3, dtype=jnp.float32), p=p, max_steps=100, atol=1e-5
-            ).x
+    def solved_x(p):
+        return solver.solve(
+            jnp.zeros(3, dtype=jnp.float32), p=p, max_steps=100, atol=1e-5
+        ).x
 
-        return jax.jvp(solved_x, (P_STACKED,), (P_STACKED_DOT,))[1]
-
-    dual = tangent("dual_cholesky")
-    primal = tangent("primal_qr")
-    assert bool(jnp.all(jnp.isfinite(dual)))
-    assert bool(jnp.all(jnp.isfinite(primal)))
-    assert jnp.allclose(dual, primal, atol=1e-3)
-    # Both agree with the analytic minimum-norm tangent of the stacked system,
+    ridged = jax.jvp(solved_x, (P_STACKED,), (P_STACKED_DOT,))[1]
+    assert bool(jnp.all(jnp.isfinite(ridged)))
+    # Agrees with the analytic minimum-norm tangent of the stacked system,
     # x_dot = pinv([A; A]) p_dot = (2 A'A)^{-1} A'(p_dot_top + p_dot_bottom),
     # up to the O(penalty * m) ridge bias.
     expected = jnp.linalg.solve(
         2.0 * A_SQUARE.T @ A_SQUARE,
         A_SQUARE.T @ (P_STACKED_DOT[:3] + P_STACKED_DOT[3:]),
     )
-    assert jnp.allclose(primal, expected, atol=5e-3)
+    assert jnp.allclose(ridged, expected, atol=5e-3)
 
 
-def test_primal_cholesky_matches_primal_qr_on_tall_problem():
-    def tangent(implicit_solver):
-        solver = tall_solver(implicit_solver=implicit_solver)
-        return jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))[1]
-
-    qr_tangent = tangent("primal_qr")
-    cholesky_tangent = tangent("primal_cholesky")
-    assert jnp.allclose(qr_tangent, cholesky_tangent, atol=1e-4)
-    assert jnp.allclose(qr_tangent, analytic_tangent(A_TALL, P_DOT), atol=1e-3)
+def test_svd_tangent_on_inconsistent_tall_matches_analytic():
+    # -S (B'B)^+ B' (r_p p_dot) = -S B^+ (r_p p_dot): the default
+    # spectral-filter pseudoinverse computes the Gauss-Newton tangent even
+    # when the residual at the solution is nonzero (the rhs B'(r_p p_dot)
+    # always lies in range(B'B), so the filtered solve is exact).
+    solver = tall_solver(ad_solver="svd")
+    svd_tangent = jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))[1]
+    # Measured 2.2e-7 float32.
+    assert jnp.allclose(svd_tangent, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
 
 
 def test_lsmr_forward_with_auto_implicit_matches_analytic_tangent():
@@ -327,11 +429,12 @@ def test_lsmr_forward_with_auto_implicit_matches_analytic_tangent():
         geodesic_acceleration=False,
         cache_jacobian=False,
     )
-    assert solver._resolved_implicit_solver == "geometry"
+    assert solver._ad_solver_at(X0, None, P0) == "svd"
 
     def solved_x(p):
         return solver.solve(X0, p=p, max_steps=100, gtol=1e-5).x
 
     x, x_dot = jax.jvp(solved_x, (P0,), (P_DOT,))
-    assert jnp.allclose(x, analytic_tangent(A_TALL, B_TALL + P0), atol=1e-3)
-    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=1e-3)
+    # Measured 3e-7 (x) and 2.2e-7 (x_dot) float32.
+    assert jnp.allclose(x, analytic_tangent(A_TALL, B_TALL + P0), atol=1e-4)
+    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=2e-6)

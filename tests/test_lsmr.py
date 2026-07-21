@@ -131,9 +131,9 @@ def test_lsmr_beats_cg_dual_step_on_ill_conditioned_operator():
     reference = LevenbergMarquardt(residual, linear_solver="augmented_qr", **common)
     cg = LevenbergMarquardt(
         residual,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=0.0,
         iterative_atol=0.0,
         iterative_maxiter=200,
@@ -351,18 +351,19 @@ def test_lsmr_geodesic_matches_cholesky():
 
 
 def test_lsmr_implicit_p_derivative_matches_analytic():
-    # auto + lsmr resolves the implicit rule by geometry; this system is tall
-    # (m=12 > n=1), so the p-derivative uses the n-wide primal QR rule and
-    # matches the analytic least-squares sensitivity sum(ts)/sum(ts^2)
-    # exactly. The dual cholesky rule (the cholesky forward solver's default)
-    # leans on its trace ridge here -- the 12x12 dual Gram is rank 1 -- so it
-    # carries an O(1e-3) relative ridge bias and is compared loosely.
+    # auto + lsmr defers the implicit form to trace-time shapes; this system
+    # is tall (m=12 > n=1), so shape_auto resolves to normal_cholesky and the
+    # p-derivative matches the analytic least-squares sensitivity
+    # sum(ts)/sum(ts^2) exactly. The gram_cholesky forward's default filter
+    # computes the same tangent through the rank-1 12x12 dual.
     ts = jnp.linspace(0.0, 2.0, 12)
 
     def residual_p(x, args, p):
         return x * ts - p
 
-    cholesky = LevenbergMarquardt(residual_p, init_damping=1e-3)
+    cholesky = LevenbergMarquardt(
+        residual_p, init_damping=1e-3, linear_solver="gram_cholesky"
+    )
     lsmr_solver = LevenbergMarquardt(
         residual_p,
         init_damping=1e-3,
@@ -370,8 +371,9 @@ def test_lsmr_implicit_p_derivative_matches_analytic():
         iterative_tol=1e-10,
         iterative_maxiter=60,
     )
-    assert lsmr_solver._resolved_implicit_solver == "geometry"
     p = jnp.asarray(1.7)
+    assert lsmr_solver._resolved_ad_solver == "auto"
+    assert lsmr_solver._ad_solver_at(jnp.zeros(()), None, p) == "svd"
     j_analytic = jnp.sum(ts) / jnp.sum(ts**2)
 
     def solved(solver, q):
@@ -380,7 +382,7 @@ def test_lsmr_implicit_p_derivative_matches_analytic():
     j_cholesky = jax.jacobian(lambda q: solved(cholesky, q))(p)
     j_lsmr = jax.jacobian(lambda q: solved(lsmr_solver, q))(p)
     assert jnp.allclose(j_lsmr, j_analytic, rtol=1e-4, atol=1e-5)
-    assert jnp.allclose(j_cholesky, j_analytic, rtol=1e-2, atol=1e-3)
+    assert jnp.allclose(j_cholesky, j_analytic, rtol=1e-4, atol=1e-5)
 
 
 # --- validation --------------------------------------------------------------
@@ -550,9 +552,11 @@ def test_whitened_preconditioner_converged_solution_invariant():
     assert jnp.allclose(rp.x, rc.x, rtol=1e-3, atol=1e-4)
 
 
-def test_whitened_preconditioner_forward_step_is_rtr_damped_surrogate():
-    # The preconditioned single-step update is the R'R-metric-damped surrogate
-    # u = (G'G + lam R'R)^{-1} G' b at x0=0 (resid = -b), NOT the I-damped step.
+def test_whitened_preconditioner_forward_step_is_identity_damped():
+    # The augmented damping row is sqrt(lam) R^{-1} z = sqrt(lam) u, so the
+    # preconditioned single-step update is EXACTLY the I-damped
+    # u = (G'G + lam I)^{-1} G' b at x0=0 (resid = -b) for any R -- and
+    # distinguishable from the old R'R-damped surrogate for this non-trivial R.
     residual, x0, G, b = _ill_conditioned_linear(m=10, n=10, cond=1e2)
     lam = 1e-2
     prec, R = _right_preconditioner(G, lam)
@@ -570,15 +574,16 @@ def test_whitened_preconditioner_forward_step_is_rtr_damped_surrogate():
     u_rtr = jnp.linalg.solve(G.T @ G + lam * (R.T @ R), G.T @ b)
     u_identity = jnp.linalg.solve(G.T @ G + lam * jnp.eye(n), G.T @ b)
     assert bool(info.accepted)
-    assert jnp.allclose(xl, u_rtr, rtol=1e-3, atol=1e-4)
-    assert not jnp.allclose(xl, u_identity, rtol=1e-2, atol=1e-3)
+    assert jnp.allclose(xl, u_identity, rtol=1e-3, atol=1e-4)
+    assert not jnp.allclose(xl, u_rtr, rtol=1e-2, atol=1e-3)
 
 
 def test_whitened_preconditioner_reverse_ad_and_implicit_p():
     # Reverse-AD through a preconditioned update is finite (the custom_linear_solve
     # on the preconditioned normal operator differentiates), and the converged
-    # p-derivative -- R-invariant, resolved by geometry to the tall primal QR
-    # implicit rule -- matches the analytic sensitivity.
+    # p-derivative -- R-invariant, resolved by shape to the normal form on
+    # this tall system -- matches the analytic sensitivity, as does the
+    # gram_cholesky forward's default filter.
     ts = jnp.linspace(0.0, 2.0, 12)
 
     def residual_p(x, args, p):
@@ -595,7 +600,9 @@ def test_whitened_preconditioner_reverse_ad_and_implicit_p():
         return jsp_linalg.solve_triangular(R.T, w, lower=True)
 
     prec = WhitenedPreconditioner(solve, solve_transpose)
-    cholesky = LevenbergMarquardt(residual_p, init_damping=1e-3)
+    cholesky = LevenbergMarquardt(
+        residual_p, init_damping=1e-3, linear_solver="gram_cholesky"
+    )
     preconditioned = LevenbergMarquardt(
         residual_p,
         init_damping=1e-3,
@@ -615,17 +622,15 @@ def test_whitened_preconditioner_reverse_ad_and_implicit_p():
     assert bool(jnp.isfinite(g))
 
     p = jnp.asarray(1.7)
+    j_analytic = jnp.sum(ts) / jnp.sum(ts**2)
 
     def solved(solver, q):
         return solver.solve(jnp.zeros(()), p=q, max_steps=60, atol=1e-9).x
 
-    j_analytic = jnp.sum(ts) / jnp.sum(ts**2)
     j_cholesky = jax.jacobian(lambda q: solved(cholesky, q))(p)
     j_preconditioned = jax.jacobian(lambda q: solved(preconditioned, q))(p)
     assert jnp.allclose(j_preconditioned, j_analytic, rtol=1e-4, atol=1e-5)
-    # The dual cholesky rule's tangent leans on its trace ridge on this
-    # rank-1 dual Gram; loose agreement only.
-    assert jnp.allclose(j_cholesky, j_analytic, rtol=1e-2, atol=1e-3)
+    assert jnp.allclose(j_cholesky, j_analytic, rtol=1e-4, atol=1e-5)
 
 
 def test_whitened_preconditioner_requires_lsmr():
@@ -634,9 +639,9 @@ def test_whitened_preconditioner_requires_lsmr():
     with pytest.raises(ValueError, match="whitened_preconditioner requires"):
         LevenbergMarquardt(
             residual,
-            linear_solver="cg",
+            linear_solver="gram_cg",
             dual_preconditioner=identity_preconditioner(),
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
             whitened_preconditioner=prec,
         )
 
@@ -668,17 +673,18 @@ def test_chained_solve_derivative_is_final_phase_implicit_rule():
     def residual(x, args, p):
         return A @ x + 0.1 * jnp.tanh(x) - p
 
-    phase1 = LevenbergMarquardt(residual, init_damping=1e-2)
+    phase1 = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver="svd")
     phase2 = LevenbergMarquardt(
         residual,
         linear_solver="lsmr",
+        ad_solver="svd",
         init_damping=1e-10,
         iterative_tol=1e-13,
         iterative_atol=1e-13,
         iterative_maxiter=200,
         geodesic_acceleration=False,
     )
-    reference = LevenbergMarquardt(residual, init_damping=1e-2)
+    reference = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver="svd")
 
     def chained(p):
         plateau = phase1.solve(jnp.zeros(n), p=p, max_steps=2, atol=0.0)

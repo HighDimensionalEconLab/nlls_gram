@@ -4,9 +4,9 @@ The library ships a small set of constructors and helpers so that models can
 assemble metrics and CG preconditioners from structure they already know,
 instead of hand-rolling callback plumbing. Everything here returns plain
 callables or `Metric` objects that the solver sees through the `metric=`,
-`dual_preconditioner=`, and `implicit_preconditioner=` arguments. The CG
-paths require explicit preconditioners; `identity_preconditioner()` is the
-explicit opt-out.
+`dual_preconditioner=`, `normal_preconditioner=`, and
+`ad_solver_preconditioner=` arguments. The CG forms require explicit
+preconditioners; `identity_preconditioner()` is the explicit opt-out.
 
 | Helper | Builds | Cost per apply |
 | --- | --- | --- |
@@ -145,7 +145,7 @@ metric = blockdiag_metric([(kernel_block, n), (scalar_block, k)])
 # kernel_block, by representation of K:
 #   metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n)))   # dense
 #   metric_from_state_space(t, *matern_state_space(sigma, ell, nu), nugget=eps)
-#   metric_from_shifted_matvec(kernel_matvec, eps)      # matvec only; cholesky/cg
+#   metric_from_shifted_matvec(kernel_matvec, eps)      # matvec only; Gram forms
 ```
 
 One structural note: the Matérn-1/2 tridiagonal shortcut does not survive
@@ -165,10 +165,14 @@ spectral tail at \(\approx \varepsilon\) and CG resolves a cluster in
 about one iteration (measured: ~32 float64 iterations for a Matérn-5/2
 Gram at n=1000, independent of \(\varepsilon\) from 1e-2 to 1e-8). It
 provides `solve` and `norm` only (no matrix-free square root), so it works
-with the `cholesky` and `cg` linear solvers and is rejected for `qr`,
-`augmented_qr`, and `lsmr` (which all require `inv_sqrt`) at construction. Combined with
-`implicit_solver="cg"` the whole pipeline — forward solve, JVP, and VJP —
-runs matrix-free (see [Implicit AD](implicit_ad.md)). This is the one
+with the Gram forms (`gram_cholesky`, `gram_cg`) and is rejected for the
+whitened forms (`normal_cholesky`, `normal_cg`, `qr`, `augmented_qr`,
+`lsmr`), which all require `inv_sqrt`, at construction — on a
+square-to-tall problem pin a Gram form explicitly, since the default `auto`
+would resolve to `normal_cholesky`. The SVD and QR AD methods also require the
+square-root pair, so pair a nonsquare solve-only metric with
+`ad_solver="gram_cg"` — the whole pipeline — forward solve, JVP, and
+VJP — then runs matrix-free (see [Implicit AD](implicit_ad.md)). This is the one
 constructor that meets the
 `metric.solve` exactness contract in a limit rather than identically: its
 inner CG tolerance is part of the answer, not of the schedule — the
@@ -176,8 +180,8 @@ residual error perturbs the selected solution and the implicit derivatives
 at order `tol`, and the implicit derivative has no accept/reject
 safeguard. The default tolerance (square root of the dtype's machine
 epsilon) matches typical outer tolerances; never cap `maxiter` as a cost
-control (a truncated CG is not a linear map, which breaks the `cg`
-linear_solver's operator assumptions).
+control (a truncated CG is not a linear map, which breaks the `gram_cg`
+solver's operator assumptions).
 
 ## Diagonal and Block-Diagonal Metrics
 
@@ -251,7 +255,11 @@ upcasts its input to `dtype`, applies the wrapped metric, and restores the
 caller's dtype on output. This keeps an ill-conditioned factorization or solve
 in wide precision (float64) while the solver's residual/parameter dtype and
 loop-carried pytrees stay at the problem dtype — the output round-trips to
-`x.dtype`, a no-op once the solver has already promoted its duals to `dtype`:
+`x.dtype`, a no-op once the solver has already promoted its dense pipelines
+to `dtype`. The solver-level
+[`metric_solve_dtype`](index.md#precision-knobs) knob applies exactly this
+wrap for you, to the resolved metric — fixed or factory-built; the helper
+stays public for wrapping a metric by hand:
 
 ```python
 from nlls_gram import metric_from_cholesky, metric_with_compute_dtype
@@ -266,7 +274,7 @@ the solver's construction-time validation is unchanged.
 
 ## Sherman–Morrison Dual Preconditioner
 
-With `linear_solver="cg"`, the `dual_preconditioner(v, damping)` argument
+With `linear_solver="gram_cg"`, the `dual_preconditioner(v, damping)` argument
 supplies an approximation of \((J M^{-1} J^\top + \lambda I)^{-1} v\) on
 residual-space vectors. It never changes the subproblem being solved: at
 inner convergence the step is identical, and a budget-truncated step still
@@ -302,9 +310,10 @@ with refinement — see the [Tuning Guide](tuning_guide.md).
 
 ## Identity Preconditioner
 
-`linear_solver="cg"` requires a `dual_preconditioner`, and a cg-resolved
-implicit solve requires an `implicit_preconditioner` — running Krylov
-methods unpreconditioned should be a decision, not a default.
+`linear_solver="gram_cg"` requires a `dual_preconditioner`,
+`linear_solver="normal_cg"` a `normal_preconditioner`, and a
+`gram_cg`-resolved AD solve an `ad_solver_preconditioner` — running
+Krylov methods unpreconditioned should be a decision, not a default.
 `identity_preconditioner()` is that decision made explicit and greppable:
 
 ```python
@@ -312,15 +321,60 @@ from nlls_gram import identity_preconditioner
 
 solver = LevenbergMarquardt(
     residual_fn,
-    linear_solver="cg",
+    linear_solver="gram_cg",
     dual_preconditioner=identity_preconditioner(),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
 )
 ```
 
-The returned callable accepts both hook signatures —
-`dual_preconditioner(v, damping)` and `implicit_preconditioner(v)` — so one
-helper serves both arguments.
+The returned callable accepts both hook signatures — `(v, damping)` and
+`(v)` — so one helper serves all three arguments (and it trivially satisfies
+the `normal_preconditioner` range-preservation requirement below).
+
+## The Normal-Space Preconditioner (`normal_cg`)
+
+`linear_solver="normal_cg"` requires a `normal_preconditioner(v, damping)`:
+a jit-traceable, linear, SPD **parameter-space** approximation of
+\((B^\top B + \lambda I_n)^{-1} v\) with \(B = JS\)
+(`identity_preconditioner()` is the explicit opt-out). Like every
+preconditioner it may approximate freely as far as *convergence* is
+concerned — at inner convergence the step is unchanged. But it carries one
+structural requirement with no Gram-side analogue:
+
+**Range preservation.** On rank-deficient problems the minimum-\(M\)-norm
+selection rests on the CG iterates staying in
+\(\operatorname{range}(B^\top)\): the right-hand side \(-B^\top r\) starts
+there, the operator \(B^\top B + \lambda I\) maps the subspace to itself, so
+unpreconditioned CG from zero never acquires a null-space component — the
+converged step and every budget-truncated step stay selection-clean. A
+preconditioner \(C\) enters the Krylov space through its images, so unless
+
+$$
+C\bigl(\operatorname{range}(B^\top)\bigr) \subseteq \operatorname{range}(B^\top),
+$$
+
+the iterates leak into the null space of \(B\) and the computed step
+silently stops being the minimum-norm one — the CG residual still converges,
+so nothing fails loudly. An arbitrary SPD approximation of the inverse does
+**not** have this property, and rank deficiency is the package's home turf
+(tall interpolation problems always carry redundant rows or collinear
+columns). Safe constructions: the identity; polynomials in the operator
+itself; an exact \((B^\top B + \tau I)^{-1}\) at a fixed shift
+\(\tau > 0\); any \(C\)
+that commutes with the orthogonal projector onto
+\(\operatorname{range}(B^\top)\). On full-column-rank problems
+(\(\operatorname{rank} B = n\)) the condition is vacuous and any SPD \(C\)
+is safe.
+
+`dual_preconditioner`, `preconditioner_factory`, and `recycle` remain
+`gram_cg`-only — they live in residual space and cannot serve the
+parameter-space system. A `normal_cg`-resolved *implicit* solve needs no
+preconditioner at all (its right-hand side lies in
+\(\operatorname{range}(B^\top)\), so unpreconditioned CG already selects
+the minimum-norm tangent); an optional `ad_solver_preconditioner` supplied
+there acts in the same parameter space under the same range-preservation
+requirement at `damping = 0` — see
+[Implicit AD](implicit_ad.md#the-ad-solver-preconditioner).
 
 ## Nyström Preconditioner for Neural-Network Least Squares
 
@@ -382,17 +436,17 @@ def ntk_matvec(V):  # (m, k) -> J (J' V), frozen at x0
 
 solver = LevenbergMarquardt(
     residual,
-    linear_solver="cg",
+    linear_solver="gram_cg",
     iterative_tol=1e-6,
     iterative_maxiter=20,
     dual_preconditioner=nystrom_preconditioner(
         ntk_matvec, m, rank, jax.random.PRNGKey(0)
     ),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
 )
 ```
 
-Passed as `implicit_preconditioner` the helper applies its undamped
+Passed as `ad_solver_preconditioner` the helper applies its undamped
 (zero-damping) inverse, which is valid only when the retained spectrum is
 strictly positive.
 
@@ -404,14 +458,15 @@ close as LM drifts \(x\). When it does not — the Jacobian rotates enough that 
 preconditioner built at \(x_0\) decays into an ineffective approximation once
 \(x\) moves, and the inner CG stalls or breaks down — pass a
 `PreconditionerFactory(prepare, apply)` instead of `dual_preconditioner` (pass
-exactly one of the two for `linear_solver="cg"`). Its `prepare(x, args, p)`
+exactly one of the two for `linear_solver="gram_cg"`; like both dual hooks it
+is `gram_cg`-only). Its `prepare(x, args, p, aux)`
 rebuilds the preconditioner state from the **current** iterate, inside the
 jitted loop as traced ops with no recompiles:
 
 ```python
 from nlls_gram import LevenbergMarquardt, PreconditionerFactory
 
-def prepare(x, args, p):
+def prepare(x, args, p, aux):
     # model-structured build from the CURRENT iterate x (the user pytree,
     # not the raveled theta); return any fixed-shape pytree of arrays
     d = jnp.exp(A @ x)
@@ -422,20 +477,22 @@ def apply(state, v, damping):
 
 solver = LevenbergMarquardt(
     residual_fn,
-    linear_solver="cg",
+    linear_solver="gram_cg",
     preconditioner_factory=PreconditionerFactory(prepare, apply),
     iterative_maxiter=...,
 )
 ```
 
-- `prepare(x, args, p) -> state` receives the **user pytree** `x` (model
-  structure intact), the residual `args`, and `p`, and returns a fixed-shape
-  pytree of arrays.
+- `prepare(x, args, p, aux) -> state` receives the **user pytree** `x` (model
+  structure intact), the residual `args`, `p`, and the residual aux evaluated
+  at the same linearization point (`None` when `has_aux=False`) — the same
+  signature as `MetricFactory.prepare` — and returns a fixed-shape pytree of
+  arrays.
 - `apply(state, v, damping) -> vector` is the per-iteration apply: an SPD,
   linear-in-`v` approximation of \((J M^{-1} J^\top + \lambda I)^{-1} v\). It
-  must stay well-defined at `damping = 0`, because the cg-resolved implicit
-  derivative reuses it (undamped) at the converged solution unless an explicit
-  `implicit_preconditioner` overrides it.
+  must stay well-defined at `damping = 0`, because a `gram_cg`-resolved
+  implicit derivative reuses it (undamped) at the converged solution unless
+  an explicit `ad_solver_preconditioner` overrides it.
 
 `prepare` runs **once per accepted step**: after a rejected step \(x\) did not
 move, so the carried state is reused and only the live `damping` changes. That
@@ -463,12 +520,16 @@ becomes exactly block diagonal —
 \(\operatorname{blockdiag}(J P J^\top + \lambda I,\; \lambda I)\) — and the
 solvers behave as follows:
 
-- **`cholesky`** is unchanged mathematically: the padded block decouples
-  exactly, and the step matches the unpadded step (regression-tested for
-  both the plain and geodesic-accelerated updates). The cost is the larger
-  materialized residual dimension and dual factor; a few padded rows are
-  harmless, large padding pays the dense residual-space price.
-- **`cg`**: a shape-fixed `dual_preconditioner` (a dense solve,
+- **The dense forms are unchanged mathematically.** Under `gram_cholesky`
+  the padded block decouples exactly and the step matches the unpadded step
+  (regression-tested for both the plain and geodesic-accelerated updates);
+  under the normal forms the zero rows contribute nothing to \(B^\top B\)
+  or \(B^\top r\), so the system is literally identical to the unpadded
+  one. One shape effect to know: padding raises \(m\), which can flip
+  `auto`'s shape rule from `gram_cholesky` to `normal_cholesky` — the step
+  is the same either way. Large padding costs the larger materialized
+  residual dimension (and, for the Gram form, its dense dual factor).
+- **`gram_cg`**: a shape-fixed `dual_preconditioner` (a dense solve,
   `nystrom_preconditioner`, or a Sherman-Morrison/Woodbury built at the
   unpadded size) fails on the padded residual space and must be wrapped;
   `pad_dual_preconditioner(base_preconditioner, n_real)` applies the base
@@ -488,18 +549,26 @@ solvers behave as follows:
   those coordinates.
 - **`qr` does not survive padding**: the padded zero rows make the Jacobian
   rank-deficient, which the QR path's triangular solves cannot handle — the
-  step is non-finite. Use `cholesky` or `cg`, or the damped augmented
-  `augmented_qr` / `lsmr` (full column rank for \(\lambda>0\) even when \(J\)
-  is rank-deficient), for padded problems.
-- **Implicit AD**: the padded rows make the *undamped* implicit dual
-  \(J P J^\top\) singular, so the library's implicit rules (dense and cg)
-  return a non-finite derivative of `solve(...).x` on padded problems — and
-  for the same reason `pad_dual_preconditioner` divides the padded block by
-  the live damping and is rejected at construction when passed as an
-  `implicit_preconditioner`. The
-  minimum-metric-norm derivative still exists mathematically (padding only
-  appends redundant equations) and equals the unpadded derivative, so
-  differentiate the unpadded formulation to compute it.
+  step is non-finite. Every other solver handles padding: the damped
+  Gram/normal forms directly, `augmented_qr` / `lsmr` through the damping
+  block that stays full column rank for \(\lambda>0\).
+- **Implicit AD**: the padded rows make the *undamped* implicit systems
+  singular *but consistent* — their `p`-derivative rows are identically
+  zero too — which is exactly the singular-but-consistent regime of
+  [the implicit rules](implicit_ad.md#rank-deficiency-and-the-ridge). The
+  `svd` computes the minimum-metric-norm tangent through its spectral-filter
+  pseudoinverse, and a `normal_cg` AD solve computes it with no ridge in exact
+  arithmetic — on its default unridged path, with the inner CG run to
+  convergence, and either unpreconditioned or with a range-preserving
+  `ad_solver_preconditioner`. `regularized_normal_cg` is the separate biased
+  method; the loud rank guard belongs to `qr`, not `normal_cg`. A
+  `gram_cg`-resolved AD solve is the
+  fragile choice here — run-to-tolerance CG on the singular padded dual —
+  and `pad_dual_preconditioner` divides the padded block by the live
+  damping, so it is rejected at construction when passed as an
+  `ad_solver_preconditioner`. The minimum-metric-norm derivative equals the
+  unpadded derivative (padding only appends redundant equations), so when
+  in doubt differentiate the unpadded formulation.
 
 ## Matrix-Free LSMR (Whitened Subproblem)
 
@@ -508,12 +577,13 @@ solvers behave as follows:
 `S Sᵀ = M⁻¹`, step `s = S u`) with [LSMR](https://web.stanford.edu/group/SOL/software/lsmr/)
 Golub-Kahan bidiagonalization, using only `J`/`Jᵀ` matvecs — the matrix-free
 counterpart of `augmented_qr`. It exists for the same reason `qr`/`augmented_qr`
-do: the `cg` dual operator `J M⁻¹ Jᵀ + damping I` has the *square* of the
-whitened operator's condition number, so at small damping its step bottoms out
-at an `eps·cond` floor (which dense direct solves hit too) with the error
-concentrated in the slow, selection-critical directions. LSMR works at
-`cond(B) ~ sqrt`, restoring endgame accuracy. See the
-[tuning guide](tuning_guide.md#solver-selection) for when to prefer it over `cg`.
+do: the Gram and normal operators (`J M⁻¹ Jᵀ + damping I`, `BᵀB + damping I`)
+carry the *square* of the whitened operator's condition number, so at small
+damping their steps bottom out at an `eps·cond` floor (which dense direct
+solves hit too) with the error concentrated in the slow, selection-critical
+directions. LSMR works at `cond(B) ~ sqrt`, restoring endgame accuracy. See
+the [tuning guide](tuning_guide.md#solver-selection) for when to prefer it
+over the CG forms.
 
 - **Stopping** maps the standard hooks: the normal-equations residual
   `||Bᵀ(B u + r) + damping·u|| = |zetabar|` (LSMR's exact monotone quantity) is
@@ -523,34 +593,38 @@ concentrated in the slow, selection-critical directions. LSMR works at
 - **Metric** it needs `metric.inv_sqrt` and `metric.inv_sqrt_transpose` (the
   default identity metric supplies both); it does not use `metric.solve`.
 - **Preconditioning** its hook is `whitened_preconditioner` (a
-  `WhitenedPreconditioner`), a parameter-space **right-preconditioner** applying
-  `R⁻¹`/`R⁻ᵀ` via `solve(v, damping)`/`solve_transpose(w, damping)`. The solver
-  runs LSMR on the preconditioned operator `B R⁻¹` — operator `x → B(solve(x))`,
-  adjoint `w → solve_transpose(Bᵀ w)`, and the step un-preconditions the final
-  iterate `u = R⁻¹ z`. A good `R` (a Schur-complement factor of the
-  parameter-space normal operator is canonical) clusters the spectrum of `B R⁻¹`
-  and cuts the endgame iteration count by orders of magnitude — an ill-conditioned
+  `WhitenedPreconditioner`), a parameter-space **right-preconditioner**
+  applying `R⁻¹`/`R⁻ᵀ` via `solve(v, damping)`/`solve_transpose(w, damping)`.
+  The solver runs LSMR on the augmented preconditioned operator
+
+        z → [B(solve(z)); sqrt(damping)·solve(z)]
+        w → solve_transpose(Bᵀ w[:m]) + sqrt(damping)·solve_transpose(w[m:])
+
+  and un-preconditions the final iterate, `u = R⁻¹ z`. Because the damping
+  row is `sqrt(damping)·R⁻¹z` — not `sqrt(damping)·z` — the least-squares
+  problem in `z` is exactly `min ||B u + r||² + damping ||u||²` over
+  `u = R⁻¹ z`: **every `damping > 0` *posed* subproblem is the
+  identity-damped whitened subproblem**, so at inner convergence the step
+  is identical to plain LSMR's and the `damping → 0` selection limit is the
+  minimum-metric-norm step for *any* `R`. `R` changes the iteration path,
+  not the subproblem — a budget-truncated (unconverged) iterate can still
+  depend on `R`. A good `R` (a Schur-complement factor of the parameter-space normal
+  operator is canonical) clusters the spectrum of `B R⁻¹` and cuts the
+  endgame iteration count by orders of magnitude — an ill-conditioned
   whitened operator can need thousands of plain iterations versus tens
-  preconditioned. **Surrogate semantics**: LSMR's scalar `damp` on `B R⁻¹`
-  regularizes in the `RᵀR` metric, so the computed step is
-  `u = -(BᵀB + damping RᵀR)⁻¹ Bᵀ r` — a documented surrogate of the `I`-damped
-  subproblem. It is admissible: LM acceptance guards on the true `||r||`, and the
-  `damping → 0` selection limit is `R`-invariant (the minimum-metric-norm step
-  regardless of `R`), so equivalence checks must use `R=None` or the `RᵀR`-damped
-  dense reference. Stopping (`iterative_tol`/`iterative_atol`) is measured on the
-  preconditioned operator. The half-solves receive the live `damping` like
-  `dual_preconditioner(v, damping)`. `None` (default) runs plain LSMR.
-  `dual_preconditioner`, `preconditioner_factory`, and `recycle` remain `cg`-only
-  and are rejected loudly for `lsmr`.
-- **Differentiation**: reverse-AD through `update` works (the whitened solution
-  is wrapped in `lax.custom_linear_solve` on the SPD normal operator
-  `BᵀB + damping I`). Differentiating a forward `solve(...).x` under the default
-  `implicit_solver="auto"` follows the Jacobian geometry: the n-wide `primal_qr`
-  implicit rule when tall or square (`m >= n`), the dense `dual_cholesky` rule
-  only when strictly fat (`m < n`)
-  (see [Implicit AD](implicit_ad.md)); set `implicit_solver="cg"` (alias of
-  `"dual_cg"`) with an `implicit_preconditioner` for a fully matrix-free
-  derivative at very large `m`.
+  preconditioned. Stopping (`iterative_tol`/`iterative_atol`) is measured on
+  the preconditioned operator. The half-solves receive the live `damping`
+  like `dual_preconditioner(v, damping)`. `None` (default) runs plain LSMR.
+  `dual_preconditioner`, `preconditioner_factory`, and `recycle` remain
+  `gram_cg`-only and are rejected loudly for `lsmr`.
+- **Differentiation**: reverse-AD through `update` works (the whitened
+  solution is wrapped in `lax.custom_linear_solve` on the SPD preconditioned
+  normal operator `R⁻ᵀ(BᵀB + damping I)R⁻¹`). Differentiating a forward
+  `solve(...).x` uses `direct` for a square system and `svd` otherwise
+  (`ad_solver="auto"`); set
+  `ad_solver="normal_cg"` (no preconditioner needed) or
+  `"gram_cg"` with an `ad_solver_preconditioner` for a fully matrix-free
+  derivative.
 
 The standalone [`lsmr`](#nlls_gram.lsmr) function (operator/transpose matvecs,
 `b`, `damp`) is exposed too, returning `(x, LSMRState)` with iteration count and
@@ -558,7 +632,7 @@ final normal-equations residual.
 
 ## Krylov Recycling / Deflation
 
-`recycle=RecycleConfig(rank=k)` on a `cg` solver carries a deflation basis
+`recycle=RecycleConfig(rank=k)` on a `gram_cg` solver carries a deflation basis
 across LM steps: each step harvests an eigCG-style basis from its CG iterations
 and recycles it into the next step's two-level additive preconditioner
 `M_defl(r) = P(r) + U E^{-1}(U'r)` (first-level `P` = the frozen

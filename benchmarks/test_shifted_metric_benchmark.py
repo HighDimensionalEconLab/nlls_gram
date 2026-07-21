@@ -127,13 +127,13 @@ def test_shifted_metric_apply(benchmark, platform, n, variant, eps):
     "variant",
     ["dense_cholesky", "state_space", "matvec_cg", "matvec_cg_woodbury"],
 )
-@pytest.mark.parametrize("linear_solver", ["cholesky", "cg"])
+@pytest.mark.parametrize("linear_solver", ["gram_cholesky", "gram_cg"])
 def test_shifted_metric_solver_step(benchmark, platform, n, variant, linear_solver):
     if not _devices(platform):
         pytest.skip(f"JAX {platform!r} backend is not available")
     if variant == "dense_cholesky" and n > DENSE_MAX_N:
         pytest.skip("dense factorization too large to materialize")
-    if variant == "matvec_cg_woodbury" and linear_solver != "cg":
+    if variant == "matvec_cg_woodbury" and linear_solver != "gram_cg":
         pytest.skip("the Woodbury dual preconditioner applies to cg only")
 
     device = _devices(platform)[0]
@@ -162,13 +162,13 @@ def test_shifted_metric_solver_step(benchmark, platform, n, variant, linear_solv
         "geodesic_acceleration": False,
         "metric": metric,
     }
-    if linear_solver == "cg":
+    if linear_solver == "gram_cg":
         solver_kwargs.update(
             {
                 "iterative_tol": 1e-8,
                 "iterative_maxiter": 100,
                 "dual_preconditioner": identity_preconditioner(),
-                "implicit_preconditioner": identity_preconditioner(),
+                "ad_solver_preconditioner": identity_preconditioner(),
             }
         )
     if variant == "matvec_cg_woodbury":

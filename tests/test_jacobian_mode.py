@@ -1,4 +1,4 @@
-"""Tests for issue #23: jacobian_mode ("auto"/"fwd"/"rev") dense Jacobian assembly."""
+# Issue #23: jacobian_mode ("auto"/"fwd"/"rev") dense Jacobian assembly.
 
 import jax
 import jax.numpy as jnp
@@ -21,11 +21,13 @@ def _pinv_solution(A, b):
     return jnp.linalg.pinv(A) @ b
 
 
+# "auto" resolves to normal_cholesky on the tall shape and gram_cholesky on
+# the fat one, so the shape parametrize covers both dense cholesky forms.
 DENSE_CONFIGS = [
     ("qr", False),
     ("augmented_qr", False),
-    ("cholesky", True),
-    ("cholesky", False),
+    ("auto", True),
+    ("auto", False),
 ]
 
 
@@ -168,25 +170,37 @@ def test_unknown_jacobian_mode_raises():
         LevenbergMarquardt(lambda x: x, jacobian_mode="bogus")
 
 
-def test_fwd_mode_with_cg_solver_raises():
+def test_fwd_mode_with_explicit_cg_ad_solver_raises():
     with pytest.raises(ValueError, match="jacobian_mode"):
         LevenbergMarquardt(
             lambda x: x,
-            linear_solver="cg",
+            linear_solver="gram_cg",
             jacobian_mode="fwd",
             dual_preconditioner=identity_preconditioner(),
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver="gram_cg",
+            ad_solver_preconditioner=identity_preconditioner(),
         )
 
 
-def test_fwd_mode_with_lsmr_and_dense_implicit_is_accepted():
-    # The lsmr forward path is matrix-free, but the dense dual_cholesky
-    # implicit rule consumes the jacobian_mode setting, so this is valid.
+def test_fwd_mode_with_lsmr_and_svd_implicit_is_accepted():
+    # The lsmr forward path is matrix-free, but the SVD implicit method
+    # consumes the jacobian_mode setting, so this is valid.
     solver = LevenbergMarquardt(
         lambda x: x,
         linear_solver="lsmr",
         jacobian_mode="fwd",
-        implicit_solver="dual_cholesky",
+        ad_solver="svd",
+    )
+    assert solver.jacobian_mode == "fwd"
+
+
+def test_fwd_mode_with_lsmr_and_assembled_ad_is_accepted():
+    # This square system resolves auto to direct, so jacobian_mode has a
+    # consumer even though the forward LSMR path is matrix-free.
+    solver = LevenbergMarquardt(
+        lambda x: x,
+        linear_solver="lsmr",
+        jacobian_mode="fwd",
     )
     assert solver.jacobian_mode == "fwd"
 
@@ -199,8 +213,8 @@ def test_geodesic_acceleration_under_fwd_mode():
     def residual(x, args, p):
         return x["a"] * jnp.exp(x["b"] * ts) - ys
 
-    # Default solver settings: cholesky, cache_jacobian=True, and
-    # geodesic_acceleration=True; tall problem (m=12 > n=2) under forced fwd.
+    # Default solver settings: auto (normal_cholesky on this tall problem,
+    # m=12 > n=2), cache_jacobian=True, geodesic_acceleration=True, forced fwd.
     solver = LevenbergMarquardt(residual, jacobian_mode="fwd")
     assert solver.geodesic_acceleration
 

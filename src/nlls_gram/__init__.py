@@ -10,14 +10,22 @@ optional callback control; solve(multi_start=MultiStart(...)) retries failed
 solves from fresh initial conditions or races them in parallel under vmap,
 returning the single best result. With has_aux=True the residual returns
 (residual, aux) and the aux output is reported on LMInfo. An optional Metric
-defines a positive-definite parameter-space metric for LM damping.
-The dense linear-solver choices include residual-space Cholesky, reduced QR,
-and direct augmented QR for small or rank-deficient systems. Two matrix-free
-solvers use only J/J' products: residual-space CG on the metric-damped dual
-(with a required dual preconditioner) and LSMR on the whitened subproblem
-(with an optional WhitenedPreconditioner right-preconditioner), the latter
-staying accurate at small damping where the squared dual solve degrades. The
-solver depends only on JAX.
+defines a positive-definite parameter-space metric for LM damping; a
+MetricFactory instead rebuilds that metric from the current iterate and
+residual aux every accepted step.
+The default linear_solver="auto" resolves at trace time to the smaller dense
+factorization: residual-space Gram Cholesky (gram_cholesky) when n > m, else
+whitened normal Cholesky (normal_cholesky) — the two compute the same step.
+Reduced QR (full row rank) and direct augmented QR cover small direct
+solves. Three matrix-free solvers use only J/J' products: CG on the
+metric-damped residual-space dual (gram_cg, required dual preconditioner),
+CG on the whitened normal system in parameter space (normal_cg, required
+normal preconditioner), and LSMR on the whitened subproblem (optional
+WhitenedPreconditioner right-preconditioner), the last staying accurate at
+small damping where the squared Gram/normal solves degrade. The implicit
+differentiation rule is independently swappable via explicit ad_solver methods:
+direct, svd, qr, augmented_qr, gram_cg, normal_cg, and
+regularized_normal_cg. The solver depends only on JAX.
 
 Tuning heuristics (solver selection, damping, inner-solve scheduling):
 https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/
@@ -33,6 +41,7 @@ from nlls_gram.gram_lm import (
     LMSolveResult,
     LMState,
     LMStatus,
+    MetricFactory,
     MultiStart,
     MultiStartInfo,
     PreconditionerFactory,
@@ -78,6 +87,7 @@ __all__ = [
     "LMSolveContext",
     "LMSolveResult",
     "Metric",
+    "MetricFactory",
     "MultiStart",
     "MultiStartInfo",
     "DrawNNXModule",

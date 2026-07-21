@@ -162,7 +162,12 @@ def test_sequential_retries_until_converged():
     p = jnp.asarray(4.0)
     ms = MultiStart(key=jax.random.key(2), num_starts=3, draw=draw_jump)
     result = solver.solve(
-        jnp.array([0.0]), p=p, max_steps=60, atol=1e-6, multi_start=ms
+        jnp.array([0.0]),
+        p=p,
+        max_steps=60,
+        max_steps_is_success=False,
+        atol=1e-6,
+        multi_start=ms,
     )
 
     assert int(result.status) == LMStatus.CONVERGED
@@ -179,7 +184,14 @@ def test_sequential_all_fail_returns_best_finite_loss():
     key = jax.random.key(3)
     num_starts = 4
     ms = MultiStart(key=key, num_starts=num_starts, draw=draw_chain)
-    result = solver.solve(x0, p=p, max_steps=2, atol=1e-9, multi_start=ms)
+    result = solver.solve(
+        x0,
+        p=p,
+        max_steps=2,
+        max_steps_is_success=False,
+        atol=1e-9,
+        multi_start=ms,
+    )
 
     # Replicate the documented schedule with plain solves and chained draws.
     x_a = x0
@@ -197,6 +209,28 @@ def test_sequential_all_fail_returns_best_finite_loss():
     assert int(result.status) == LMStatus.MAX_STEPS
     assert jnp.allclose(result.x, manual[expected].x, rtol=1e-7)
     assert jnp.allclose(result.multi_start.loss, losses[expected], rtol=1e-7)
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_default_multi_start_accepts_max_steps(parallel):
+    solver = LevenbergMarquardt(residual_inconsistent, init_damping=1.0)
+    ms = MultiStart(
+        key=jax.random.key(31),
+        num_starts=3,
+        draw=draw_chain,
+        parallel=parallel,
+    )
+    result = solver.solve(
+        jnp.array([37.0]), p=jnp.asarray(0.0), max_steps=2, multi_start=ms
+    )
+
+    assert result.status == LMStatus.MAX_STEPS
+    assert bool(result.multi_start.accepted)
+    if parallel:
+        assert int(result.multi_start.attempts_run) == 3
+    else:
+        assert int(result.multi_start.attempt) == 0
+        assert int(result.multi_start.attempts_run) == 1
 
 
 @pytest.mark.parametrize("jit", [True, False])
@@ -296,6 +330,7 @@ def test_sequential_draw_receives_previous_initial_values():
         x0,
         args0,
         max_steps=3,
+        max_steps_is_success=False,
         atol=1e-9,
         callback=mutating_callback,
         multi_start=ms,
@@ -378,7 +413,14 @@ def test_parallel_all_fail_and_all_nonfinite_fallbacks():
     key = jax.random.key(12)
     num_starts = 4
     ms = MultiStart(key=key, num_starts=num_starts, draw=draw_chain, parallel=True)
-    result = solver.solve(x0, p=p, max_steps=2, atol=1e-9, multi_start=ms)
+    result = solver.solve(
+        x0,
+        p=p,
+        max_steps=2,
+        max_steps_is_success=False,
+        atol=1e-9,
+        multi_start=ms,
+    )
 
     lanes = [x0] + [
         draw_chain(attempt_subkeys(key, k)[0], x0, None)[0]
@@ -656,7 +698,7 @@ def test_mv2020_style_draw_resamples_args(parallel):
         new_args = jax.lax.cond(ctx.step == 1, fresh, lambda _: ctx.args, None)
         return LMSolveAction(args=new_args)
 
-    solver = LevenbergMarquardt(residual, init_damping=1e-2)
+    solver = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver="svd")
     args0 = {"data": jnp.array([1.0, -2.0, 0.5]), "key": jax.random.key(22)}
     x0 = jnp.array([jnp.nan, jnp.nan, jnp.nan])  # forces one retry
     p = jnp.asarray(2.0)

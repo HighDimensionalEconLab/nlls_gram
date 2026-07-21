@@ -138,9 +138,9 @@ def test_swap_fixture_reaches_forked_cg(monkeypatch):
     solver = LevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=20,
     )
@@ -163,9 +163,9 @@ def test_cg_step_matches_cholesky_identity_step(use_recycled_cg):
     cg_solver = LevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=20,
     )
@@ -197,9 +197,9 @@ def test_cg_update_jits(use_recycled_cg):
     solver = LevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=20,
     )
@@ -232,9 +232,9 @@ def test_cg_geodesic_acceleration_matches_cholesky(use_recycled_cg):
     cg_solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=10,
         geodesic_acceleration=True,
@@ -271,8 +271,8 @@ def test_cg_preconditioned_step_matches_cholesky_identity_step(use_recycled_cg):
     cg_solver = LevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
-        linear_solver="cg",
-        implicit_preconditioner=identity_preconditioner(),
+        linear_solver="gram_cg",
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=40,
         dual_preconditioner=lambda v, damping: v / weights,
@@ -304,8 +304,8 @@ def test_cg_preconditioned_update_jits(use_recycled_cg):
     solver = LevenbergMarquardt(
         residual_fn,
         init_damping=1e-2,
-        linear_solver="cg",
-        implicit_preconditioner=identity_preconditioner(),
+        linear_solver="gram_cg",
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=40,
         dual_preconditioner=lambda v, damping: v / weights,
@@ -338,8 +338,8 @@ def test_cg_preconditioned_geodesic_matches_cholesky(use_recycled_cg):
     cg_solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
-        linear_solver="cg",
-        implicit_preconditioner=identity_preconditioner(),
+        linear_solver="gram_cg",
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=10,
         geodesic_acceleration=True,
@@ -388,9 +388,9 @@ def test_cg_dual_preconditioner_enables_ill_conditioned_convergence(use_recycled
 
     common = dict(
         init_damping=1e-6,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         iterative_maxiter=3,
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         metric=metric_from_cholesky(L),
     )
     plain = LevenbergMarquardt(
@@ -936,7 +936,7 @@ def _reset_recycle(lm_state):
 def test_recycle_requires_cg():
     with pytest.raises(ValueError, match="recycle requires"):
         LevenbergMarquardt(
-            lambda x: x, linear_solver="cholesky", recycle=RecycleConfig(rank=2)
+            lambda x: x, linear_solver="gram_cholesky", recycle=RecycleConfig(rank=2)
         )
 
 
@@ -945,9 +945,9 @@ def test_recycle_config_hashing_shares_compilation():
     # different rank is a different compiled program.
     residual, _ = isolated_mode_problem()
     common = dict(
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
     )
     a = LevenbergMarquardt(residual, recycle=RecycleConfig(rank=4), **common)
     b = LevenbergMarquardt(residual, recycle=RecycleConfig(rank=4), **common)
@@ -960,9 +960,9 @@ def test_init_allocates_cold_recycle_state():
     residual, x0 = isolated_mode_problem()
     solver = LevenbergMarquardt(
         residual,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         recycle=RecycleConfig(rank=4),
     )
     state = solver.init(x0)
@@ -981,10 +981,10 @@ def test_recycling_reduces_total_inner_iterations():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-4,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         geodesic_acceleration=False,
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_maxiter=40,
         iterative_tol=1e-8,
         recycle=RecycleConfig(rank=3),
@@ -1010,10 +1010,10 @@ def test_recycled_solve_converges_ill_conditioned():
     residual, x0 = isolated_mode_problem()
     common = dict(
         init_damping=1e-4,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         geodesic_acceleration=False,
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_maxiter=6,
         iterative_tol=1e-8,
     )
@@ -1037,9 +1037,9 @@ def test_recycled_update_reverse_ad_matches_cholesky():
     recycled = LevenbergMarquardt(
         residual_data,
         init_damping=1e-2,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-9,
         iterative_maxiter=60,
         recycle=RecycleConfig(rank=4),
@@ -1068,9 +1068,9 @@ def test_recycled_solve_implicit_p_derivative_matches_plain():
 
     common = dict(
         init_damping=1e-3,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-10,
         iterative_maxiter=40,
     )
@@ -1092,10 +1092,10 @@ def test_recycled_multi_start_vmap():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-4,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         geodesic_acceleration=False,
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_maxiter=8,
         iterative_tol=1e-8,
         recycle=RecycleConfig(rank=3),
@@ -1120,10 +1120,10 @@ def test_recycled_callback_maxiter_schedule_composes():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-4,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         geodesic_acceleration=False,
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_maxiter=2,
         iterative_tol=1e-8,
         recycle=RecycleConfig(rank=3),
@@ -1150,9 +1150,9 @@ def test_recycled_multi_start_cold_resets_basis():
     residual, x0 = isolated_mode_problem()
     solver = LevenbergMarquardt(
         residual,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         recycle=RecycleConfig(rank=3),
     )
     state = solver.init(x0)
@@ -1183,9 +1183,9 @@ def test_recycled_update_nan_residual_rejects_step():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-2,
-        linear_solver="cg",
+        linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_maxiter=10,
         recycle=RecycleConfig(rank=1),
     )

@@ -23,6 +23,47 @@ It does not mean LM hyperparameters such as `init_damping`, `max_steps`,
 the initial guess `x0` as fixed for this derivative (their tangents are zero,
 not an error).
 
+### Status policy and the initial AD point
+
+Implicit AD is defined for `LMStatus.CONVERGED` and, by default,
+`LMStatus.MAX_STEPS`. The forgiving default supports fixed-step solves: a
+result that exhausts its budget relinearizes at the returned
+`(result.x, result.args, result.p)`, while its diagnostic status remains
+`MAX_STEPS`. Pass `max_steps_is_success=False` to make `MAX_STEPS` strict: it
+then follows the same failed-AD path as `NONFINITE`, `CALLBACK_STOP`, or any
+other non-`CONVERGED` status.
+
+An AD-successful solve relinearizes at its returned values. A failed solve
+keeps the primal result, status, aux, and diagnostics unchanged but returns
+exactly zero tangents through `result.x` and `result.aux`. `result.p` remains
+an independent identity pass-through.
+
+The failed lane's linear tangent program is evaluated at stop-gradient copies
+of the caller's original `(x0, args, p)`, with the `p` tangent masked to zero
+before the implicit solve. This gives automatic transposition a finite linear
+program even when the returned failed iterate is nonfinite, and keeps a failed
+lane from poisoning successful lanes under `vmap`. These initial values are a
+safety point, not a fallback solution: the returned failed iterate is never
+replaced.
+
+The original initial point must therefore be **JVP-safe**, not merely finite.
+The residual and aux map must have valid derivatives there. A `MetricFactory`
+must also be JVP-safe there when the resolved non-direct AD method consumes its
+metric, and a `PreconditionerFactory` must be JVP-safe there when it supplies a
+`gram_cg` AD preconditioner. A direct square AD solve ignores both factories,
+so it does not rebuild aux for them. When a selected multi-start winner fails
+the implicit-AD status policy, the safety point is the caller's original
+`(x0, args, p)`, not one of the drawn starts; custom acceptance is independent.
+
+Aux is reevaluated for factory construction only when it is actually consumed:
+a failed `MetricFactory` lane under a non-direct AD method, or a failed
+`gram_cg` lane whose `PreconditionerFactory` supplies the AD preconditioner.
+Fixed metrics, explicit AD preconditioners, and direct square solves do not
+trigger that factory-only rebuild. An AD-successful lane always reuses
+`result.aux` for factory construction. Independently, when `has_aux=True`, the
+aux map is linearized once at the selected point to compute the returned aux
+tangent itself.
+
 There is no setup stage that AD must trace through: the whole iteration —
 every update, callback, and the final aux evaluation — sits inside one
 `jax.custom_jvp` boundary, so derivative information flows only through the
@@ -33,7 +74,15 @@ implicitly via `cache_jacobian=True`, contributes exactly zero to any
 derivative. `result.aux` also participates in the implicit rule — see
 [Aux outputs](#aux-outputs) below. One
 construction-time caveat: the solver (including any `Metric` callbacks) is a
-static object — do not build it from traced values.
+static object — do not build it from traced values. Constructing
+`LevenbergMarquardt` *inside* a jitted function is supported: every
+constructor argument is a static Python value (option strings, floats,
+hooks) and the solver holds no arrays, so equal configurations share one
+compilation. What must not happen is feeding a traced value into the
+constructor, or rebuilding the *pieces* per call — an inline `lambda`
+residual or a hook closed over fresh arrays keys a new compile by object
+identity (see
+[what is free to sweep](tuning_guide.md#what-is-free-to-sweep)).
 
 ## Root Selection and the Metric
 
@@ -97,211 +146,254 @@ so
 $$
 \dot\theta
 = -P J_\theta^\top
-(J_\theta P J_\theta^\top)^{-1}
+(J_\theta P J_\theta^\top)^{+}
 J_p\dot p.
 $$
 
-In code, \(P x\) is applied with `metric.solve(x)` when available. If a QR
-metric is supplied only through square-root callbacks, the same inverse metric is
-applied as \(P x = S S^\top x\) using `metric.inv_sqrt` and
-`metric.inv_sqrt_transpose`.
-
-## Implicit Solver Geometries: Dual vs Primal, Dense vs Matrix-Free
-
-Every implicit rule linearizes the same undamped residual constraint at the
-returned solution,
+In whitened variables — \(B = J_\theta S\) with \(S S^\top = P\) and
+\(\dot\theta = S\dot u\) — the same tangent is the minimum-norm solution of
 
 $$
-J_\theta \dot\theta = -J_p\dot p,
-$$
-
-and the rules differ only in which *geometry* factors it. The **dual** rules
-work in residual space:
-
-$$
-(J_\theta P J_\theta^\top)y = J_p\dot p,
+B^\top B\,\dot u = -B^\top J_p\dot p,
 \qquad
-\dot\theta = -P J_\theta^\top y.
-$$
-
-The **primal** rules work in whitened parameter space, matched to a tall
-or square (\(m \ge n\)) full-column-rank Jacobian, where the \(m\times m\) dual Gram is
-structurally singular. With \(S = M^{-1/2}\) (so \(S S^\top = P\)) and
-\(B = J_\theta S \in \mathbb R^{m\times n}\), the Gauss-Newton tangent is
-
-$$
-\dot\theta = S\,u_p,
+\dot u = -B^{+} J_p\dot p,
 \qquad
-u_p
-= \arg\min_u \|B u + J_p\dot p\|^2 + \rho\,\|u\|^2
-= -(B^\top B + \rho I_n)^{-1} B^\top J_p\dot p,
+\dot\theta = S\,\dot u,
 $$
 
-with the relative ridge
-\(\rho = \) `implicit_penalty` \(\cdot\ \operatorname{trace}(B^\top B)\).
-Because \(\operatorname{trace}(B^\top B) = \operatorname{trace}(J_\theta P
-J_\theta^\top)\), `implicit_penalty` means the *same relative ridge* in both
-geometries. `primal_qr` never forms \(B^\top B\): it takes the reduced QR of
-the augmented matrix
-\(\begin{bmatrix} B \\ \sqrt{\rho}\, I_n \end{bmatrix} = QR\) and solves
+using \((B^\top B)^{+}B^\top = B^{+}\). In code, the **dense** AD rule
+computes exactly this: it materializes \(B\) and applies \(B^{+}\) from its
+SVD. The **gram_cg** rule solves the \(m \times m\) dual system above
+matrix-free, applying \(P x\) with `metric.solve(x)` when available, else as
+\(P x = S S^\top x\) through the square-root callbacks; the **normal_cg**
+rule solves the whitened normal system matrix-free through
+`metric.inv_sqrt`/`inv_sqrt_transpose`.
 
-$$
-R\,u_p = -Q^\top \begin{bmatrix} J_p\dot p \\ 0 \end{bmatrix},
-\qquad
-\dot\theta = S\,u_p,
-$$
+### Iterate-Dependent Metrics Are Frozen per Solve
 
-so it avoids **both** the \(m\times m\) dual Gram **and** the
-condition-squaring normal equations. \(B\) is assembled by \(n\)
-forward-mode JVP columns over the parameter identity basis — no \(m\times m\)
-residual identity is ever materialized. Like the whitened forward solvers,
-the primal rules apply the metric through its square-root callbacks
-`metric.inv_sqrt` / `metric.inv_sqrt_transpose` (the identity metric
-supplies them). A custom metric must therefore provide both callbacks to use
-an explicit `"primal_qr"`/`"primal_cholesky"` — a solve-only metric is
-rejected at construction rather than silently whitening with the identity
-(the whitened forward solvers already require the same callbacks, so the
-`"auto"`-geometry path can never hit this).
+With an iterate-dependent metric (`metric_factory=`), the metric is FROZEN at
+the returned solution: `prepare`/`build` run once at
+`(result.x, result.args, result.p, result.aux)` and the resulting \(P\) is
+applied exactly as a fixed metric would be. The state-dependence of the metric
+is deliberately not differentiated — the same contract as a fixed metric
+closing over constants, matching the forward selection role the metric plays.
+The built metric must stay self-adjoint and positive definite for that fixed
+state.
 
-**One contract holds across all rules**: nonzero-residual implicit
-differentiation *intentionally* uses the Gauss-Newton linearization of the
-residual constraint \(r(\theta^\star, a, p) = 0\) at the returned solution —
-it does not differentiate the full least-squares stationarity condition
-\(J_\theta^\top r = 0\), so no residual-weighted second-derivative terms
-ever appear. At an exact root the two coincide; at a nonzero-residual
-solution the Gauss-Newton tangent is the documented answer, consistent with
-the forward solver's Gauss-Newton contract.
+The freeze is a **first-order** statement. Each first-order implicit solve
+applies the metric frozen at *its* solution — the verified contract
+(first-order forward and reverse mode, fixed or factory-built metric). The
+tangent field \(p \mapsto \dot\theta(p)\) so defined uses, at every \(p\),
+the metric rebuilt at that point's solution. But **higher-order AD through
+a factory-built metric's state dependence is unsupported in every AD rule**:
+the metric-aware assembled and CG methods alike apply the frozen metric through
+identity-matvec `custom_linear_solve` wrappers whose declared solves are
+opaque to AD, so second derivatives do not account for the metric's point
+dependence. Take higher-order derivatives of `solve` only with a fixed
+metric (subject also to the spectral-filter caveat in
+[the rank-deficiency section](#rank-deficiency-and-the-ridge)). Those same wrappers
+declare each metric's transpose explicitly, so first-order reverse mode is
+correct even when `inv_sqrt` is not reverse-differentiable but
+`inv_sqrt_transpose` is supplied.
 
-The solver exposes four concrete implicit solvers plus an automatic
-selector (the resolution is recorded in
-`solver._resolved_implicit_solver`):
+## The AD Solver
 
-- `implicit_solver="dual_cholesky"` (backward-compatible alias:
-  `"cholesky"`) materializes \(J_\theta^\top\), assembles
-  \(J_\theta P J_\theta^\top\), and uses a dense Cholesky solve. This is the
-  historical rule and is still the explicit escape hatch. Its Jacobian
-  assembly is now geometry-aware like the forward dense solvers: \(n\)
-  forward-mode columns when tall or square (\(n \le m\)), \(m\) reverse-mode rows
-  otherwise (see `jacobian_mode` in the
-  [tuning guide](tuning_guide.md#solver-selection)). The implicit Gram
-  has no `+ damping I` floor from the forward solve, but it is regularized by
-  a small **relative ridge**, `+ implicit_penalty * trace(J P J') I`
-  (default: `1e-12`/`1e-6` for a float64/float32 dual solve; see below) —
-  still the most
-  conditioning-sensitive solve in the library; `dual_solve_dtype=jnp.float64`
-  runs it in float64
-  for a float32 model (measured on a \(10^{-7}\)-weight spike metric: a
-  float32 implicit tangent wrong by ~5% — and its VJP by ~40% — becomes
-  accurate to ~\(10^{-7}\), with the returned tangent still float32).
-- `implicit_solver="dual_cg"` (alias: `"cg"`) applies
-  \(y \mapsto J_\theta P J_\theta^\top y\)
-  matrix-free using JAX JVP/VJP closures, then solves with CG wrapped in
-  `jax.lax.custom_linear_solve(..., symmetric=True)`. This makes both JVP and
-  VJP of `solve(...).x` matrix-free.
-- `implicit_solver="primal_qr"` is the tall-system rule above: the
-  augmented QR of \([B; \sqrt{\rho} I_n]\), \(n\)-wide throughout. It honors
-  `dual_solve_dtype` promotion exactly like the dense dual rule (wide
-  factorization and solves, tangent cast back).
-- `implicit_solver="primal_cholesky"` computes the same tangent through the
-  \(n\times n\) whitened normal equations \(B^\top B + \rho I_n\) —
-  cheaper than the QR, but it re-introduces the condition-number squaring
-  the QR avoids. It is the documented normal-equations trade-off for small,
-  well-conditioned \(B\).
-- `implicit_solver="auto"` (the default) follows the forward solver's
-  geometry: `linear_solver="cg"` resolves to `dual_cg`;
-  `linear_solver="qr"`, `"augmented_qr"`, and `"lsmr"` resolve by Jacobian
-  shape at trace time (shapes are static) — `primal_qr` when \(m \ge n\)
-  (the square tie deliberately avoids the condition-squaring Gram assembly),
-  `dual_cholesky` otherwise; and `linear_solver="cholesky"` resolves to
-  `dual_cholesky`.
+`ad_solver` selects how the implicit tangent and cotangent systems are
+solved. Each method name selects exactly one algorithm:
 
-A cg-resolved implicit solve requires an explicit `implicit_preconditioner`
-— an approximation of the undamped \((J_\theta P J_\theta^\top)^{-1} v\) —
-at construction, even if `solve(...).x` is never differentiated. Note that
-the default `implicit_solver="auto"` resolves to CG whenever
-`linear_solver="cg"`, so a forward CG solver always needs both callbacks.
+- **`direct`** assembles the general square Jacobian and solves
+  \(J_\theta\dot\theta=-J_p\dot p\) with `jnp.linalg.solve`. It is the
+  inexpensive choice for a square, nonsingular root and gives the correct
+  transpose solve in VJP even when \(J_\theta\) is nonsymmetric. A unique
+  square root has no metric-dependent tangent selection, so `direct`
+  intentionally ignores the metric. It rejects nonsquare systems.
+- **`svd`** assembles the whitened Jacobian \(B=J_\theta S\) and applies its
+  spectral pseudoinverse. It is the robust dense choice for rank-deficient or
+  nearly rank-deficient problems and returns the minimum-\(M\)-norm tangent.
+- **`qr`** factors the same \(B\) without regularization. It is cheaper than
+  SVD at full numerical rank and fails loudly with a NaN tangent when the
+  rank guard detects deficiency.
+- **`augmented_qr`** factors
+  \([B;\sqrt{\delta}I]\), where
+  \(\delta=\texttt{ad\_solver\_penalty}\operatorname{tr}(B^\top B)\).
+  This is the explicitly regularized dense method.
+- **`gram_cg`** applies \(J_\theta P J_\theta^\top\) matrix-free and solves
+  the residual-space system with CG.
+- **`normal_cg`** applies \(B^\top B\) matrix-free. Its tangent right-hand
+  side lies in \(\operatorname{range}(B^\top)\), so CG from zero selects the
+  minimum-norm tangent without a ridge.
+- **`regularized_normal_cg`** is the explicit matrix-free regularized method.
+  It scales its ridge by a Rayleigh quotient of \(B^\top B\) over a fixed
+  deterministic probe so the tangent remains linear in \(\dot p\).
+
+The default `ad_solver="auto"` dispatches from traced shapes first:
+
+| traced system / forward `linear_solver` | `auto` resolves to |
+| --- | --- |
+| square, for every forward solver | `direct` |
+| nonsquare with `gram_cg` forward | `gram_cg` |
+| nonsquare with `normal_cg` forward | `normal_cg` |
+| any other nonsquare system | `svd` |
+
+The shape-first rule matters: a square algebraic system gets the direct
+solve even if its primal step used CG. The AD method is otherwise independent
+of the forward solver, so an `lsmr` forward with explicit
+`ad_solver="normal_cg"` remains matrix-free end to end.
+
+The SVD and QR methods work from \(B\), never from a formed squared operator,
+so their numerical accuracy is governed by \(\operatorname{cond}(B)\), not
+\(\operatorname{cond}(B)^2\). They assemble the Jacobian from its small side;
+see [`jacobian_mode`](tuning_guide.md#jacobian-assembly-jacobian_mode).
+`direct`, `svd`, `qr`, and `augmented_qr` inherit `linear_solve_dtype`.
+
+For `normal_cg`, reverse mode cannot simply reuse CG on a possibly singular
+normal operator with an arbitrary cotangent. Its declared transpose uses the
+push-through identity \(N^+=B^\top(BB^\top)^{+2}B\), which keeps both dual
+solves consistent. The final metric-square-root application declares
+`inv_sqrt_transpose` explicitly, so triangular and other non-self-adjoint
+square roots transpose correctly.
+
+Both CG forms assume the inner solve **converges**.
+`jax.lax.custom_linear_solve` transposes the declared solve as an exact
+linear map, but a truncated or early-stopped CG (a small bounded
+`ad_solver_maxiter`) is not a linear function of its right-hand side — its
+declared transpose then no longer matches what was computed, and
+derivatives are silently inaccurate on top of the truncation error itself.
+Run the AD CG solves to tolerance (the default
+`ad_solver_maxiter=None`), and treat a bounded budget as valid only with a
+preconditioner exact enough to converge within it.
+
+The undamped implicit system is often the most conditioning-sensitive solve in
+the library. `linear_solve_dtype=jnp.float64` promotes the assembled AD methods
+while leaving model inputs and returned tangents at their original dtype.
+
+### The AD Solver Preconditioner
+
+An explicit `gram_cg` AD method requires an `ad_solver_preconditioner` at
+construction. With `ad_solver="auto"`, the requirement is checked when a
+differentiated nonsquare forward `gram_cg` solve is traced; a square system
+has already resolved to `direct`. The hook approximates the undamped
+residual-space \((J_\theta P J_\theta^\top)^{-1} v\) on \(m\)-vectors, and
+a forward `preconditioner_factory`'s state at the solution serves as the
+default when no explicit hook is given. Under `normal_cg` the hook is
+**optional**: the tangent right-hand side lies in
+\(\operatorname{range}(B^\top)\), so unpreconditioned CG already selects
+the minimum-norm tangent. A hook supplied there acts in *parameter* space —
+an approximation of the undamped \((B^\top B)^{-1} v\) on \(n\)-vectors —
+and on rank-deficient problems it must preserve
+\(\operatorname{range}(B^\top)\), the same structural requirement as the
+forward
+[`normal_preconditioner`](utilities.md#the-normal-space-preconditioner-normal_cg);
+the dual-space factory can never serve this parameter-space system. The
+assembled methods use no preconditioner.
+
 The callback may take `(v)` or `(v, damping)`: a callable *requiring* the
 damping argument is called with an explicit zero damping (the implicit
 system is undamped), and one whose damping has a default passes through
 unchanged — so `identity_preconditioner()`,
 `sherman_morrison_preconditioner`, `woodbury_preconditioner`, and
-`nystrom_preconditioner` all serve both hooks directly. The one exception
+`nystrom_preconditioner` all serve the hook directly. The one exception
 is `pad_dual_preconditioner`, which divides by the live damping and is
-rejected at construction (implicit AD on padded problems is singular
-anyway). Pass `identity_preconditioner()` to run the implicit CG
-unpreconditioned, or `implicit_solver="dual_cholesky"` to use the dense rule
-instead. The forward `dual_preconditioner` is never reused implicitly: it
-approximates the damped operator, and the implicit system is undamped —
+rejected at construction. Pass `identity_preconditioner()` to run the
+AD CG unpreconditioned, or `ad_solver="svd"` to use the assembled
+pseudoinverse instead. The forward `dual_preconditioner` is never reused for AD:
+it approximates the damped operator, and the implicit system is undamped —
 reusing one is an explicit choice (pass the same callable to both
-arguments).
+arguments). Any `ad_solver_preconditioner` must be linear, self-adjoint, and
+positive definite for the operator of its resolved space, and the metric
+inverse \(P\) must be linear, self-adjoint, and positive definite in
+parameter space.
 
-The matrix-free rule has the same mathematical contract as the dense dual
-rule: \(J_\theta P J_\theta^\top\) must be nonsingular, so \(J_\theta\) must
-have full row rank under the chosen metric (the primal rules dually need
-full *column* rank, the natural condition for a tall system). The operator
-is assumed symmetric
-positive definite; the metric inverse \(P\) must be linear, self-adjoint, and
-positive definite in parameter space, and any `implicit_preconditioner` must be
-linear, self-adjoint, and positive definite for the residual-space operator.
-The rules treat rank deficiency differently. The **dual_cg rule** is
-intentionally not damped, because damping would change the
-minimum-\(M\)-norm derivative: its run-to-tolerance default produces
-non-finite derivatives on a singular system (loud), while a small bounded
-`implicit_maxiter` returns a finite — and wrong — derivative with no
-diagnostic, so reserve the bounded-budget mode for exact preconditioners.
-The **dense rules** — `dual_cholesky` and both primal rules — instead add
-the relative Tikhonov ridge before factorization:
-`implicit_penalty * trace(J P J') I` on the dual Gram, the equal-scale
-`implicit_penalty * trace(B'B) I` on the whitened normal operator. Redundant
-residual rows at the returned solution — e.g. a simulated trajectory that
-has settled onto its steady state, so late-horizon rows repeat — make the
-undamped dual singular *but consistent*, and for such systems the ridge
-tangent converges to the minimum-norm derivative as the penalty shrinks;
-the default (`implicit_penalty=None`, resolving to `1e-12` for a float64
-dual solve and `1e-6` for float32, after any `dual_solve_dtype` promotion)
-therefore returns the min-norm tangent at an O(`implicit_penalty * m`)
-relative bias instead of a NaN. The constants are empirical: for
-near-duplicate float64 rows the factorization-noise floor sits below
-`1e-14` and visible tangent bias above `~1e-6`, so the default is orders
-of magnitude from both edges. The trade-off is visibility: on a genuinely *inconsistent* singular
-dual the ridge returns a finite, penalty-inflated tangent where the
-unregularized rule failed loudly. Pass `implicit_penalty=0.0` to restore
-the exact unregularized contract (non-finite tangents on any singular
-dual). The dual_cg implicit rule ignores `implicit_penalty` entirely.
+## Rank Deficiency and the Ridge
 
-Self-adjointness of \(P\) is all the dual rules need from `metric.solve`: the
+One invariant holds package-wide: **no default applies a ridge to an implicit
+tangent solve.** Regularization requires an explicit algorithm name and an
+explicit positive penalty. The primal solve's only regularizer remains the LM
+damping itself.
+
+The implicit system is intentionally not damped — damping would change the
+minimum-\(M\)-norm derivative. What happens on a rank-deficient system
+depends on consistency, and interpolation problems produce **consistent**
+linearized systems by construction: differentiating the root identity
+\(r(\theta^\star(p), a, p) = 0\) along the solution branch gives
+\(J_\theta\dot\theta^\star + J_p\dot p = 0\), i.e.
+\(J_p\dot p \in \operatorname{range}(J_\theta)\) — redundant rows and
+collinear columns included. The methods behave as follows:
+
+- **`direct`** is exact for a nonsingular square Jacobian and fails through the
+  underlying solve when the Jacobian is singular.
+- **`svd`** applies \(B^+\) at the standard cutoff
+  \(\max(m,n)\,\mathrm{eps}\,\sigma_{\max}\). This is the robust choice for
+  a consistent rank-deficient system. The cutoff is numerical, so meaningful
+  singular values below it are treated as null directions. Higher derivatives
+  are exact only while the active singular subspace is locally constant.
+- **`qr`** is exact at full numerical rank and returns NaNs when its rank guard
+  detects deficiency.
+- **`augmented_qr`** is smooth across rank changes but biased by
+  O(`ad_solver_penalty` · dimension). Typical starting penalties are `1e-12`
+  in float64 and `1e-6` in float32.
+- **`gram_cg`** is unregularized and can fail on a singular dual even when the
+  primal tangent equation is consistent. A small fixed iteration budget can
+  instead return a finite but inaccurate answer, so run it to tolerance.
+- **`normal_cg`** remains unregularized and converges to the minimum-norm
+  tangent on singular-but-consistent systems in exact arithmetic.
+- **`regularized_normal_cg`** supplies the explicit matrix-free ridge.
+
+`ad_solver_penalty` is required and must be positive for `augmented_qr` and
+`regularized_normal_cg`. It is rejected for every other method, including
+`auto`; it never switches algorithms.
+
+**Gauss–Newton semantics on inconsistent systems.** When the returned
+point is a least-squares stationary point with nonzero residual rather than
+an exact root, \(J_p\dot p\) need not lie in
+\(\operatorname{range}(J_\theta)\). The default rules still return a finite
+answer — the minimum-\(M\)-norm **Gauss–Newton sensitivity of the
+linearized system**: the normal equations
+\(B^\top B\dot u = -B^\top J_p\dot p\) are consistent regardless (any
+\(B^\top\)-image is), and \(B^{+}\) applies their minimum-norm solution
+directly. That tangent is *not* the exact optimizer
+sensitivity — the exact derivative of a nonzero-residual stationary point
+carries residual-weighted second-derivative (curvature) terms that the
+frozen-Jacobian system drops. A one-line counterexample:
+\(r(x, p) = (x - p,\ x^2 - 1)\) at the stationary point \(x = 0.5\),
+\(p = -0.25\) has exact sensitivity \(dx/dp = 2\), while the Gauss–Newton
+normal system gives \(0.5\). The implicit rules are exact at interpolating
+(zero-residual) roots — the package's target — and Gauss–Newton
+approximations away from them. The non-default modes differ: an opt-in
+ridge returns a penalty-inflated finite tangent, and
+`gram_cg` fails loudly (its Krylov solve faces the singular-inconsistent
+dual).
+
+Metric callback requirements follow the factorization each form uses.
+`svd`, `qr`, `augmented_qr`, `normal_cg`, and `regularized_normal_cg` work in
+whitened variables and need the
+square-root pair `metric.inv_sqrt`/`inv_sqrt_transpose`; the final
+\(S\dot u\) map is not self-adjoint and declares that true transpose pair,
+so triangular Cholesky factors differentiate correctly in reverse mode.
+`direct` does not use the metric. `gram_cg` needs only `metric.solve`, and only ever *evaluates* it: the
 final \(P J_\theta^\top y\) application acts on tangent data, and its
-transpose in the VJP is declared to be \(P\) itself
-(a symmetric `jax.lax.custom_linear_solve`, which also batches under
-`jax.vmap`), so `metric.solve` is only ever
-*evaluated*, never transposed. The primal rules use the same device for
-\(S\): the final \(S u_p\) application is wrapped in an identity
-`jax.lax.custom_linear_solve` whose transpose solve is declared to be
-`metric.inv_sqrt_transpose`, so `metric.inv_sqrt` is likewise only ever
-evaluated. That is what lets an iterative metric callback —
+transpose in the VJP is declared to be \(P\) itself (a symmetric
+`jax.lax.custom_linear_solve`, which also batches under `jax.vmap`). That
+is what lets an iterative, solve-only metric —
 [`metric_from_shifted_matvec`](utilities.md#unified-shifted-block-metrics),
 or any hand-written CG-based `Metric.solve` — participate in both JVP and
-VJP even though transposing through JAX's CG is unsupported.
+VJP even though transposing through JAX's CG is unsupported: pair such a
+metric with `ad_solver="gram_cg"`.
 
-Accuracy is controlled separately from the forward iterative solve:
+Accuracy of the CG forms is controlled separately from the forward
+iterative solve:
 
-- `implicit_tol=None` uses a dtype-aware default (`1e-6` in float32, `1e-10`
+- `ad_solver_tol=None` uses a dtype-aware default (`1e-6` in float32, `1e-10`
   in float64), chosen for derivative accuracy rather than forward-step speed.
   The same attainable-floor bound as any CG applies: the residual stagnates
-  near `machine_eps` times the dual operator's condition number, so at small
+  near `machine_eps` times the operator's condition number, so at small
   `eps` (spike weight \(c^2/\varepsilon\)) the float64 default is reachable
   only with the spike preconditioner below.
-- `implicit_atol=0.0` and `implicit_maxiter=None` are passed to JAX CG.
+- `ad_solver_atol=0.0` and `ad_solver_maxiter=None` are passed to JAX CG.
   `None` leaves the iteration budget to JAX's CG policy.
-- `implicit_preconditioner` is the preconditioner for the undamped implicit
-  dual system, required whenever the implicit solver resolves to `dual_cg`.
-  It is
-  deliberately a separate argument from `dual_preconditioner`, because the
-  forward callback approximates the damped system and reuse should be a
-  decision, not a default. Reusing one is now just passing the same
-  callable to both arguments: a `(v, damping)` callable is called with an
-  explicit zero damping on the implicit side, so no wrapper is needed
-  (single-argument `(v)` callables remain valid).
+- `ad_solver_preconditioner` is deliberately a separate argument from the
+  forward preconditioner hooks — see
+  [above](#the-ad-solver-preconditioner).
 
 Two notes for the
 [unified shifted metric](gauss_newton.md#shifted-metrics-and-the-seminorm-limit)
@@ -309,16 +401,17 @@ Two notes for the
 
 - The scalar block injects its rank-\(k\) spike of weight \(c^2/\varepsilon\)
   into the *undamped* implicit dual operator too — there is no LM damping
-  here to mask it — so at small \(\varepsilon\) the implicit CG needs the
-  same
+  here to mask it — so at small \(\varepsilon\) a `gram_cg` AD solve
+  needs the same
   [Sherman–Morrison/Woodbury spike preconditioner](utilities.md#shermanmorrison-dual-preconditioner)
-  as the forward solve — pass the helper directly; the implicit hook calls
+  as the forward solve — pass the helper directly; the AD hook calls
   it with zero damping.
-- With `metric_from_shifted_matvec` the implicit CG nests an inner metric CG
-  inside every operator application, and the outer solve cannot be more
-  accurate than the inner one: for derivative-critical work set the metric's
-  `tol` at or below `implicit_tol` (the metric's default, the square root of
-  machine epsilon, is looser than the float64 implicit default of `1e-10`).
+- With `metric_from_shifted_matvec` the `gram_cg` AD solve nests an
+  inner metric CG inside every operator application, and the outer solve
+  cannot be more accurate than the inner one: for derivative-critical work
+  set the metric's `tol` at or below `ad_solver_tol` (the metric's default,
+  the square root of machine epsilon, is looser than the float64 AD
+  default of `1e-10`).
 
 Example sketch for a large matrix-free residual:
 
@@ -328,30 +421,40 @@ from nlls_gram import LevenbergMarquardt
 
 def residual(theta, _, p):
     # `features(theta)` is evaluated by JVP/VJP closures; no dense Jacobian is
-    # formed by the forward CG solve or the implicit CG derivative.
+    # formed by the forward CG solve or the CG-based AD rule.
     return features(theta) - p
 
 
-def implicit_preconditioner(v):
+def ad_solver_preconditioner(v):
     return approximate_undamped_dual_solve(v)
 
 
 solver = LevenbergMarquardt(
     residual,
-    linear_solver="cg",
+    linear_solver="gram_cg",
     iterative_tol=1e-3,
     iterative_maxiter=20,
     dual_preconditioner=identity_preconditioner(),
-    implicit_solver="auto",
-    implicit_tol=None,
-    implicit_preconditioner=implicit_preconditioner,
+    ad_solver="auto",
+    ad_solver_tol=None,
+    ad_solver_preconditioner=ad_solver_preconditioner,
 )
 ```
 
 ## VJP
 
-The transpose of the same map gives the VJP. For a cotangent
-\(\bar\theta\) on `result.x`, solve
+JAX derives the VJP by automatically transposing this solver's linear custom
+JVP rule; there is no separate custom VJP or cotangent solver. Writing
+\(K=J_p\), \(G=J_\theta P J_\theta^\top\), and using the same pseudoinverse or
+filtered solve as the JVP, the maps are
+
+$$
+\dot\theta=-P J_\theta^\top G^+ K\dot p,
+\qquad
+\bar p=-K^\top G^+ J_\theta P\bar\theta.
+$$
+
+Equivalently, for a cotangent \(\bar\theta\) on `result.x`, solve
 
 $$
 (J_\theta P J_\theta^\top)y = J_\theta P\bar\theta,
@@ -359,12 +462,20 @@ $$
 \bar p = -J_p^\top y.
 $$
 
-For a pytree `p`, \(J_p^\top y\) means the JAX VJP of the residual with respect
-to the `p` argument only.
+For the square direct method, the JVP solves
+\(J_\theta\dot\theta=-K\dot p\). Its automatically transposed VJP solves
+\(J_\theta^\top\lambda=\bar\theta\) and returns
+\(\bar p=-K^\top\lambda\).
 
-The residual-space system must be nonsingular; in the intended underdetermined
-interpolation setting this means \(J_\theta\) has full row rank under the chosen
-metric.
+For a pytree `p`, \(J_p^\top y\) means the JAX VJP of the residual with respect
+to the `p` argument only. The whitened rules compute the identical cotangent
+by transposing the whitened map instead — the `svd` rule through
+\((B^{+})^\top\) from the same factorization, the unridged `normal_cg` rule
+through its declared push-through transpose, since a cotangent right-hand
+side need not lie in \(\operatorname{range}(B^\top)\). Rank-deficient
+systems behave as in [the ridge section](#rank-deficiency-and-the-ridge):
+the VJP applies the transpose of the same regularized, filtered, or exact
+solve the JVP uses.
 
 Example:
 
@@ -436,7 +547,7 @@ as \(J_p \dot p\) above); transposes mean the corresponding VJP.
 
 $$
 \dot a = G_\theta\,\dot\theta + G_p\,\dot p
-= \bigl(-G_\theta P J_\theta^\top (J_\theta P J_\theta^\top)^{-1} J_p
+= \bigl(-G_\theta P J_\theta^\top (J_\theta P J_\theta^\top)^{+} J_p
   + G_p\bigr)\,\dot p.
 $$
 
@@ -446,14 +557,20 @@ $$
 directly:
 
 $$
-(J_\theta P J_\theta^\top)\, y
-= J_\theta P\,(\bar\theta + G_\theta^\top \bar a),
+y=(J_\theta P J_\theta^\top)^+
+J_\theta P\,(\bar\theta + G_\theta^\top \bar a),
 \qquad
 \bar p = -J_p^\top y + G_p^\top \bar a.
 $$
 
 Setting \(\bar a = 0\) recovers the `x`-only VJP above; setting
 \(\bar\theta = 0\) gives the pure aux pullback.
+
+On a failed solve both \(\dot\theta\) and \(\dot a\) are masked to exact zero
+after this tangent program is evaluated at the original JVP-safe initial
+point. Automatic transposition therefore contributes zero implicit cotangents
+from `result.x` and `result.aux`, while any cotangent on the independently
+returned `result.p` still passes through unchanged.
 
 Example — the residual from above with an aux that depends on `p` both ways:
 
