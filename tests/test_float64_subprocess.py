@@ -112,7 +112,7 @@ solver = LevenbergMarquardt(
     iterative_tol=1e-10,
     iterative_maxiter=20,
     dual_preconditioner=identity_preconditioner(),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
 )
 lm_state = solver.init(theta, (matrix, target))
 theta, lm_state, info = solver.update(theta, lm_state, (matrix, target))
@@ -206,7 +206,7 @@ solver = LevenbergMarquardt(
         matrix.shape[0],
         jax.random.PRNGKey(3),
     ),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
 )
 lm_state = solver.init(theta, (matrix, target))
 theta_nystrom, lm_state, info = solver.update(theta, lm_state, (matrix, target))
@@ -354,7 +354,11 @@ t_promoted = tangent(promoted, t032, p32)
 t_reference = tangent(reference, t064, p64)
 assert t_promoted.dtype == jnp.float32
 assert rel(t_promoted, t_reference) < 1e-6, rel(t_promoted, t_reference)
-assert rel(tangent(plain32, t032, p32), t_reference) > 1e-3
+# Unlike the forward step (whose float32 cholesky forms B'B and pays the
+# squared-assembly floor, > 1e-3 above), the dense AD rule factors B itself:
+# the UNPROMOTED float32 tangent already tracks the float64 reference on
+# this cond ~ 1e3 fixture (measured 3.9e-7), so promotion is a no-op here.
+assert rel(tangent(plain32, t032, p32), t_reference) < 1e-5
 
 
 def summed_gradient(solver, theta0, p_value):
@@ -365,7 +369,8 @@ g_promoted = float(summed_gradient(promoted, t032, p32))
 g_reference = float(summed_gradient(reference, t064, p64))
 g_plain = float(summed_gradient(plain32, t032, p32))
 assert abs(g_promoted - g_reference) / abs(g_reference) < 1e-5
-assert abs(g_plain - g_reference) / abs(g_reference) > 1e-2
+# Same cond(B)-not-cond(B)^2 story in reverse mode (measured 1.1e-6).
+assert abs(g_plain - g_reference) / abs(g_reference) < 1e-4
 
 
 # On a well-conditioned problem the flag changes nothing beyond float32
@@ -557,7 +562,7 @@ normal_cg = LevenbergMarquardt(
     init_damping=1e-3,
     linear_solver="normal_cg",
     normal_preconditioner=identity_preconditioner(),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
     iterative_tol=1e-10,
     iterative_maxiter=30,
     geodesic_acceleration=False,
@@ -578,9 +583,9 @@ implicit_normal_cg = LevenbergMarquardt(
     residual64,
     init_damping=1e-3,
     linear_solver="normal_cholesky",
-    implicit_solver="normal_cg",
-    implicit_preconditioner=identity_preconditioner(),
-    implicit_maxiter=30,
+    ad_solver="normal_cg",
+    ad_solver_preconditioner=identity_preconditioner(),
+    ad_solver_maxiter=30,
     geodesic_acceleration=False,
 )
 jaxpr = str(jax.make_jaxpr(lambda q: tangent(implicit_normal_cg, t064, q))(p64))
@@ -658,7 +663,7 @@ def residual(z, args, p):
 solver = LevenbergMarquardt(
     residual,
     linear_solver="augmented_qr",
-    implicit_solver="gram_cholesky",
+    ad_solver="dense",
     geodesic_acceleration=False,
     cache_jacobian=False,
 )
@@ -999,14 +1004,26 @@ def dense_composite(eps):
 
 
 def solved_x(metric, p):
-    # implicit_penalty=0.0: the eps-shifted metric spikes the dual trace by
+    # ad_solver_penalty=0.0: the eps-shifted metric spikes the dual trace by
     # 1/eps, so a trace-scaled ridge would perturb this exact-limit check.
+    # A solve-only (matvec) composite cannot serve the dense AD rule, which
+    # whitens: pin the gram_cg AD solve at a matching tight tolerance.
+    ad_kwargs = (
+        {}
+        if metric.inv_sqrt is not None
+        else {
+            "ad_solver": "gram_cg",
+            "ad_solver_tol": 1e-12,
+            "ad_solver_preconditioner": identity_preconditioner(),
+        }
+    )
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
         metric=metric,
         geodesic_acceleration=False,
-        implicit_penalty=0.0,
+        ad_solver_penalty=0.0,
+        **ad_kwargs,
     )
     return solver.solve(jnp.zeros(n + k), p=p, max_steps=200, atol=1e-12).x
 
@@ -1059,7 +1076,7 @@ for tol in (1e-4, 1e-12):
 assert derivative_errors[1e-12] < derivative_errors[1e-4], derivative_errors
 assert derivative_errors[1e-12] < 1e-8, derivative_errors
 
-# The matrix-free cg implicit rule (metric tol at or below implicit_tol, per
+# The matrix-free cg implicit rule (metric tol at or below ad_solver_tol, per
 # the nested-tolerance guidance) reproduces the dense-rule derivative in
 # both directions.
 def solved_x_cg_implicit(p_value):
@@ -1068,9 +1085,9 @@ def solved_x_cg_implicit(p_value):
         init_damping=1e-6,
         metric=matvec_composite(1e-12),
         geodesic_acceleration=False,
-        implicit_solver="gram_cg",
-        implicit_tol=1e-12,
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver="gram_cg",
+        ad_solver_tol=1e-12,
+        ad_solver_preconditioner=identity_preconditioner(),
     )
     return solver.solve(jnp.zeros(n + k), p=p_value, max_steps=200, atol=1e-12).x
 
@@ -1143,7 +1160,7 @@ for line in jaxpr.splitlines():
     assert result.returncode == 0, result.stderr + result.stdout
 
 
-def test_float64_dense_implicit_penalty_near_duplicate_rows():
+def test_float64_dense_ad_solver_penalty_near_duplicate_rows():
     # The growth-model pathology: a converged simulation duplicates its
     # late-horizon states to ~1e-13, so the float64 undamped implicit dual has
     # eigenvalues far below the factorization noise floor and the unregularized
@@ -1166,7 +1183,7 @@ def residual_fn(x, args, p):
 
 
 x0 = jnp.zeros(3)
-solver = LevenbergMarquardt(residual_fn, implicit_solver="gram_cholesky")
+solver = LevenbergMarquardt(residual_fn, ad_solver="dense")
 
 
 def sum_x_star(target):
@@ -1435,7 +1452,7 @@ solver = LevenbergMarquardt(
     iterative_maxiter=30,
     iterative_tol=1e-10,
     dual_preconditioner=identity_preconditioner(),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
     recycle=RecycleConfig(rank=3),
 )
 # gtol is set above the solver's attainable gradient floor for this

@@ -17,11 +17,11 @@ def identity_preconditioner():
 
     ``linear_solver="gram_cg"`` requires ``dual_preconditioner``, and a
     cg-resolved
-    implicit solve requires ``implicit_preconditioner`` -- nobody should run
+    implicit solve requires ``ad_solver_preconditioner`` -- nobody should run
     Krylov methods without thinking about preconditioning, so opting out is an
     explicit, greppable decision rather than a silent default. The returned
     callable accepts both hook signatures: ``dual_preconditioner(v, damping)``
-    and ``implicit_preconditioner(v)``.
+    and ``ad_solver_preconditioner(v)``.
     """
 
     def preconditioner(v, damping=None):
@@ -41,7 +41,7 @@ def sherman_morrison_preconditioner(solve, u, weight):
     ``J M^{-1} J'``. The ``damping`` argument is accepted per the
     ``dual_preconditioner`` contract and ignored -- spectral closeness to the
     damped operator is all a preconditioner needs -- which also makes the
-    helper directly valid as ``implicit_preconditioner`` (the solver calls
+    helper directly valid as ``ad_solver_preconditioner`` (the solver calls
     two-argument callables with zero damping there).
     """
 
@@ -70,7 +70,7 @@ def woodbury_preconditioner(solve, U, weights):
     must be positive -- not validated, since inputs may be traced. The
     ``damping`` argument is accepted per the ``dual_preconditioner``
     contract and ignored, so the helper is directly valid as
-    ``implicit_preconditioner`` too.
+    ``ad_solver_preconditioner`` too.
     """
 
     U = jnp.asarray(U)
@@ -110,11 +110,11 @@ def pad_dual_preconditioner(base_preconditioner, n_real):
     forgoes the exact padded-block inverse. Like ``nystrom_preconditioner``
     this uses the live ``damping`` argument, and because the padded block
     divides by it, the returned callback serves only the damped forward
-    solve -- never the ``implicit_preconditioner`` hook. Relatedly, padded
-    rows make the undamped implicit dual ``J P J'`` singular, so the
-    library's implicit rules return a non-finite derivative on padded
-    problems; the minimum-metric-norm derivative still exists mathematically
-    and equals the unpadded one, so differentiate the unpadded formulation.
+    solve -- never the ``ad_solver_preconditioner`` hook. Relatedly, padded
+    rows make the undamped dual ``J P J'`` singular; the default dense AD
+    rule handles this exactly (its spectral filter computes the
+    minimum-metric-norm tangent, which equals the unpadded one), while an
+    explicit ``ad_solver_penalty=0.0`` fails loudly there.
     """
 
     if not isinstance(n_real, int) or isinstance(n_real, bool) or n_real <= 0:
@@ -160,7 +160,7 @@ def nystrom_preconditioner(matvec, n, rank, key, *, dtype=None):
     for fast-decaying spectra. This is the one shipped helper that uses the
     live ``damping`` argument (Sherman-Morrison/Woodbury ignore it): one
     construction serves every LM damping value, and passed as
-    ``implicit_preconditioner`` it is called with zero damping and applies
+    ``ad_solver_preconditioner`` it is called with zero damping and applies
     the undamped inverse (valid only when the retained spectrum is strictly
     positive).
 

@@ -48,14 +48,14 @@ def solver_kwargs_for(linear_solver):
             "iterative_tol": 1e-7,
             "iterative_maxiter": 30,
             "dual_preconditioner": identity_preconditioner(),
-            "implicit_preconditioner": identity_preconditioner(),
+            "ad_solver_preconditioner": identity_preconditioner(),
         }
     if linear_solver == "normal_cg":
         return {
             "iterative_tol": 1e-7,
             "iterative_maxiter": 30,
             "normal_preconditioner": identity_preconditioner(),
-            "implicit_preconditioner": identity_preconditioner(),
+            "ad_solver_preconditioner": identity_preconditioner(),
         }
     if linear_solver == "lsmr":
         return {"iterative_tol": 1e-10, "iterative_maxiter": 50}
@@ -304,10 +304,8 @@ def test_jacobian_assembly_does_not_differentiate_aux():
     assert bool(jnp.isfinite(result.x["a"]))
 
 
-@pytest.mark.parametrize(
-    "implicit_solver", ["gram_cholesky", "gram_cg", "normal_cholesky", "normal_cg"]
-)
-def test_implicit_jvp_freezes_metric_at_solution(implicit_solver):
+@pytest.mark.parametrize("ad_solver", ["dense", "gram_cg", "normal_cg"])
+def test_implicit_jvp_freezes_metric_at_solution(ad_solver):
     # Underdetermined linear residual with a p-dependent metric read from aux:
     # the solve returns the min-M(p)-norm solution, and the implicit tangent
     # must use the FROZEN metric at the solution -- the min-norm formula with
@@ -326,13 +324,11 @@ def test_implicit_jvp_freezes_metric_at_solution(implicit_solver):
         init_damping=1e-2,
         metric_factory=factory,
         geodesic_acceleration=False,
-        implicit_solver=implicit_solver,
-        implicit_preconditioner=(
-            identity_preconditioner()
-            if implicit_solver in ("gram_cg", "normal_cg")
-            else None
+        ad_solver=ad_solver,
+        ad_solver_preconditioner=(
+            identity_preconditioner() if ad_solver in ("gram_cg", "normal_cg") else None
         ),
-        implicit_maxiter=30 if implicit_solver in ("gram_cg", "normal_cg") else None,
+        ad_solver_maxiter=30 if ad_solver in ("gram_cg", "normal_cg") else None,
     )
 
     def solved_x(p):

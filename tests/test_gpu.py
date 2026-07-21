@@ -31,7 +31,7 @@ _MATRIX_FREE_GPU_KWARGS = {
         "iterative_tol": 1e-7,
         "iterative_maxiter": 10,
         "dual_preconditioner": identity_preconditioner(),
-        "implicit_preconditioner": identity_preconditioner(),
+        "ad_solver_preconditioner": identity_preconditioner(),
     },
     "lsmr": {"iterative_tol": 1e-8, "iterative_maxiter": 10},
 }

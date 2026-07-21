@@ -177,7 +177,7 @@ def test_fwd_mode_with_cg_solver_raises():
             linear_solver="gram_cg",
             jacobian_mode="fwd",
             dual_preconditioner=identity_preconditioner(),
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
         )
 
 
@@ -188,14 +188,14 @@ def test_fwd_mode_with_lsmr_and_dense_implicit_is_accepted():
         lambda x: x,
         linear_solver="lsmr",
         jacobian_mode="fwd",
-        implicit_solver="gram_cholesky",
+        ad_solver="dense",
     )
     assert solver.jacobian_mode == "fwd"
 
 
-def test_fwd_mode_with_lsmr_and_shape_auto_implicit_is_accepted():
-    # implicit_solver="auto" under lsmr defers to the trace-time shape rule,
-    # which always resolves to a dense form -- jacobian_mode has a consumer.
+def test_fwd_mode_with_lsmr_and_dense_ad_is_accepted():
+    # ad_solver="auto" under lsmr resolves to the dense AD rule --
+    # jacobian_mode has a consumer.
     solver = LevenbergMarquardt(
         lambda x: x,
         linear_solver="lsmr",

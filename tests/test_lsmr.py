@@ -133,7 +133,7 @@ def test_lsmr_beats_cg_dual_step_on_ill_conditioned_operator():
         residual,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=0.0,
         iterative_atol=0.0,
         iterative_maxiter=200,
@@ -371,7 +371,7 @@ def test_lsmr_implicit_p_derivative_matches_analytic():
         iterative_tol=1e-10,
         iterative_maxiter=60,
     )
-    assert lsmr_solver._resolved_implicit_solver == "shape_auto"
+    assert lsmr_solver._resolved_ad_solver == "dense"
     p = jnp.asarray(1.7)
     j_analytic = jnp.sum(ts) / jnp.sum(ts**2)
 
@@ -640,7 +640,7 @@ def test_whitened_preconditioner_requires_lsmr():
             residual,
             linear_solver="gram_cg",
             dual_preconditioner=identity_preconditioner(),
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
             whitened_preconditioner=prec,
         )
 
@@ -672,22 +672,18 @@ def test_chained_solve_derivative_is_final_phase_implicit_rule():
     def residual(x, args, p):
         return A @ x + 0.1 * jnp.tanh(x) - p
 
-    phase1 = LevenbergMarquardt(
-        residual, init_damping=1e-2, implicit_solver="gram_cholesky"
-    )
+    phase1 = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver="dense")
     phase2 = LevenbergMarquardt(
         residual,
         linear_solver="lsmr",
-        implicit_solver="gram_cholesky",
+        ad_solver="dense",
         init_damping=1e-10,
         iterative_tol=1e-13,
         iterative_atol=1e-13,
         iterative_maxiter=200,
         geodesic_acceleration=False,
     )
-    reference = LevenbergMarquardt(
-        residual, init_damping=1e-2, implicit_solver="gram_cholesky"
-    )
+    reference = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver="dense")
 
     def chained(p):
         plateau = phase1.solve(jnp.zeros(n), p=p, max_steps=2, atol=0.0)

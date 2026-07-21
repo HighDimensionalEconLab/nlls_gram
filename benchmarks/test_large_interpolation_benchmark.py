@@ -47,7 +47,7 @@ def _make_large_interpolation_problem(
                 "iterative_atol": 0.0,
                 "iterative_maxiter": ITERATIVE_MAXITER,
                 "dual_preconditioner": identity_preconditioner(),
-                "implicit_preconditioner": identity_preconditioner(),
+                "ad_solver_preconditioner": identity_preconditioner(),
             }
         )
 

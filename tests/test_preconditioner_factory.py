@@ -62,13 +62,13 @@ def test_factory_and_dual_preconditioner_mutually_exclusive():
             lambda x: x,
             linear_solver="gram_cg",
             dual_preconditioner=identity_preconditioner(),
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
             preconditioner_factory=factory,
         )
 
 
 def test_factory_satisfies_cg_and_implicit_requirements():
-    # With neither dual_preconditioner nor implicit_preconditioner, a factory alone
+    # With neither dual_preconditioner nor ad_solver_preconditioner, a factory alone
     # satisfies both the forward-cg and cg-implicit preconditioner requirements.
     residual, x0, prepare, apply = rotating_problem()
     solver = LevenbergMarquardt(
@@ -153,7 +153,7 @@ def test_factory_matches_frozen_when_theta_independent():
     common = dict(
         init_damping=1e-2,
         linear_solver="gram_cg",
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=40,
     )
@@ -193,7 +193,7 @@ def test_factory_converges_where_frozen_stalls():
         init_damping=1e-3,
         linear_solver="gram_cg",
         geodesic_acceleration=False,
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_maxiter=2,
         iterative_tol=1e-12,
     )
@@ -399,10 +399,10 @@ def target_problem(n=12):
 
 def test_factory_implicit_p_derivative_matches_cholesky():
     # solve()'s p-derivative comes from the implicit rule at the converged root.
-    # With a factory and no explicit implicit_preconditioner, the implicit cg rule
+    # With a factory and no explicit ad_solver_preconditioner, the implicit cg rule
     # seeds its preconditioner from prepare(result.x) at the solution; on a
     # full-rank dual the derivative is preconditioner-independent, so it must match
-    # both the dense cholesky rule and an explicit identity implicit_preconditioner.
+    # both the dense cholesky rule and an explicit identity ad_solver_preconditioner.
     residual_p, x0, prepare, apply, p = target_problem()
     common = dict(init_damping=1e-3, geodesic_acceleration=False)
     cholesky = LevenbergMarquardt(residual_p, linear_solver="gram_cholesky", **common)
@@ -418,7 +418,7 @@ def test_factory_implicit_p_derivative_matches_cholesky():
         residual_p,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-12,
         iterative_maxiter=40,
         **common,

@@ -83,7 +83,12 @@ def test_default_metric_matches_explicit_identity_metric_solve():
         residual_fn,
         init_damping=1e-2,
         linear_solver="gram_cholesky",
-        metric=Metric(solve=lambda x: x, norm=jnp.linalg.norm),
+        metric=Metric(
+            solve=lambda x: x,
+            norm=jnp.linalg.norm,
+            inv_sqrt=lambda x: x,
+            inv_sqrt_transpose=lambda x: x,
+        ),
     )
 
     default_x, default_state, default_info = default_solver.update(
@@ -241,54 +246,54 @@ def test_iterative_options_must_be_valid():
             residual_fn,
             linear_solver="gram_cg",
             dual_preconditioner=identity_preconditioner(),
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
             iterative_tol=0.0,
             iterative_atol=0.0,
             iterative_maxiter=None,
         )
 
 
-def test_implicit_solver_options_must_be_valid():
-    with pytest.raises(ValueError, match="unknown implicit_solver"):
-        LevenbergMarquardt(residual_fn, implicit_solver="lu")
-    with pytest.raises(ValueError, match="implicit_tol must be nonnegative"):
-        LevenbergMarquardt(residual_fn, implicit_tol=-1.0)
-    with pytest.raises(ValueError, match="implicit_atol must be nonnegative"):
-        LevenbergMarquardt(residual_fn, implicit_atol=-1.0)
-    with pytest.raises(ValueError, match="implicit_maxiter must be positive or None"):
-        LevenbergMarquardt(residual_fn, implicit_maxiter=0)
-    with pytest.raises(ValueError, match="implicit_penalty must be nonnegative"):
-        LevenbergMarquardt(residual_fn, implicit_penalty=-1e-8)
-    with pytest.raises(ValueError, match="implicit_maxiter must be set"):
+def test_ad_solver_options_must_be_valid():
+    with pytest.raises(ValueError, match="unknown ad_solver"):
+        LevenbergMarquardt(residual_fn, ad_solver="lu")
+    with pytest.raises(ValueError, match="ad_solver_tol must be nonnegative"):
+        LevenbergMarquardt(residual_fn, ad_solver_tol=-1.0)
+    with pytest.raises(ValueError, match="ad_solver_atol must be nonnegative"):
+        LevenbergMarquardt(residual_fn, ad_solver_atol=-1.0)
+    with pytest.raises(ValueError, match="ad_solver_maxiter must be positive or None"):
+        LevenbergMarquardt(residual_fn, ad_solver_maxiter=0)
+    with pytest.raises(ValueError, match="ad_solver_penalty must be nonnegative"):
+        LevenbergMarquardt(residual_fn, ad_solver_penalty=-1e-8)
+    with pytest.raises(ValueError, match="ad_solver_maxiter must be set"):
         LevenbergMarquardt(
             residual_fn,
-            implicit_tol=0.0,
-            implicit_atol=0.0,
-            implicit_maxiter=None,
+            ad_solver_tol=0.0,
+            ad_solver_atol=0.0,
+            ad_solver_maxiter=None,
         )
-    with pytest.raises(ValueError, match="implicit_preconditioner"):
-        LevenbergMarquardt(residual_fn, implicit_preconditioner=lambda v: v)
-    with pytest.raises(ValueError, match="implicit_preconditioner"):
+    with pytest.raises(ValueError, match="ad_solver_preconditioner"):
+        LevenbergMarquardt(residual_fn, ad_solver_preconditioner=lambda v: v)
+    with pytest.raises(ValueError, match="ad_solver_preconditioner"):
         LevenbergMarquardt(
             residual_fn,
             linear_solver="qr",
-            implicit_solver="auto",
-            implicit_preconditioner=lambda v: v,
+            ad_solver="auto",
+            ad_solver_preconditioner=lambda v: v,
         )
 
     auto_cg = LevenbergMarquardt(
         residual_fn,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=lambda v: v,
+        ad_solver_preconditioner=lambda v: v,
     )
     explicit_cg = LevenbergMarquardt(
         residual_fn,
-        implicit_solver="gram_cg",
-        implicit_preconditioner=lambda v: v,
+        ad_solver="gram_cg",
+        ad_solver_preconditioner=lambda v: v,
     )
-    assert auto_cg.implicit_solver == "auto"
-    assert explicit_cg.implicit_solver == "gram_cg"
+    assert auto_cg.ad_solver == "auto"
+    assert explicit_cg.ad_solver == "gram_cg"
 
 
 def test_linear_solve_dtype_validation():
@@ -301,7 +306,7 @@ def test_linear_solve_dtype_validation():
             iterative_tol=1e-7,
             iterative_maxiter=20,
             dual_preconditioner=identity_preconditioner(),
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
             linear_solve_dtype=jnp.float64,
         )
     # x64 is disabled in this test process, so float64 is unavailable and
@@ -369,7 +374,7 @@ def test_cg_step_matches_cholesky_identity_step():
         init_damping=1e-2,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=20,
     )
@@ -583,7 +588,7 @@ def test_cg_update_jits():
         init_damping=1e-2,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=20,
     )
@@ -706,7 +711,7 @@ def test_cg_geodesic_acceleration_matches_cholesky():
         init_damping=1e-6,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=10,
         geodesic_acceleration=True,
@@ -923,7 +928,7 @@ def test_metric_step_matches_closed_form_solution(linear_solver):
             "iterative_tol": 1e-7,
             "iterative_maxiter": 30,
             "dual_preconditioner": identity_preconditioner(),
-            "implicit_preconditioner": identity_preconditioner(),
+            "ad_solver_preconditioner": identity_preconditioner(),
         }
 
     solver = LevenbergMarquardt(
@@ -1012,7 +1017,7 @@ def test_metric_geodesic_acceleration_ratio_uses_metric_norm(linear_solver):
             "iterative_tol": 1e-7,
             "iterative_maxiter": 30,
             "dual_preconditioner": identity_preconditioner(),
-            "implicit_preconditioner": identity_preconditioner(),
+            "ad_solver_preconditioner": identity_preconditioner(),
         }
     solver = LevenbergMarquardt(
         residual,
@@ -1518,7 +1523,7 @@ def test_vmap_over_solve_tolerances():
     assert int(batched.steps[1]) > int(batched.steps[0])
 
 
-def test_dense_implicit_penalty_handles_singular_dual_from_redundant_rows():
+def test_dense_ad_solver_penalty_handles_singular_dual_from_redundant_rows():
     # Two identical residual rows: the undamped implicit dual J J' is singular
     # (rank 1) everywhere, but the system is consistent and x*(p) is smooth
     # with minimum-norm derivative d x* / d target = w / ||w||^2 from x0 = 0.
@@ -1546,7 +1551,7 @@ def test_dense_implicit_penalty_handles_singular_dual_from_redundant_rows():
 
     # An explicit (larger) penalty is plumbed through and still resolves the
     # singular dual; the bias grows with the penalty but stays O(penalty * m).
-    blunt = LevenbergMarquardt(duplicated_rows_residual, implicit_penalty=1e-4)
+    blunt = LevenbergMarquardt(duplicated_rows_residual, ad_solver_penalty=1e-4)
     blunt_grad = jax.jacobian(lambda p: sum_x_star(blunt, p))(p)["target"]
     assert jnp.isfinite(blunt_grad)
     assert jnp.allclose(blunt_grad, expected, rtol=1e-3)
@@ -1603,14 +1608,12 @@ def test_implicit_cg_jvp_and_vjp_match_cholesky_with_metric():
             metric=metric_from_cholesky(L),
             geodesic_acceleration=False,
         )
-        dense_implicit = LevenbergMarquardt(
-            residual, implicit_solver="gram_cholesky", **common
-        )
+        dense_implicit = LevenbergMarquardt(residual, ad_solver="dense", **common)
         cg_implicit = LevenbergMarquardt(
             residual,
-            implicit_solver="gram_cg",
-            implicit_tol=1e-7,
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver="gram_cg",
+            ad_solver_tol=1e-7,
+            ad_solver_preconditioner=identity_preconditioner(),
             **common,
         )
         theta0 = jnp.zeros(matrix.shape[1])
@@ -1647,11 +1650,11 @@ def test_implicit_cg_sign_and_transpose_match_closed_form():
         init_damping=1e-2,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=30,
-        implicit_solver="gram_cg",
-        implicit_tol=1e-7,
+        ad_solver="gram_cg",
+        ad_solver_tol=1e-7,
         metric=metric_from_diagonal(metric_weights),
         geodesic_acceleration=False,
     )
@@ -1687,11 +1690,11 @@ def test_implicit_cg_jvp_and_vjp_jit():
         init_damping=1e-2,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=20,
-        implicit_solver="auto",
-        implicit_tol=1e-7,
+        ad_solver="auto",
+        ad_solver_tol=1e-7,
     )
 
     def solved_x(p):
@@ -1740,12 +1743,12 @@ def test_implicit_cg_jaxpr_does_not_materialize_dense_jacobian_transpose():
         init_damping=1e-2,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-6,
         iterative_maxiter=5,
-        implicit_solver="auto",
-        implicit_tol=1e-6,
-        implicit_maxiter=5,
+        ad_solver="auto",
+        ad_solver_tol=1e-6,
+        ad_solver_maxiter=5,
         geodesic_acceleration=False,
     )
 
@@ -1874,7 +1877,7 @@ def test_grad_norm_and_step_norm_match_closed_form(linear_solver):
             "iterative_tol": 1e-7,
             "iterative_maxiter": 30,
             "dual_preconditioner": identity_preconditioner(),
-            "implicit_preconditioner": identity_preconditioner(),
+            "ad_solver_preconditioner": identity_preconditioner(),
         }
     elif linear_solver == "lsmr":
         solver_kwargs = {"iterative_tol": 1e-10, "iterative_maxiter": 50}
@@ -2229,7 +2232,7 @@ def test_callback_grows_cg_budget_when_loss_small(jit):
         linear_solver="gram_cg",
         iterative_maxiter=2,
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
     )
     theta0 = jnp.zeros(8)
     fixed = solver.solve(theta0, max_steps=60, jit=jit)
@@ -2502,7 +2505,7 @@ def test_cache_jacobian_is_inert_for_non_cholesky_solvers(linear_solver):
     if linear_solver == "gram_cg":
         solver_kwargs |= {
             "dual_preconditioner": identity_preconditioner(),
-            "implicit_preconditioner": identity_preconditioner(),
+            "ad_solver_preconditioner": identity_preconditioner(),
         }
     solver = LevenbergMarquardt(
         residual_fn,
@@ -2576,7 +2579,7 @@ def test_has_aux_reports_aux_at_pre_step_x(linear_solver):
             "iterative_tol": 1e-7,
             "iterative_maxiter": 20,
             "dual_preconditioner": identity_preconditioner(),
-            "implicit_preconditioner": identity_preconditioner(),
+            "ad_solver_preconditioner": identity_preconditioner(),
         }
     elif linear_solver == "lsmr":
         solver_kwargs = {"iterative_tol": 1e-8, "iterative_maxiter": 20}
@@ -2809,11 +2812,11 @@ def test_implicit_cg_works_with_has_aux_and_pytree_x_p():
         init_damping=1e-2,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=20,
-        implicit_solver="auto",
-        implicit_tol=1e-7,
+        ad_solver="auto",
+        ad_solver_tol=1e-7,
         has_aux=True,
     )
     x0 = {"left": jnp.asarray(0.0), "right": {"value": jnp.asarray(0.0)}}
@@ -2995,7 +2998,7 @@ def test_cg_requires_dual_preconditioner():
         LevenbergMarquardt(
             residual_fn,
             linear_solver="gram_cg",
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
         )
     # Both callbacks missing reports both remedies in one error.
     with pytest.raises(ValueError, match="and the gram_cg-resolved"):
@@ -3003,11 +3006,11 @@ def test_cg_requires_dual_preconditioner():
 
 
 def test_implicit_cg_requires_preconditioner():
-    with pytest.raises(ValueError, match="implicit_preconditioner"):
-        LevenbergMarquardt(residual_fn, implicit_solver="gram_cg")
-    # implicit_solver="auto" resolves to cg when linear_solver="gram_cg", so the
+    with pytest.raises(ValueError, match="ad_solver_preconditioner"):
+        LevenbergMarquardt(residual_fn, ad_solver="gram_cg")
+    # ad_solver="auto" resolves to cg when linear_solver="gram_cg", so the
     # default auto still requires the implicit callback.
-    with pytest.raises(ValueError, match="implicit_preconditioner"):
+    with pytest.raises(ValueError, match="ad_solver_preconditioner"):
         LevenbergMarquardt(
             residual_fn,
             linear_solver="gram_cg",
@@ -3018,7 +3021,7 @@ def test_implicit_cg_requires_preconditioner():
         residual_fn,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_solver="gram_cholesky",
+        ad_solver="dense",
     )
 
 
@@ -3030,7 +3033,7 @@ def test_implicit_cg_exact_preconditioner_matches_closed_form_with_tiny_budget()
     def residual(theta, _, p):
         return matrix @ theta - target_matrix @ p
 
-    def exact_implicit_preconditioner(v):
+    def exact_ad_solver_preconditioner(v):
         return _solve_2x2(gram, v)
 
     preconditioned = LevenbergMarquardt(
@@ -3040,10 +3043,10 @@ def test_implicit_cg_exact_preconditioner_matches_closed_form_with_tiny_budget()
         dual_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=20,
-        implicit_solver="gram_cg",
-        implicit_tol=0.0,
-        implicit_maxiter=1,
-        implicit_preconditioner=exact_implicit_preconditioner,
+        ad_solver="gram_cg",
+        ad_solver_tol=0.0,
+        ad_solver_maxiter=1,
+        ad_solver_preconditioner=exact_ad_solver_preconditioner,
         geodesic_acceleration=False,
     )
     theta0 = jnp.zeros(matrix.shape[1])
@@ -3081,12 +3084,12 @@ def test_implicit_cg_does_not_reuse_forward_dual_preconditioner():
         residual,
         init_damping=1e-2,
         linear_solver="gram_cg",
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=20,
         dual_preconditioner=dual_preconditioner,
-        implicit_solver="auto",
-        implicit_tol=1e-7,
+        ad_solver="auto",
+        ad_solver_tol=1e-7,
     )
 
     def solved_x(p):
@@ -3112,10 +3115,10 @@ def test_implicit_cg_can_explicitly_reuse_zero_damping_dual_preconditioner():
         iterative_tol=1e-7,
         iterative_maxiter=20,
         dual_preconditioner=dual_preconditioner,
-        implicit_solver="auto",
-        implicit_tol=0.0,
-        implicit_maxiter=1,
-        implicit_preconditioner=lambda v: dual_preconditioner(
+        ad_solver="auto",
+        ad_solver_tol=0.0,
+        ad_solver_maxiter=1,
+        ad_solver_preconditioner=lambda v: dual_preconditioner(
             v, jnp.asarray(0.0, v.dtype)
         ),
     )
@@ -3131,7 +3134,7 @@ def test_implicit_cg_can_explicitly_reuse_zero_damping_dual_preconditioner():
     assert jnp.allclose(p_bar, (3.0 + 2.0 * 4.0) / 5.0, atol=1e-6)
 
 
-def test_implicit_preconditioner_accepts_dual_signature():
+def test_ad_solver_preconditioner_accepts_dual_signature():
     # A callable REQUIRING (v, damping) serves the implicit hook directly:
     # the solver calls it with an explicit ZERO damping. The dual here is
     # diag(1, 25), so v / (diag + damping) at a one-iteration budget is
@@ -3152,17 +3155,17 @@ def test_implicit_preconditioner_accepts_dual_signature():
         iterative_tol=1e-7,
         iterative_maxiter=20,
         dual_preconditioner=dual_preconditioner,
-        implicit_solver="auto",
-        implicit_tol=0.0,
-        implicit_maxiter=1,
+        ad_solver="auto",
+        ad_solver_tol=0.0,
+        ad_solver_maxiter=1,
         geodesic_acceleration=False,
     )
     direct = LevenbergMarquardt(
-        residual, implicit_preconditioner=dual_preconditioner, **common
+        residual, ad_solver_preconditioner=dual_preconditioner, **common
     )
     wrapped = LevenbergMarquardt(
         residual,
-        implicit_preconditioner=lambda v: dual_preconditioner(
+        ad_solver_preconditioner=lambda v: dual_preconditioner(
             v, jnp.asarray(0.0, v.dtype)
         ),
         **common,
@@ -3183,7 +3186,7 @@ def test_implicit_preconditioner_accepts_dual_signature():
     assert jnp.allclose(p_bar, 3.0 + 4.0 / 5.0, atol=1e-6)
 
 
-def test_implicit_preconditioner_arity_edge_cases():
+def test_ad_solver_preconditioner_arity_edge_cases():
     def residual(theta, _, p):
         return jnp.array([theta[0] + 2.0 * theta[1] - p])
 
@@ -3193,7 +3196,7 @@ def test_implicit_preconditioner_arity_edge_cases():
         iterative_tol=1e-7,
         iterative_maxiter=20,
         dual_preconditioner=identity_preconditioner(),
-        implicit_tol=1e-7,
+        ad_solver_tol=1e-7,
     )
 
     # A 1-arg-callable with a defaulted EXTRA argument passes through
@@ -3207,7 +3210,7 @@ def test_implicit_preconditioner_arity_edge_cases():
         return solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).x
 
     solver = LevenbergMarquardt(
-        residual, implicit_preconditioner=one_arg_with_default, **common
+        residual, ad_solver_preconditioner=one_arg_with_default, **common
     )
     _, x_dot = jax.jvp(
         lambda q: solved_x(solver, q), (jnp.asarray(3.0),), (jnp.asarray(0.7),)
@@ -3215,18 +3218,20 @@ def test_implicit_preconditioner_arity_edge_cases():
     assert jnp.allclose(x_dot, jnp.array([0.7 / 5.0, 1.4 / 5.0]), atol=1e-6)
 
     # A jit-wrapped 1-arg callable is accepted unchanged.
-    LevenbergMarquardt(residual, implicit_preconditioner=jax.jit(lambda v: v), **common)
+    LevenbergMarquardt(
+        residual, ad_solver_preconditioner=jax.jit(lambda v: v), **common
+    )
 
     # Zero-argument callables are rejected at construction.
     with pytest.raises(ValueError, match="callable as .v."):
-        LevenbergMarquardt(residual, implicit_preconditioner=lambda: 0, **common)
+        LevenbergMarquardt(residual, ad_solver_preconditioner=lambda: 0, **common)
 
     # pad_dual_preconditioner divides by the live damping; the zero-damping
     # implicit hook rejects it at construction instead of dividing by zero.
     with pytest.raises(ValueError, match="undamped"):
         LevenbergMarquardt(
             residual,
-            implicit_preconditioner=pad_dual_preconditioner(
+            ad_solver_preconditioner=pad_dual_preconditioner(
                 identity_preconditioner(), 1
             ),
             **common,
@@ -3246,7 +3251,7 @@ def test_cg_preconditioned_step_matches_cholesky_identity_step():
         residual_fn,
         init_damping=1e-2,
         linear_solver="gram_cg",
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=40,
         dual_preconditioner=lambda v, damping: v / weights,
@@ -3279,7 +3284,7 @@ def test_cg_preconditioned_update_jits():
         residual_fn,
         init_damping=1e-2,
         linear_solver="gram_cg",
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=40,
         dual_preconditioner=lambda v, damping: v / weights,
@@ -3313,7 +3318,7 @@ def test_cg_preconditioned_geodesic_matches_cholesky():
         residual,
         init_damping=1e-6,
         linear_solver="gram_cg",
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-7,
         iterative_maxiter=10,
         geodesic_acceleration=True,
@@ -3364,7 +3369,7 @@ def test_cg_dual_preconditioner_enables_ill_conditioned_convergence():
         init_damping=1e-6,
         linear_solver="gram_cg",
         iterative_maxiter=3,
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         metric=metric_from_cholesky(L),
     )
     plain = LevenbergMarquardt(
@@ -4110,7 +4115,7 @@ def test_metric_from_state_space_matern_cg_and_preconditioner_smoke():
         init_damping=1e-2,
         linear_solver="gram_cg",
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-10,
         iterative_maxiter=50,
         metric=metric,
@@ -4191,16 +4196,26 @@ def test_metric_from_shifted_matvec_validation_and_solver_requirements():
     metric = metric_from_shifted_matvec(lambda x: 2.0 * x, 1.0)
     with pytest.raises(ValueError, match="inv_sqrt"):
         LevenbergMarquardt(residual_fn, linear_solver="qr", metric=metric)
-    LevenbergMarquardt(residual_fn, metric=metric)
+    # The dense AD rule whitens, so a solve-only metric is rejected unless
+    # the AD solve is pinned to gram_cg (whose metric.solve requirement this
+    # metric satisfies).
+    with pytest.raises(ValueError, match="inv_sqrt"):
+        LevenbergMarquardt(residual_fn, metric=metric)
     LevenbergMarquardt(
         residual_fn,
         linear_solver="gram_cg",
         metric=metric,
         dual_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
     )
     # norm is provided, so geodesic acceleration accepts this metric.
-    LevenbergMarquardt(residual_fn, metric=metric, geodesic_acceleration=True)
+    LevenbergMarquardt(
+        residual_fn,
+        metric=metric,
+        geodesic_acceleration=True,
+        ad_solver="gram_cg",
+        ad_solver_preconditioner=identity_preconditioner(),
+    )
 
 
 @pytest.mark.parametrize("kernel_block", ["dense", "state_space", "matvec"])
@@ -4291,11 +4306,18 @@ def test_shifted_metric_step_matches_closed_form_across_solvers(
     preconditioner_kwargs = (
         {
             "dual_preconditioner": identity_preconditioner(),
-            "implicit_preconditioner": identity_preconditioner(),
+            "ad_solver_preconditioner": identity_preconditioner(),
         }
         if linear_solver == "gram_cg"
         else {}
     )
+    if metric.inv_sqrt is None:
+        # A solve-only metric cannot serve the dense AD rule (it whitens):
+        # pin the gram_cg AD solve.
+        preconditioner_kwargs["ad_solver"] = "gram_cg"
+        preconditioner_kwargs.setdefault(
+            "ad_solver_preconditioner", identity_preconditioner()
+        )
     solver = LevenbergMarquardt(
         residual,
         init_damping=damping,
@@ -4343,11 +4365,19 @@ def test_shifted_metric_implicit_jvp_and_vjp_match_dense():
         preconditioner_kwargs = (
             {
                 "dual_preconditioner": identity_preconditioner(),
-                "implicit_preconditioner": identity_preconditioner(),
+                "ad_solver_preconditioner": identity_preconditioner(),
             }
             if linear_solver == "gram_cg"
             else {}
         )
+        if metric.inv_sqrt is None:
+            # Solve-only composite: the dense AD rule whitens, so pin the
+            # gram_cg AD solve (metric.solve serves it exactly).
+            preconditioner_kwargs["ad_solver"] = "gram_cg"
+            preconditioner_kwargs.setdefault(
+                "ad_solver_preconditioner", identity_preconditioner()
+            )
+            preconditioner_kwargs["ad_solver_tol"] = 1e-8
         solver = LevenbergMarquardt(
             residual,
             init_damping=1e-2,
@@ -4448,7 +4478,7 @@ def test_cg_with_woodbury_spike_preconditioner_matches_cholesky_step():
     cg_solver = LevenbergMarquardt(
         residual,
         linear_solver="gram_cg",
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-8,
         iterative_maxiter=200,
         dual_preconditioner=dual_preconditioner,
@@ -4604,7 +4634,7 @@ def test_cg_nystrom_preconditioner_enables_ill_conditioned_convergence():
         init_damping=1e-6,
         linear_solver="gram_cg",
         iterative_maxiter=3,
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
     )
     plain = LevenbergMarquardt(
         residual, dual_preconditioner=identity_preconditioner(), **common
@@ -4667,7 +4697,7 @@ def test_cg_nystrom_mlp_ntk_example():
         dual_preconditioner=nystrom_preconditioner(
             ntk_matvec, m, 6, jax.random.PRNGKey(54)
         ),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
     )
     cholesky_solver = LevenbergMarquardt(residual, init_damping=1e-2)
 
@@ -4780,7 +4810,7 @@ def test_padded_zero_residual_cg_with_padded_preconditioner():
         iterative_tol=0.0,
         iterative_maxiter=1,
         dual_preconditioner=pad_dual_preconditioner(base_preconditioner, m),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         geodesic_acceleration=False,
     )
     cholesky_solver = LevenbergMarquardt(
@@ -4803,7 +4833,7 @@ def test_padded_zero_residual_cg_with_padded_preconditioner():
         iterative_tol=0.0,
         iterative_maxiter=1,
         dual_preconditioner=base_preconditioner,
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         geodesic_acceleration=False,
     )
     with pytest.raises(ValueError, match="inconsistent size"):
@@ -4849,7 +4879,7 @@ def test_padded_zero_residual_qr_is_rank_deficient():
 
 def test_padded_zero_residual_implicit_ad_is_singular_by_design():
     # Padded rows are zero Jacobian rows, so the UNDAMPED implicit dual
-    # J P J' is singular. With implicit_penalty=0.0 the dense rule keeps the
+    # J P J' is singular. With ad_solver_penalty=0.0 the dense rule keeps the
     # loud unregularized contract (non-finite tangent); the default eps *
     # trace ridge resolves the padding -- a consistent singularity -- to the
     # minimum-metric-norm tangent of the unpadded formulation, with no
@@ -4867,7 +4897,7 @@ def test_padded_zero_residual_implicit_ad_is_singular_by_design():
         residual_padded,
         init_damping=1e-2,
         geodesic_acceleration=False,
-        implicit_penalty=0.0,
+        ad_solver_penalty=0.0,
     )
     padded_default = LevenbergMarquardt(
         residual_padded, init_damping=1e-2, geodesic_acceleration=False
@@ -4917,18 +4947,20 @@ def test_implicit_cg_with_shifted_matvec_metric_matches_dense():
     def residual(theta, _, p):
         return A @ theta - jnp.array([p, 0.5 * p, -p])
 
-    def solved_x(metric, linear_solver, implicit_solver, p):
+    def solved_x(metric, linear_solver, ad_solver, p):
         preconditioner_kwargs = {}
         if linear_solver == "gram_cg":
             preconditioner_kwargs["dual_preconditioner"] = identity_preconditioner()
-        if implicit_solver == "gram_cg":
-            preconditioner_kwargs["implicit_preconditioner"] = identity_preconditioner()
+        if ad_solver == "gram_cg":
+            preconditioner_kwargs["ad_solver_preconditioner"] = (
+                identity_preconditioner()
+            )
         solver = LevenbergMarquardt(
             residual,
             init_damping=1e-2,
             linear_solver=linear_solver,
-            implicit_solver=implicit_solver,
-            implicit_tol=1e-8,
+            ad_solver=ad_solver,
+            ad_solver_tol=1e-8,
             metric=metric,
             iterative_tol=1e-8,
             iterative_maxiter=500,
@@ -4939,11 +4971,9 @@ def test_implicit_cg_with_shifted_matvec_metric_matches_dense():
     p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
     x_bar = jnp.linspace(-1.0, 1.0, n + k)
     _, dense_dot = jax.jvp(
-        lambda q: solved_x(dense, "gram_cholesky", "gram_cholesky", q), (p,), (p_dot,)
+        lambda q: solved_x(dense, "gram_cholesky", "dense", q), (p,), (p_dot,)
     )
-    _, dense_pull = jax.vjp(
-        lambda q: solved_x(dense, "gram_cholesky", "gram_cholesky", q), p
-    )
+    _, dense_pull = jax.vjp(lambda q: solved_x(dense, "gram_cholesky", "dense", q), p)
 
     # cg implicit rule with the matvec metric, under both forward solvers
     # (cholesky forward + cg implicit is the forced-"gram_cg" combination).
@@ -4988,7 +5018,7 @@ def test_implicit_cg_woodbury_preconditioner_with_shifted_metric():
         base_solve, J_beta, (1.0 / eps) * jnp.ones(k)
     )
 
-    def solved_x(implicit_kwargs, p):
+    def solved_x(ad_kwargs_value, p):
         solver = LevenbergMarquardt(
             residual,
             init_damping=1e-2,
@@ -4998,30 +5028,28 @@ def test_implicit_cg_woodbury_preconditioner_with_shifted_metric():
             iterative_maxiter=200,
             metric=metric,
             geodesic_acceleration=False,
-            **implicit_kwargs,
+            **ad_kwargs_value,
         )
         return solver.solve(jnp.zeros(n + k), p=p, max_steps=80, atol=1e-6).x
 
     p, p_dot = jnp.asarray(1.0), jnp.asarray(1.0)
     _, dense_dot = jax.jvp(
-        # implicit_penalty=0.0: the spiked metric puts 1/eps into the dual
+        # ad_solver_penalty=0.0: the spiked metric puts 1/eps into the dual
         # trace, so the trace-scaled default ridge would bias this exact
         # dense reference.
-        lambda q: solved_x(
-            {"implicit_solver": "gram_cholesky", "implicit_penalty": 0.0}, q
-        ),
+        lambda q: solved_x({"ad_solver": "dense", "ad_solver_penalty": 0.0}, q),
         (p,),
         (p_dot,),
     )
     _, spike_dot = jax.jvp(
         lambda q: solved_x(
             {
-                "implicit_solver": "gram_cg",
-                "implicit_tol": 0.0,
-                "implicit_maxiter": 1,
+                "ad_solver": "gram_cg",
+                "ad_solver_tol": 0.0,
+                "ad_solver_maxiter": 1,
                 # A (v, damping) helper passes directly; the implicit hook
                 # calls it with zero damping.
-                "implicit_preconditioner": spike_preconditioner,
+                "ad_solver_preconditioner": spike_preconditioner,
             },
             q,
         ),
@@ -5055,10 +5083,10 @@ def test_implicit_cg_vmap_and_hessian_match_dense():
     def residual(theta, _, p):
         return A @ theta - jnp.array([p, 0.5 * p, -p])
 
-    def solved_x(metric, implicit_solver, p):
+    def solved_x(metric, ad_solver, p):
         preconditioner_kwargs = (
-            {"implicit_preconditioner": identity_preconditioner()}
-            if implicit_solver == "gram_cg"
+            {"ad_solver_preconditioner": identity_preconditioner()}
+            if ad_solver == "gram_cg"
             else {}
         )
         solver = LevenbergMarquardt(
@@ -5066,8 +5094,8 @@ def test_implicit_cg_vmap_and_hessian_match_dense():
             init_damping=1e-2,
             linear_solver="gram_cg",
             dual_preconditioner=identity_preconditioner(),
-            implicit_solver=implicit_solver,
-            implicit_tol=1e-8,
+            ad_solver=ad_solver,
+            ad_solver_tol=1e-8,
             metric=metric,
             iterative_tol=1e-8,
             iterative_maxiter=300,
@@ -5081,7 +5109,7 @@ def test_implicit_cg_vmap_and_hessian_match_dense():
         lambda q: jax.jvp(lambda r: solved_x(composite, "gram_cg", r), (q,), (one,))
     )(ps)
     _, dots_dense = jax.vmap(
-        lambda q: jax.jvp(lambda r: solved_x(dense, "gram_cholesky", r), (q,), (one,))
+        lambda q: jax.jvp(lambda r: solved_x(dense, "dense", r), (q,), (one,))
     )(ps)
     assert jnp.allclose(dots_cg, dots_dense, atol=1e-4)
 
@@ -5089,7 +5117,7 @@ def test_implicit_cg_vmap_and_hessian_match_dense():
         return jnp.sum(solved_x(composite, "gram_cg", q) ** 2)
 
     def loss_dense(q):
-        return jnp.sum(solved_x(dense, "gram_cholesky", q) ** 2)
+        return jnp.sum(solved_x(dense, "dense", q) ** 2)
 
     assert jnp.allclose(
         jax.vmap(jax.grad(loss_cg))(ps), jax.vmap(jax.grad(loss_dense))(ps), atol=1e-3
@@ -5103,9 +5131,9 @@ def test_implicit_cg_vmap_and_hessian_match_dense():
 
 def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
     # J P J' singular with an INCONSISTENT tangent right-hand side: the
-    # unregularized dense rule (implicit_penalty=0.0) NaNs through cho_solve,
+    # unregularized dense rule (ad_solver_penalty=0.0) hits the QR rank guard,
     # and the cg rule's run-to-tolerance default diverges to non-finite as
-    # well. Only a small bounded implicit_maxiter (the exact-preconditioner
+    # well. Only a small bounded ad_solver_maxiter (the exact-preconditioner
     # budget mode) returns a finite -- and wrong -- derivative, which is why
     # that mode is reserved for exact preconditioners. (No ridge can make an
     # inconsistent dual meaningful; the default ridge would return a finite,
@@ -5121,10 +5149,10 @@ def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
     def residual(theta, _, p):
         return A @ theta - p
 
-    def x_dot(implicit_solver, implicit_maxiter):
+    def x_dot(ad_solver, ad_solver_maxiter):
         preconditioner_kwargs = (
-            {"implicit_preconditioner": identity_preconditioner()}
-            if implicit_solver == "gram_cg"
+            {"ad_solver_preconditioner": identity_preconditioner()}
+            if ad_solver == "gram_cg"
             else {}
         )
         solver = LevenbergMarquardt(
@@ -5132,10 +5160,10 @@ def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
             init_damping=1e-2,
             linear_solver="gram_cg",
             dual_preconditioner=identity_preconditioner(),
-            implicit_solver=implicit_solver,
-            implicit_tol=1e-8,
-            implicit_maxiter=implicit_maxiter,
-            implicit_penalty=0.0,
+            ad_solver=ad_solver,
+            ad_solver_tol=1e-8,
+            ad_solver_maxiter=ad_solver_maxiter,
+            ad_solver_penalty=0.0,
             iterative_tol=1e-8,
             iterative_maxiter=100,
             geodesic_acceleration=False,
@@ -5149,7 +5177,7 @@ def test_implicit_cg_rank_deficient_dual_fails_loudly_by_default():
         p_dot = jnp.array([1.0, 0.0, 0.0])
         return jax.jvp(solved_x, (p0,), (p_dot,))[1]
 
-    assert not bool(jnp.all(jnp.isfinite(x_dot("gram_cholesky", None))))
+    assert not bool(jnp.all(jnp.isfinite(x_dot("dense", None))))
     assert not bool(jnp.all(jnp.isfinite(x_dot("gram_cg", None))))
     assert bool(jnp.all(jnp.isfinite(x_dot("gram_cg", 1))))
 

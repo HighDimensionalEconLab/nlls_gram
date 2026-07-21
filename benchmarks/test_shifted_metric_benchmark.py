@@ -168,7 +168,7 @@ def test_shifted_metric_solver_step(benchmark, platform, n, variant, linear_solv
                 "iterative_tol": 1e-8,
                 "iterative_maxiter": 100,
                 "dual_preconditioner": identity_preconditioner(),
-                "implicit_preconditioner": identity_preconditioner(),
+                "ad_solver_preconditioner": identity_preconditioner(),
             }
         )
     if variant == "matvec_cg_woodbury":

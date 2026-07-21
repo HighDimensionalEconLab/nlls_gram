@@ -68,22 +68,22 @@ def normal_cg_kwargs(maxiter=100, tol=1e-7):
     return dict(
         linear_solver="normal_cg",
         normal_preconditioner=identity_preconditioner(),
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=tol,
         iterative_maxiter=maxiter,
     )
 
 
-def implicit_kwargs(implicit_solver):
-    if implicit_solver in ("gram_cg", "normal_cg"):
+def ad_kwargs(ad_solver):
+    if ad_solver in ("gram_cg", "normal_cg"):
         return {
-            "implicit_preconditioner": identity_preconditioner(),
-            "implicit_maxiter": 50,
+            "ad_solver_preconditioner": identity_preconditioner(),
+            "ad_solver_maxiter": 50,
         }
     return {}
 
 
-IMPLICIT_FORMS = ["gram_cholesky", "normal_cholesky", "gram_cg", "normal_cg"]
+AD_FORMS = ["dense", "gram_cg", "normal_cg"]
 
 
 # --- normal_cholesky closed-form steps ---------------------------------------
@@ -187,7 +187,7 @@ def test_normal_cg_step_matches_normal_cholesky(preconditioned):
         exp_residual,
         linear_solver="normal_cg",
         normal_preconditioner=normal_preconditioner,
-        implicit_preconditioner=identity_preconditioner(),
+        ad_solver_preconditioner=identity_preconditioner(),
         iterative_tol=1e-8,
         iterative_maxiter=100,
         **common,
@@ -277,7 +277,7 @@ gram_cg = LevenbergMarquardt(
     residual,
     linear_solver="gram_cg",
     dual_preconditioner=identity_preconditioner(),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
     iterative_tol=1e-12,
     iterative_maxiter=100,
     **common,
@@ -289,7 +289,7 @@ normal_cg = LevenbergMarquardt(
     residual,
     linear_solver="normal_cg",
     normal_preconditioner=identity_preconditioner(),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
     iterative_tol=1e-12,
     iterative_maxiter=100,
     **common,
@@ -401,10 +401,10 @@ def test_old_solver_names_are_unknown():
         LevenbergMarquardt(exp_residual, linear_solver="cholesky")
     with pytest.raises(ValueError, match="unknown linear_solver"):
         LevenbergMarquardt(exp_residual, linear_solver="cg")
-    with pytest.raises(ValueError, match="unknown implicit_solver"):
-        LevenbergMarquardt(exp_residual, implicit_solver="cholesky")
-    with pytest.raises(ValueError, match="unknown implicit_solver"):
-        LevenbergMarquardt(exp_residual, implicit_solver="cg")
+    with pytest.raises(ValueError, match="unknown ad_solver"):
+        LevenbergMarquardt(exp_residual, ad_solver="cholesky")
+    with pytest.raises(ValueError, match="unknown ad_solver"):
+        LevenbergMarquardt(exp_residual, ad_solver="cg")
     with pytest.raises(TypeError, match="dual_solve_dtype"):
         LevenbergMarquardt(exp_residual, dual_solve_dtype=jnp.float64)
 
@@ -444,7 +444,7 @@ def test_normal_preconditioner_required_by_and_exclusive_to_normal_cg():
             exp_residual,
             linear_solver="gram_cg",
             dual_preconditioner=identity_preconditioner(),
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
             iterative_maxiter=30,
             normal_preconditioner=identity_preconditioner(),
         )
@@ -469,24 +469,24 @@ def test_gram_cg_still_requires_dual_preconditioner():
         LevenbergMarquardt(
             exp_residual,
             linear_solver="gram_cg",
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
             iterative_maxiter=30,
         )
 
 
-def test_implicit_preconditioner_requires_cg_resolved_implicit():
-    with pytest.raises(ValueError, match="implicit_preconditioner"):
+def test_ad_solver_preconditioner_requires_cg_resolved_implicit():
+    with pytest.raises(ValueError, match="ad_solver_preconditioner"):
         LevenbergMarquardt(
             exp_residual,
             linear_solver="normal_cholesky",
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
         )
-    with pytest.raises(ValueError, match="implicit_preconditioner"):
+    with pytest.raises(ValueError, match="ad_solver_preconditioner"):
         LevenbergMarquardt(
             exp_residual,
             linear_solver="normal_cholesky",
-            implicit_solver="gram_cholesky",
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver="dense",
+            ad_solver_preconditioner=identity_preconditioner(),
         )
 
 
@@ -539,9 +539,9 @@ try:
     LevenbergMarquardt(
         residual,
         linear_solver="lsmr",
-        implicit_solver="normal_cg",
-        implicit_preconditioner=identity_preconditioner(),
-        implicit_maxiter=30,
+        ad_solver="normal_cg",
+        ad_solver_preconditioner=identity_preconditioner(),
+        ad_solver_maxiter=30,
         iterative_maxiter=30,
         linear_solve_dtype=jnp.float64,
     )
@@ -759,7 +759,7 @@ def test_range_violating_normal_preconditioner_loses_min_norm_selection():
             init_damping=1e-3,
             linear_solver="normal_cg",
             normal_preconditioner=hook,
-            implicit_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
             iterative_tol=0.0,
             iterative_atol=0.0,
             iterative_maxiter=2,
@@ -873,16 +873,16 @@ def test_geodesic_parity_across_forms():
 # --- implicit AD: four forms x three regimes ---------------------------------
 
 
-@pytest.mark.parametrize("implicit_solver", IMPLICIT_FORMS)
-def test_implicit_forms_underdetermined_min_norm(implicit_solver):
+@pytest.mark.parametrize("ad_solver", AD_FORMS)
+def test_implicit_forms_underdetermined_min_norm(ad_solver):
     def residual(theta, _, p):
         return jnp.array([theta[0] + 2.0 * theta[1] - p])
 
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-2,
-        implicit_solver=implicit_solver,
-        **implicit_kwargs(implicit_solver),
+        ad_solver=ad_solver,
+        **ad_kwargs(ad_solver),
     )
     theta0 = jnp.zeros(2)
 
@@ -900,8 +900,8 @@ def test_implicit_forms_underdetermined_min_norm(implicit_solver):
     assert jnp.allclose(p_bar, (3.0 + 2.0 * 4.0) / 5.0, atol=1e-5)
 
 
-@pytest.mark.parametrize("implicit_solver", IMPLICIT_FORMS)
-def test_implicit_forms_square_full_rank_jvp_and_vjp(implicit_solver):
+@pytest.mark.parametrize("ad_solver", AD_FORMS)
+def test_implicit_forms_square_full_rank_jvp_and_vjp(ad_solver):
     # Square nonsingular Jacobian: the ridge -> 0 sensitivity is exactly
     # -J^{-1} J_p p_dot = A^{-1} c p_dot.
     c = jnp.array([1.0, -0.7])
@@ -912,8 +912,8 @@ def test_implicit_forms_square_full_rank_jvp_and_vjp(implicit_solver):
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-2,
-        implicit_solver=implicit_solver,
-        **implicit_kwargs(implicit_solver),
+        ad_solver=ad_solver,
+        **ad_kwargs(ad_solver),
     )
     theta0 = jnp.zeros(2)
 
@@ -933,9 +933,9 @@ def test_implicit_forms_square_full_rank_jvp_and_vjp(implicit_solver):
     assert jnp.allclose(p_bar, w @ dx_dp, atol=1e-4)
 
 
-@pytest.mark.parametrize("implicit_solver", IMPLICIT_FORMS)
+@pytest.mark.parametrize("ad_solver", AD_FORMS)
 def test_implicit_forms_tall_rank_deficient_consistent_min_norm_tangent(
-    implicit_solver,
+    ad_solver,
 ):
     # Interpolation keeps the system consistent for every p (r_p p_dot lies in
     # range(B) by construction), so all four forms return the min-norm tangent
@@ -946,9 +946,9 @@ def test_implicit_forms_tall_rank_deficient_consistent_min_norm_tangent(
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        implicit_solver=implicit_solver,
+        ad_solver=ad_solver,
         geodesic_acceleration=False,
-        **implicit_kwargs(implicit_solver),
+        **ad_kwargs(ad_solver),
     )
     theta0 = jnp.zeros(3)
 
@@ -974,14 +974,14 @@ def test_implicit_normal_cg_reverse_grad_nondiagonal_metric_matches_closed_form(
     def residual(theta, _, p):
         return jnp.array([a @ theta - p])
 
-    def make_solver(implicit_solver):
+    def make_solver(ad_solver):
         return LevenbergMarquardt(
             residual,
             init_damping=1e-2,
             metric=metric_from_cholesky(L3),
             geodesic_acceleration=False,
-            implicit_solver=implicit_solver,
-            **implicit_kwargs(implicit_solver),
+            ad_solver=ad_solver,
+            **ad_kwargs(ad_solver),
         )
 
     def solved_dot_w(solver, p):
@@ -990,17 +990,18 @@ def test_implicit_normal_cg_reverse_grad_nondiagonal_metric_matches_closed_form(
     P = jnp.linalg.inv(L3 @ L3.T)
     direction = P @ a / (a @ P @ a)
     p = jnp.asarray(2.0)
-    grad_dense = jax.grad(lambda q: solved_dot_w(make_solver("normal_cholesky"), q))(p)
+    grad_dense = jax.grad(lambda q: solved_dot_w(make_solver("dense"), q))(p)
     grad_cg = jax.grad(lambda q: solved_dot_w(make_solver("normal_cg"), q))(p)
 
     assert jnp.allclose(grad_dense, w @ direction, atol=1e-4)
     assert jnp.allclose(grad_cg, w @ direction, atol=1e-4)
 
 
-def test_implicit_shape_auto_resolves_by_solution_shape():
-    # A matrix-free forward (lsmr) defers the implicit form to trace time:
-    # eval_shape picks gram on the wide problem and normal on the tall one, and
-    # both must produce the min-norm tangent.
+def test_dense_ad_under_lsmr_produces_min_norm_tangent_at_both_shapes():
+    # A matrix-free forward (lsmr) uses the shape-independent dense AD rule:
+    # the wide and the tall problem both must produce the min-norm tangent
+    # through the same rule (the small-side factorization is a cost choice,
+    # never a semantic one).
     def wide_residual(theta, _, p):
         return jnp.array([theta[0] + 2.0 * theta[1] - p])
 
@@ -1035,8 +1036,8 @@ def test_implicit_shape_auto_resolves_by_solution_shape():
     assert jnp.allclose(x_dot, root, atol=2e-3)
 
 
-def test_implicit_penalty_zero_fails_loudly_on_rank_deficient_normal_cholesky():
-    # implicit_penalty trio on the singular undamped N = B'B: the default None
+def test_ad_solver_penalty_zero_fails_loudly_on_rank_deficient_normal_cholesky():
+    # ad_solver_penalty trio on the singular undamped N = B'B: the default None
     # takes the spectral-filter pseudoinverse (exact min-norm tangent), an
     # explicit positive value factors the trace-scaled ridge (finite, O(penalty)
     # bias), and 0.0 is the unridged solve whose rank guard poisons the tangent
@@ -1044,12 +1045,12 @@ def test_implicit_penalty_zero_fails_loudly_on_rank_deficient_normal_cholesky():
     def residual(theta, _, p):
         return A_RD @ theta - p * B_RD
 
-    def tangent(implicit_penalty):
+    def tangent(ad_solver_penalty):
         solver = LevenbergMarquardt(
             residual,
             init_damping=1e-3,
-            implicit_solver="normal_cholesky",
-            implicit_penalty=implicit_penalty,
+            ad_solver="dense",
+            ad_solver_penalty=ad_solver_penalty,
             geodesic_acceleration=False,
         )
         return jax.jvp(
@@ -1075,15 +1076,15 @@ def make_ridged_normal_cg_solver():
     return LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        implicit_solver="normal_cg",
-        implicit_penalty=1e-4,
-        implicit_preconditioner=identity_preconditioner(),
-        implicit_maxiter=50,
+        ad_solver="normal_cg",
+        ad_solver_penalty=1e-4,
+        ad_solver_preconditioner=identity_preconditioner(),
+        ad_solver_maxiter=50,
         geodesic_acceleration=False,
     )
 
 
-def test_implicit_penalty_positive_normal_cg_tangent_is_linear():
+def test_ad_solver_penalty_positive_normal_cg_tangent_is_linear():
     # The explicit-positive normal_cg ridge is scaled by a Rayleigh quotient
     # over a FIXED probe, not the rhs: an rhs-scaled ridge makes the tangent
     # map T(p_dot) affine-but-not-linear, breaking T(a) + T(b) = T(a + b) and
@@ -1105,7 +1106,7 @@ def test_implicit_penalty_positive_normal_cg_tangent_is_linear():
     assert jnp.allclose(t_b, 0.5 * min_m_norm_root(A_RD, B_RD), atol=5e-3)
 
 
-def test_implicit_penalty_positive_normal_cg_vjp_runs_and_is_finite():
+def test_ad_solver_penalty_positive_normal_cg_vjp_runs_and_is_finite():
     # Reverse mode transposes the tangent map; the rhs-scaled ridge was not
     # linear, so this vjp used to raise NotImplementedError.
     solver = make_ridged_normal_cg_solver()
@@ -1118,7 +1119,7 @@ def test_implicit_penalty_positive_normal_cg_vjp_runs_and_is_finite():
     assert jnp.allclose(grad, min_m_norm_root(A_RD, B_RD) @ w, atol=5e-3)
 
 
-def test_implicit_penalty_positive_normal_cg_zero_seed_gives_zero_tangent():
+def test_ad_solver_penalty_positive_normal_cg_zero_seed_gives_zero_tangent():
     # A zero p_dot must map to an exactly-zero tangent even with the ridge
     # live (the fixed-probe scale is seed-independent, the rhs is zero).
     solver = make_ridged_normal_cg_solver()
@@ -1131,7 +1132,7 @@ def test_implicit_penalty_positive_normal_cg_zero_seed_gives_zero_tangent():
 
 
 def test_default_implicit_tangent_has_no_ridge_bias_float64():
-    # Guard-rail over ALL FOUR implicit forms: implicit_penalty=None must be
+    # Guard-rail over ALL FOUR implicit forms: ad_solver_penalty=None must be
     # the EXACT min-norm tangent (spectral filter / unridged CG). Measured
     # error is ~4e-15 at float64; any hidden default ridge (a 1e-12
     # trace-scaled one biases ~1e-11) fails the 1e-12 bound.
@@ -1153,11 +1154,11 @@ def residual(theta, _, p):
     return A @ theta - p * b
 
 
-def tangent(implicit_solver, **kwargs):
+def tangent(ad_solver, **kwargs):
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        implicit_solver=implicit_solver,
+        ad_solver=ad_solver,
         geodesic_acceleration=False,
         **kwargs,
     )
@@ -1170,13 +1171,12 @@ def tangent(implicit_solver, **kwargs):
 
 expected = 0.5 * root
 cg_kwargs = dict(
-    implicit_preconditioner=identity_preconditioner(),
-    implicit_tol=1e-14,
-    implicit_maxiter=100,
+    ad_solver_preconditioner=identity_preconditioner(),
+    ad_solver_tol=1e-14,
+    ad_solver_maxiter=100,
 )
 for form, kwargs in (
-    ("gram_cholesky", {}),
-    ("normal_cholesky", {}),
+    ("dense", {}),
     ("gram_cg", cg_kwargs),
     ("normal_cg", cg_kwargs),
 ):
@@ -1192,7 +1192,7 @@ for form, kwargs in (
     assert result.returncode == 0, result.stderr + result.stdout
 
 
-def test_implicit_penalty_trio_on_rank_deficient_gram_cholesky():
+def test_ad_solver_penalty_trio_on_rank_deficient_gram_cholesky():
     # The gram trio after the unification, mirroring the normal one: default
     # None takes the spectral-filter pseudoinverse of the singular dual
     # G = J P J' (min-norm tangent), an explicit positive value factors the
@@ -1201,12 +1201,12 @@ def test_implicit_penalty_trio_on_rank_deficient_gram_cholesky():
     def residual(theta, _, p):
         return A_RD @ theta - p * B_RD
 
-    def tangent(implicit_penalty):
+    def tangent(ad_solver_penalty):
         solver = LevenbergMarquardt(
             residual,
             init_damping=1e-3,
-            implicit_solver="gram_cholesky",
-            implicit_penalty=implicit_penalty,
+            ad_solver="dense",
+            ad_solver_penalty=ad_solver_penalty,
             geodesic_acceleration=False,
         )
         return jax.jvp(
@@ -1239,8 +1239,8 @@ def test_gram_penalty_zero_nan_is_the_guard_not_roundoff_on_inconsistent_dual():
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
-        implicit_solver="gram_cholesky",
-        implicit_penalty=0.0,
+        ad_solver="dense",
+        ad_solver_penalty=0.0,
         geodesic_acceleration=False,
     )
     _, t = jax.jvp(

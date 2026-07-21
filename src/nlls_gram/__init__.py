@@ -23,8 +23,8 @@ CG on the whitened normal system in parameter space (normal_cg, required
 normal preconditioner), and LSMR on the whitened subproblem (optional
 WhitenedPreconditioner right-preconditioner), the last staying accurate at
 small damping where the squared Gram/normal solves degrade. The implicit
-differentiation rule is independently swappable across the same gram/normal
-taxonomy via implicit_solver. The solver depends only on JAX.
+differentiation rule is independently swappable via ad_solver ("dense" SVD/QR
+at cond(B), or matrix-free gram_cg/normal_cg). The solver depends only on JAX.
 
 Tuning heuristics (solver selection, damping, inner-solve scheduling):
 https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/
