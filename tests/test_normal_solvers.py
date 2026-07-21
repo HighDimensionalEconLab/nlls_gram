@@ -5,6 +5,7 @@ import textwrap
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
+import numpy as np
 import pytest
 
 from nlls_gram import (
@@ -928,9 +929,10 @@ def test_implicit_forms_square_full_rank_jvp_and_vjp(ad_solver):
     w = jnp.array([0.4, -0.2])
     (p_bar,) = pullback(w)
 
-    assert jnp.allclose(x, dx_dp * p, atol=1e-4)
-    assert jnp.allclose(x_dot, dx_dp * p_dot, atol=1e-4)
-    assert jnp.allclose(p_bar, w @ dx_dp, atol=1e-4)
+    # Measured 6e-8 float32 across all three forms.
+    assert jnp.allclose(x, dx_dp * p, atol=1e-6)
+    assert jnp.allclose(x_dot, dx_dp * p_dot, atol=1e-6)
+    assert jnp.allclose(p_bar, w @ dx_dp, atol=1e-6)
 
 
 @pytest.mark.parametrize("ad_solver", AD_FORMS)
@@ -960,8 +962,10 @@ def test_implicit_forms_tall_rank_deficient_consistent_min_norm_tangent(
     p_dot = jnp.asarray(0.5)
     x, x_dot = jax.jvp(solved_x, (p,), (p_dot,))
 
-    assert jnp.allclose(x, p * root, atol=2e-3)
-    assert jnp.allclose(x_dot, p_dot * root, atol=2e-3)
+    # x is forward-convergence-limited (measured 2.5e-4 at solve atol 1e-6);
+    # the tangent itself is filter/CG-exact (measured <= 8.3e-7 float32).
+    assert jnp.allclose(x, p * root, atol=1e-3)
+    assert jnp.allclose(x_dot, p_dot * root, atol=1e-5)
 
 
 def test_implicit_normal_cg_reverse_grad_nondiagonal_metric_matches_closed_form():
@@ -993,8 +997,9 @@ def test_implicit_normal_cg_reverse_grad_nondiagonal_metric_matches_closed_form(
     grad_dense = jax.grad(lambda q: solved_dot_w(make_solver("dense"), q))(p)
     grad_cg = jax.grad(lambda q: solved_dot_w(make_solver("normal_cg"), q))(p)
 
-    assert jnp.allclose(grad_dense, w @ direction, atol=1e-4)
-    assert jnp.allclose(grad_cg, w @ direction, atol=1e-4)
+    # Measured 3e-8 float32 for both forms.
+    assert jnp.allclose(grad_dense, w @ direction, atol=1e-6)
+    assert jnp.allclose(grad_cg, w @ direction, atol=1e-6)
 
 
 def test_dense_ad_under_lsmr_produces_min_norm_tangent_at_both_shapes():
@@ -1024,7 +1029,8 @@ def test_dense_ad_under_lsmr_produces_min_norm_tangent_at_both_shapes():
         (jnp.asarray(3.0),),
         (jnp.asarray(1.0),),
     )
-    assert jnp.allclose(x_dot, jnp.array([1.0 / 5.0, 2.0 / 5.0]), atol=1e-3)
+    # Measured 4.5e-8 (wide) and 1.7e-6 (tall) float32.
+    assert jnp.allclose(x_dot, jnp.array([1.0 / 5.0, 2.0 / 5.0]), atol=1e-6)
 
     tall = make_solver(tall_residual)
     root = min_m_norm_root(A_RD, B_RD)
@@ -1033,47 +1039,14 @@ def test_dense_ad_under_lsmr_produces_min_norm_tangent_at_both_shapes():
         (jnp.asarray(1.2),),
         (jnp.asarray(1.0),),
     )
-    assert jnp.allclose(x_dot, root, atol=2e-3)
-
-
-def test_ad_solver_penalty_zero_fails_loudly_on_rank_deficient_normal_cholesky():
-    # ad_solver_penalty trio on the singular undamped N = B'B: the default None
-    # takes the spectral-filter pseudoinverse (exact min-norm tangent), an
-    # explicit positive value factors the trace-scaled ridge (finite, O(penalty)
-    # bias), and 0.0 is the unridged solve whose rank guard poisons the tangent
-    # to NaN rather than returning a quiet pseudo-solution.
-    def residual(theta, _, p):
-        return A_RD @ theta - p * B_RD
-
-    def tangent(ad_solver_penalty):
-        solver = LevenbergMarquardt(
-            residual,
-            init_damping=1e-3,
-            ad_solver="dense",
-            ad_solver_penalty=ad_solver_penalty,
-            geodesic_acceleration=False,
-        )
-        return jax.jvp(
-            lambda p: solver.solve(jnp.zeros(3), p=p, max_steps=80, atol=1e-6).x,
-            (jnp.asarray(1.2),),
-            (jnp.asarray(0.5),),
-        )[1]
-
-    expected = 0.5 * min_m_norm_root(A_RD, B_RD)
-    default_tangent = tangent(None)
-    assert bool(jnp.all(jnp.isfinite(default_tangent)))
-    assert jnp.allclose(default_tangent, expected, atol=2e-3)
-    ridged_tangent = tangent(1e-4)
-    assert bool(jnp.all(jnp.isfinite(ridged_tangent)))
-    assert jnp.allclose(ridged_tangent, expected, atol=5e-3)
-    assert not bool(jnp.all(jnp.isfinite(tangent(0.0))))
+    assert jnp.allclose(x_dot, root, atol=2e-5)
 
 
 def make_ridged_normal_cg_solver():
     def residual(theta, _, p):
         return A_RD @ theta - p * B_RD
 
-    return LevenbergMarquardt(
+    solver = LevenbergMarquardt(
         residual,
         init_damping=1e-3,
         ad_solver="normal_cg",
@@ -1082,6 +1055,10 @@ def make_ridged_normal_cg_solver():
         ad_solver_maxiter=50,
         geodesic_acceleration=False,
     )
+    # The three ridge guards below pin the normal_cg Rayleigh-probe ridge; a
+    # silent reroute to the dense rule would void them.
+    assert solver._resolved_ad_solver == "normal_cg"
+    return solver
 
 
 def test_ad_solver_penalty_positive_normal_cg_tangent_is_linear():
@@ -1132,9 +1109,9 @@ def test_ad_solver_penalty_positive_normal_cg_zero_seed_gives_zero_tangent():
 
 
 def test_default_implicit_tangent_has_no_ridge_bias_float64():
-    # Guard-rail over ALL FOUR implicit forms: ad_solver_penalty=None must be
-    # the EXACT min-norm tangent (spectral filter / unridged CG). Measured
-    # error is ~4e-15 at float64; any hidden default ridge (a 1e-12
+    # Guard-rail over all three AD forms: ad_solver_penalty=None must be the
+    # EXACT min-norm tangent (SVD-of-B spectral filter / unridged CG).
+    # Measured error is ~4e-15 at float64; any hidden default ridge (a 1e-12
     # trace-scaled one biases ~1e-11) fails the 1e-12 bound.
     script = r"""
 import jax
@@ -1162,6 +1139,7 @@ def tangent(ad_solver, **kwargs):
         geodesic_acceleration=False,
         **kwargs,
     )
+    assert solver._resolved_ad_solver == ad_solver, ad_solver
     return jax.jvp(
         lambda p: solver.solve(jnp.zeros(3), p=p, max_steps=80, atol=1e-9).x,
         (jnp.asarray(1.2),),
@@ -1192,12 +1170,12 @@ for form, kwargs in (
     assert result.returncode == 0, result.stderr + result.stdout
 
 
-def test_ad_solver_penalty_trio_on_rank_deficient_gram_cholesky():
-    # The gram trio after the unification, mirroring the normal one: default
-    # None takes the spectral-filter pseudoinverse of the singular dual
-    # G = J P J' (min-norm tangent), an explicit positive value factors the
-    # trace-scaled ridge (finite, O(penalty) bias), and 0.0 is the unridged
-    # solve whose rank guard poisons the tangent to NaN.
+def test_ad_solver_penalty_trio_on_rank_deficient_dense():
+    # The one shape-independent dense rule on the singular tall fixture:
+    # default None takes the SVD-of-B spectral-filter pseudoinverse (min-norm
+    # tangent), an explicit positive value solves the small-side augmented QR
+    # [B; sqrt(penalty * trace) I] (finite, O(penalty) bias), and 0.0 is the
+    # plain QR whose |R_ii| rank guard poisons the tangent to NaN.
     def residual(theta, _, p):
         return A_RD @ theta - p * B_RD
 
@@ -1218,19 +1196,30 @@ def test_ad_solver_penalty_trio_on_rank_deficient_gram_cholesky():
     expected = 0.5 * min_m_norm_root(A_RD, B_RD)
     default_tangent = tangent(None)
     assert bool(jnp.all(jnp.isfinite(default_tangent)))
-    assert jnp.allclose(default_tangent, expected, atol=2e-3)
+    # Measured 1.8e-7 float32: the filter default carries no ridge bias.
+    assert jnp.allclose(default_tangent, expected, atol=2e-6)
     ridged_tangent = tangent(1e-4)
     assert bool(jnp.all(jnp.isfinite(ridged_tangent)))
+    # O(penalty) bias against the min-norm tangent, but tight (measured
+    # 2.9e-5) against the float64 analytic ridge it claims to solve.
     assert jnp.allclose(ridged_tangent, expected, atol=5e-3)
+    G64 = np.asarray(A_RD, np.float64).T @ np.asarray(A_RD, np.float64)
+    analytic_ridged = 0.5 * np.linalg.solve(
+        G64 + 1e-4 * np.trace(G64) * np.eye(3),
+        np.asarray(A_RD, np.float64).T @ np.asarray(B_RD, np.float64),
+    )
+    assert np.allclose(
+        np.asarray(ridged_tangent, np.float64), analytic_ridged, atol=3e-4
+    )
     assert bool(jnp.all(jnp.isnan(tangent(0.0))))
 
 
-def test_gram_penalty_zero_nan_is_the_guard_not_roundoff_on_inconsistent_dual():
-    # The integer-valued A_RD makes the undamped dual G EXACTLY singular, and
-    # potrf can round such a matrix through to a finite factorization -- which
-    # on this INCONSISTENT system (c outside range(A_RD), so the tangent rhs
-    # leaves range(G)) would be a silently wrong finite tangent. The rank
-    # guard, not factorization roundoff, must deterministically poison it.
+def test_dense_penalty_zero_nan_is_the_guard_not_roundoff_on_inconsistent_rhs():
+    # The integer-valued A_RD is EXACTLY rank-deficient, yet a factorization
+    # can round it through to a finite solve -- which on this INCONSISTENT
+    # system (c outside range(A_RD), so the tangent rhs leaves the dual's
+    # range) would be a silently wrong finite tangent. The |R_ii| rank guard,
+    # not factorization roundoff, must deterministically poison it.
     c = jnp.array([1.0, 0.0, 0.0, 0.0])
 
     def residual(theta, _, p):
@@ -1249,3 +1238,51 @@ def test_gram_penalty_zero_nan_is_the_guard_not_roundoff_on_inconsistent_dual():
         (jnp.asarray(0.5),),
     )
     assert bool(jnp.all(jnp.isnan(t)))
+
+
+def test_dense_trio_on_wide_rank_deficient_fixture():
+    # The FAT side of the one dense rule (m = 3 < n = 4, rank 2: the
+    # small-side factorization runs on the dual and pushes through, but the
+    # semantics must match the tall side): default None is the exact min-norm
+    # tangent, an explicit penalty matches the analytic ridge exactly --
+    # B'(BB' + penalty tr I)^{-1} = (B'B + penalty tr I)^{-1} B' with the
+    # same trace either side -- and 0.0 is the rank-guard NaN.
+    A_W = A_RD.T
+    b_w = A_W @ jnp.array([1.0, -1.0, 2.0, 0.5])
+
+    def residual(theta, _, p):
+        return A_W @ theta - p * b_w
+
+    def tangent(ad_solver_penalty):
+        solver = LevenbergMarquardt(
+            residual,
+            init_damping=1e-3,
+            ad_solver="dense",
+            ad_solver_penalty=ad_solver_penalty,
+            geodesic_acceleration=False,
+        )
+        return jax.jvp(
+            lambda p: solver.solve(jnp.zeros(4), p=p, max_steps=80, atol=1e-6).x,
+            (jnp.asarray(1.2),),
+            (jnp.asarray(0.5),),
+        )[1]
+
+    default_tangent = tangent(None)
+    assert bool(jnp.all(jnp.isfinite(default_tangent)))
+    # Measured 6e-7 float32 against the exact min-norm tangent.
+    assert jnp.allclose(default_tangent, 0.5 * min_m_norm_root(A_W, b_w), atol=5e-6)
+
+    delta = 1e-4
+    G64 = np.asarray(A_W, np.float64).T @ np.asarray(A_W, np.float64)
+    analytic_ridged = 0.5 * np.linalg.solve(
+        G64 + delta * np.trace(G64) * np.eye(4),
+        np.asarray(A_W, np.float64).T @ np.asarray(b_w, np.float64),
+    )
+    ridged_tangent = tangent(delta)
+    assert bool(jnp.all(jnp.isfinite(ridged_tangent)))
+    # Measured 5.7e-8 float32 against the float64 analytic ridge.
+    assert np.allclose(
+        np.asarray(ridged_tangent, np.float64), analytic_ridged, atol=1e-6
+    )
+
+    assert bool(jnp.all(jnp.isnan(tangent(0.0))))

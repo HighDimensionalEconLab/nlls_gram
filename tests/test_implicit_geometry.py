@@ -63,8 +63,9 @@ def test_tall_augmented_qr_jvp_matches_analytic_and_finite_differences():
 
     solved_x = solved_x_fn(solver)
     x, x_dot = jax.jvp(solved_x, (P0,), (P_DOT,))
-    assert jnp.allclose(x, analytic_tangent(A_TALL, B_TALL + P0), atol=1e-3)
-    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=1e-3)
+    # Measured 1.8e-7 (x) and 2.2e-7 (x_dot) float32 under the SVD/QR rule.
+    assert jnp.allclose(x, analytic_tangent(A_TALL, B_TALL + P0), atol=1e-4)
+    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
 
     # Central finite differences: the problem is linear in p, so a large step
     # has zero truncation error and only solver noise divided by 2 * eps.
@@ -81,8 +82,9 @@ def test_tall_vjp_jvp_dot_product_transpose_identity():
     _, x_dot = jax.jvp(solved_x, (P0,), (P_DOT,))
     _, pullback = jax.vjp(solved_x, P0)
     (p_bar,) = pullback(X_BAR)
+    # Measured 3.7e-6 relative float32.
     assert jnp.allclose(
-        jnp.vdot(X_BAR, x_dot), jnp.vdot(p_bar, P_DOT), rtol=1e-3, atol=1e-4
+        jnp.vdot(X_BAR, x_dot), jnp.vdot(p_bar, P_DOT), rtol=5e-5, atol=1e-6
     )
 
 
@@ -94,7 +96,8 @@ def test_metric_whitened_tall_tangent_is_metric_independent():
     solver = tall_solver(metric=metric)
     assert solver._resolved_ad_solver == "dense"
     _, x_dot = jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))
-    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=1e-3)
+    # Measured 6e-8 float32.
+    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=1e-6)
 
 
 # Rank-deficient tall system: parameter column 2 duplicates column 1, so
@@ -133,15 +136,78 @@ def test_rank_deficient_tall_penalty_regularizes_and_zero_penalty_fails_loudly()
     assert bool(jnp.all(jnp.isfinite(filtered)))
     assert jnp.allclose(filtered[1], filtered[2], atol=1e-5)
 
-    # The opt-in trace-scaled ridge approximates the same minimum-norm
-    # tangent, still splitting evenly across the duplicated parameters; the
-    # augmented-QR solve's conditioning is bounded by the ridge (~1/penalty).
-    regularized = tangent(1e-4)
-    assert bool(jnp.all(jnp.isfinite(regularized)))
-    assert jnp.allclose(regularized[1], regularized[2], atol=1e-4)
+    # The opt-in ridge solves the augmented QR [B; sqrt(penalty * trace) I];
+    # check it against the float64 analytic ridged solution. Resolving an
+    # EXACTLY duplicated column pair against the ridge pivot is a cancellation
+    # at eps32 * sigma_max^2 / (penalty * trace) regardless of factorization
+    # (measured: 5.6e-5 relative at penalty 1e-4, 1.3e-3 at 1e-5, 4.8e-2 at
+    # 1e-6), so this fixture floors near penalty 1e-5 in float32; the
+    # cond(B)-not-cond(B)^2 accuracy of the path itself is pinned on a
+    # generic fixture by test_ridged_dense_tangent_accuracy_scales_with_cond_b.
+    A64 = np.asarray(_A_RANK_DEFICIENT, np.float64)
+    G64 = A64.T @ A64
+    p_dot64 = np.asarray(P_DOT, np.float64)
+
+    def analytic_ridged(penalty):
+        return np.linalg.solve(
+            G64 + penalty * np.trace(G64) * np.eye(N), A64.T @ p_dot64
+        )
+
+    for penalty, tolerance in ((1e-4, 3e-4), (1e-5, 5e-3)):
+        regularized = tangent(penalty)
+        assert bool(jnp.all(jnp.isfinite(regularized)))
+        reference = analytic_ridged(penalty)
+        relative = np.linalg.norm(
+            np.asarray(regularized, np.float64) - reference
+        ) / np.linalg.norm(reference)
+        assert relative < tolerance, (penalty, relative)
 
     unregularized = tangent(0.0)
     assert not bool(jnp.all(jnp.isfinite(unregularized)))
+
+
+def test_ridged_dense_tangent_accuracy_scales_with_cond_b():
+    # Regression for the cond(B)-not-cond(B)^2 contract of the ridged dense
+    # rule: at cond(B) ~ 1e3 and penalty 1e-6 a normal-equations Cholesky
+    # loses eps32 * cond^2 ~ 0.1 of the tangent, while the small-side
+    # augmented QR [B; sqrt(penalty * trace) I] keeps the float32 error at
+    # the eps32 * cond level -- measured 2.2e-6 relative against the float64
+    # analytic ridge.
+    m, n, penalty = 12, 4, 1e-6
+    U, _ = jnp.linalg.qr(jax.random.normal(jax.random.key(0), (m, n)))
+    V, _ = jnp.linalg.qr(jax.random.normal(jax.random.key(1), (n, n)))
+    A = ((U * jnp.logspace(0.0, -3.0, n)) @ V.T).astype(jnp.float32)
+    b = jax.random.normal(jax.random.key(2), (m,), dtype=jnp.float32)
+    p_dot = jax.random.normal(jax.random.key(3), (m,), dtype=jnp.float32)
+
+    def residual(x, args, p):
+        return A @ x - (b + p)
+
+    solver = LevenbergMarquardt(
+        residual,
+        linear_solver="augmented_qr",
+        geodesic_acceleration=False,
+        cache_jacobian=False,
+        ad_solver_penalty=penalty,
+    )
+    x_dot = jax.jvp(
+        lambda p: (
+            solver.solve(jnp.zeros(n, jnp.float32), p=p, max_steps=100, gtol=1e-5).x
+        ),
+        (jnp.zeros(m, jnp.float32),),
+        (p_dot,),
+    )[1]
+
+    A64 = np.asarray(A, np.float64)
+    G64 = A64.T @ A64
+    expected = np.linalg.solve(
+        G64 + penalty * np.trace(G64) * np.eye(n),
+        A64.T @ np.asarray(p_dot, np.float64),
+    )
+    relative = np.linalg.norm(
+        np.asarray(x_dot, np.float64) - expected
+    ) / np.linalg.norm(expected)
+    assert relative < 2e-5, relative
 
 
 A_FAT = jnp.asarray(_rng.normal(size=(2, 4)), dtype=jnp.float32)
@@ -269,7 +335,8 @@ def test_dense_default_tangent_on_inconsistent_tall_matches_analytic():
     # always lies in range(B'B), so the filtered solve is exact).
     solver = tall_solver(ad_solver="dense")
     dense_tangent = jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))[1]
-    assert jnp.allclose(dense_tangent, analytic_tangent(A_TALL, P_DOT), atol=1e-3)
+    # Measured 2.2e-7 float32.
+    assert jnp.allclose(dense_tangent, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
 
 
 def test_lsmr_forward_with_auto_implicit_matches_analytic_tangent():
@@ -287,5 +354,6 @@ def test_lsmr_forward_with_auto_implicit_matches_analytic_tangent():
         return solver.solve(X0, p=p, max_steps=100, gtol=1e-5).x
 
     x, x_dot = jax.jvp(solved_x, (P0,), (P_DOT,))
-    assert jnp.allclose(x, analytic_tangent(A_TALL, B_TALL + P0), atol=1e-3)
-    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=1e-3)
+    # Measured 3e-7 (x) and 2.2e-7 (x_dot) float32.
+    assert jnp.allclose(x, analytic_tangent(A_TALL, B_TALL + P0), atol=1e-4)
+    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
