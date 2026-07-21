@@ -1066,3 +1066,123 @@ def test_implicit_penalty_zero_fails_loudly_on_rank_deficient_normal_cholesky():
     assert bool(jnp.all(jnp.isfinite(ridged_tangent)))
     assert jnp.allclose(ridged_tangent, expected, atol=5e-3)
     assert not bool(jnp.all(jnp.isfinite(tangent(0.0))))
+
+
+def make_ridged_normal_cg_solver():
+    def residual(theta, _, p):
+        return A_RD @ theta - p * B_RD
+
+    return LevenbergMarquardt(
+        residual,
+        init_damping=1e-3,
+        implicit_solver="normal_cg",
+        implicit_penalty=1e-4,
+        implicit_preconditioner=identity_preconditioner(),
+        implicit_maxiter=50,
+        geodesic_acceleration=False,
+    )
+
+
+def test_implicit_penalty_positive_normal_cg_tangent_is_linear():
+    # The explicit-positive normal_cg ridge is scaled by a Rayleigh quotient
+    # over a FIXED probe, not the rhs: an rhs-scaled ridge makes the tangent
+    # map T(p_dot) affine-but-not-linear, breaking T(a) + T(b) = T(a + b) and
+    # homogeneity on exactly this rank-deficient shape.
+    solver = make_ridged_normal_cg_solver()
+    p = jnp.asarray(1.2)
+
+    def T(p_dot):
+        return jax.jvp(
+            lambda q: solver.solve(jnp.zeros(3), p=q, max_steps=80, atol=1e-6).x,
+            (p,),
+            (jnp.asarray(p_dot),),
+        )[1]
+
+    t_a, t_b = T(0.3), T(0.5)
+    assert jnp.allclose(T(0.8), t_a + t_b, rtol=1e-4, atol=1e-5)
+    assert jnp.allclose(T(0.9), 3.0 * t_a, rtol=1e-4, atol=1e-5)
+    # And the ridge stays a small perturbation of the min-norm tangent.
+    assert jnp.allclose(t_b, 0.5 * min_m_norm_root(A_RD, B_RD), atol=5e-3)
+
+
+def test_implicit_penalty_positive_normal_cg_vjp_runs_and_is_finite():
+    # Reverse mode transposes the tangent map; the rhs-scaled ridge was not
+    # linear, so this vjp used to raise NotImplementedError.
+    solver = make_ridged_normal_cg_solver()
+    w = jnp.array([0.4, -0.2, 0.7])
+
+    grad = jax.grad(
+        lambda q: solver.solve(jnp.zeros(3), p=q, max_steps=80, atol=1e-6).x @ w
+    )(jnp.asarray(1.2))
+    assert bool(jnp.isfinite(grad))
+    assert jnp.allclose(grad, min_m_norm_root(A_RD, B_RD) @ w, atol=5e-3)
+
+
+def test_implicit_penalty_positive_normal_cg_zero_seed_gives_zero_tangent():
+    # A zero p_dot must map to an exactly-zero tangent even with the ridge
+    # live (the fixed-probe scale is seed-independent, the rhs is zero).
+    solver = make_ridged_normal_cg_solver()
+    _, t_zero = jax.jvp(
+        lambda q: solver.solve(jnp.zeros(3), p=q, max_steps=80, atol=1e-6).x,
+        (jnp.asarray(1.2),),
+        (jnp.asarray(0.0),),
+    )
+    assert jnp.array_equal(t_zero, jnp.zeros(3))
+
+
+def test_default_implicit_tangent_has_no_ridge_bias_float64():
+    # Guard-rail: implicit_penalty=None must be the EXACT min-norm tangent
+    # (spectral filter / unridged CG). Measured error is ~4e-15 at float64;
+    # any hidden default ridge (a 1e-12 trace-scaled one biases ~1e-11) fails
+    # the 1e-12 bound.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import LevenbergMarquardt, identity_preconditioner
+
+A = jnp.array(
+    [[1.0, 2.0, 3.0], [0.0, 1.0, 1.0], [1.0, 2.0, 3.0], [2.0, 1.0, 3.0]]
+)
+b = A @ jnp.array([1.0, -1.0, 2.0])
+root = jnp.linalg.pinv(A) @ b
+
+
+def residual(theta, _, p):
+    return A @ theta - p * b
+
+
+def tangent(implicit_solver, **kwargs):
+    solver = LevenbergMarquardt(
+        residual,
+        init_damping=1e-3,
+        implicit_solver=implicit_solver,
+        geodesic_acceleration=False,
+        **kwargs,
+    )
+    return jax.jvp(
+        lambda p: solver.solve(jnp.zeros(3), p=p, max_steps=80, atol=1e-9).x,
+        (jnp.asarray(1.2),),
+        (jnp.asarray(0.5),),
+    )[1]
+
+
+expected = 0.5 * root
+t_dense = tangent("normal_cholesky")
+assert jnp.allclose(t_dense, expected, atol=1e-12), t_dense - expected
+t_cg = tangent(
+    "normal_cg",
+    implicit_preconditioner=identity_preconditioner(),
+    implicit_tol=1e-14,
+    implicit_maxiter=100,
+)
+assert jnp.allclose(t_cg, expected, atol=1e-12), t_cg - expected
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
