@@ -256,7 +256,8 @@ A = jnp.array(
 b = A @ jnp.array([1.0, -1.0, 2.0])
 L = jnp.array([[1.5, 0.0, 0.0], [0.4, 1.2, 0.0], [-0.3, 0.2, 0.9]])
 S = jsp_linalg.solve_triangular(L.T, jnp.eye(3), lower=False)
-expected = S @ jnp.linalg.pinv(A @ S) @ b
+B = A @ S
+expected = S @ jnp.linalg.pinv(B) @ b
 
 
 def residual(theta, args, p):
@@ -299,7 +300,9 @@ normal_cg = LevenbergMarquardt(
 theta1, _, _ = normal_cg.update(theta0, normal_cg.init(theta0))
 assert jnp.allclose(theta1, expected, atol=1e-6), ("normal_cg", theta1, expected)
 
-R = jnp.linalg.cholesky(A.T @ A + jnp.eye(3)).T
+# The right-preconditioner acts in the whitened u coordinates, so approximate
+# B.T @ B rather than the unwhitened A.T @ A.
+R = jnp.linalg.cholesky(B.T @ B + jnp.eye(3)).T
 lsmr_common = dict(iterative_tol=1e-14, iterative_atol=0.0, iterative_maxiter=400)
 plain = LevenbergMarquardt(residual, linear_solver="lsmr", **lsmr_common, **common)
 preconditioned = LevenbergMarquardt(
