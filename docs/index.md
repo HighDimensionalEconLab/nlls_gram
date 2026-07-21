@@ -1,8 +1,11 @@
 # nlls_gram
 
 `nlls_gram` provides metric-aware Levenberg-Marquardt nonlinear least-squares for
-JAX pytrees. It is designed for underdetermined or interpolating problems where
-the parameter dimension is often larger than the residual dimension.
+JAX pytrees, aimed at solving systems of equations (i.e., interpolation). The
+core use cases are underdetermined systems — more parameters than residuals —
+where LM is solved in its Gram form, and square or redundant tall nonlinear
+systems where regularization is needed to select among the interpolating
+solutions, with the selection controlled by a user-chosen metric.
 
 The solver is intentionally small: users provide `residual_fn(x, args, p)`,
 and `LevenbergMarquardt` exposes `init()`, `update(...)`, and

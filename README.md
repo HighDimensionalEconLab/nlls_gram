@@ -8,8 +8,11 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
 Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX pytrees, aimed
-at underdetermined or interpolating problems where the number of parameters is
-larger than the number of residuals.
+at solving systems of equations (i.e., interpolation). The core use cases are
+underdetermined systems — more parameters than residuals — where LM is solved
+in its Gram form, and square or redundant tall nonlinear systems where
+regularization is needed to select among the interpolating solutions, with the
+selection controlled by a user-chosen metric.
 
 `LevenbergMarquardt` minimizes a user residual taking
 `(x)`, `(x, args)`, or `(x, args, p)`, always in that order. The unknown `x`
