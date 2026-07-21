@@ -554,15 +554,15 @@ solvers behave as follows:
 - **Implicit AD**: the padded rows make the *undamped* implicit systems
   singular *but consistent* — their `p`-derivative rows are identically
   zero too — which is exactly the singular-but-consistent regime of
-  [the implicit rules](implicit_ad.md#rank-deficiency-and-the-ridge). A
-  `gram_cholesky`-resolved implicit returns the minimum-metric-norm tangent
-  at the documented O(`implicit_penalty`) ridge bias, a
-  `normal_cholesky`-resolved implicit computes it exactly through its
-  default spectral-filter pseudoinverse, and a `normal_cg`-resolved
-  implicit computes it with no ridge in exact arithmetic — on its default
-  unridged path, with the inner CG run to convergence, and either
-  unpreconditioned or with a range-preserving `implicit_preconditioner`
-  (with `implicit_penalty=0.0` the dense rules fail loudly instead). A
+  [the implicit rules](implicit_ad.md#rank-deficiency-and-the-ridge). The
+  dense-resolved rules compute the minimum-metric-norm tangent exactly
+  through their default spectral-filter pseudoinverses, and a
+  `normal_cg`-resolved implicit computes it with no ridge in exact
+  arithmetic — on its default unridged path, with the inner CG run to
+  convergence, and either unpreconditioned or with a range-preserving
+  `implicit_preconditioner` (an opt-in `implicit_penalty` ridge biases at
+  the documented order; an explicit `0.0` fails loudly through the dense
+  rank guard). A
   `gram_cg`-resolved implicit is the
   fragile choice here — run-to-tolerance CG on the singular padded dual —
   and `pad_dual_preconditioner` divides the padded block by the live

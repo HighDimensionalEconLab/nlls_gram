@@ -46,7 +46,9 @@ $$
 
 The Lagrangian \(\tfrac12 s^\top M s + y^\top (J s + r)\) has first-order
 conditions \(M s + J^\top y = 0\), so \(s = -P J^\top y\); imposing the
-constraint gives \(J P J^\top y = r\), and therefore
+constraint gives \(J P J^\top y = r\) (invertible for full-row-rank \(J\);
+the [rank-deficient case](#rank-deficiency) replaces it with a
+pseudoinverse), and therefore
 
 $$
 s_{\mathrm{GN},M} = -P J^\top \left(J P J^\top\right)^{-1} r.

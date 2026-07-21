@@ -43,7 +43,10 @@ resolved at trace time from the concrete shapes. The rule reads shapes, not
 numerical rank — and it does not need to: rank-deficient problems
 (redundant rows, collinear columns — tall interpolation problems always
 have some) are handled by every form except `qr`, with the
-minimum-`M`-norm small-damping selection intact.
+minimum-`M`-norm small-damping selection intact. The flip also never
+changes derivative semantics: both dense implicit defaults apply exact
+spectral-filter pseudoinverses, so the implicit tangent `auto` produces is
+the same whichever form the shapes select.
 
 | situation | use |
 | --- | --- |

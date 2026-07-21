@@ -159,25 +159,27 @@ to the dense shape rule:
 | `normal_cg` | `normal_cg` |
 | `auto`, `qr`, `augmented_qr`, `lsmr` | `gram_cholesky` if \(n > m\), else `normal_cholesky` |
 
-The shape fallback matters structurally: on a square-to-tall problem
-(\(m \ge n\)) the \(m \times m\) dual is singular whenever \(J_\theta\) has
-rank below \(m\) — which rank alone forces for \(m > n\) — so the normal
-forms are the right implicit rules there, and that is what the fallback
-picks.
+The shape fallback picks the smaller factorization, and only that: both
+dense defaults apply exact pseudoinverses, so the resolved form never
+changes the computed tangent (in exact arithmetic). On a square-to-tall
+problem (\(m \ge n\)) the \(m \times m\) dual is structurally singular
+whenever \(J_\theta\) has rank below \(m\) — which rank alone forces for
+\(m > n\) — a case the default spectral filter handles; the \(n \times n\)
+normal form is simply the natural factorization there, and that is what the
+fallback picks.
 
 The four forms:
 
 - **`gram_cholesky`** materializes \(J_\theta^\top\), assembles the
-  \(m \times m\) dual \(J_\theta P J_\theta^\top\), and factors it densely,
-  regularized by the relative ridge described
-  [below](#rank-deficiency-and-the-ridge).
+  \(m \times m\) dual \(G = J_\theta P J_\theta^\top\), and solves it
+  densely — by default through the exact **pseudoinverse** of \(G\) via an
+  `eigh` spectral filter; `implicit_penalty` selects among three behaviors,
+  [described below](#rank-deficiency-and-the-ridge).
 - **`normal_cholesky`** assembles \(B^\top = S^\top J_\theta^\top\)
   (\(n \times m\)) and solves the \(n \times n\) normal system
   \(B^\top B\,\dot u = -B^\top J_p\dot p\), mapping back
-  \(\dot\theta = S\dot u\). By default it applies the exact
-  **pseudoinverse** of \(B^\top B\) through an `eigh` spectral filter —
-  `implicit_penalty` selects among three behaviors,
-  [described below](#rank-deficiency-and-the-ridge).
+  \(\dot\theta = S\dot u\) — the same default pseudoinverse and the same
+  `implicit_penalty` trio as `gram_cholesky`.
 - **`gram_cg`** applies \(y \mapsto J_\theta P J_\theta^\top y\)
   matrix-free using JAX JVP/VJP closures, then solves with CG wrapped in a
   symmetric `jax.lax.custom_linear_solve` — both JVP and VJP of
@@ -257,6 +259,11 @@ parameter space.
 
 ## Rank Deficiency and the Ridge
 
+One invariant holds package-wide: **no default applies any ridge or
+regularization to the implicit tangent solves.** Every ridge is an explicit
+opt-in kwarg with a documented bias, and the primal solve's only
+regularizer is the LM damping itself.
+
 The implicit system is intentionally not damped — damping would change the
 minimum-\(M\)-norm derivative. What happens on a rank-deficient system
 depends on consistency, and interpolation problems produce **consistent**
@@ -266,51 +273,51 @@ linearized systems by construction: differentiating the root identity
 \(J_p\dot p \in \operatorname{range}(J_\theta)\) — redundant rows and
 collinear columns included. The four forms then behave as follows:
 
-- **`gram_cholesky`** adds a relative Tikhonov ridge,
-  `implicit_penalty * trace(J P J') I`, before factorization (default:
-  `implicit_penalty=None`, resolving to `1e-12` for a float64 solve and
-  `1e-6` for float32, after any `linear_solve_dtype` promotion). On a
-  singular-but-consistent dual — redundant residual rows at the returned
-  solution, e.g. a simulated trajectory that has settled onto its steady
-  state — the ridge tangent converges to the minimum-norm tangent as the
-  penalty shrinks, so the default returns the min-norm tangent at an
-  O(`implicit_penalty` · \(m\)) relative bias instead of a NaN. A ridge is
-  compatible with min-norm accuracy here because the composition ends in
-  \(J_\theta^\top\), which annihilates dual-null factorization noise. The
-  default constants are empirical: for near-duplicate float64 rows the
-  factorization-noise floor sits below `1e-14` and visible tangent bias
-  above `~1e-6`, so the default is orders of magnitude from both edges.
-  The trade-off is visibility: on a genuinely *inconsistent* singular dual
-  the ridge returns a finite, penalty-inflated tangent where an
-  unregularized rule fails loudly. Pass `implicit_penalty=0.0` for the
-  exact unridged factorization (non-finite on any singular dual).
-- **`normal_cholesky`** treats `implicit_penalty` as a trio of behaviors,
-  because no ridge can serve as *its* default: this rule ends in \(S\),
-  with no \(J_\theta^\top\)-style cleanup, so a ridge \(\delta\) leaves an
-  error floor of order \(\mathrm{eps}/\delta + \delta\) along
-  \(\ker B\) — minimized at \(\sim\sqrt{\mathrm{eps}}\), provably short of
-  min-norm-tangent accuracy. The default `None` therefore applies the exact
-  **pseudoinverse** of \(B^\top B\) by an `eigh` spectral filter at the
-  standard \(n \cdot \mathrm{eps} \cdot \lambda_{\max}\) rank cutoff:
-  exact Gauss-Newton sensitivity at full column rank (square nonsingular:
-  \(-J_\theta^{-1}J_p\dot p\)), the minimum-\(M\)-norm tangent for
-  consistent rank-deficient systems, with no ridge bias in either. Genuine
-  eigenvalues below the cutoff are treated as rank-deficient — standard
-  pseudoinverse semantics. The filter sits inside a symmetric
-  `custom_linear_solve`, so higher-order AD re-applies the solve to new
-  right-hand sides and never differentiates `eigh` itself (whose
-  derivative rule breaks on exactly the repeated-zero spectra this path
-  exists for). That re-application drops the derivative of the range
-  projector, which rotates when the active subspace moves with the
-  differentiation point — higher-order derivatives through the filtered
-  solve are exact only while the active subspace is locally constant. An explicitly *positive* `implicit_penalty` opts into the
-  trace-scaled ridge `B'B + implicit_penalty * trace(B'B) I` —
-  O(`implicit_penalty` · \(n\)) bias, smooth in the spectrum for
-  higher-order AD on nearly-degenerate problems. An explicit `0.0` demands
-  the unridged Cholesky, guarded by a deterministic pivot-based rank check
-  that poisons the tangent to NaN on rank deficiency — without the guard
-  an exactly-zero pivot can round into a finite answer silently shifted
-  along \(\ker B\).
+- **The dense rules** (`gram_cholesky`, `normal_cholesky`) share one
+  `implicit_penalty` contract with three behaviors:
+    - **Default `None` — the exact pseudoinverse** of the resolved matrix,
+      by an `eigh` spectral filter at the standard rank cutoff:
+      \(G = J_\theta P J_\theta^\top\) at
+      \(m \cdot \mathrm{eps} \cdot \lambda_{\max}\), or \(B^\top B\) at
+      \(n \cdot \mathrm{eps} \cdot \lambda_{\max}\). This is the exact
+      Gauss–Newton sensitivity at full rank (square nonsingular:
+      \(-J_\theta^{-1}J_p\dot p\)) and the minimum-\(M\)-norm tangent for
+      consistent rank-deficient systems, with no ridge bias in either.
+      The cutoff is a numerical rank threshold, not an algebraic
+      certificate: genuine eigenvalues below it are silently treated as
+      rank-deficient — standard pseudoinverse semantics — so promote with
+      `linear_solve_dtype` or set an explicit penalty when tiny
+      eigenvalues are real. The filter sits inside a symmetric
+      `custom_linear_solve`, so higher-order AD re-applies the solve to
+      new right-hand sides and never differentiates `eigh` itself (whose
+      derivative rule breaks on exactly the repeated-zero spectra this
+      path exists for). That re-application drops the derivative of the
+      range projector, which rotates when the active subspace moves with
+      the differentiation point — higher-order derivatives through the
+      filtered solve are exact only while the active subspace is locally
+      constant.
+    - **An explicitly positive `implicit_penalty` — the trace-scaled
+      ridge** `+ implicit_penalty * trace(·) I`, Cholesky-factored: smooth
+      in the spectrum for higher-order AD on nearly-degenerate problems,
+      at an O(`implicit_penalty` · \(m\)) (Gram) or
+      O(`implicit_penalty` · \(n\)) (normal) relative bias on consistent
+      systems, and a penalty-inflated finite tangent on genuinely
+      *inconsistent* singular ones. In the Gram form the ridge is
+      additionally kernel-safe: the composition ends in
+      \(PJ_\theta^\top\), which annihilates dual-null factorization noise.
+      The normal form has no such cleanup — its trailing \(S\) passes
+      \(\ker B\) noise through, adding an
+      \(\mathrm{eps}/\delta + \delta\) error floor along \(\ker B\)
+      (minimized at \(\sim\sqrt{\mathrm{eps}}\)) on top of the bias, which
+      is the structural reason a ridge could never serve as a default.
+      Typical ridge values are `1e-12` for a float64 solve and `1e-6` for
+      float32: empirical constants sitting orders of magnitude above the
+      near-duplicate-row factorization-noise floor (below `1e-14` in
+      float64) and below visible tangent bias (`~1e-6`).
+    - **An explicit `0.0` — the exact unridged Cholesky**, guarded by a
+      deterministic pivot-based rank check that poisons the tangent to NaN
+      on rank deficiency — without the guard an exactly-zero pivot can
+      round into a finite answer silently shifted along the null space.
 - **`gram_cg`** ignores `implicit_penalty` entirely: its run-to-tolerance
   default produces non-finite derivatives on a singular dual (loud), while
   a small bounded `implicit_maxiter` returns a finite — and wrong —
@@ -319,30 +326,35 @@ collinear columns included. The four forms then behave as follows:
 - **`normal_cg`** is exact by default: no ridge, and its range-preserving
   Krylov iteration converges to the min-norm tangent on
   singular-but-consistent systems anyway. A matrix-free ridge is added only
-  when `implicit_penalty` is passed explicitly positive (its scale set by
+  when `implicit_penalty` is passed explicitly positive, its scale set by
   a Rayleigh quotient of \(B^\top B\) over a fixed deterministic probe
-  vector, so the tangent map stays linear in the seed) — an opt-in
-  stabilizer for systems where floating-point drift, not rank, is the
-  issue. The default stays exact rather than silently biased.
+  vector — which keeps the tangent map linear in \(\dot p\) and the ridge
+  alive on a zero tangent — an opt-in stabilizer for systems where
+  floating-point drift, not rank, is the issue. The default stays exact
+  rather than silently biased.
 
 **Gauss–Newton semantics on inconsistent systems.** When the returned
 point is a least-squares stationary point with nonzero residual rather than
 an exact root, \(J_p\dot p\) need not lie in
-\(\operatorname{range}(J_\theta)\). The normal equations
+\(\operatorname{range}(J_\theta)\). The default rules still return a finite
+answer — the minimum-\(M\)-norm **Gauss–Newton sensitivity of the
+linearized system** — and they agree on it: the normal equations
 \(B^\top B\dot u = -B^\top J_p\dot p\) are consistent regardless (any
-\(B^\top\)-image is), so the normal forms return a finite answer: the
-minimum-\(M\)-norm **Gauss–Newton sensitivity of the linearized system**.
-That is *not* the exact optimizer sensitivity — the exact derivative of a
-nonzero-residual stationary point carries residual-weighted
-second-derivative (curvature) terms that the frozen-Jacobian system drops.
-A one-line counterexample: \(r(x, p) = (x - p,\ x^2 - 1)\) at the
-stationary point \(x = 0.5\), \(p = -0.25\) has exact sensitivity
-\(dx/dp = 2\), while the Gauss–Newton normal system gives \(0.5\). The
-implicit rules are exact at interpolating (zero-residual) roots — the
-package's target — and Gauss–Newton approximations away from them. The
-Gram forms don't even get that far: their dual system is
-singular-inconsistent there, giving a ridge-inflated finite tangent
-(`gram_cholesky`) or a loud failure (`gram_cg`).
+\(B^\top\)-image is), and the dense pseudoinverses coincide through the
+identities \(B^\top(BB^\top)^{+} = (B^\top B)^{+}B^\top = B^{+}\), so the
+Gram and normal filtered solves compute the same tangent even on an
+inconsistent right-hand side. That tangent is *not* the exact optimizer
+sensitivity — the exact derivative of a nonzero-residual stationary point
+carries residual-weighted second-derivative (curvature) terms that the
+frozen-Jacobian system drops. A one-line counterexample:
+\(r(x, p) = (x - p,\ x^2 - 1)\) at the stationary point \(x = 0.5\),
+\(p = -0.25\) has exact sensitivity \(dx/dp = 2\), while the Gauss–Newton
+normal system gives \(0.5\). The implicit rules are exact at interpolating
+(zero-residual) roots — the package's target — and Gauss–Newton
+approximations away from them. The non-default modes differ: an opt-in
+ridge returns a penalty-inflated finite tangent in either dense form, and
+`gram_cg` fails loudly (its Krylov solve faces the singular-inconsistent
+dual).
 
 Self-adjointness of \(P\) is all the Gram forms need from `metric.solve`:
 the final \(P J_\theta^\top y\) application acts on tangent data, and its

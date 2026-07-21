@@ -941,51 +941,51 @@ class LevenbergMarquardt:
     tangent, and a supplied hook must preserve ``range(B')`` exactly like
     ``normal_preconditioner``.
 
-    ``implicit_penalty`` regularizes the dense implicit rules (the cg rules
-    run exact and unridged by default). Its meaning follows the resolved
-    form:
+    ``implicit_penalty`` selects how a singular implicit system is handled.
+    The default never regularizes, anywhere in the package:
 
-    - gram_cholesky: the implicit dual is factored as
-      ``J P J' + implicit_penalty * trace(J P J') I_m``. Redundant residual
-      rows at the returned solution -- e.g. a simulated trajectory settled
-      onto its steady state -- make the undamped dual singular and the
-      unregularized factorization non-finite; for such consistent systems
-      the ridge returns the minimum-norm tangent with an
-      O(``implicit_penalty * m``) relative bias. The default ``None``
-      resolves to ``1e-12`` for a float64 dual solve and ``1e-6`` for
-      float32 (after any ``linear_solve_dtype`` promotion).
-    - normal_cholesky: the default ``None`` applies the pseudoinverse of the
-      undamped ``B'B`` by an eigh spectral filter at the standard
-      ``n * eps * lambda_max`` rank cutoff -- exact Gauss-Newton sensitivity
-      at full column rank (square nonsingular: ``-J^{-1} J_p p_dot``), the
-      minimum-``M``-norm tangent for consistent rank-deficient systems, with
-      no ridge bias in either. The cutoff is a NUMERICAL rank threshold,
-      not an algebraic certificate: an ill-conditioned but genuinely
-      full-rank spectrum whose smallest eigenvalue falls under
-      ``n * eps * lambda_max`` (float32 ``diag(1, eps)``) has that direction
-      silently treated as rank-deficient -- promote with
+    - Default ``None``, both dense forms: the exact spectral-filter
+      pseudoinverse of the factored operator -- the ``m x m`` dual
+      ``J P J'`` under gram_cholesky, the ``n x n`` whitened normal matrix
+      ``B'B`` under normal_cholesky -- by eigh at the standard
+      ``dim * eps * lambda_max`` rank cutoff. That is the exact Gauss-Newton
+      sensitivity at full rank (square nonsingular: ``-J^{-1} J_p p_dot``)
+      and the exact minimum-``M``-norm tangent for consistent rank-deficient
+      systems (redundant residual rows at the returned solution -- e.g. a
+      simulated trajectory settled onto its steady state -- or collinear
+      columns), with no ridge bias in either. The cutoff is a NUMERICAL
+      rank threshold, not an algebraic certificate: an ill-conditioned but
+      genuinely full-rank spectrum whose smallest eigenvalue falls under
+      ``dim * eps * lambda_max`` (float32 ``diag(1, eps)``) has that
+      direction silently treated as rank-deficient -- promote with
       ``linear_solve_dtype`` or set an explicit penalty when tiny
       eigenvalues are real. Higher-order AD re-solves the differentiated
       equation through the frozen filter, which omits the derivative of the
-      range projector: second derivatives are exact only while the active
-      subspace does not rotate with ``p``; on rank-deficient problems whose
-      range moves, they carry a first-order-only guarantee. An explicitly
-      positive value opts into the trace-scaled ridge
-      ``B'B + implicit_penalty * trace(B'B) I_n``
-      (O(``implicit_penalty * n``) bias, smooth in the spectrum for
-      higher-order AD on nearly-degenerate problems).
-    - normal_cg: an explicitly positive value adds a matrix-free ridge
-      scaled by a Rayleigh quotient of ``B'B`` over a fixed deterministic
-      probe vector, keeping the tangent map linear in ``p_dot`` and the
-      ridge alive on a zero tangent.
+      range projector: in both dense forms second derivatives are exact
+      only while the active subspace does not rotate with ``p``; on
+      rank-deficient problems whose range moves, they carry a
+      first-order-only guarantee.
+    - Explicitly positive, dense forms: a trace-scaled Tikhonov ridge on
+      the factored operator (``+ implicit_penalty * trace I``),
+      cho-factored -- minimum-``M``-norm tangent for consistent systems
+      with an O(``implicit_penalty * dim``) relative bias, smooth in the
+      spectrum for higher-order AD on nearly-degenerate problems. In the
+      gram form the trailing ``P J'`` application annihilates dual-null
+      factorization noise, so the ridge is kernel-safe there;
+      ``implicit_penalty=1e-12`` (float64 solves) / ``1e-6`` (float32)
+      restores that form's former default ridge.
+    - Explicitly positive, normal_cg: a matrix-free ridge scaled by a
+      Rayleigh quotient of ``B'B`` over a fixed deterministic probe vector,
+      keeping the tangent map linear in ``p_dot`` and the ridge alive on a
+      zero tangent.
 
     In every form ``0.0`` demands the exact unregularized solve, which fails
     loudly (non-finite tangents) on a singular operator rather than silently
-    selecting a particular solution; the normal_cholesky guard enforcing
-    that shares the numerical-rank caveat above (a cho pivot is not a rank
-    certificate either, so a genuinely tiny pivot is poisoned the same way).
-    A solution with ``J = 0`` zeroes every trace-scaled ridge itself and
-    fails just as loudly at any penalty.
+    selecting a particular solution; the dense guards enforcing that share
+    the numerical-rank caveat above (a cho pivot is not a rank certificate
+    either, so a genuinely tiny pivot is poisoned the same way). A solution
+    with ``J = 0`` zeroes every trace-scaled ridge itself and fails just as
+    loudly at any penalty.
 
     ``linear_solve_dtype=jnp.float64`` promotes the dense linear-solve
     pipelines -- the forward ``gram_cholesky``/``normal_cholesky`` (and
@@ -2718,28 +2718,71 @@ class LevenbergMarquardt:
         transposed_jacobian = Jt.astype(implicit_dtype)
         gram_step_left = metric_inverse(transposed_jacobian)
         gram = transposed_jacobian.T @ gram_step_left
-        # Tikhonov ridge scaled by the trace: redundant residual rows at the
-        # returned solution (e.g. a simulated trajectory settled onto its steady
-        # state) make the undamped dual singular and the factorization non-finite;
-        # for such consistent systems the ridge returns the minimum-norm tangent
-        # with an O(implicit_penalty * m) relative bias. The defaults sit orders
-        # of magnitude from both empirical edges (see the redundant-rows tests):
-        # near-duplicate float64 rows need > ~1e-14 to factor while visible
-        # tangent bias starts above ~1e-6, and the float32 value stays below the
-        # library's float32 tangent tolerances while dominating float32 assembly
-        # noise. implicit_penalty=0.0 disables (non-finite on a singular dual).
+        dual_rhs = residual_p_dot.astype(implicit_dtype)
         penalty = self.implicit_penalty
         if penalty is None:
-            penalty = (
-                1e-12 if jnp.dtype(implicit_dtype) == jnp.dtype(jnp.float64) else 1e-6
+            # Default: apply G^+ (G = J P J', the undamped dual) by an eigh
+            # spectral filter at the standard m * eps * lambda_max rank
+            # cutoff, the same unregularized-by-default trio as the
+            # normal_cholesky rule. Redundant residual rows at the returned
+            # solution (e.g. a simulated trajectory settled onto its steady
+            # state) make G singular; for such consistent systems
+            # -P J' G^+ (r_p p_dot) is the exact minimum-M-norm tangent with
+            # no ridge bias, at eps * cond(active spectrum) accuracy. Inside
+            # a symmetric custom_linear_solve so higher-order AD re-applies
+            # the filter and never differentiates eigh, whose derivative
+            # rule breaks on the degenerate spectra this path exists for.
+            eigenvalues, eigenvectors = jnp.linalg.eigh(gram)
+            cutoff = (
+                gram.shape[0]
+                * jnp.asarray(
+                    np.finfo(jnp.dtype(implicit_dtype)).eps, dtype=implicit_dtype
+                )
+                * eigenvalues[-1]
             )
-        gram = gram + penalty * jnp.trace(gram) * jnp.eye(
-            gram.shape[0], dtype=implicit_dtype
-        )
-        factor = jsp_linalg.cho_factor(gram)
-        dual_solution = jsp_linalg.cho_solve(
-            factor, residual_p_dot.astype(implicit_dtype)
-        )
+            inverse_eigenvalues = jnp.where(
+                eigenvalues > cutoff, 1.0 / eigenvalues, 0.0
+            )
+
+            def pinv_solve(_, rhs_value):
+                return eigenvectors @ (
+                    inverse_eigenvalues * (eigenvectors.T @ rhs_value)
+                )
+
+            dual_solution = jax.lax.custom_linear_solve(
+                lambda v: gram @ v,
+                dual_rhs,
+                pinv_solve,
+                symmetric=True,
+            )
+        else:
+            # An explicit implicit_penalty opts into the trace-scaled
+            # Tikhonov ridge, cho-factored: minimum-M-norm tangent for
+            # consistent systems with an O(implicit_penalty * m) relative
+            # bias, smooth in the spectrum for any AD order -- and
+            # kernel-safe in this form, since the trailing P J' application
+            # annihilates dual-null factorization noise. 0.0 is the exact
+            # unridged factorization with the deterministic pivot guard: an
+            # exactly zero pivot can round into a finite particular
+            # solution (correct for consistent systems after the P J'
+            # cleanup, silently wrong for inconsistent ones), so the loud
+            # contract is enforced explicitly.
+            ridged = gram + penalty * jnp.trace(gram) * jnp.eye(
+                gram.shape[0], dtype=implicit_dtype
+            )
+            factor = jsp_linalg.cho_factor(ridged)
+            dual_solution = jsp_linalg.cho_solve(factor, dual_rhs)
+            if penalty == 0:
+                pivots_sq = jnp.diagonal(factor[0]) ** 2
+                cutoff = (
+                    gram.shape[0]
+                    * jnp.asarray(
+                        np.finfo(jnp.dtype(implicit_dtype)).eps, dtype=implicit_dtype
+                    )
+                    * jnp.max(pivots_sq)
+                )
+                singular = jnp.any(~(pivots_sq > cutoff))
+                dual_solution = jnp.where(singular, jnp.nan, dual_solution)
         theta_dot = -gram_step_left @ dual_solution
         return unravel(theta_dot.astype(residual.dtype))
 
@@ -2857,11 +2900,11 @@ class LevenbergMarquardt:
         if penalty is None:
             # Default: apply N^+ (N = B'B undamped, B = J S) by an eigh
             # spectral filter at the standard n * eps * lambda_max rank
-            # cutoff. Unlike the gram rule, no ridge can serve here: the gram
-            # composition ends in J', which annihilates dual-null
-            # factorization noise, while this rule ends in S with no such
-            # cleanup, so a ridged cho_solve floors at eps/ridge + ridge ~
-            # sqrt(eps) in ker(B). The filter zeroes ker(B) exactly instead:
+            # cutoff. No ridge default could serve here: this composition
+            # ends in S with no kernel cleanup (unlike the gram form's
+            # trailing P J'), so a ridged cho_solve floors at
+            # eps/ridge + ridge ~ sqrt(eps) in ker(B). The filter zeroes
+            # ker(B) exactly instead:
             # exact GN sensitivity at full column rank (square nonsingular:
             # -J^{-1} J_p p_dot), the minimum-M-norm tangent for consistent
             # rank-deficient systems (interpolation puts r_p p_dot in
