@@ -259,7 +259,7 @@ class MultiStartInfo:
 
     ``attempt`` is the winning attempt/lane index (0 = the caller's
     ``(x0, args)``), ``accepted`` whether the winner passed the success test
-    (``MultiStart.accept``, or ``status == LMStatus.CONVERGED``), and
+    (``MultiStart.accept``, or the solve's ``max_steps_is_success`` policy), and
     ``attempts_run`` how many starts were solved (sequential mode stops at the
     first success; parallel mode always runs ``num_starts``). ``loss`` is the
     ranking loss selection used: the sum of squared residuals at the returned
@@ -282,8 +282,9 @@ class MultiStart:
     condition; it must be traceable and type-stable (returning the same pytree
     structure, shapes, and dtypes as its ``(x, args)`` inputs). ``accept(key,
     result) -> bool`` optionally overrides the success test (default:
-    ``result.status == LMStatus.CONVERGED``); it receives its own key so it can
-    draw fresh validation data, and may return any scalar boolean-like value.
+    ``CONVERGED`` plus ``MAX_STEPS`` when the solve's
+    ``max_steps_is_success=True``); it receives its own key so it can draw fresh
+    validation data, and may return any scalar boolean-like value.
     Sequential mode (``parallel=False``) solves from ``(x0, args)`` and retries
     on failure, chaining each attempt's *initial* values into the next
     ``draw``; parallel mode solves all ``num_starts`` lanes under ``vmap``
@@ -1003,6 +1004,18 @@ class LevenbergMarquardt:
     explicit ``normal_cg`` AD solve stays fully matrix-free, while a square
     algebraic root gets the inexpensive direct solve even when its forward
     solver is CG.
+
+    Implicit AD is defined for ``LMStatus.CONVERGED`` and, by the forgiving
+    default, ``LMStatus.MAX_STEPS``. Pass ``max_steps_is_success=False`` to
+    treat exhaustion as failure instead. A failed result keeps its primal data
+    and diagnostics but returns exact zero tangents for ``result.x`` and
+    ``result.aux``; ``result.p`` remains an identity pass-through. The failed
+    lane's linear tangent program uses stop-gradient copies of the caller's
+    original ``(x0, args, p)``. Those values must be JVP-safe for the residual
+    and aux map, plus any ``MetricFactory`` or ``PreconditionerFactory``
+    consumed by the resolved AD method. A selected multi-start winner that
+    fails this AD policy uses the caller's original initial point, not a drawn
+    retry, regardless of the custom acceptance result.
 
     A ``gram_cg`` AD solve requires ``ad_solver_preconditioner``, an
     approximation of the UNDAMPED ``(J P J')^{-1} v``, taking either ``(v)``
@@ -2307,6 +2320,7 @@ class LevenbergMarquardt:
         p=None,
         lm_state=None,
         max_steps=256,
+        max_steps_is_success=True,
         atol=0.0,
         gtol=0.0,
         xtol=0.0,
@@ -2314,20 +2328,27 @@ class LevenbergMarquardt:
         user_state=None,
         save_steps=False,
         multi_start=None,
-        failure_ad_reference=None,
         jit=True,
     ):
         """Run repeated LM updates until a stopping rule fires.
 
         Parameters are the same as ``update`` plus loop controls. ``max_steps``
-        is always enforced. ``atol`` stops when the residual norm is below the
+        is always enforced. ``max_steps_is_success=True`` (the default) treats
+        ``LMStatus.MAX_STEPS`` as a usable result for implicit AD and the
+        default multi-start acceptance policy while preserving the
+        ``MAX_STEPS`` status for diagnostics. Set it to ``False`` for strict
+        failure semantics. ``atol`` stops when the residual norm is below the
         threshold, ``gtol`` when the gradient norm ``||J' r||`` is below the
         threshold, and ``xtol`` when an accepted step has norm below the
         threshold; each tolerance set to ``0`` disables that check, and all
         three report ``LMStatus.CONVERGED``. ``callback`` receives an
         ``LMSolveContext`` after each step and may return an ``LMSolveAction``
         to stop or to override x/lm_state/args/user_state. ``p`` is passed to
-        the residual and callback but cannot be replaced by the action.
+        the residual and callback but cannot be replaced by the action. A
+        callback that installs an invalid ``x`` or ``args`` must also stop with
+        a failed status such as ``LMStatus.NONFINITE``; otherwise a final-step
+        replacement is legitimately reported as ``MAX_STEPS`` and follows the
+        configured success policy.
         ``save_steps=True`` records the full iterate history onto the result:
         ``x_history`` stacks x0 and every kept post-step iterate along a
         ``(max_steps + 1)`` leading axis (rows beyond ``steps`` are zero
@@ -2351,18 +2372,19 @@ class LevenbergMarquardt:
         same implicit rule as a plain solve. With ``multi_start=None``
         nothing changes.
 
-        ``failure_ad_reference=(x_ref, args_ref, p_ref)`` optionally supplies a
-        domain-safe point for implicit AD when the returned status is not
-        ``LMStatus.CONVERGED``. It must match the structures, shapes, and
-        dtypes of ``(x0, args, p)``. The primal result is never replaced. A
-        failed lane receives a zero tangent, linearized at the reference so a
-        nonfinite failed iterate cannot poison successful lanes under
-        ``vmap``/VJP. The reference itself is differentiation-inert. Callers
-        are responsible for choosing a point where the residual and any
-        metric factory are well-defined.
+        Implicit AD uses ``LMStatus.CONVERGED`` and also ``LMStatus.MAX_STEPS``
+        when ``max_steps_is_success=True``. Every failed status receives zero
+        tangents for ``result.x`` and ``result.aux``. To keep automatic VJP
+        transposition finite under ``vmap``, the failed lane's linear tangent
+        program is evaluated at differentiation-inert copies of the original
+        ``(x0, args, p)``. Those initial values must be valid for JVP evaluation
+        of the residual, aux map, and any metric or preconditioner factory that
+        the resolved AD method consumes. The primal failed result is never
+        replaced.
         """
         self._check_residual_args(args, p)
-        _check_failure_ad_reference(x0, args, p, failure_ad_reference)
+        if not isinstance(max_steps_is_success, bool):
+            raise TypeError("max_steps_is_success must be a bool")
         if max_steps <= 0:
             raise ValueError("max_steps must be positive")
         # Tolerances are traced data inside the loop, so vmapped/traced values
@@ -2408,7 +2430,14 @@ class LevenbergMarquardt:
             # identity-hashing wrapper (hash/eq by the wrapped function, so
             # repeat calls still share the compilation).
             draw = _hashable_hook(multi_start.draw if num_starts > 1 else None)
-            accept = _hashable_hook(multi_start.accept)
+            default_accept = (
+                _accept_converged_or_max_steps
+                if max_steps_is_success
+                else _accept_converged
+            )
+            accept = _hashable_hook(
+                default_accept if multi_start.accept is None else multi_start.accept
+            )
             parallel = multi_start.parallel and num_starts > 1
             if draw is not None and jit:
                 # Abstract trace only (no RNG, no FLOPs): fail loudly here
@@ -2430,7 +2459,6 @@ class LevenbergMarquardt:
                 atol,
                 gtol,
                 xtol,
-                failure_ad_reference,
             ):
                 return self._multi_start_impl(
                     x,
@@ -2456,7 +2484,10 @@ class LevenbergMarquardt:
             def solve_multi_start_with_ad_p_jvp(primals, tangents):
                 p_dot = tangents[3]
                 result = solve_multi_start_with_ad_p(*primals)
-                return result, self._ad_result_tangent(result, p_dot, primals[-1])
+                initial_ad_point = (primals[0], primals[2], primals[3])
+                return result, self._ad_result_tangent(
+                    result, p_dot, initial_ad_point, max_steps_is_success
+                )
 
             return solve_multi_start_with_ad_p(
                 x0,
@@ -2469,7 +2500,6 @@ class LevenbergMarquardt:
                 atol,
                 gtol,
                 xtol,
-                failure_ad_reference,
             )
 
         @jax.custom_jvp
@@ -2483,7 +2513,6 @@ class LevenbergMarquardt:
             atol,
             gtol,
             xtol,
-            failure_ad_reference,
         ):
             return self._solve_impl(
                 x,
@@ -2504,7 +2533,10 @@ class LevenbergMarquardt:
         def solve_with_ad_p_jvp(primals, tangents):
             p_dot = tangents[3]
             result = solve_with_ad_p(*primals)
-            return result, self._ad_result_tangent(result, p_dot, primals[-1])
+            initial_ad_point = (primals[0], primals[2], primals[3])
+            return result, self._ad_result_tangent(
+                result, p_dot, initial_ad_point, max_steps_is_success
+            )
 
         return solve_with_ad_p(
             x0,
@@ -2516,7 +2548,6 @@ class LevenbergMarquardt:
             atol,
             gtol,
             xtol,
-            failure_ad_reference,
         )
 
     def _solve_impl(
@@ -2659,7 +2690,7 @@ class LevenbergMarquardt:
         accept,
         parallel,
     ):
-        accept_fn = _accept_converged if accept is None else accept
+        accept_fn = accept
         cold = _cold_lm_state(lm_state)
 
         def run_attempt(x_a, lm_state_a, args_a, attempt):
@@ -2730,37 +2761,51 @@ class LevenbergMarquardt:
         )
         return dataclasses.replace(best, multi_start=info)
 
-    def _ad_result_tangent(self, result, p_dot, failure_ad_reference=None):
-        # The tangent is a pure function of the returned solution: relinearize
-        # the residual at (result.x, result.args, result.p), never reusing the
-        # forward iterations. Everything except x, p, and aux -- histories,
-        # counters, multi-start diagnostics -- is bookkeeping with zero
-        # tangents.
-        ad_x, ad_args, ad_p, ad_aux = (
-            result.x,
-            result.args,
-            result.p,
-            result.aux,
+    def _ad_result_tangent(self, result, p_dot, initial_ad_point, max_steps_is_success):
+        # A successful tangent relinearizes at the returned solution. A failed
+        # tangent uses the differentiation-inert original initial point so an
+        # invalid returned iterate cannot poison a vmapped transpose. Nothing
+        # reuses the forward iterations. Everything except x, p, and aux --
+        # histories, counters, multi-start diagnostics -- is bookkeeping with
+        # zero tangents.
+        initial_x, initial_args, initial_p = jax.tree.map(
+            jax.lax.stop_gradient, initial_ad_point
         )
-        ad_p_dot = p_dot
-        converged = None
-        if failure_ad_reference is not None:
-            x_ref, args_ref, p_ref = failure_ad_reference
-            converged = result.status == LMStatus.CONVERGED
-            ad_x = _where_tree(converged, result.x, x_ref)
-            ad_args = _where_tree(converged, result.args, args_ref)
-            ad_p = _where_tree(converged, result.p, p_ref)
-            ad_p_dot = _mask_tangent_tree(converged, p_dot)
-            if self.has_aux:
-                # A metric factory may consume aux, so rebuild it at the same
-                # safe point used to linearize the residual rather than
-                # forwarding a nonfinite failed result.aux.
-                ad_aux = self._residual_and_aux(ad_x, ad_args, ad_p)[1]
+        ad_success = result.status == LMStatus.CONVERGED
+        if max_steps_is_success:
+            ad_success = ad_success | (result.status == LMStatus.MAX_STEPS)
+        ad_x = _where_tree(ad_success, result.x, initial_x)
+        ad_args = _where_tree(ad_success, result.args, initial_args)
+        ad_p = _where_tree(ad_success, result.p, initial_p)
+        ad_p_dot = _mask_tangent_tree(ad_success, p_dot)
+        resolved = None if ad_p is None else self._ad_solver_at(ad_x, ad_args, ad_p)
 
-        x_dot = self._ad_x_tangent_from_p(ad_x, ad_args, ad_p, ad_p_dot, ad_aux)
+        factory_needs_aux = (
+            ad_p is not None
+            and self.has_aux
+            and resolved != "direct"
+            and (
+                self.metric_factory is not None
+                or (
+                    resolved == "gram_cg"
+                    and self.ad_solver_preconditioner is None
+                    and self.preconditioner_factory is not None
+                )
+            )
+        )
+        ad_aux = result.aux
+        if factory_needs_aux:
+            ad_aux = jax.lax.cond(
+                ad_success,
+                lambda: result.aux,
+                lambda: self._residual_and_aux(ad_x, ad_args, ad_p)[1],
+            )
+
+        x_dot = self._ad_x_tangent_from_p(
+            ad_x, ad_args, ad_p, ad_p_dot, ad_aux, resolved
+        )
         zero_result = jax.tree.map(_zero_tangent_leaf, result)
-        if converged is not None:
-            x_dot = _where_tree(converged, x_dot, zero_result.x)
+        x_dot = _where_tree(ad_success, x_dot, zero_result.x)
         aux_dot = zero_result.aux
         if self.has_aux and ad_p is not None:
             # aux depends on p directly and through the solution x*(p);
@@ -2771,8 +2816,7 @@ class LevenbergMarquardt:
                 return self.residual_fn(x_value, ad_args, p_value)[1]
 
             aux_dot = jax.jvp(aux_at_solution, (ad_x, ad_p), (x_dot, ad_p_dot))[1]
-            if converged is not None:
-                aux_dot = _where_tree(converged, aux_dot, zero_result.aux)
+            aux_dot = _where_tree(ad_success, aux_dot, zero_result.aux)
         return dataclasses.replace(zero_result, x=x_dot, p=p_dot, aux=aux_dot)
 
     def _ad_solver_at(self, x, args, p):
@@ -2795,10 +2839,9 @@ class LevenbergMarquardt:
             return "normal_cg"
         return "svd"
 
-    def _ad_x_tangent_from_p(self, x, args, p, p_dot, aux):
+    def _ad_x_tangent_from_p(self, x, args, p, p_dot, aux, resolved):
         if p is None:
             return jax.tree.map(_zero_tangent_leaf, x)
-        resolved = self._ad_solver_at(x, args, p)
         if resolved == "direct":
             return self._ad_tangent_direct(x, args, p, p_dot)
         if (
@@ -3689,6 +3732,10 @@ def _accept_converged(_, result):
     return result.status == LMStatus.CONVERGED
 
 
+def _accept_converged_or_max_steps(_, result):
+    return (result.status == LMStatus.CONVERGED) | (result.status == LMStatus.MAX_STEPS)
+
+
 def _cold_lm_state(lm_state):
     # Drawn starts must not reuse a Jacobian cache, a deflation basis, or a
     # preconditioner/metric state built at another (x, args); damping and
@@ -3757,11 +3804,6 @@ def _type_spec(tree):
     return treedef, specs
 
 
-def _shape_dtype_spec(tree):
-    treedef, specs = _type_spec(tree)
-    return treedef, [(shape, dtype) for shape, dtype, _ in specs]
-
-
 def _check_drawn_types(x, args, drawn):
     # Works on concrete draws and on jax.eval_shape outputs alike; a mismatch
     # would otherwise surface as an inscrutable while_loop/vmap error.
@@ -3770,25 +3812,6 @@ def _check_drawn_types(x, args, drawn):
             "multi_start.draw must return (x, args) matching the structure, "
             f"shapes, and dtypes of its inputs; expected {_type_spec((x, args))}, "
             f"got {_type_spec(drawn)}"
-        )
-
-
-def _check_failure_ad_reference(x, args, p, reference):
-    if reference is None:
-        return
-    if not isinstance(reference, tuple) or len(reference) != 3:
-        raise ValueError(
-            "failure_ad_reference must be a tuple (x_ref, args_ref, p_ref)"
-        )
-    # Unlike a while-loop carry, the reference is only selected into a safe
-    # AD evaluation point. JAX weak typing therefore need not match: where
-    # canonicalizes a weak scalar reference to the real input's aval.
-    expected = _shape_dtype_spec((x, args, p))
-    actual = _shape_dtype_spec(reference)
-    if actual != expected:
-        raise ValueError(
-            "failure_ad_reference must match the structure, shapes, and dtypes "
-            f"of (x0, args, p); expected {expected}, got {actual}"
         )
 
 
@@ -3810,7 +3833,7 @@ def _multi_start_sequential_impl(
     draw,
     accept,
 ):
-    accept_fn = _accept_converged if accept is None else accept
+    accept_fn = accept
 
     def run_attempt(x_a, lm_state_a, args_a, attempt):
         result = _solve_loop_impl(
@@ -3894,7 +3917,7 @@ def _multi_start_parallel_impl(
     accept,
     num_starts,
 ):
-    accept_fn = _accept_converged if accept is None else accept
+    accept_fn = accept
     lanes = jnp.arange(num_starts, dtype=jnp.int32)
     attempt_keys = jax.vmap(lambda i: jax.random.fold_in(key, i))(lanes)
     lane_keys = jax.vmap(jax.random.split)(attempt_keys)

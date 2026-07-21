@@ -98,9 +98,12 @@ def draw(key, x_old, args_old):
 
 ## The accept hook
 
-By default an attempt succeeds when `result.status == LMStatus.CONVERGED`.
-Pass `accept` to override the test — for example to require a fresh-data
-validation metric rather than trusting the training tolerance:
+By default an attempt succeeds when its finite-loss result has status
+`LMStatus.CONVERGED` or `LMStatus.MAX_STEPS`, matching
+`solve(max_steps_is_success=True)`. Pass `max_steps_is_success=False` to retry
+after budget exhaustion. Pass `accept` to override the status test entirely —
+for example to require a fresh-data validation metric rather than trusting the
+training tolerance:
 
 ```python
 def accept(key, result):
@@ -166,16 +169,24 @@ before it.
 
 Gradients with respect to `p` flow through the **selected solution only**,
 via the same implicit rule as a plain solve (see
-[implicit differentiation](implicit_ad.md)): the residual is relinearized at
-the returned `(x, args, p)`, and everything else — the key, the initial
-conditions, the losing attempts, the diagnostics — has zero tangents.
+[implicit differentiation](implicit_ad.md)): an AD-successful winner is
+relinearized at its returned `(x, args, p)`, and everything else — the key,
+the initial conditions, the losing attempts, the diagnostics — has zero
+tangents. A custom `accept` controls multi-start selection, while
+`max_steps_is_success` independently controls whether a selected `MAX_STEPS`
+result is differentiated or masked as failed.
 
 Because selection is discrete, the derivative is **piecewise**: it is the
 chosen basin's implicit derivative, and it jumps when a different start wins
 (ties, basin switches). The acceptance test and the argmin are not
-differentiated. Derivatives are only meaningful when the winner actually
-solved the problem — after an all-fail fallback the rule linearizes at a
-non-solution.
+differentiated. If the selected winner's status fails the implicit-AD policy,
+`result.x` and `result.aux` contribute exactly zero derivatives, and the failed
+tangent program uses stop-gradient copies of the caller's original
+`(x0, args, p)` as its safety point. This is independent of
+`result.multi_start.accepted`: for example, a custom hook may reject a
+`MAX_STEPS` winner that remains AD-successful under the forgiving default.
+The original point must satisfy the same JVP-safety precondition as an ordinary
+solve; a drawn retry cannot rescue an invalid original point.
 
 ## Interactions
 

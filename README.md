@@ -128,9 +128,16 @@ and uses SVD otherwise. Every method is independently swappable (an `lsmr` forwa
 `ad_solver="normal_cg"` is fully matrix-free end to end). The metric
 matters for underdetermined roots because it selects which tangent is the
 minimum-norm solution. The per-step `update(...)` interface does not define
-the implicit AD rule. Batched domain-restricted problems can provide
-`failure_ad_reference=(x_ref, args_ref, p_ref)` to keep non-converged lanes'
-JVP/VJP contributions at zero without changing their primal results.
+the implicit AD rule. By default, both `CONVERGED` and `MAX_STEPS` results are
+usable: fixed-step solves retain their implicit derivative while the status
+still reports `MAX_STEPS`. Pass `max_steps_is_success=False` for strict
+failure semantics. A failed solve keeps its primal result and diagnostics but
+contributes exactly zero through `result.x` and `result.aux`; `result.p`
+remains an identity pass-through. Its linear tangent program is evaluated
+safely at differentiation-inert copies of the caller's original
+`(x0, args, p)`, so those initial inputs must be JVP-safe for the residual,
+aux map, and any metric or preconditioner factory used by the selected AD
+method. This also keeps mixed successful/failed `vmap` lanes finite.
 
 ## Metric Example
 

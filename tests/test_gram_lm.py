@@ -1158,6 +1158,14 @@ def test_solve_reports_max_steps_without_atol_convergence():
     assert int(result.steps) == 3
     assert jnp.isfinite(result.info.loss)
 
+    with pytest.raises(TypeError, match="max_steps_is_success must be a bool"):
+        solver.solve(
+            jnp.array([0.0]),
+            jnp.array([1.0]),
+            max_steps=3,
+            max_steps_is_success=1,
+        )
+
 
 def test_solve_callback_can_abort_on_nonfinite_candidate():
     def residual(theta, _, __):

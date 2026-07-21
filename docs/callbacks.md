@@ -25,9 +25,13 @@ x = result.x
   was accepted (rejected steps say nothing about stationarity).
 
 With all three at zero the solve runs until `max_steps` unless a callback
-stops it. The tolerances and `max_steps` are traced values: changing them
-between calls does not recompile the loop. They are validated in Python, so
-pass concrete numbers, not tracers from an enclosing `jax.jit`.
+stops it. The returned status remains `LMStatus.MAX_STEPS`, but the default
+`max_steps_is_success=True` treats that finite result as usable for implicit AD
+and default multi-start acceptance. Set it to `False` when budget exhaustion
+must use the strict failed-solve path. `max_steps_is_success` is a static Python
+boolean. The tolerances and `max_steps` are traced values: changing them between
+calls does not recompile the loop. They are validated in Python, so pass
+concrete numbers, not tracers from an enclosing `jax.jit`.
 `solve(jit=True)` is the default and jits the loop; use `jit=False` for
 debugging Python callbacks.
 
@@ -47,7 +51,7 @@ Status codes are integer constants:
 | Status | Meaning |
 | --- | --- |
 | `LMStatus.CONVERGED` | A tolerance (`atol`, `gtol`, or `xtol`) was met. |
-| `LMStatus.MAX_STEPS` | `max_steps` was reached. |
+| `LMStatus.MAX_STEPS` | `max_steps` was reached; usable by default, strict when `max_steps_is_success=False`. |
 | `LMStatus.NONFINITE` | The current loss is nonfinite, or a callback chose this status. |
 | `LMStatus.CALLBACK_STOP` | A callback stopped without a custom status. |
 | `LMStatus.RUNNING` | Internal running state, not a final successful status. |
@@ -67,6 +71,13 @@ unchanged. The callback may set `stop`, `status`, `x`, `lm_state`, `args`, or
 `user_state`; it cannot replace `p`. When an action changes the values of `x`
 or `args`, that step's tolerance checks are skipped — the diagnostics describe
 the pre-action problem — and resume after the next update.
+
+A callback that replaces `x` or `args` with a point that is not valid for the
+residual or implicit AD must also stop with `status=LMStatus.NONFINITE` (or
+another failed status). In particular, a replacement on the final iteration is
+otherwise reported as `MAX_STEPS`, which is intentionally AD-successful by
+default; the solver does not pay for another unconditional residual check just
+to second-guess a callback's explicit replacement.
 
 ### Resettable Hyperparameters
 

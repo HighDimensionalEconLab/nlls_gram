@@ -743,6 +743,88 @@ assert result32.info.loss.dtype == jnp.float32
     assert result.returncode == 0, result.stderr + result.stdout
 
 
+def test_failed_implicit_ad_float64_is_finite_and_exactly_zero():
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import LMStatus, LevenbergMarquardt
+
+
+def residual(x, args, p):
+    return x + args - p
+
+
+solver = LevenbergMarquardt(
+    residual,
+    cache_jacobian=False,
+    geodesic_acceleration=False,
+)
+x0 = jnp.zeros(1, dtype=jnp.float64)
+args = jnp.asarray(0.0, dtype=jnp.float64)
+parameters = jnp.asarray([0.0, 1.0], dtype=jnp.float64)
+atols = jnp.asarray([1e-12, 0.0], dtype=jnp.float64)
+
+
+def solved_x(values):
+    return jax.vmap(
+        lambda value, atol: solver.solve(
+            x0,
+            args,
+            p=value,
+            max_steps=1,
+            max_steps_is_success=False,
+            atol=atol,
+        ).x[0]
+    )(values, atols)
+
+
+statuses = jax.vmap(
+    lambda value, atol: solver.solve(
+        x0,
+        args,
+        p=value,
+        max_steps=1,
+        max_steps_is_success=False,
+        atol=atol,
+    ).status
+)(parameters, atols)
+assert jnp.array_equal(
+    statuses,
+    jnp.asarray([LMStatus.CONVERGED, LMStatus.MAX_STEPS], dtype=jnp.int32),
+)
+
+_, tangent = jax.jvp(
+    solved_x,
+    (parameters,),
+    (jnp.ones_like(parameters),),
+)
+_, pullback = jax.vjp(solved_x, parameters)
+(cotangent,) = pullback(jnp.ones_like(parameters))
+
+expected = jnp.asarray([1.0, 0.0], dtype=jnp.float64)
+assert tangent.dtype == jnp.float64
+assert cotangent.dtype == jnp.float64
+assert jnp.all(jnp.isfinite(tangent))
+assert jnp.all(jnp.isfinite(cotangent))
+assert jnp.array_equal(tangent, expected)
+assert jnp.array_equal(cotangent, expected)
+
+hessian = jax.hessian(lambda values: jnp.sum(solved_x(values)))(parameters)
+assert hessian.dtype == jnp.float64
+assert jnp.all(jnp.isfinite(hessian))
+assert jnp.array_equal(hessian, jnp.zeros_like(hessian))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
 def test_quasiseparable_float64_parallel_matches_sequential():
     # The evidence gating the parallel-apply default (off-CPU + float64):
     # sequential and associative-scan applies must agree, and the parallel

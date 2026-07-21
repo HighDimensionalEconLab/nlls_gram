@@ -323,7 +323,7 @@ the step count.
 | --- | --- | --- |
 | `status == NONFINITE` at step 0 | bad initial point or data | check `residual_fn(x0, ...)` directly |
 | `qr` gives non-finite steps; other solvers fine | rank-deficient Jacobian | any other solver: the damped Gram/normal forms (`auto`), or `augmented_qr` / `lsmr` |
-| `MAX_STEPS` but loss small and flat | converged without a stopping rule | set `gtol`/`xtol` |
+| `MAX_STEPS` but loss small and flat | settled without a stopping rule | keep the default usable fixed-step result, or set `gtol`/`xtol` for a `CONVERGED` diagnostic |
 | damping grows without bound (float32 `inf`) | rejection storm | `max_damping`, or check residual scaling |
 | every `solve` call recompiles | residual/callback/metric object rebuilt per call (solvers compare by configuration, but their pieces key by identity) | define the pieces once at setup scope |
 | implicit `jax.jvp`/`vjp` wrong or zero | `p` not in the residual signature, or perturbing `args` | move perturbed quantities into `p` |

@@ -23,32 +23,46 @@ It does not mean LM hyperparameters such as `init_damping`, `max_steps`,
 the initial guess `x0` as fixed for this derivative (their tangents are zero,
 not an error).
 
-### Failed solves and domain-safe references
+### Status policy and the initial AD point
 
-By default, the implicit rule relinearizes at the returned point regardless of
-status. Callers that batch solves over inputs with restricted domains can pass
+Implicit AD is defined for `LMStatus.CONVERGED` and, by default,
+`LMStatus.MAX_STEPS`. The forgiving default supports fixed-step solves: a
+result that exhausts its budget relinearizes at the returned
+`(result.x, result.args, result.p)`, while its diagnostic status remains
+`MAX_STEPS`. Pass `max_steps_is_success=False` to make `MAX_STEPS` strict: it
+then follows the same failed-AD path as `NONFINITE`, `CALLBACK_STOP`, or any
+other non-`CONVERGED` status.
 
-```python
-solver.solve(
-    x0,
-    args,
-    p=p,
-    failure_ad_reference=(x_ref, args_ref, p_ref),
-)
-```
+An AD-successful solve relinearizes at its returned values. A failed solve
+keeps the primal result, status, aux, and diagnostics unchanged but returns
+exactly zero tangents through `result.x` and `result.aux`. `result.p` remains
+an independent identity pass-through.
 
-The three reference pytrees must match the structures, shapes, and dtypes of
-`(x0, args, p)`. A `CONVERGED` lane still linearizes at its returned solution.
-Any other status linearizes at the supplied domain-safe reference and returns a
-zero tangent for `result.x` and `result.aux`. This prevents a nonfinite failed
-lane from poisoning successful lanes when the custom JVP is transposed for a
-VJP. The primal result, status, and diagnostics are unchanged, and `result.p`
-remains the pass-through input.
+The failed lane's linear tangent program is evaluated at stop-gradient copies
+of the caller's original `(x0, args, p)`, with the `p` tangent masked to zero
+before the implicit solve. This gives automatic transposition a finite linear
+program even when the returned failed iterate is nonfinite, and keeps a failed
+lane from poisoning successful lanes under `vmap`. These initial values are a
+safety point, not a fallback solution: the returned failed iterate is never
+replaced.
 
-The reference is differentiation-inert and is only a safe evaluation point;
-it is not a fallback solution. The caller must ensure that the residual, aux
-map, and any `MetricFactory` are well-defined there. Without
-`failure_ad_reference`, behavior is unchanged.
+The original initial point must therefore be **JVP-safe**, not merely finite.
+The residual and aux map must have valid derivatives there. A `MetricFactory`
+must also be JVP-safe there when the resolved non-direct AD method consumes its
+metric, and a `PreconditionerFactory` must be JVP-safe there when it supplies a
+`gram_cg` AD preconditioner. A direct square AD solve ignores both factories,
+so it does not rebuild aux for them. When a selected multi-start winner fails
+the implicit-AD status policy, the safety point is the caller's original
+`(x0, args, p)`, not one of the drawn starts; custom acceptance is independent.
+
+Aux is reevaluated for factory construction only when it is actually consumed:
+a failed `MetricFactory` lane under a non-direct AD method, or a failed
+`gram_cg` lane whose `PreconditionerFactory` supplies the AD preconditioner.
+Fixed metrics, explicit AD preconditioners, and direct square solves do not
+trigger that factory-only rebuild. An AD-successful lane always reuses
+`result.aux` for factory construction. Independently, when `has_aux=True`, the
+aux map is linearized once at the selected point to compute the returned aux
+tangent itself.
 
 There is no setup stage that AD must trace through: the whole iteration —
 every update, callback, and the final aux evaluation — sits inside one
@@ -132,7 +146,7 @@ so
 $$
 \dot\theta
 = -P J_\theta^\top
-(J_\theta P J_\theta^\top)^{-1}
+(J_\theta P J_\theta^\top)^{+}
 J_p\dot p.
 $$
 
@@ -429,14 +443,29 @@ solver = LevenbergMarquardt(
 
 ## VJP
 
-The transpose of the same map gives the VJP. For a cotangent
-\(\bar\theta\) on `result.x`, solve
+JAX derives the VJP by automatically transposing this solver's linear custom
+JVP rule; there is no separate custom VJP or cotangent solver. Writing
+\(K=J_p\), \(G=J_\theta P J_\theta^\top\), and using the same pseudoinverse or
+filtered solve as the JVP, the maps are
+
+$$
+\dot\theta=-P J_\theta^\top G^+ K\dot p,
+\qquad
+\bar p=-K^\top G^+ J_\theta P\bar\theta.
+$$
+
+Equivalently, for a cotangent \(\bar\theta\) on `result.x`, solve
 
 $$
 (J_\theta P J_\theta^\top)y = J_\theta P\bar\theta,
 \qquad
 \bar p = -J_p^\top y.
 $$
+
+For the square direct method, the JVP solves
+\(J_\theta\dot\theta=-K\dot p\). Its automatically transposed VJP solves
+\(J_\theta^\top\lambda=\bar\theta\) and returns
+\(\bar p=-K^\top\lambda\).
 
 For a pytree `p`, \(J_p^\top y\) means the JAX VJP of the residual with respect
 to the `p` argument only. The whitened rules compute the identical cotangent
@@ -518,7 +547,7 @@ as \(J_p \dot p\) above); transposes mean the corresponding VJP.
 
 $$
 \dot a = G_\theta\,\dot\theta + G_p\,\dot p
-= \bigl(-G_\theta P J_\theta^\top (J_\theta P J_\theta^\top)^{-1} J_p
+= \bigl(-G_\theta P J_\theta^\top (J_\theta P J_\theta^\top)^{+} J_p
   + G_p\bigr)\,\dot p.
 $$
 
@@ -528,14 +557,20 @@ $$
 directly:
 
 $$
-(J_\theta P J_\theta^\top)\, y
-= J_\theta P\,(\bar\theta + G_\theta^\top \bar a),
+y=(J_\theta P J_\theta^\top)^+
+J_\theta P\,(\bar\theta + G_\theta^\top \bar a),
 \qquad
 \bar p = -J_p^\top y + G_p^\top \bar a.
 $$
 
 Setting \(\bar a = 0\) recovers the `x`-only VJP above; setting
 \(\bar\theta = 0\) gives the pure aux pullback.
+
+On a failed solve both \(\dot\theta\) and \(\dot a\) are masked to exact zero
+after this tangent program is evaluated at the original JVP-safe initial
+point. Automatic transposition therefore contributes zero implicit cotangents
+from `result.x` and `result.aux`, while any cotangent on the independently
+returned `result.p` still passes through unchanged.
 
 Example — the residual from above with an aux that depends on `p` both ways:
 
