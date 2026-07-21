@@ -321,7 +321,7 @@ solver = LevenbergMarquardt(
     linear_solver="gram_cg",
     iterative_maxiter=2,
     dual_preconditioner=identity_preconditioner(),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
 )
 
 

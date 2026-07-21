@@ -230,10 +230,9 @@ $$
 using JAX linearization for JVPs/VJPs and `jax.scipy.sparse.linalg.cg`.
 The iterative solve defaults to a small fixed budget: `iterative_tol=0.0`,
 `iterative_atol=0.0`, and `iterative_maxiter=8`.
-With the default `implicit_solver="auto"`, differentiating `solve(...).x`
+With the default `ad_solver="auto"`, differentiating `solve(...).x`
 also stays matrix-free for forward `gram_cg` solves. Pass
-`implicit_solver="gram_cholesky"` (or `"normal_cholesky"`) to use a dense
-implicit rule instead.
+`ad_solver="dense"` to use the dense AD rule instead.
 
 `linear_solver="gram_cg"` requires a `dual_preconditioner(v, damping)`
 callback, applied as the CG preconditioner (for the geodesic-acceleration
@@ -244,13 +243,13 @@ step still lies in \(\operatorname{range}(P J^\top)\), preserving the
 minimum-metric-norm structure — so approximations are safe. Nobody should
 run Krylov methods without thinking about preconditioning; to opt out
 explicitly, pass `identity_preconditioner()` for unpreconditioned CG. When
-the implicit solver resolves to `gram_cg` (the default
-`implicit_solver="auto"` does exactly that when `linear_solver="gram_cg"`),
-an `implicit_preconditioner` is required as well —
-`identity_preconditioner()` works there too, or pass a dense
-`implicit_solver` for a dense implicit rule. (A `normal_cg`-resolved
-implicit needs no preconditioner; see
-[Implicit AD](implicit_ad.md#the-implicit-preconditioner).) See
+the AD solver resolves to `gram_cg` (the default
+`ad_solver="auto"` does exactly that when `linear_solver="gram_cg"`),
+an `ad_solver_preconditioner` is required as well —
+`identity_preconditioner()` works there too, or pass
+`ad_solver="dense"` for the dense AD rule. (A `normal_cg`-resolved
+AD solve needs no preconditioner; see
+[Implicit AD](implicit_ad.md#the-ad-solver-preconditioner).) See
 [Utilities](utilities.md) for structural constructors
 (`sherman_morrison_preconditioner`, `woodbury_preconditioner`) and the
 randomized `nystrom_preconditioner`. Like `metric`, the preconditioner
@@ -390,9 +389,14 @@ recording.
 ## Performance Notes
 
 - The solver instance and the callback are static arguments of the internal
-  jitted loop, keyed by object identity. Construct the solver once and define
-  callbacks at setup scope; an inline `lambda` at the call site recompiles
-  every `solve`.
+  jitted loop, keyed by object identity — but solvers compare by
+  configuration, so equal settings share one compilation. Constructing
+  `LevenbergMarquardt` inside a jitted function is supported when every
+  constructor argument is a static Python value (option strings, floats,
+  hooks; the solver holds no arrays) — never from traced values. What
+  recompiles is rebuilding the *pieces* per call: define residuals,
+  callbacks, and hooks once at setup scope; an inline `lambda` at the call
+  site recompiles every `solve`.
 - `max_steps`, `atol`, `gtol`, and `xtol` are traced values: sweeping them
   does not recompile (concrete numbers, not tracers).
 - `jax.vmap(lambda x0: solver.solve(x0, ...))` works for independent
@@ -401,7 +405,11 @@ recording.
   runtime is governed by the slowest lane. See
   [Callbacks and Cookbook](callbacks.md#batched-multi-start).
 - Each `update` costs one residual linearization, one Jacobian
-  materialization (`n_residuals` VJP passes in the dense paths), and one
+  materialization in the dense paths — `jacobian_mode="auto"` assembles it
+  from the small side, `n_params` JVP columns when tall or square and
+  `n_residuals` VJP rows when strictly fat, and `"fwd"`/`"rev"` force one
+  mode (see the
+  [tuning guide](tuning_guide.md#jacobian-assembly-jacobian_mode)) — and one
   candidate residual evaluation; geodesic acceleration adds a
   forward-over-forward directional derivative and, only when the ratio gate
   passes, one more residual evaluation.
@@ -457,8 +465,8 @@ pytree `p`: derivatives of `result.x` (and, with `has_aux=True`, of
 `result.aux`) are defined by the residual equation at the returned solution
 rather than by differentiating through the LM iterations. See
 [Implicit Differentiation](implicit_ad.md) for the math, the role of the
-metric in selecting the minimum-norm tangent, matrix-free CG implicit solves,
-and worked examples.
+metric in selecting the minimum-norm tangent, the `ad_solver` forms (one
+dense rule and two matrix-free CG rules), and worked examples.
 
 ## Geodesic Acceleration
 
@@ -518,8 +526,8 @@ data.
   float32-fragile for stiff systems (e.g. a metric weight injecting a
   \(1/\varepsilon\) spike into \(P\)) — this knob is the targeted fix. It
   requires a solver that has a dense pipeline to promote: forward
-  `auto`/`gram_cholesky`/`normal_cholesky`, or a dense-resolved
-  `implicit_solver`.
+  `auto`/`gram_cholesky`/`normal_cholesky`, or a `dense`-resolved
+  `ad_solver`.
 - **`metric_solve_dtype=jnp.float64`** sets the dtype the resolved metric
   callbacks *compute in*: the solver wraps the metric — a fixed `metric` or
   a `metric_factory`'s built one, after `build` — with the

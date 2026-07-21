@@ -33,7 +33,15 @@ implicitly via `cache_jacobian=True`, contributes exactly zero to any
 derivative. `result.aux` also participates in the implicit rule — see
 [Aux outputs](#aux-outputs) below. One
 construction-time caveat: the solver (including any `Metric` callbacks) is a
-static object — do not build it from traced values.
+static object — do not build it from traced values. Constructing
+`LevenbergMarquardt` *inside* a jitted function is supported: every
+constructor argument is a static Python value (option strings, floats,
+hooks) and the solver holds no arrays, so equal configurations share one
+compilation. What must not happen is feeding a traced value into the
+constructor, or rebuilding the *pieces* per call — an inline `lambda`
+residual or a hook closed over fresh arrays keys a new compile by object
+identity (see
+[what is free to sweep](tuning_guide.md#what-is-free-to-sweep)).
 
 ## Root Selection and the Metric
 
@@ -101,21 +109,24 @@ $$
 J_p\dot p.
 $$
 
-The dual system above is how the **Gram** implicit forms compute the
-tangent. The **normal** forms compute the same minimum-\(M\)-norm tangent in
-whitened variables: with \(B = J_\theta S\) (\(S S^\top = P\)) and
-\(\dot\theta = S\dot u\),
+In whitened variables — \(B = J_\theta S\) with \(S S^\top = P\) and
+\(\dot\theta = S\dot u\) — the same tangent is the minimum-norm solution of
 
 $$
 B^\top B\,\dot u = -B^\top J_p\dot p,
 \qquad
+\dot u = -B^{+} J_p\dot p,
+\qquad
 \dot\theta = S\,\dot u,
 $$
 
-whose minimum-norm solution maps back to exactly the tangent above. In code,
-the Gram forms apply \(P x\) with `metric.solve(x)` when available, else as
-\(P x = S S^\top x\) through the square-root callbacks; the normal forms use
-`metric.inv_sqrt`/`inv_sqrt_transpose` directly.
+using \((B^\top B)^{+}B^\top = B^{+}\). In code, the **dense** AD rule
+computes exactly this: it materializes \(B\) and applies \(B^{+}\) from its
+SVD. The **gram_cg** rule solves the \(m \times m\) dual system above
+matrix-free, applying \(P x\) with `metric.solve(x)` when available, else as
+\(P x = S S^\top x\) through the square-root callbacks; the **normal_cg**
+rule solves the whitened normal system matrix-free through
+`metric.inv_sqrt`/`inv_sqrt_transpose`.
 
 ### Iterate-Dependent Metrics Are Frozen per Solve
 
@@ -141,45 +152,45 @@ with a fixed metric, where the declared solves re-apply correctly (subject
 to the spectral-filter caveat in
 [the ridge section](#rank-deficiency-and-the-ridge)).
 
-## The Four Implicit Forms
+## The AD Solver
 
-`implicit_solver` selects among
-`{"auto", "gram_cholesky", "normal_cholesky", "gram_cg", "normal_cg"}` —
-the same Gram/normal taxonomy as the forward solver, and always
-independently swappable from it (an `lsmr` forward solve with
-`implicit_solver="normal_cg"` is fully matrix-free end to end). The default
-`"auto"` matches the forward form where one exists and otherwise falls back
-to the dense shape rule:
+`ad_solver` selects how the implicit tangent and cotangent systems are
+solved: `{"auto", "dense", "gram_cg", "normal_cg"}` — always independently
+swappable from the forward solver (an `lsmr` forward solve with
+`ad_solver="normal_cg"` is fully matrix-free end to end). The default
+`"auto"` keeps a matrix-free forward solve matrix-free and uses the dense
+rule everywhere else:
 
-| forward `linear_solver` | `implicit_solver="auto"` resolves to |
+| forward `linear_solver` | `ad_solver="auto"` resolves to |
 | --- | --- |
-| `gram_cholesky` | `gram_cholesky` |
-| `normal_cholesky` | `normal_cholesky` |
 | `gram_cg` | `gram_cg` |
 | `normal_cg` | `normal_cg` |
-| `auto`, `qr`, `augmented_qr`, `lsmr` | `gram_cholesky` if \(n > m\), else `normal_cholesky` |
+| `auto`, `gram_cholesky`, `normal_cholesky`, `qr`, `augmented_qr`, `lsmr` | `dense` |
 
-The shape fallback picks the smaller factorization, and only that: both
-dense defaults apply exact pseudoinverses, so the resolved form never
-changes the computed tangent (in exact arithmetic). On a square-to-tall
-problem (\(m \ge n\)) the \(m \times m\) dual is structurally singular
-whenever \(J_\theta\) has rank below \(m\) — which rank alone forces for
-\(m > n\) — a case the default spectral filter handles; the \(n \times n\)
-normal form is simply the natural factorization there, and that is what the
-fallback picks.
+There is one dense rule, not a Gram/normal pair, because on the AD side
+there is nothing to choose: for the same penalty \(\delta\) the
+\(m \times m\) dual and \(n \times n\) normal answers coincide exactly —
+the push-through identity
+\(S(B^\top B + \delta I)^{-1}B^\top = P J_\theta^\top (J_\theta P J_\theta^\top + \delta I)^{-1}\)
+holds at every \(\delta > 0\), the trace scales agree
+(\(\operatorname{tr}(B^\top B) = \operatorname{tr}(J_\theta P J_\theta^\top)\)),
+and in the \(\delta \to 0\) limit both sides are the same pseudoinverse
+tangent \(-S B^{+} J_p\dot p\). The dense rule is shape-independent: it
+works directly with the singular values of \(B\), so tall, square, and wide
+systems — rank-deficient or not — go through the identical code path.
 
-The four forms:
+The three forms:
 
-- **`gram_cholesky`** materializes \(J_\theta^\top\), assembles the
-  \(m \times m\) dual \(G = J_\theta P J_\theta^\top\), and solves it
-  densely — by default through the exact **pseudoinverse** of \(G\) via an
-  `eigh` spectral filter; `implicit_penalty` selects among three behaviors,
+- **`dense`** materializes the whitened Jacobian \(B = J_\theta S\)
+  (assembled from the small side — see
+  [`jacobian_mode`](tuning_guide.md#jacobian-assembly-jacobian_mode)) and
+  computes the tangent from factorizations of \(B\) itself — SVD by
+  default, augmented or plain QR under an explicit `ad_solver_penalty` —
+  never from the squared operators \(B^\top B\) or
+  \(J_\theta P J_\theta^\top\). Every mode therefore works at
+  \(\operatorname{cond}(B)\), not \(\operatorname{cond}(B)^2\); the
+  `ad_solver_penalty` trio is
   [described below](#rank-deficiency-and-the-ridge).
-- **`normal_cholesky`** assembles \(B^\top = S^\top J_\theta^\top\)
-  (\(n \times m\)) and solves the \(n \times n\) normal system
-  \(B^\top B\,\dot u = -B^\top J_p\dot p\), mapping back
-  \(\dot\theta = S\dot u\) — the same default pseudoinverse and the same
-  `implicit_penalty` trio as `gram_cholesky`.
 - **`gram_cg`** applies \(y \mapsto J_\theta P J_\theta^\top y\)
   matrix-free using JAX JVP/VJP closures, then solves with CG wrapped in a
   symmetric `jax.lax.custom_linear_solve` — both JVP and VJP of
@@ -198,7 +209,7 @@ The four forms:
   *consistent* \(m\)-space dual CG solves (unpreconditioned — the
   parameter-space hook does not apply there), with the trailing
   \(B^\top\) annihilating dual-null rounding noise. The ridged path (an
-  explicitly positive `implicit_penalty`) is nonsingular and stays
+  explicitly positive `ad_solver_penalty`) is nonsingular and stays
   symmetric. The final \(\dot\theta = S\dot u\) map likewise declares its
   exact transpose (`inv_sqrt_transpose`), so non-self-adjoint square roots
   — a triangular Cholesky factor — differentiate correctly in reverse
@@ -207,25 +218,25 @@ The four forms:
 Both CG forms assume the inner solve **converges**.
 `jax.lax.custom_linear_solve` transposes the declared solve as an exact
 linear map, but a truncated or early-stopped CG (a small bounded
-`implicit_maxiter`) is not a linear function of its right-hand side — its
+`ad_solver_maxiter`) is not a linear function of its right-hand side — its
 declared transpose then no longer matches what was computed, and
 derivatives are silently inaccurate on top of the truncation error itself.
-Run the implicit CG solves to tolerance (the default
-`implicit_maxiter=None`), and treat a bounded budget as valid only with a
+Run the AD CG solves to tolerance (the default
+`ad_solver_maxiter=None`), and treat a bounded budget as valid only with a
 preconditioner exact enough to converge within it.
 
-The dense-resolved implicit rules inherit `linear_solve_dtype`: the undamped
+The dense AD rule inherits `linear_solve_dtype`: the undamped
 implicit system is the most conditioning-sensitive solve in the library, so
 it is never silently less precise than the damped forward solve (measured on
 a \(10^{-7}\)-weight spike metric: a float32 implicit tangent wrong by ~5% —
 and its VJP by ~40% — becomes accurate to ~\(10^{-7}\), with the returned
 tangent still float32).
 
-### The Implicit Preconditioner
+### The AD Solver Preconditioner
 
-A `gram_cg`-resolved implicit solve requires an `implicit_preconditioner`
+A `gram_cg`-resolved AD solve requires an `ad_solver_preconditioner`
 at construction, even if `solve(...).x` is never differentiated — and the
-default `implicit_solver="auto"` resolves to `gram_cg` whenever the forward
+default `ad_solver="auto"` resolves to `gram_cg` whenever the forward
 solver is `gram_cg`. There the hook approximates the undamped
 residual-space \((J_\theta P J_\theta^\top)^{-1} v\) on \(m\)-vectors, and
 a forward `preconditioner_factory`'s state at the solution serves as the
@@ -238,7 +249,8 @@ and on rank-deficient problems it must preserve
 \(\operatorname{range}(B^\top)\), the same structural requirement as the
 forward
 [`normal_preconditioner`](utilities.md#the-normal-space-preconditioner-normal_cg);
-the dual-space factory can never serve this parameter-space system.
+the dual-space factory can never serve this parameter-space system. The
+`dense` rule uses no preconditioner.
 
 The callback may take `(v)` or `(v, damping)`: a callable *requiring* the
 damping argument is called with an explicit zero damping (the implicit
@@ -248,11 +260,11 @@ unchanged — so `identity_preconditioner()`,
 `nystrom_preconditioner` all serve the hook directly. The one exception
 is `pad_dual_preconditioner`, which divides by the live damping and is
 rejected at construction. Pass `identity_preconditioner()` to run the
-implicit CG unpreconditioned, or a dense `implicit_solver` to use a dense
-rule instead. The forward `dual_preconditioner` is never reused implicitly:
+AD CG unpreconditioned, or `ad_solver="dense"` to use the dense
+rule instead. The forward `dual_preconditioner` is never reused for AD:
 it approximates the damped operator, and the implicit system is undamped —
 reusing one is an explicit choice (pass the same callable to both
-arguments). Any `implicit_preconditioner` must be linear, self-adjoint, and
+arguments). Any `ad_solver_preconditioner` must be linear, self-adjoint, and
 positive definite for the operator of its resolved space, and the metric
 inverse \(P\) must be linear, self-adjoint, and positive definite in
 parameter space.
@@ -271,62 +283,60 @@ linearized systems by construction: differentiating the root identity
 \(r(\theta^\star(p), a, p) = 0\) along the solution branch gives
 \(J_\theta\dot\theta^\star + J_p\dot p = 0\), i.e.
 \(J_p\dot p \in \operatorname{range}(J_\theta)\) — redundant rows and
-collinear columns included. The four forms then behave as follows:
+collinear columns included. The three forms then behave as follows:
 
-- **The dense rules** (`gram_cholesky`, `normal_cholesky`) share one
-  `implicit_penalty` contract with three behaviors:
-    - **Default `None` — the exact pseudoinverse** of the resolved matrix,
-      by an `eigh` spectral filter at the standard rank cutoff:
-      \(G = J_\theta P J_\theta^\top\) at
-      \(m \cdot \mathrm{eps} \cdot \lambda_{\max}\), or \(B^\top B\) at
-      \(n \cdot \mathrm{eps} \cdot \lambda_{\max}\). This is the exact
-      Gauss–Newton sensitivity at full rank (square nonsingular:
+- **`dense`** — one `ad_solver_penalty` contract with three behaviors, all
+  computed from factorizations of \(B\) itself at
+  \(\operatorname{cond}(B)\):
+    - **Default `None` — the exact pseudoinverse** \(B^{+}\) by a spectral
+      filter on the SVD of \(B\), at the standard rank cutoff
+      \(\max(m, n) \cdot \mathrm{eps} \cdot \sigma_{\max}\). This is the
+      exact Gauss–Newton sensitivity at full rank (square nonsingular:
       \(-J_\theta^{-1}J_p\dot p\)) and the minimum-\(M\)-norm tangent for
       consistent rank-deficient systems, with no ridge bias in either.
-      The cutoff is a numerical rank threshold, not an algebraic
-      certificate: genuine eigenvalues below it are silently treated as
-      rank-deficient — standard pseudoinverse semantics — so promote with
-      `linear_solve_dtype` or set an explicit penalty when tiny
-      eigenvalues are real. The filter sits inside a symmetric
-      `custom_linear_solve`, so higher-order AD re-applies the solve to
-      new right-hand sides and never differentiates `eigh` itself (whose
-      derivative rule breaks on exactly the repeated-zero spectra this
-      path exists for). That re-application drops the derivative of the
-      range projector, which rotates when the active subspace moves with
-      the differentiation point — higher-order derivatives through the
-      filtered solve are exact only while the active subspace is locally
-      constant.
-    - **An explicitly positive `implicit_penalty` — the trace-scaled
-      ridge** `+ implicit_penalty * trace(·) I`, Cholesky-factored: smooth
-      in the spectrum for higher-order AD on nearly-degenerate problems,
-      at an O(`implicit_penalty` · \(m\)) (Gram) or
-      O(`implicit_penalty` · \(n\)) (normal) relative bias on consistent
-      systems, and a penalty-inflated finite tangent on genuinely
-      *inconsistent* singular ones. In the Gram form the ridge is
-      additionally kernel-safe: the composition ends in
-      \(PJ_\theta^\top\), which annihilates dual-null factorization noise.
-      The normal form has no such cleanup — its trailing \(S\) passes
-      \(\ker B\) noise through, adding an
-      \(\mathrm{eps}/\delta + \delta\) error floor along \(\ker B\)
-      (minimized at \(\sim\sqrt{\mathrm{eps}}\)) on top of the bias, which
-      is the structural reason a ridge could never serve as a default.
-      Typical ridge values are `1e-12` for a float64 solve and `1e-6` for
-      float32: empirical constants sitting orders of magnitude above the
-      near-duplicate-row factorization-noise floor (below `1e-14` in
-      float64) and below visible tangent bias (`~1e-6`).
-    - **An explicit `0.0` — the exact unridged Cholesky**, guarded by a
-      deterministic pivot-based rank check that poisons the tangent to NaN
-      on rank deficiency — without the guard an exactly-zero pivot can
-      round into a finite answer silently shifted along the null space.
-- **`gram_cg`** ignores `implicit_penalty` entirely: its run-to-tolerance
+      The singular values come from \(B\) directly — never from the
+      squared \(B^\top B\) — so directions are classified at
+      \(\operatorname{cond}(B)\) accuracy. The cutoff is still a numerical
+      rank threshold, not an algebraic certificate: genuine singular
+      values below it are silently treated as rank-deficient — standard
+      pseudoinverse semantics — so promote with `linear_solve_dtype` or
+      set an explicit penalty when tiny singular values are real. The
+      filter sits inside a symmetric `custom_linear_solve`, so
+      higher-order AD re-applies the solve to new right-hand sides and
+      never differentiates the SVD itself (whose derivative rule breaks
+      on exactly the repeated-zero spectra this path exists for). That
+      re-application drops the derivative of the range projector, which
+      rotates when the active subspace moves with the differentiation
+      point — higher-order derivatives through the filtered solve are
+      exact only while the active subspace is locally constant.
+    - **An explicitly positive `ad_solver_penalty` — the trace-scaled
+      ridge** \(\delta = \texttt{ad\_solver\_penalty} \cdot
+      \operatorname{tr}(B^\top B)\), solved by QR of the augmented matrix
+      \([B;\ \sqrt{\delta}\, I_n]\) — the ridged tangent computed without
+      ever forming \(B^\top B + \delta I\). The bias is
+      O(`ad_solver_penalty` · \(n\)) relative on consistent systems, a
+      penalty-inflated finite tangent on genuinely *inconsistent* singular
+      ones, and the solution is smooth in \(p\) where the filter's rank
+      cutoff is a hard threshold. The ridge earns its kwarg in exactly two
+      situations: hypergradient loops over \(p\) whose numerical rank
+      drifts across the filter cutoff (the filtered tangent jumps at each
+      crossing; the ridged one moves smoothly), and float32 problems whose
+      genuine small singular values sit near the cutoff. Typical values
+      are `1e-12` for a float64 solve and `1e-6` for float32.
+    - **An explicit `0.0` — plain QR of \(B\)**, exact at full column
+      rank, guarded by a deterministic rank check that poisons the tangent
+      to NaN on rank deficiency — without the guard an exactly-zero pivot
+      can round into a finite answer silently shifted along the null
+      space.
+- **`gram_cg`** ignores `ad_solver_penalty` entirely: its run-to-tolerance
   default produces non-finite derivatives on a singular dual (loud), while
-  a small bounded `implicit_maxiter` returns a finite — and wrong —
+  a small bounded `ad_solver_maxiter` returns a finite — and wrong —
   derivative with no diagnostic, so reserve the bounded-budget mode for
   exact preconditioners.
 - **`normal_cg`** is exact by default: no ridge, and its range-preserving
   Krylov iteration converges to the min-norm tangent on
   singular-but-consistent systems anyway. A matrix-free ridge is added only
-  when `implicit_penalty` is passed explicitly positive, its scale set by
+  when `ad_solver_penalty` is passed explicitly positive, its scale set by
   a Rayleigh quotient of \(B^\top B\) over a fixed deterministic probe
   vector — which keeps the tangent map linear in \(\dot p\) and the ridge
   alive on a zero tangent — an opt-in stabilizer for systems where
@@ -338,12 +348,10 @@ point is a least-squares stationary point with nonzero residual rather than
 an exact root, \(J_p\dot p\) need not lie in
 \(\operatorname{range}(J_\theta)\). The default rules still return a finite
 answer — the minimum-\(M\)-norm **Gauss–Newton sensitivity of the
-linearized system** — and they agree on it: the normal equations
+linearized system**: the normal equations
 \(B^\top B\dot u = -B^\top J_p\dot p\) are consistent regardless (any
-\(B^\top\)-image is), and the dense pseudoinverses coincide through the
-identities \(B^\top(BB^\top)^{+} = (B^\top B)^{+}B^\top = B^{+}\), so the
-Gram and normal filtered solves compute the same tangent even on an
-inconsistent right-hand side. That tangent is *not* the exact optimizer
+\(B^\top\)-image is), and \(B^{+}\) applies their minimum-norm solution
+directly. That tangent is *not* the exact optimizer
 sensitivity — the exact derivative of a nonzero-residual stationary point
 carries residual-weighted second-derivative (curvature) terms that the
 frozen-Jacobian system drops. A one-line counterexample:
@@ -352,36 +360,39 @@ frozen-Jacobian system drops. A one-line counterexample:
 normal system gives \(0.5\). The implicit rules are exact at interpolating
 (zero-residual) roots — the package's target — and Gauss–Newton
 approximations away from them. The non-default modes differ: an opt-in
-ridge returns a penalty-inflated finite tangent in either dense form, and
+ridge returns a penalty-inflated finite tangent, and
 `gram_cg` fails loudly (its Krylov solve faces the singular-inconsistent
 dual).
 
-Self-adjointness of \(P\) is all the Gram forms need from `metric.solve`:
-the final \(P J_\theta^\top y\) application acts on tangent data, and its
-transpose in the VJP is declared to be \(P\) itself
-(a symmetric `jax.lax.custom_linear_solve`, which also batches under
-`jax.vmap`), so `metric.solve` is only ever
-*evaluated*, never transposed. That is what lets an iterative metric solve —
+Metric callback requirements follow the factorization each form uses. The
+`dense` and `normal_cg` rules work in whitened variables and need the
+square-root pair `metric.inv_sqrt`/`inv_sqrt_transpose`; the final
+\(S\dot u\) map is not self-adjoint and declares that true transpose pair,
+so triangular Cholesky factors differentiate correctly in reverse mode.
+`gram_cg` needs only `metric.solve`, and only ever *evaluates* it: the
+final \(P J_\theta^\top y\) application acts on tangent data, and its
+transpose in the VJP is declared to be \(P\) itself (a symmetric
+`jax.lax.custom_linear_solve`, which also batches under `jax.vmap`). That
+is what lets an iterative, solve-only metric —
 [`metric_from_shifted_matvec`](utilities.md#unified-shifted-block-metrics),
 or any hand-written CG-based `Metric.solve` — participate in both JVP and
-VJP even though transposing through JAX's CG is unsupported. The normal
-forms' final \(S\dot u\) map is *not* self-adjoint and declares the true
-transpose pair (`inv_sqrt`/`inv_sqrt_transpose`) instead.
+VJP even though transposing through JAX's CG is unsupported: pair such a
+metric with `ad_solver="gram_cg"`.
 
 Accuracy of the CG forms is controlled separately from the forward
 iterative solve:
 
-- `implicit_tol=None` uses a dtype-aware default (`1e-6` in float32, `1e-10`
+- `ad_solver_tol=None` uses a dtype-aware default (`1e-6` in float32, `1e-10`
   in float64), chosen for derivative accuracy rather than forward-step speed.
   The same attainable-floor bound as any CG applies: the residual stagnates
   near `machine_eps` times the operator's condition number, so at small
   `eps` (spike weight \(c^2/\varepsilon\)) the float64 default is reachable
   only with the spike preconditioner below.
-- `implicit_atol=0.0` and `implicit_maxiter=None` are passed to JAX CG.
+- `ad_solver_atol=0.0` and `ad_solver_maxiter=None` are passed to JAX CG.
   `None` leaves the iteration budget to JAX's CG policy.
-- `implicit_preconditioner` is deliberately a separate argument from the
+- `ad_solver_preconditioner` is deliberately a separate argument from the
   forward preconditioner hooks — see
-  [above](#the-implicit-preconditioner).
+  [above](#the-ad-solver-preconditioner).
 
 Two notes for the
 [unified shifted metric](gauss_newton.md#shifted-metrics-and-the-seminorm-limit)
@@ -389,16 +400,16 @@ Two notes for the
 
 - The scalar block injects its rank-\(k\) spike of weight \(c^2/\varepsilon\)
   into the *undamped* implicit dual operator too — there is no LM damping
-  here to mask it — so at small \(\varepsilon\) a `gram_cg` implicit solve
+  here to mask it — so at small \(\varepsilon\) a `gram_cg` AD solve
   needs the same
   [Sherman–Morrison/Woodbury spike preconditioner](utilities.md#shermanmorrison-dual-preconditioner)
-  as the forward solve — pass the helper directly; the implicit hook calls
+  as the forward solve — pass the helper directly; the AD hook calls
   it with zero damping.
-- With `metric_from_shifted_matvec` the `gram_cg` implicit solve nests an
+- With `metric_from_shifted_matvec` the `gram_cg` AD solve nests an
   inner metric CG inside every operator application, and the outer solve
   cannot be more accurate than the inner one: for derivative-critical work
-  set the metric's `tol` at or below `implicit_tol` (the metric's default,
-  the square root of machine epsilon, is looser than the float64 implicit
+  set the metric's `tol` at or below `ad_solver_tol` (the metric's default,
+  the square root of machine epsilon, is looser than the float64 AD
   default of `1e-10`).
 
 Example sketch for a large matrix-free residual:
@@ -409,11 +420,11 @@ from nlls_gram import LevenbergMarquardt
 
 def residual(theta, _, p):
     # `features(theta)` is evaluated by JVP/VJP closures; no dense Jacobian is
-    # formed by the forward CG solve or the implicit CG derivative.
+    # formed by the forward CG solve or the CG-based AD rule.
     return features(theta) - p
 
 
-def implicit_preconditioner(v):
+def ad_solver_preconditioner(v):
     return approximate_undamped_dual_solve(v)
 
 
@@ -423,9 +434,9 @@ solver = LevenbergMarquardt(
     iterative_tol=1e-3,
     iterative_maxiter=20,
     dual_preconditioner=identity_preconditioner(),
-    implicit_solver="auto",
-    implicit_tol=None,
-    implicit_preconditioner=implicit_preconditioner,
+    ad_solver="auto",
+    ad_solver_tol=None,
+    ad_solver_preconditioner=ad_solver_preconditioner,
 )
 ```
 
@@ -441,8 +452,9 @@ $$
 $$
 
 For a pytree `p`, \(J_p^\top y\) means the JAX VJP of the residual with respect
-to the `p` argument only. The normal forms compute the identical cotangent
-by transposing the whitened map instead — for the unridged `normal_cg` rule
+to the `p` argument only. The whitened rules compute the identical cotangent
+by transposing the whitened map instead — the `dense` rule through
+\((B^{+})^\top\) from the same factorization, the unridged `normal_cg` rule
 through its declared push-through transpose, since a cotangent right-hand
 side need not lie in \(\operatorname{range}(B^\top)\). Rank-deficient
 systems behave as in [the ridge section](#rank-deficiency-and-the-ridge):

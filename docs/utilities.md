@@ -5,7 +5,7 @@ assemble metrics and CG preconditioners from structure they already know,
 instead of hand-rolling callback plumbing. Everything here returns plain
 callables or `Metric` objects that the solver sees through the `metric=`,
 `dual_preconditioner=`, `normal_preconditioner=`, and
-`implicit_preconditioner=` arguments. The CG forms require explicit
+`ad_solver_preconditioner=` arguments. The CG forms require explicit
 preconditioners; `identity_preconditioner()` is the explicit opt-out.
 
 | Helper | Builds | Cost per apply |
@@ -169,9 +169,10 @@ with the Gram forms (`gram_cholesky`, `gram_cg`) and is rejected for the
 whitened forms (`normal_cholesky`, `normal_cg`, `qr`, `augmented_qr`,
 `lsmr`), which all require `inv_sqrt`, at construction — on a
 square-to-tall problem pin a Gram form explicitly, since the default `auto`
-would resolve to `normal_cholesky`. Combined with
-`implicit_solver="gram_cg"` the whole pipeline — forward solve, JVP, and
-VJP — runs matrix-free (see [Implicit AD](implicit_ad.md)). This is the one
+would resolve to `normal_cholesky`. The dense AD rule also requires the
+square-root pair, so pair a solve-only metric with
+`ad_solver="gram_cg"` — the whole pipeline — forward solve, JVP, and
+VJP — then runs matrix-free (see [Implicit AD](implicit_ad.md)). This is the one
 constructor that meets the
 `metric.solve` exactness contract in a limit rather than identically: its
 inner CG tolerance is part of the answer, not of the schedule — the
@@ -311,7 +312,7 @@ with refinement — see the [Tuning Guide](tuning_guide.md).
 
 `linear_solver="gram_cg"` requires a `dual_preconditioner`,
 `linear_solver="normal_cg"` a `normal_preconditioner`, and a
-`gram_cg`-resolved implicit solve an `implicit_preconditioner` — running
+`gram_cg`-resolved AD solve an `ad_solver_preconditioner` — running
 Krylov methods unpreconditioned should be a decision, not a default.
 `identity_preconditioner()` is that decision made explicit and greppable:
 
@@ -322,7 +323,7 @@ solver = LevenbergMarquardt(
     residual_fn,
     linear_solver="gram_cg",
     dual_preconditioner=identity_preconditioner(),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
 )
 ```
 
@@ -370,10 +371,10 @@ is safe.
 parameter-space system. A `normal_cg`-resolved *implicit* solve needs no
 preconditioner at all (its right-hand side lies in
 \(\operatorname{range}(B^\top)\), so unpreconditioned CG already selects
-the minimum-norm tangent); an optional `implicit_preconditioner` supplied
+the minimum-norm tangent); an optional `ad_solver_preconditioner` supplied
 there acts in the same parameter space under the same range-preservation
 requirement at `damping = 0` — see
-[Implicit AD](implicit_ad.md#the-implicit-preconditioner).
+[Implicit AD](implicit_ad.md#the-ad-solver-preconditioner).
 
 ## Nyström Preconditioner for Neural-Network Least Squares
 
@@ -441,11 +442,11 @@ solver = LevenbergMarquardt(
     dual_preconditioner=nystrom_preconditioner(
         ntk_matvec, m, rank, jax.random.PRNGKey(0)
     ),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
 )
 ```
 
-Passed as `implicit_preconditioner` the helper applies its undamped
+Passed as `ad_solver_preconditioner` the helper applies its undamped
 (zero-damping) inverse, which is valid only when the retained spectrum is
 strictly positive.
 
@@ -491,7 +492,7 @@ solver = LevenbergMarquardt(
   linear-in-`v` approximation of \((J M^{-1} J^\top + \lambda I)^{-1} v\). It
   must stay well-defined at `damping = 0`, because a `gram_cg`-resolved
   implicit derivative reuses it (undamped) at the converged solution unless
-  an explicit `implicit_preconditioner` overrides it.
+  an explicit `ad_solver_preconditioner` overrides it.
 
 `prepare` runs **once per accepted step**: after a rejected step \(x\) did not
 move, so the carried state is reused and only the live `damping` changes. That
@@ -555,19 +556,19 @@ solvers behave as follows:
   singular *but consistent* — their `p`-derivative rows are identically
   zero too — which is exactly the singular-but-consistent regime of
   [the implicit rules](implicit_ad.md#rank-deficiency-and-the-ridge). The
-  dense-resolved rules compute the minimum-metric-norm tangent exactly
-  through their default spectral-filter pseudoinverses, and a
-  `normal_cg`-resolved implicit computes it with no ridge in exact
+  dense AD rule computes the minimum-metric-norm tangent exactly
+  through its default spectral-filter pseudoinverse, and a
+  `normal_cg`-resolved AD solve computes it with no ridge in exact
   arithmetic — on its default unridged path, with the inner CG run to
   convergence, and either unpreconditioned or with a range-preserving
-  `implicit_preconditioner` (an opt-in `implicit_penalty` ridge biases at
+  `ad_solver_preconditioner` (an opt-in `ad_solver_penalty` ridge biases at
   the documented order; an explicit `0.0` fails loudly through the dense
   rank guard). A
-  `gram_cg`-resolved implicit is the
+  `gram_cg`-resolved AD solve is the
   fragile choice here — run-to-tolerance CG on the singular padded dual —
   and `pad_dual_preconditioner` divides the padded block by the live
   damping, so it is rejected at construction when passed as an
-  `implicit_preconditioner`. The minimum-metric-norm derivative equals the
+  `ad_solver_preconditioner`. The minimum-metric-norm derivative equals the
   unpadded derivative (padding only appends redundant equations), so when
   in doubt differentiate the unpadded formulation.
 
@@ -621,10 +622,10 @@ over the CG forms.
 - **Differentiation**: reverse-AD through `update` works (the whitened
   solution is wrapped in `lax.custom_linear_solve` on the SPD preconditioned
   normal operator `R⁻ᵀ(BᵀB + damping I)R⁻¹`). Differentiating a forward
-  `solve(...).x` uses a dense implicit rule by default
-  (`implicit_solver="auto"` applies the shape rule); set
-  `implicit_solver="normal_cg"` (no preconditioner needed) or
-  `"gram_cg"` with an `implicit_preconditioner` for a fully matrix-free
+  `solve(...).x` uses the dense AD rule by default
+  (`ad_solver="auto"`); set
+  `ad_solver="normal_cg"` (no preconditioner needed) or
+  `"gram_cg"` with an `ad_solver_preconditioner` for a fully matrix-free
   derivative.
 
 The standalone [`lsmr`](#nlls_gram.lsmr) function (operator/transpose matvecs,

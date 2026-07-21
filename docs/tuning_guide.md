@@ -44,9 +44,9 @@ numerical rank — and it does not need to: rank-deficient problems
 (redundant rows, collinear columns — tall interpolation problems always
 have some) are handled by every form except `qr`, with the
 minimum-`M`-norm small-damping selection intact. The flip also never
-changes derivative semantics: both dense implicit defaults apply exact
-spectral-filter pseudoinverses, so the implicit tangent `auto` produces is
-the same whichever form the shapes select.
+changes derivative semantics: every non-CG forward resolves to the one
+shape-independent dense AD rule, so the implicit tangent is the same
+whichever forward form the shapes select.
 
 | situation | use |
 | --- | --- |
@@ -114,20 +114,39 @@ the same whichever form the shapes select.
   maps the same `iterative_tol`/`iterative_atol`/`iterative_maxiter` hooks
   (relative/absolute bound on the normal-equations residual, measured on the
   preconditioned operator, callback-schedulable). Differentiating a forward
-  `lsmr` `solve(...).x` uses a dense implicit rule by default
-  (`implicit_solver="auto"` applies the shape rule); pass
-  `implicit_solver="normal_cg"` (no preconditioner needed) or `"gram_cg"`
-  with an `implicit_preconditioner` for a fully matrix-free derivative.
+  `lsmr` `solve(...).x` uses the dense AD rule by default
+  (`ad_solver="auto"`); pass
+  `ad_solver="normal_cg"` (no preconditioner needed) or `"gram_cg"`
+  with an `ad_solver_preconditioner` for a fully matrix-free derivative.
 - The CG forms return an *approximate* step under their iteration budget.
   That is usually fine — LM's accept/reject absorbs inexactness — but see
-  the scheduling pattern below. With the default `implicit_solver="auto"`,
+  the scheduling pattern below. With the default `ad_solver="auto"`,
   differentiating a forward `gram_cg`/`normal_cg` `solve(...).x` uses the
   matching matrix-free CG rule instead of materializing \(J^\top\).
 
+## Jacobian Assembly (`jacobian_mode`)
+
+The dense forward solvers (`auto`, `gram_cholesky`, `normal_cholesky`,
+`qr`, `augmented_qr`) and the dense AD rule materialize the Jacobian;
+`jacobian_mode` controls from which side. `"auto"` (the default) vmaps the
+identity basis over the **small** dimension: `n` forward-mode JVP columns
+when the system is tall or square (`n <= m`), `m` reverse-mode VJP rows
+only when strictly fat (`n > m`), with the square tie going to the cheaper
+JVP passes. That choice is about compile-time memory and pass cost, never
+semantics — an `m x m` residual-space basis over a tall system was a
+compile-time memory blowup. `"fwd"`/`"rev"` force one mode (e.g. a residual
+whose primitives lack a transpose rule needs `"fwd"`). The matrix-free
+solvers never materialize `J` and ignore the setting; a *forced* mode in a
+configuration where nothing dense could consume it — a matrix-free forward
+solver with a CG-resolved `ad_solver` — is rejected at construction rather
+than silently ignored.
+
 ## Float64 à la Carte
 
-The Gram and normal forms square the condition number (they factor
-`J P J'` or `B'B`). If that system is ill-conditioned or implicit
+The Gram and normal forward forms square the condition number (they factor
+`J P J'` or `B'B`; the dense AD rule works from the SVD of `B` at
+`cond(B)`, but classifying singular values near the rank cutoff still
+benefits from precision). If that system is ill-conditioned or implicit
 derivatives must be accurate, reach for float64 — it fixes more numerical
 trouble than any damping adjustment. Three grades, from narrowest to
 widest:
@@ -141,7 +160,7 @@ widest:
   not the solver algebra, is the fragile part.
 - **`linear_solve_dtype=jnp.float64`** promotes the dense linear-solve
   pipelines: the `gram_cholesky`/`normal_cholesky` forward factorizations
-  and the dense implicit rules, while the model stays float32 — measured
+  and the dense AD rule, while the model stays float32 — measured
   ~1.4x per `gram_cholesky` update at `m=100, n=2000` for a *trivial*
   residual (an upper bound: real residual and Jacobian costs dominate and
   stay float32), recovering the float64 answer to ~1e-6 on a 1e-7-spike
@@ -194,13 +213,13 @@ exactly then). Three patterns, in order of preference:
    (`auto`) warm-started with `result.x` and `result.lm_state`. The implicit
    derivative is unaffected (it is defined at the returned solution only).
 
-Forward iterative tolerances and implicit AD tolerances are separate. The
-implicit CG rules use `implicit_tol=None` by default, which means `1e-6` in
+Forward iterative tolerances and AD tolerances are separate. The
+CG-based AD rules use `ad_solver_tol=None` by default, which means `1e-6` in
 float32 and `1e-10` in float64; these defaults target derivative accuracy, not
-cheap forward steps. Pass a dense `implicit_solver`
-(`"gram_cholesky"`/`"normal_cholesky"`) when you want a dense implicit rule
-under an iterative forward solver, or tune `implicit_tol`, `implicit_atol`,
-`implicit_maxiter`, and `implicit_preconditioner(v)` for a matrix-free
+cheap forward steps. Pass `ad_solver="dense"`
+when you want the dense AD rule
+under a matrix-free forward solver, or tune `ad_solver_tol`, `ad_solver_atol`,
+`ad_solver_maxiter`, and `ad_solver_preconditioner(v)` for a matrix-free
 derivative.
 
 Before scheduling accuracy, check whether a structural `dual_preconditioner`
@@ -270,11 +289,11 @@ preconditioner every step, closing the terminal gap a frozen `P` cannot.
   `None` cannot be switched on), and the *values* of `x0`/`args`/`p`.
   The one exception is `max_steps` with `save_steps=True`: the history
   buffer's shape depends on it, so each distinct value then retraces.
-- **Recompiles per value (static):** `linear_solver`,
-  `implicit_solver`, the `implicit_*` accuracy knobs,
+- **Recompiles per value (static):** `linear_solver`, `jacobian_mode`,
+  `ad_solver`, the `ad_solver_*` accuracy knobs,
   `geodesic_acceleration`, `cache_jacobian`, `has_aux`, the `Metric`
   callbacks, `dual_preconditioner`, `preconditioner_factory`,
-  `whitened_preconditioner`, `implicit_preconditioner`, `recycle` (the
+  `whitened_preconditioner`, `ad_solver_preconditioner`, `recycle` (the
   `RecycleConfig`, whose `rank`/`window` size the carried basis), and the
   callback function identity.
   Solvers themselves compare by configuration, so a freshly constructed

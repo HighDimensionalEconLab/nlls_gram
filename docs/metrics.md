@@ -23,29 +23,32 @@ Shape requirements:
 
 - `solve` must support vectors `(n_params,)` and matrices `(n_params, k)`.
 - `inv_sqrt` must support vectors `(n_params,)`; matrices
-  `(n_params, n_residuals)` are additionally required for implicit
-  differentiation when the metric has no `solve`.
+  `(n_params, n_residuals)` are additionally required by the dense AD rule
+  (it assembles the whitened Jacobian).
 - `inv_sqrt_transpose` must support matrices `(n_params, n_residuals)` for
-  the dense whitened forms (`normal_cholesky`, `qr`, `augmented_qr`) and
-  their implicit rules; the matrix-free forms (`normal_cg`, `lsmr`) apply it
-  to vectors only.
+  the dense whitened forward forms (`normal_cholesky`, `qr`,
+  `augmented_qr`) and the dense AD rule; the matrix-free forms
+  (`normal_cg`, `lsmr`) apply it to vectors only.
 - `norm` only needs to support vectors `(n_params,)`.
 
 Validation rules — which callbacks a custom metric must supply depends on
 the *form* the solver works in:
 
-| form (forward or resolved implicit) | requires |
+| form | requires |
 | --- | --- |
-| Gram: `gram_cholesky`, `gram_cg` | `solve` |
-| whitened: `normal_cholesky`, `normal_cg`, `qr`, `augmented_qr`, `lsmr` | `inv_sqrt` + `inv_sqrt_transpose` |
+| Gram forward: `gram_cholesky`, `gram_cg` | `solve` |
+| whitened forward: `normal_cholesky`, `normal_cg`, `qr`, `augmented_qr`, `lsmr` | `inv_sqrt` + `inv_sqrt_transpose` |
+| AD: `dense`, `normal_cg` | `inv_sqrt` + `inv_sqrt_transpose` |
+| AD: `gram_cg` | `solve` |
 | geodesic acceleration + custom metric | `norm` |
 
-- Concrete solver names validate eagerly at construction. `"auto"` defers
-  the check to trace time, when the concrete shapes resolve the form — the
-  same precedent as a `metric_factory`, whose built metric is validated
-  when `build` first runs. The resolved *implicit* form's requirements
-  apply too: a statically normal-resolved implicit solver with a fixed
-  metric lacking the square-root pair fails eagerly.
+- Concrete forward solver names validate eagerly at construction; a forward
+  `"auto"` defers its check to trace time, when the concrete shapes resolve
+  the form — the same precedent as a `metric_factory`, whose built metric
+  is validated when `build` first runs. The AD side has no shape rule, so
+  its requirements are always static: a solve-only metric under any
+  `dense`-resolved `ad_solver` fails eagerly — pair such a metric with
+  `ad_solver="gram_cg"`.
 - If geodesic acceleration is enabled (the default) and a custom metric is
   supplied, `metric.norm` is required — supply it or pass
   `geodesic_acceleration=False`.
@@ -128,14 +131,17 @@ solver = LevenbergMarquardt(
     linear_solver="gram_cg",
     metric=metric_from_shifted_matvec(kernel_matvec, eps),
     dual_preconditioner=identity_preconditioner(),
-    implicit_preconditioner=identity_preconditioner(),
+    ad_solver_preconditioner=identity_preconditioner(),
 )
 ```
 
 It has no matrix-free square root, so it serves the Gram forms only
 (`gram_cholesky`, `gram_cg`) — on a square-to-tall problem pin one of them
 explicitly, since the default `auto` would resolve to `normal_cholesky` and
-reject the metric at trace time.
+reject the metric at trace time. The same constraint applies to the AD
+side: pair it with `ad_solver="gram_cg"` (the dense AD rule needs the
+square-root pair; a `gram_cholesky` forward with the default
+`ad_solver="auto"` would resolve to `dense` and reject it).
 
 This changes the LM damping metric. It is not a preconditioner for the inner CG
 iteration; it changes the step being solved for — which is why the inner
