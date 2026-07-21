@@ -166,6 +166,74 @@ def test_rank_deficient_tall_penalty_regularizes_and_zero_penalty_fails_loudly()
     assert not bool(jnp.all(jnp.isfinite(unregularized)))
 
 
+def test_dense_zero_penalty_success_path_on_full_rank_tall_and_square():
+    # The m >= n ad_solver_penalty=0.0 SUCCESS path: on a full-column-rank
+    # system the plain small-side QR is nonsingular and returns the exact
+    # Gauss-Newton tangent, rather than the rank-guard NaN the singular case
+    # produces. (Previously only the FAT branch had value coverage at 0.0.)
+    def dense_tangent(p_dot, **overrides):
+        solver = LevenbergMarquardt(
+            tall_residual,
+            linear_solver="augmented_qr",
+            geodesic_acceleration=False,
+            cache_jacobian=False,
+            ad_solver="dense",
+            ad_solver_penalty=0.0,
+            **overrides,
+        )
+        return jax.jvp(solved_x_fn(solver), (P0,), (p_dot,))[1]
+
+    x_dot = dense_tangent(P_DOT)
+    assert bool(jnp.all(jnp.isfinite(x_dot)))
+    assert jnp.allclose(x_dot, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
+
+    # A non-identity metric leaves the full-column-rank tangent unchanged but
+    # exercises the inv_sqrt composition inside the 0.0 branch.
+    metric = metric_from_diagonal(jnp.array([1.0, 4.0, 0.25], dtype=jnp.float32))
+    x_dot_metric = dense_tangent(P_DOT, metric=metric)
+    assert jnp.allclose(x_dot_metric, analytic_tangent(A_TALL, P_DOT), atol=2e-6)
+
+    # jvp/vjp dot-product identity on the linear tangent map T(p_dot) = x_dot.
+    solver = LevenbergMarquardt(
+        tall_residual,
+        linear_solver="augmented_qr",
+        geodesic_acceleration=False,
+        cache_jacobian=False,
+        ad_solver="dense",
+        ad_solver_penalty=0.0,
+    )
+    solved_x = solved_x_fn(solver)
+    _, vjp_fn = jax.vjp(solved_x, P0)
+    lhs = jnp.vdot(X_BAR, jax.jvp(solved_x, (P0,), (P_DOT,))[1])
+    rhs = jnp.vdot(vjp_fn(X_BAR)[0], P_DOT)
+    assert jnp.allclose(lhs, rhs, atol=2e-5)
+
+    # Square nonsingular: the same 0.0 path gives dx/dp = A^{-1} p_dot.
+    sq_rng = np.random.default_rng(7)
+    A_sq = jnp.asarray(sq_rng.normal(size=(N, N)), dtype=jnp.float32)
+    b_sq = jnp.asarray(sq_rng.normal(size=(N,)), dtype=jnp.float32)
+
+    def square_residual(x, args, p):
+        return A_sq @ x - (b_sq + p)
+
+    square_solver = LevenbergMarquardt(
+        square_residual,
+        linear_solver="augmented_qr",
+        geodesic_acceleration=False,
+        cache_jacobian=False,
+        ad_solver="dense",
+        ad_solver_penalty=0.0,
+    )
+    p0 = jnp.asarray(sq_rng.normal(size=(N,)), dtype=jnp.float32)
+    p_dot = jnp.asarray(sq_rng.normal(size=(N,)), dtype=jnp.float32)
+    sq_tangent = jax.jvp(
+        lambda p: square_solver.solve(X0, p=p, max_steps=100, gtol=1e-6).x,
+        (p0,),
+        (p_dot,),
+    )[1]
+    assert jnp.allclose(sq_tangent, jnp.linalg.solve(A_sq, p_dot), atol=2e-5)
+
+
 def test_ridged_dense_tangent_accuracy_scales_with_cond_b():
     # Regression for the cond(B)-not-cond(B)^2 contract of the ridged dense
     # rule: at cond(B) ~ 1e3 and penalty 1e-6 a normal-equations Cholesky
@@ -210,17 +278,10 @@ def test_ridged_dense_tangent_accuracy_scales_with_cond_b():
     assert relative < 2e-5, relative
 
 
-A_FAT = jnp.asarray(_rng.normal(size=(2, 4)), dtype=jnp.float32)
-P_FAT = jnp.asarray(_rng.normal(size=(2,)), dtype=jnp.float32)
-P_FAT_DOT = jnp.asarray(_rng.normal(size=(2,)), dtype=jnp.float32)
-X0_FAT = jnp.zeros(4, dtype=jnp.float32)
-
-
-def fat_residual(x, args, p):
-    return A_FAT @ x - p
-
-
 def test_auto_ad_solver_dispatch():
+    # linear_solver="auto" is itself a non-cg forward, so its AD resolves dense.
+    assert LevenbergMarquardt(tall_residual)._resolved_ad_solver == "dense"
+
     cg_solver = LevenbergMarquardt(
         tall_residual,
         linear_solver="gram_cg",
@@ -246,6 +307,26 @@ def test_auto_ad_solver_dispatch():
         )
         follows = LevenbergMarquardt(tall_residual, linear_solver=form, **kwargs)
         assert follows._resolved_ad_solver == resolved
+
+
+def test_dense_ad_tangent_is_invariant_across_jacobian_mode():
+    # The dense AD rule assembles B via _assemble_jt, which picks fwd/rev by
+    # shape; a forced mode must change only cost, never the tangent (guards a
+    # transposed-axis / (m, n) arg-order flip that a green suite would miss).
+    def tangent(jacobian_mode):
+        solver = LevenbergMarquardt(
+            tall_residual,
+            linear_solver="augmented_qr",
+            jacobian_mode=jacobian_mode,
+            geodesic_acceleration=False,
+            cache_jacobian=False,
+            ad_solver="dense",
+        )
+        return jax.jvp(solved_x_fn(solver), (P0,), (P_DOT,))[1]
+
+    reference = analytic_tangent(A_TALL, P_DOT)
+    for jacobian_mode in ("auto", "fwd", "rev"):
+        assert jnp.allclose(tangent(jacobian_mode), reference, atol=2e-6)
 
 
 def _iter_jaxprs(jaxpr):

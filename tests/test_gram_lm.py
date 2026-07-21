@@ -2041,6 +2041,12 @@ def test_equal_settings_solvers_share_the_compiled_solve_loop():
     assert a != LevenbergMarquardt(
         lambda theta, args, p: theta - args, init_damping=1e-2, cache_jacobian=False
     )
+    # The knobs added by the reconciliation phase must also key the compiled
+    # loop -- a collision here would silently reuse a loop with the wrong AD
+    # or assembly behavior, the exact failure this package guards against.
+    assert a != build(jacobian_mode="rev")
+    assert a != build(ad_solver_penalty=1e-6)
+    assert a != build(ad_solver="dense")
 
 
 @pytest.mark.parametrize("cache_jacobian", [False, True])

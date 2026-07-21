@@ -408,6 +408,18 @@ def test_old_solver_names_are_unknown():
         LevenbergMarquardt(exp_residual, ad_solver="cg")
     with pytest.raises(TypeError, match="dual_solve_dtype"):
         LevenbergMarquardt(exp_residual, dual_solve_dtype=jnp.float64)
+    # The pre-rename implicit_* kwarg family must not be silently accepted by
+    # a future **kwargs/compat shim.
+    for old_kwarg in (
+        "implicit_solver",
+        "implicit_penalty",
+        "implicit_preconditioner",
+        "implicit_tol",
+        "implicit_atol",
+        "implicit_maxiter",
+    ):
+        with pytest.raises(TypeError, match=old_kwarg):
+            LevenbergMarquardt(exp_residual, **{old_kwarg: None})
 
 
 def test_gram_cg_only_hooks_rejected_elsewhere():
