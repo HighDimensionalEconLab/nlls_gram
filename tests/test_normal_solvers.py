@@ -1131,10 +1131,10 @@ def test_implicit_penalty_positive_normal_cg_zero_seed_gives_zero_tangent():
 
 
 def test_default_implicit_tangent_has_no_ridge_bias_float64():
-    # Guard-rail: implicit_penalty=None must be the EXACT min-norm tangent
-    # (spectral filter / unridged CG). Measured error is ~4e-15 at float64;
-    # any hidden default ridge (a 1e-12 trace-scaled one biases ~1e-11) fails
-    # the 1e-12 bound.
+    # Guard-rail over ALL FOUR implicit forms: implicit_penalty=None must be
+    # the EXACT min-norm tangent (spectral filter / unridged CG). Measured
+    # error is ~4e-15 at float64; any hidden default ridge (a 1e-12
+    # trace-scaled one biases ~1e-11) fails the 1e-12 bound.
     script = r"""
 import jax
 jax.config.update("jax_enable_x64", True)
@@ -1169,15 +1169,19 @@ def tangent(implicit_solver, **kwargs):
 
 
 expected = 0.5 * root
-t_dense = tangent("normal_cholesky")
-assert jnp.allclose(t_dense, expected, atol=1e-12), t_dense - expected
-t_cg = tangent(
-    "normal_cg",
+cg_kwargs = dict(
     implicit_preconditioner=identity_preconditioner(),
     implicit_tol=1e-14,
     implicit_maxiter=100,
 )
-assert jnp.allclose(t_cg, expected, atol=1e-12), t_cg - expected
+for form, kwargs in (
+    ("gram_cholesky", {}),
+    ("normal_cholesky", {}),
+    ("gram_cg", cg_kwargs),
+    ("normal_cg", cg_kwargs),
+):
+    t = tangent(form, **kwargs)
+    assert jnp.allclose(t, expected, atol=1e-12), (form, t - expected)
 """
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],
@@ -1186,3 +1190,62 @@ assert jnp.allclose(t_cg, expected, atol=1e-12), t_cg - expected
         text=True,
     )
     assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_implicit_penalty_trio_on_rank_deficient_gram_cholesky():
+    # The gram trio after the unification, mirroring the normal one: default
+    # None takes the spectral-filter pseudoinverse of the singular dual
+    # G = J P J' (min-norm tangent), an explicit positive value factors the
+    # trace-scaled ridge (finite, O(penalty) bias), and 0.0 is the unridged
+    # solve whose rank guard poisons the tangent to NaN.
+    def residual(theta, _, p):
+        return A_RD @ theta - p * B_RD
+
+    def tangent(implicit_penalty):
+        solver = LevenbergMarquardt(
+            residual,
+            init_damping=1e-3,
+            implicit_solver="gram_cholesky",
+            implicit_penalty=implicit_penalty,
+            geodesic_acceleration=False,
+        )
+        return jax.jvp(
+            lambda p: solver.solve(jnp.zeros(3), p=p, max_steps=80, atol=1e-6).x,
+            (jnp.asarray(1.2),),
+            (jnp.asarray(0.5),),
+        )[1]
+
+    expected = 0.5 * min_m_norm_root(A_RD, B_RD)
+    default_tangent = tangent(None)
+    assert bool(jnp.all(jnp.isfinite(default_tangent)))
+    assert jnp.allclose(default_tangent, expected, atol=2e-3)
+    ridged_tangent = tangent(1e-4)
+    assert bool(jnp.all(jnp.isfinite(ridged_tangent)))
+    assert jnp.allclose(ridged_tangent, expected, atol=5e-3)
+    assert bool(jnp.all(jnp.isnan(tangent(0.0))))
+
+
+def test_gram_penalty_zero_nan_is_the_guard_not_roundoff_on_inconsistent_dual():
+    # The integer-valued A_RD makes the undamped dual G EXACTLY singular, and
+    # potrf can round such a matrix through to a finite factorization -- which
+    # on this INCONSISTENT system (c outside range(A_RD), so the tangent rhs
+    # leaves range(G)) would be a silently wrong finite tangent. The rank
+    # guard, not factorization roundoff, must deterministically poison it.
+    c = jnp.array([1.0, 0.0, 0.0, 0.0])
+
+    def residual(theta, _, p):
+        return A_RD @ theta - p * c
+
+    solver = LevenbergMarquardt(
+        residual,
+        init_damping=1e-3,
+        implicit_solver="gram_cholesky",
+        implicit_penalty=0.0,
+        geodesic_acceleration=False,
+    )
+    _, t = jax.jvp(
+        lambda p: solver.solve(jnp.zeros(3), p=p, max_steps=80, atol=0.0).x,
+        (jnp.asarray(1.2),),
+        (jnp.asarray(0.5),),
+    )
+    assert bool(jnp.all(jnp.isnan(t)))
