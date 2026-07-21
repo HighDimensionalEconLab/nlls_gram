@@ -350,10 +350,12 @@ def test_lsmr_geodesic_matches_cholesky():
     )
 
 
-def test_lsmr_implicit_p_derivative_matches_cholesky():
-    # auto + lsmr defers the implicit form to trace-time shapes; pinning the
-    # dense gram rule, the p-derivative (defined at the solution) must match
-    # the gram_cholesky forward.
+def test_lsmr_implicit_p_derivative_matches_analytic():
+    # auto + lsmr defers the implicit form to trace-time shapes; this system
+    # is tall (m=12 > n=1), so shape_auto resolves to normal_cholesky and the
+    # p-derivative matches the analytic least-squares sensitivity
+    # sum(ts)/sum(ts^2) exactly. The gram_cholesky forward's default filter
+    # computes the same tangent through the rank-1 12x12 dual.
     ts = jnp.linspace(0.0, 2.0, 12)
 
     def residual_p(x, args, p):
@@ -366,19 +368,20 @@ def test_lsmr_implicit_p_derivative_matches_cholesky():
         residual_p,
         init_damping=1e-3,
         linear_solver="lsmr",
-        implicit_solver="gram_cholesky",
         iterative_tol=1e-10,
         iterative_maxiter=60,
     )
-    assert lsmr_solver._resolved_implicit_solver == "gram_cholesky"
+    assert lsmr_solver._resolved_implicit_solver == "shape_auto"
     p = jnp.asarray(1.7)
+    j_analytic = jnp.sum(ts) / jnp.sum(ts**2)
 
     def solved(solver, q):
         return solver.solve(jnp.zeros(()), p=q, max_steps=60, atol=1e-9).x
 
     j_cholesky = jax.jacobian(lambda q: solved(cholesky, q))(p)
     j_lsmr = jax.jacobian(lambda q: solved(lsmr_solver, q))(p)
-    assert jnp.allclose(j_lsmr, j_cholesky, rtol=1e-4, atol=1e-5)
+    assert jnp.allclose(j_lsmr, j_analytic, rtol=1e-4, atol=1e-5)
+    assert jnp.allclose(j_cholesky, j_analytic, rtol=1e-4, atol=1e-5)
 
 
 # --- validation --------------------------------------------------------------
@@ -577,8 +580,9 @@ def test_whitened_preconditioner_forward_step_is_identity_damped():
 def test_whitened_preconditioner_reverse_ad_and_implicit_p():
     # Reverse-AD through a preconditioned update is finite (the custom_linear_solve
     # on the preconditioned normal operator differentiates), and the converged
-    # p-derivative -- R-invariant, resolved by the cholesky implicit rule --
-    # matches cholesky.
+    # p-derivative -- R-invariant, resolved by shape to the normal form on
+    # this tall system -- matches the analytic sensitivity, as does the
+    # gram_cholesky forward's default filter.
     ts = jnp.linspace(0.0, 2.0, 12)
 
     def residual_p(x, args, p):
@@ -602,7 +606,6 @@ def test_whitened_preconditioner_reverse_ad_and_implicit_p():
         residual_p,
         init_damping=1e-3,
         linear_solver="lsmr",
-        implicit_solver="gram_cholesky",
         whitened_preconditioner=prec,
         iterative_tol=1e-10,
         iterative_maxiter=60,
@@ -618,13 +621,15 @@ def test_whitened_preconditioner_reverse_ad_and_implicit_p():
     assert bool(jnp.isfinite(g))
 
     p = jnp.asarray(1.7)
+    j_analytic = jnp.sum(ts) / jnp.sum(ts**2)
 
     def solved(solver, q):
         return solver.solve(jnp.zeros(()), p=q, max_steps=60, atol=1e-9).x
 
     j_cholesky = jax.jacobian(lambda q: solved(cholesky, q))(p)
     j_preconditioned = jax.jacobian(lambda q: solved(preconditioned, q))(p)
-    assert jnp.allclose(j_preconditioned, j_cholesky, rtol=1e-4, atol=1e-5)
+    assert jnp.allclose(j_preconditioned, j_analytic, rtol=1e-4, atol=1e-5)
+    assert jnp.allclose(j_cholesky, j_analytic, rtol=1e-4, atol=1e-5)
 
 
 def test_whitened_preconditioner_requires_lsmr():

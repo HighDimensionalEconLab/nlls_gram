@@ -858,6 +858,19 @@ class LevenbergMarquardt:
     ``R``. Differentiating a forward ``lsmr`` solve resolves the implicit rule
     by shape under ``implicit_solver="auto"``.
 
+    ``jacobian_mode`` controls how the dense paths -- the cholesky forms
+    (directly or via ``linear_solver="auto"``), ``qr``, ``augmented_qr``, and
+    the dense-resolved implicit rules -- materialize ``J'``: ``"auto"`` (the
+    default) takes ``n`` forward-mode JVP columns when the system is tall or
+    square (``n <= m``) and ``m`` reverse-mode VJP rows only when strictly
+    fat (``n > m``), so the identity basis that is vmapped over is always
+    the small side (an ``m x m`` residual basis over a tall system is a
+    compile-time memory blowup), with the square tie going to the cheaper
+    JVP passes; ``"fwd"``/``"rev"`` force one mode. The matrix-free solvers
+    (``gram_cg``, ``normal_cg``, ``lsmr``) never materialize ``J``, so a
+    forced mode that no dense forward or dense-resolved implicit path could
+    consume is rejected at construction rather than silently ignored.
+
     ``linear_solver="gram_cg"`` requires ``dual_preconditioner(v, damping)``: a
     jit-traceable, linear, SPD approximation of
     ``(J P J' + damping I_m)^{-1} v`` used as the CG preconditioner (for the
@@ -1031,6 +1044,7 @@ class LevenbergMarquardt:
         damping_increase=4.0,
         max_damping=None,
         linear_solver="auto",
+        jacobian_mode="auto",
         iterative_tol=0.0,
         iterative_atol=0.0,
         iterative_maxiter=8,
@@ -1066,6 +1080,8 @@ class LevenbergMarquardt:
             "lsmr",
         ):
             raise ValueError(f"unknown linear_solver: {linear_solver}")
+        if jacobian_mode not in ("auto", "fwd", "rev"):
+            raise ValueError(f"unknown jacobian_mode: {jacobian_mode}")
         if init_damping <= 0:
             raise ValueError("init_damping must be positive")
         if damping_decrease <= 0:
@@ -1148,6 +1164,22 @@ class LevenbergMarquardt:
             resolved_implicit_solver = linear_solver
         else:
             resolved_implicit_solver = "shape_auto"
+        # jacobian_mode is consumed by the dense forward paths (the cholesky
+        # forms directly or via "auto", qr, augmented_qr) and by the
+        # dense-resolved implicit rules ("shape_auto" always resolves dense).
+        # The matrix-free solvers never materialize J, so a forced mode that
+        # nothing could ever read is a construction error, not a silent no-op.
+        if (
+            jacobian_mode != "auto"
+            and linear_solver in ("gram_cg", "normal_cg", "lsmr")
+            and resolved_implicit_solver in ("gram_cg", "normal_cg")
+        ):
+            raise ValueError(
+                "jacobian_mode controls dense Jacobian assembly, but neither "
+                f'linear_solver="{linear_solver}" nor the '
+                f'"{resolved_implicit_solver}"-resolved implicit solver ever '
+                "consumes it"
+            )
         if implicit_preconditioner is not None and resolved_implicit_solver not in (
             "gram_cg",
             "normal_cg",
@@ -1270,6 +1302,7 @@ class LevenbergMarquardt:
         self.damping_increase = damping_increase
         self.max_damping = max_damping
         self.linear_solver = linear_solver
+        self.jacobian_mode = jacobian_mode
         self.iterative_tol = iterative_tol
         self.iterative_atol = iterative_atol
         self.iterative_maxiter = iterative_maxiter
@@ -1349,6 +1382,7 @@ class LevenbergMarquardt:
                 damping_increase,
                 max_damping,
                 linear_solver,
+                jacobian_mode,
                 iterative_tol,
                 iterative_atol,
                 iterative_maxiter,
@@ -1507,6 +1541,37 @@ class LevenbergMarquardt:
             residual_norm=jnp.zeros((), dtype=dtype),
         )
 
+    def _resolve_jacobian_mode(self, m, n):
+        # Static (shape-driven) choice of dense Jacobian assembly: "auto"
+        # takes n forward-mode columns when the system is tall or square
+        # (n <= m) and m reverse-mode rows only when strictly fat (n > m),
+        # so the identity basis being vmapped is always the small side (an
+        # m x m residual basis over a tall system is a compile-time memory
+        # blowup). The square tie goes to forward mode: at equal pass counts
+        # a JVP is cheaper than a VJP.
+        if self.jacobian_mode != "auto":
+            return self.jacobian_mode
+        return "fwd" if n <= m else "rev"
+
+    def _assemble_jt(self, jvp_fn, theta, resid):
+        # J' with shape (n, m) from a linearized JVP closure, assembled per
+        # _resolve_jacobian_mode.
+        if self._resolve_jacobian_mode(resid.shape[0], theta.shape[0]) == "fwd":
+            parameter_basis = jnp.eye(theta.shape[0], dtype=theta.dtype)
+            return jax.vmap(jvp_fn)(parameter_basis)
+        transpose_fn = jax.linear_transpose(jvp_fn, theta)
+        residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
+        return jax.vmap(lambda cotangent: transpose_fn(cotangent)[0])(residual_basis).T
+
+    def _dense_resid_jt_aux(self, residual_flat, theta):
+        # Materialize the residual and J' for the dense paths.
+        if self.has_aux:
+            resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
+        else:
+            resid, jvp_fn = jax.linearize(residual_flat, theta)
+            aux = None
+        return resid, self._assemble_jt(jvp_fn, theta, resid), aux
+
     def _residual_and_aux(self, x, args, p):
         if self.has_aux:
             value, aux = self.residual_fn(x, args, p)
@@ -1568,8 +1633,9 @@ class LevenbergMarquardt:
 
             residual_value = residual_flat
 
-        # Build J': matrix-free JVP/VJP closures for the cg forms and lsmr; m VJP
-        # passes for the dense paths, reused from the cache after a rejected step.
+        # Build J': matrix-free JVP/VJP closures for the cg forms and lsmr; the
+        # dense paths materialize J' from the small side per jacobian_mode,
+        # reused from the cache after a rejected step.
         if self.linear_solver in ("gram_cg", "normal_cg", "lsmr"):
             if self.has_aux:
                 resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
@@ -1584,16 +1650,7 @@ class LevenbergMarquardt:
                 )
 
             def compute_resid_and_jt(_):
-                if self.has_aux:
-                    resid, pullback, aux = jax.vjp(residual_flat, theta, has_aux=True)
-                else:
-                    resid, pullback = jax.vjp(residual_flat, theta)
-                    aux = None
-                residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
-                Jt = jax.vmap(lambda cotangent: pullback(cotangent)[0])(
-                    residual_basis
-                ).T
-                return resid, Jt, aux
+                return self._dense_resid_jt_aux(residual_flat, theta)
 
             def reuse_resid_and_jt(_):
                 return lm_state.resid, lm_state.Jt, lm_state.aux
@@ -1605,11 +1662,7 @@ class LevenbergMarquardt:
                 operand=None,
             )
         else:
-            if self.has_aux:
-                resid, pullback, aux = jax.vjp(residual_flat, theta, has_aux=True)
-            else:
-                resid, pullback = jax.vjp(residual_flat, theta)
-                aux = None
+            resid, Jt, aux = self._dense_resid_jt_aux(residual_flat, theta)
         damping = jnp.asarray(lm_state.damping, dtype=resid.dtype)
         # Traced hyperparameters from the lm_state when present (resettable by
         # solve callbacks); the None fallback compiles to the same constants
@@ -1924,11 +1977,6 @@ class LevenbergMarquardt:
                 return metric_inv_sqrt(u)
 
         else:
-            if not self.cache_jacobian:
-                residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
-                Jt = jax.vmap(lambda cotangent: pullback(cotangent)[0])(
-                    residual_basis
-                ).T
             grad = Jt @ resid
 
             if self.linear_solver == "augmented_qr":
@@ -2697,9 +2745,7 @@ class LevenbergMarquardt:
             return self._residual_and_aux(unravel(theta_value), args, p)[0]
 
         residual, theta_jvp = jax.linearize(residual_from_theta, theta)
-        residual_basis = jnp.eye(residual.shape[0], dtype=residual.dtype)
-        theta_transpose = jax.linear_transpose(theta_jvp, theta)
-        Jt = jax.vmap(lambda cotangent: theta_transpose(cotangent)[0])(residual_basis).T
+        Jt = self._assemble_jt(theta_jvp, theta, residual)
 
         def residual_from_p(p_value):
             return self._residual_and_aux(x, args, p_value)[0]
@@ -2877,9 +2923,7 @@ class LevenbergMarquardt:
             return self._residual_and_aux(unravel(theta_value), args, p)[0]
 
         residual, theta_jvp = jax.linearize(residual_from_theta, theta)
-        residual_basis = jnp.eye(residual.shape[0], dtype=residual.dtype)
-        theta_transpose = jax.linear_transpose(theta_jvp, theta)
-        Jt = jax.vmap(lambda cotangent: theta_transpose(cotangent)[0])(residual_basis).T
+        Jt = self._assemble_jt(theta_jvp, theta, residual)
 
         def residual_from_p(p_value):
             return self._residual_and_aux(x, args, p_value)[0]
