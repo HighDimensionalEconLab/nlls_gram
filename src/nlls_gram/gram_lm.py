@@ -1004,15 +1004,23 @@ class LevenbergMarquardt:
       keeping the tangent map linear in ``p_dot`` and the ridge alive on a
       zero tangent.
 
-    In every form ``0.0`` demands the exact unregularized solve, which
-    fails loudly (non-finite tangents) on a rank-deficient ``B`` rather
-    than silently selecting a particular solution: the dense rule QR-factors
-    ``B`` from its small side and poisons the tangent to NaN when any
-    ``|R_ii|`` falls under the rank cutoff (a triangular pivot is not a
-    rank certificate either, so a genuinely tiny pivot is poisoned the
-    same way -- the numerical-rank caveat above). A solution with
-    ``J = 0`` zeroes every trace-scaled ridge itself and fails just as
-    loudly at any penalty.
+    A ``gram_cg``-resolved AD solve has no ridge to select: it always runs
+    to tolerance and fails loudly (non-finite tangents) on a singular dual,
+    so an explicit positive ``ad_solver_penalty`` there is rejected at
+    construction rather than silently ignored (``0.0`` is the exact/loud
+    solve it does natively and stays legal).
+
+    Under ``"dense"``, ``0.0`` demands the exact unregularized solve: it
+    QR-factors ``B`` from its small side and poisons the tangent to NaN when
+    any ``|R_ii|`` falls under the rank cutoff (a triangular pivot is not a
+    rank certificate either, so a genuinely tiny pivot is poisoned the same
+    way -- the numerical-rank caveat above), rather than silently selecting a
+    particular solution on a rank-deficient ``B``. Under ``normal_cg``, ``0.0``
+    is just the default no-ridge solve -- unpreconditioned CG from zero still
+    reaches the exact minimum-``M``-norm tangent on consistent systems and
+    fails to converge only when the system is inconsistent. A solution with
+    ``J = 0`` zeroes every trace-scaled ridge itself and fails just as loudly
+    at any penalty.
 
     ``linear_solve_dtype=jnp.float64`` promotes the dense linear-solve
     pipelines -- the forward ``gram_cholesky``/``normal_cholesky`` (and
@@ -1152,10 +1160,6 @@ class LevenbergMarquardt:
             raise ValueError("ad_solver_maxiter must be positive or None")
         if ad_solver_penalty is not None and ad_solver_penalty < 0:
             raise ValueError("ad_solver_penalty must be nonnegative or None")
-        if ad_solver_tol == 0 and ad_solver_atol == 0 and ad_solver_maxiter is None:
-            raise ValueError(
-                "ad_solver_maxiter must be set when both ad_solver tolerances are zero"
-            )
         # AD-solver resolution: an explicit choice wins; "auto" keeps a cg
         # forward in its own space and sends every other forward to the one
         # shape-independent dense rule.
@@ -1165,6 +1169,30 @@ class LevenbergMarquardt:
             resolved_ad_solver = linear_solver
         else:
             resolved_ad_solver = "dense"
+        if (
+            resolved_ad_solver in ("gram_cg", "normal_cg")
+            and ad_solver_tol == 0
+            and ad_solver_atol == 0
+            and ad_solver_maxiter is None
+        ):
+            raise ValueError(
+                "ad_solver_maxiter must be set when both ad_solver tolerances are zero"
+            )
+        # ad_solver_penalty is the dense/normal_cg ridge knob; a gram_cg-resolved
+        # AD solve has no ridge (it runs to tolerance and fails loudly on a
+        # singular dual). A positive penalty there requests regularization the
+        # rule cannot apply, so it is a construction error rather than a
+        # silently ignored argument; 0.0 is the exact/loud solve gram_cg does
+        # natively and stays legal.
+        if (
+            ad_solver_penalty is not None
+            and ad_solver_penalty > 0
+            and resolved_ad_solver == "gram_cg"
+        ):
+            raise ValueError(
+                'a positive ad_solver_penalty applies to ad_solver="dense" and '
+                '"normal_cg" only; a gram_cg-resolved ad_solver has no ridge'
+            )
         # jacobian_mode is consumed by the dense forward paths (the cholesky
         # forms directly or via "auto", qr, augmented_qr) and by the dense AD
         # rule. The matrix-free solvers never materialize J, so a forced mode

@@ -264,12 +264,26 @@ def test_ad_solver_options_must_be_valid():
         LevenbergMarquardt(residual_fn, ad_solver_maxiter=0)
     with pytest.raises(ValueError, match="ad_solver_penalty must be nonnegative"):
         LevenbergMarquardt(residual_fn, ad_solver_penalty=-1e-8)
+    # The zero-tolerance guard is a cg stopping control: it fires only for a
+    # cg-resolved ad_solver, not for the shape-independent dense rule.
     with pytest.raises(ValueError, match="ad_solver_maxiter must be set"):
         LevenbergMarquardt(
             residual_fn,
+            linear_solver="gram_cg",
+            dual_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
             ad_solver_tol=0.0,
             ad_solver_atol=0.0,
             ad_solver_maxiter=None,
+        )
+    # A positive ridge is meaningless for a gram_cg-resolved AD solve.
+    with pytest.raises(ValueError, match="positive ad_solver_penalty"):
+        LevenbergMarquardt(
+            residual_fn,
+            linear_solver="gram_cg",
+            dual_preconditioner=identity_preconditioner(),
+            ad_solver_preconditioner=identity_preconditioner(),
+            ad_solver_penalty=1e-6,
         )
     with pytest.raises(ValueError, match="ad_solver_preconditioner"):
         LevenbergMarquardt(residual_fn, ad_solver_preconditioner=lambda v: v)

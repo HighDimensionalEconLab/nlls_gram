@@ -16,7 +16,7 @@ residual aux every accepted step.
 The default linear_solver="auto" resolves at trace time to the smaller dense
 factorization: residual-space Gram Cholesky (gram_cholesky) when n > m, else
 whitened normal Cholesky (normal_cholesky) — the two compute the same step.
-Reduced QR and direct augmented QR cover small or rank-deficient direct
+Reduced QR (full row rank) and direct augmented QR cover small direct
 solves. Three matrix-free solvers use only J/J' products: CG on the
 metric-damped residual-space dual (gram_cg, required dual preconditioner),
 CG on the whitened normal system in parameter space (normal_cg, required

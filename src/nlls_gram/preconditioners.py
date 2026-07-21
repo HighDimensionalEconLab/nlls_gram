@@ -16,12 +16,12 @@ def identity_preconditioner():
     """The identity map as an explicit "no preconditioner" choice.
 
     ``linear_solver="gram_cg"`` requires ``dual_preconditioner``, and a
-    cg-resolved
-    implicit solve requires ``ad_solver_preconditioner`` -- nobody should run
-    Krylov methods without thinking about preconditioning, so opting out is an
-    explicit, greppable decision rather than a silent default. The returned
-    callable accepts both hook signatures: ``dual_preconditioner(v, damping)``
-    and ``ad_solver_preconditioner(v)``.
+    ``gram_cg``-resolved AD solve requires ``ad_solver_preconditioner`` (under
+    ``normal_cg`` the hook is optional) -- nobody should run Krylov methods
+    without thinking about preconditioning, so opting out is an explicit,
+    greppable decision rather than a silent default. The returned callable
+    accepts every hook signature: ``dual_preconditioner(v, damping)``,
+    ``normal_preconditioner(v, damping)``, and ``ad_solver_preconditioner(v)``.
     """
 
     def preconditioner(v, damping=None):
@@ -157,8 +157,9 @@ def nystrom_preconditioner(matvec, n, rank, key, *, dtype=None):
     the sketch resolved are inverted against the live shift, and the
     unresolved complement is treated as sitting at ``rho`` rather than at
     zero -- that balance is what carries the FTU condition-number guarantee
-    for fast-decaying spectra. This is the one shipped helper that uses the
-    live ``damping`` argument (Sherman-Morrison/Woodbury ignore it): one
+    for fast-decaying spectra. This is the one shipped base preconditioner
+    that uses the live ``damping`` argument (Sherman-Morrison/Woodbury ignore
+    it; the ``pad_dual_preconditioner`` wrapper also uses it): one
     construction serves every LM damping value, and passed as
     ``ad_solver_preconditioner`` it is called with zero damping and applies
     the undamped inverse (valid only when the retained spectrum is strictly

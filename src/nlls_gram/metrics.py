@@ -340,9 +340,10 @@ def metric_from_shifted_matvec(
     ``~sqrt(lambda_max / shift) * log(1/tol)`` matvecs. A concrete
     ``shift <= 0`` raises; a traced ``shift`` is not validated and must be
     positive. Only ``solve`` and ``norm`` are provided (there is no
-    matrix-free square root), so the solver accepts this metric for the
-    ``cholesky`` and ``cg`` paths and rejects ``qr``, ``augmented_qr``, and
-    ``lsmr`` -- which all require ``inv_sqrt`` -- at construction.
+    matrix-free square root), so the solver accepts this metric for the Gram
+    forms (``gram_cholesky``, ``gram_cg``) and rejects the whitened forms
+    (``normal_cholesky``, ``normal_cg``, ``qr``, ``augmented_qr``, ``lsmr``)
+    -- which all require ``inv_sqrt`` -- at construction.
 
     ``solve`` runs ``jax.scipy.sparse.linalg.cg`` on the shifted matvec, so
     it meets the library's exactness contract only in the tight-``tol``
@@ -366,8 +367,10 @@ def metric_from_shifted_matvec(
 
     Because the inner CG is built on ``lax.custom_linear_solve`` with a
     symmetric operator, ``solve`` composes with ``jax.jvp``/``jax.vjp``/
-    ``jax.grad`` — including the dense and cg-form implicit-AD rules and
-    differentiating ``update`` through the ``gram_cg`` path — and with
+    ``jax.grad`` — including the ``gram_cg`` implicit-AD rule (a solve-only
+    metric cannot reach the dense or ``normal_cg`` rules, which need the
+    square-root pair) and differentiating ``update`` through the ``gram_cg``
+    path — and with
     values the matvec closes over; ``matvec`` itself
     only needs to be linear. (Closure-value differentiation holds for
     direct ``Metric`` use and through ``update``; the LM ``solve()``
