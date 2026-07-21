@@ -423,7 +423,7 @@ residual and Jacobian are identical — only the damping changed. With
 `cache_jacobian=True` (the default) the solver carries `(resid, Jt)` in
 `LMState` and a
 rejected step's successor skips the residual evaluation and the
-`n_residuals` VJP passes, re-solving only the small damped system (roughly
+Jacobian assembly passes, re-solving only the small damped system (roughly
 2x faster per rejected step; more when the residual is expensive relative to
 the Gram assembly). The flag only affects the dense Gram/normal forms —
 `gram_cholesky`, `normal_cholesky`, and `auto`, which resolves to one of

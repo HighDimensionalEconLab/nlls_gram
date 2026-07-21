@@ -143,14 +143,15 @@ The freeze is a **first-order** statement. Each first-order implicit solve
 applies the metric frozen at *its* solution — the verified contract
 (first-order forward and reverse mode, fixed or factory-built metric). The
 tangent field \(p \mapsto \dot\theta(p)\) so defined uses, at every \(p\),
-the metric rebuilt at that point's solution — but **higher-order AD through
-a factory-built metric's state dependence is unsupported in the implicit
-rules**: the metric wrappers inside the tangent solve cannot see the
-solve-side parameters, so second derivatives do not account for the
-metric's point dependence. Take higher-order derivatives of `solve` only
-with a fixed metric, where the declared solves re-apply correctly (subject
-to the spectral-filter caveat in
-[the ridge section](#rank-deficiency-and-the-ridge)).
+the metric rebuilt at that point's solution. The **`dense`** rule applies
+the built metric through plain traced ops, so its state dependence *is*
+differentiated at higher order — use `ad_solver="dense"` when that
+dependence must itself be differentiated (subject to the spectral-filter
+caveat in [the ridge section](#rank-deficiency-and-the-ridge)). The
+**cg-resolved** rules cannot: their identity-matvec `custom_linear_solve`
+wrappers hide the metric inside an opaque `solve`, so second derivatives
+through `gram_cg`/`normal_cg` do not account for the metric's point
+dependence.
 
 ## The AD Solver
 
@@ -328,11 +329,13 @@ collinear columns included. The three forms then behave as follows:
       to NaN on rank deficiency — without the guard an exactly-zero pivot
       can round into a finite answer silently shifted along the null
       space.
-- **`gram_cg`** ignores `ad_solver_penalty` entirely: its run-to-tolerance
-  default produces non-finite derivatives on a singular dual (loud), while
-  a small bounded `ad_solver_maxiter` returns a finite — and wrong —
-  derivative with no diagnostic, so reserve the bounded-budget mode for
-  exact preconditioners.
+- **`gram_cg`** has no ridge to select, so an explicitly positive
+  `ad_solver_penalty` is rejected at construction (`0.0` — the exact
+  solve it does natively — stays legal). Its run-to-tolerance default
+  produces non-finite derivatives on a singular dual (loud), while a small
+  bounded `ad_solver_maxiter` returns a finite — and wrong — derivative
+  with no diagnostic, so reserve the bounded-budget mode for exact
+  preconditioners.
 - **`normal_cg`** is exact by default: no ridge, and its range-preserving
   Krylov iteration converges to the min-norm tangent on
   singular-but-consistent systems anyway. A matrix-free ridge is added only

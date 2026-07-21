@@ -290,9 +290,10 @@ preconditioner every step, closing the terminal gap a frozen `P` cannot.
   The one exception is `max_steps` with `save_steps=True`: the history
   buffer's shape depends on it, so each distinct value then retraces.
 - **Recompiles per value (static):** `linear_solver`, `jacobian_mode`,
-  `ad_solver`, the `ad_solver_*` accuracy knobs,
-  `geodesic_acceleration`, `cache_jacobian`, `has_aux`, the `Metric`
-  callbacks, `dual_preconditioner`, `preconditioner_factory`,
+  `ad_solver`, the `ad_solver_*` accuracy knobs, `linear_solve_dtype`,
+  `metric_solve_dtype`, `geodesic_acceleration`, `cache_jacobian`,
+  `has_aux`, the `Metric` callbacks, `metric_factory`, `dual_preconditioner`,
+  `preconditioner_factory`, `normal_preconditioner`,
   `whitened_preconditioner`, `ad_solver_preconditioner`, `recycle` (the
   `RecycleConfig`, whose `rank`/`window` size the carried basis), and the
   callback function identity.

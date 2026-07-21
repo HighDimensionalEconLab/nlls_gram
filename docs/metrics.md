@@ -22,9 +22,9 @@ metric that depends on the current iterate or on residual aux outputs, see
 Shape requirements:
 
 - `solve` must support vectors `(n_params,)` and matrices `(n_params, k)`.
-- `inv_sqrt` must support vectors `(n_params,)`; matrices
-  `(n_params, n_residuals)` are additionally required by the dense AD rule
-  (it assembles the whitened Jacobian).
+- `inv_sqrt` is applied to vectors `(n_params,)` only (every forward path
+  and the dense AD rule use it that way); the whitened Jacobian is assembled
+  with `inv_sqrt_transpose`, below.
 - `inv_sqrt_transpose` must support matrices `(n_params, n_residuals)` for
   the dense whitened forward forms (`normal_cholesky`, `qr`,
   `augmented_qr`) and the dense AD rule; the matrix-free forms
@@ -39,7 +39,7 @@ the *form* the solver works in:
 | Gram forward: `gram_cholesky`, `gram_cg` | `solve` |
 | whitened forward: `normal_cholesky`, `normal_cg`, `qr`, `augmented_qr`, `lsmr` | `inv_sqrt` + `inv_sqrt_transpose` |
 | AD: `dense`, `normal_cg` | `inv_sqrt` + `inv_sqrt_transpose` |
-| AD: `gram_cg` | `solve` |
+| AD: `gram_cg` | `solve`, or the pair (falls back to \(P = SS^\top\)) |
 | geodesic acceleration + custom metric | `norm` |
 
 - Concrete forward solver names validate eagerly at construction; a forward
@@ -228,10 +228,11 @@ Rules and semantics:
 - Under implicit differentiation of `solve` with respect to `p`, the metric
   is frozen at the returned solution: `prepare`/`build` run once at
   `(result.x, result.args, result.p, result.aux)` and the state-dependence
-  is not differentiated. The freeze is a first-order statement — and
-  higher-order AD through a factory-built metric's state dependence is
-  unsupported in the implicit rules; take higher-order derivatives of
-  `solve` only with a fixed metric. See
+  is not differentiated. The freeze is a first-order statement: the `dense`
+  rule still propagates the metric's state dependence at higher order (plain
+  traced ops), while the cg-resolved rules cannot (their opaque solve
+  wrappers hide it) — so for higher-order derivatives through a factory
+  metric use `ad_solver="dense"`. See
   [Implicit differentiation](implicit_ad.md#iterate-dependent-metrics-are-frozen-per-solve).
 - Like every jit-static hook, define the `(prepare, build)` pair once at
   setup scope; a fresh closure per call keys a new compilation.

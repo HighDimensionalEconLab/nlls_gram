@@ -562,8 +562,8 @@ solvers behave as follows:
   arithmetic — on its default unridged path, with the inner CG run to
   convergence, and either unpreconditioned or with a range-preserving
   `ad_solver_preconditioner` (an opt-in `ad_solver_penalty` ridge biases at
-  the documented order; an explicit `0.0` fails loudly through the dense
-  rank guard). A
+  the documented order; `0.0` here is that same exact unridged solve — the
+  loud rank guard is the `dense` rule's behavior, not `normal_cg`'s). A
   `gram_cg`-resolved AD solve is the
   fragile choice here — run-to-tolerance CG on the singular padded dual —
   and `pad_dual_preconditioner` divides the padded block by the live
