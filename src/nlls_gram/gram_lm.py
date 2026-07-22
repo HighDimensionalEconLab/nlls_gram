@@ -64,11 +64,22 @@ class LMHyperparams:
 
     damping_decrease: jax.Array
     damping_increase: jax.Array
+    min_damping: jax.Array
     max_damping: jax.Array | None
     geodesic_acceptance_ratio: jax.Array
     iterative_tol: jax.Array
     iterative_atol: jax.Array
     iterative_maxiter: jax.Array | None
+
+
+def _damping_floor(min_damping, dtype):
+    if dtype is None:
+        seed = 0.0 if min_damping is None else min_damping
+        dtype = jnp.asarray(seed).dtype
+    dtype_floor = jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
+    if min_damping is None:
+        return dtype_floor
+    return jnp.maximum(jnp.asarray(min_damping, dtype=dtype), dtype_floor)
 
 
 def _cast_hyper(hyper, dtype):
@@ -77,6 +88,7 @@ def _cast_hyper(hyper, dtype):
     return LMHyperparams(
         jnp.asarray(hyper.damping_decrease, dtype=dtype),
         jnp.asarray(hyper.damping_increase, dtype=dtype),
+        _damping_floor(hyper.min_damping, dtype),
         None
         if hyper.max_damping is None
         else jnp.asarray(hyper.max_damping, dtype=dtype),
@@ -984,6 +996,15 @@ class LevenbergMarquardt:
     Take higher-order derivatives of ``solve`` with a fixed metric. See
     :class:`MetricFactory`.
 
+    ``min_damping`` is the absolute lower bound applied before every linear
+    solve and after every damping update. ``None`` (the default) resolves to
+    ``jnp.finfo(residual.dtype).tiny``, the smallest positive normal value, so
+    damping cannot enter a backend's flush-to-zero range. This is only an
+    underflow floor. A standard conditioning-oriented minimum is instead on
+    the order of machine epsilon times a representative scale of ``B'B`` (or
+    ``B B'``); pass that larger absolute value explicitly when the damping must
+    remain numerically effective in the linear system.
+
     ``solve(...).x`` has a custom implicit AD rule with respect to ``p``,
     relinearized at the returned solution. ``ad_solver`` explicitly selects
     one method from ``{"direct", "svd", "qr", "augmented_qr", "gram_cg",
@@ -1104,6 +1125,7 @@ class LevenbergMarquardt:
         init_damping=1e-3,
         damping_decrease=0.5,
         damping_increase=4.0,
+        min_damping=None,
         max_damping=None,
         linear_solver="auto",
         jacobian_mode="auto",
@@ -1150,6 +1172,10 @@ class LevenbergMarquardt:
             raise ValueError("damping_decrease must be positive")
         if damping_increase <= 0:
             raise ValueError("damping_increase must be positive")
+        if min_damping is not None and min_damping <= 0:
+            raise ValueError("min_damping must be positive or None")
+        if min_damping is not None and min_damping > init_damping:
+            raise ValueError("min_damping must not exceed init_damping")
         if max_damping is not None and max_damping < init_damping:
             raise ValueError("max_damping must be at least init_damping")
         if iterative_tol < 0:
@@ -1365,6 +1391,7 @@ class LevenbergMarquardt:
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
+        self.min_damping = min_damping
         self.max_damping = max_damping
         self.linear_solver = linear_solver
         self.jacobian_mode = jacobian_mode
@@ -1445,6 +1472,7 @@ class LevenbergMarquardt:
                 init_damping,
                 damping_decrease,
                 damping_increase,
+                min_damping,
                 max_damping,
                 linear_solver,
                 jacobian_mode,
@@ -1489,6 +1517,7 @@ class LevenbergMarquardt:
         return LMHyperparams(
             jnp.asarray(self.damping_decrease, dtype=dtype),
             jnp.asarray(self.damping_increase, dtype=dtype),
+            _damping_floor(self.min_damping, dtype),
             None
             if self.max_damping is None
             else jnp.asarray(self.max_damping, dtype=dtype),
@@ -1508,7 +1537,10 @@ class LevenbergMarquardt:
         # populates it for its callbacks.
         self._check_residual_args(args, p)
         residual, aux = self._residual_and_aux(x0, args, p)
-        damping = jnp.asarray(self.init_damping, dtype=residual.dtype)
+        min_damping = _damping_floor(self.min_damping, residual.dtype)
+        damping = jnp.maximum(
+            jnp.asarray(self.init_damping, dtype=residual.dtype), min_damping
+        )
         recycle = self._init_recycle_state(residual)
         precond, precond_valid = self._init_precond(x0, args, p, aux)
         metric_state, metric_valid = self._init_metric_state(x0, args, p, aux)
@@ -1728,7 +1760,6 @@ class LevenbergMarquardt:
             )
         else:
             resid, Jt, aux = self._dense_resid_jt_aux(residual_flat, theta)
-        damping = jnp.asarray(lm_state.damping, dtype=resid.dtype)
         # Traced hyperparameters from the lm_state when present (resettable by
         # solve callbacks); the None fallback compiles to the same constants
         # as reading the constructor values directly.
@@ -1739,6 +1770,10 @@ class LevenbergMarquardt:
         )
         damping_decrease = jnp.asarray(hyper.damping_decrease, dtype=resid.dtype)
         damping_increase = jnp.asarray(hyper.damping_increase, dtype=resid.dtype)
+        min_damping = _damping_floor(hyper.min_damping, resid.dtype)
+        damping = jnp.maximum(
+            jnp.asarray(lm_state.damping, dtype=resid.dtype), min_damping
+        )
 
         # Trace-time shape resolution of the default solver: shapes are concrete
         # while tracing, so this is a plain Python branch (never a lax.cond).
@@ -2231,8 +2266,12 @@ class LevenbergMarquardt:
         new_damping = damping * damping_factor
         if hyper.max_damping is not None:
             new_damping = jnp.minimum(
-                new_damping, jnp.asarray(hyper.max_damping, dtype=resid.dtype)
+                new_damping,
+                jnp.maximum(
+                    jnp.asarray(hyper.max_damping, dtype=resid.dtype), min_damping
+                ),
             )
+        new_damping = jnp.maximum(new_damping, min_damping)
         loss = jnp.where(improved, loss_candidate, loss_old)
         # New recycle state: the velocity solve's harvested basis and the (stop-
         # gradient'd) dual solutions become warm starts for the next step. Threads

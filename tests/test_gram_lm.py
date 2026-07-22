@@ -234,6 +234,13 @@ def test_damping_update_factors_must_be_positive():
         LevenbergMarquardt(residual_fn, damping_increase=0.0)
 
 
+def test_min_damping_must_be_positive_and_not_exceed_initial_damping():
+    with pytest.raises(ValueError, match="min_damping must be positive or None"):
+        LevenbergMarquardt(residual_fn, min_damping=0.0)
+    with pytest.raises(ValueError, match="min_damping must not exceed"):
+        LevenbergMarquardt(residual_fn, init_damping=1e-3, min_damping=1e-2)
+
+
 def test_iterative_options_must_be_valid():
     with pytest.raises(ValueError, match="iterative_tol must be nonnegative"):
         LevenbergMarquardt(residual_fn, linear_solver="gram_cg", iterative_tol=-1.0)
@@ -359,6 +366,56 @@ def test_default_float32_x_keeps_float32_outputs():
 def test_max_damping_below_init_damping_raises():
     with pytest.raises(ValueError, match="max_damping must be at least"):
         LevenbergMarquardt(residual_fn, init_damping=1e-2, max_damping=1e-3)
+
+
+@pytest.mark.parametrize("jit", [False, True])
+@pytest.mark.parametrize("linear_solver", ["auto", "lsmr"])
+def test_default_min_damping_repairs_zero_and_prevents_float32_underflow(
+    jit, linear_solver
+):
+    def residual(theta):
+        return theta
+
+    solver = LevenbergMarquardt(
+        residual,
+        init_damping=1e-3,
+        linear_solver=linear_solver,
+        cache_jacobian=False,
+        geodesic_acceleration=False,
+    )
+    state = LMState(jnp.asarray(0.0, dtype=jnp.float32))
+    update = solver.update if not jit else jax.jit(lambda x, s: solver.update(x, s))
+    x, state, info = update(jnp.ones(1, dtype=jnp.float32), state)
+    floor = jnp.asarray(jnp.finfo(jnp.float32).tiny, dtype=jnp.float32)
+
+    assert bool(info.accepted)
+    assert jnp.all(jnp.isfinite(x))
+    assert state.damping == floor
+    assert info.damping == floor
+
+
+@pytest.mark.parametrize("jit", [False, True])
+def test_explicit_min_damping_is_used_by_step_and_update(jit):
+    def residual(theta):
+        return theta
+
+    min_damping = 1e-4
+    solver = LevenbergMarquardt(
+        residual,
+        init_damping=1e-3,
+        min_damping=min_damping,
+        cache_jacobian=False,
+        geodesic_acceleration=False,
+    )
+    state = LMState(jnp.asarray(0.0, dtype=jnp.float32))
+    update = solver.update if not jit else jax.jit(lambda x, s: solver.update(x, s))
+    x, state, info = update(jnp.ones(1, dtype=jnp.float32), state)
+    expected_x = min_damping / (1.0 + min_damping)
+
+    assert bool(info.accepted)
+    assert jnp.allclose(x, expected_x, rtol=1e-4, atol=1e-7)
+    assert float(state.damping) == pytest.approx(min_damping)
+    assert float(info.damping) == pytest.approx(min_damping)
 
 
 def test_metric_requirements_per_linear_solver():
@@ -2053,6 +2110,7 @@ def test_equal_settings_solvers_share_the_compiled_solve_loop():
     # Any static-setting change (or a different residual function) is a
     # different solver, so it cannot silently reuse the wrong compiled loop.
     assert a != build(init_damping=2e-2)
+    assert a != build(min_damping=1e-8)
     assert a != build(geodesic_acceleration=False)
     assert a != LevenbergMarquardt(
         lambda theta, args, p: theta - args, init_damping=1e-2, cache_jacobian=False
@@ -2216,6 +2274,8 @@ def test_hyperparams_typing_and_solve_population():
     assert solver.init({"a": 1.0, "b": 0.0}, (ts, ys)).hyper is None
     hyper = solver.hyperparams(jnp.float32)
     assert hyper.damping_decrease.dtype == jnp.float32
+    assert hyper.min_damping.dtype == jnp.float32
+    assert hyper.min_damping == jnp.finfo(jnp.float32).tiny
     assert hyper.iterative_maxiter.dtype == jnp.int32
     assert hyper.max_damping is None
     result = solver.solve({"a": 1.0, "b": 0.0}, (ts, ys), max_steps=2)
