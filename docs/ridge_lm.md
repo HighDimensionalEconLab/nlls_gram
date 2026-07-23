@@ -287,6 +287,34 @@ conditioning as the normal equations, so it fixes neither of the problems
 residuals, low-rank penalty) and would slot into the same typed
 `linear_solver` menu.
 
+### Whitening: the cheap alternative to `QR()` at deep ridge
+
+When a square (block-)factor \(\bar L\) of the penalty exists, the
+variable change \(y = \bar L x\) (identity-extended on unpenalized
+coordinates) turns the penalty into \(\lambda\|y_{\text{head}}\|^2\) —
+solve the wrapped residual \(r(\bar L^{-1} y)\) with
+`penalty_from_factor([I | 0])` and the plain Cholesky path. The normal
+matrix becomes \(\tilde J^\top \tilde J + \lambda I_{\text{head}}\): a
+clean spectral floor at \(\lambda\), no interaction between the kernel's
+conditioning and the Gram product. Measured on two production DAE kernel
+drivers at \(\lambda = 3{\times}10^{-12}\) (where the unwhitened Cholesky
+path stalls and `QR()` was previously required): whitening converged in
+25–35% fewer LM steps at the Cholesky path's ~9× lower per-step cost —
+1.8–3× faster wall-clock across every parameter variant with identical
+residuals and solution quality. The wrap costs one triangular solve per
+penalized block per residual evaluation and needs no solver support.
+
+The same experiments produced a clear negative result for **dropping
+penalty rows** to shrink the `QR()` stack: on those DAE drivers, deleting
+the penalty blocks whose *levels* are pinned by initial conditions (so
+that formally only the free-offset blocks carry rows) left the residual
+converged but let the unpenalized paths drift enormously between
+collocation points — the dropped blocks' seminorms exploded by 2–80×
+and the solutions failed their ground-truth checks. The
+\(\operatorname{rank}([J;L]) = p\) condition can hold *marginally* while
+the selection still needs every block's seminorm in the objective; verify
+any reduced factor against the full-\(L\) solution before trusting it.
+
 ## Implicit differentiation
 
 `solve(...).x` has a custom implicit rule with respect to `p`: Gauss–Newton
