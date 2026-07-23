@@ -27,9 +27,11 @@ place of `J` and second-derivative contributions from the penalty identically
 zero.
 
 Target selection semantics (why this solver exists): under
-`ker J ∩ ker L = {0}` at the solution, each fixed-λ problem has an isolated
-minimizer `x_λ`, and `x_λ → x† = argmin q s.t. r = 0` with `O(λ)` error — the
-minimum-seminorm (min-RKHS-norm) interpolant. No metric solves, no epsilon
+`ker J ∩ ker L = {0}` at the solution — plus the standard local regularity
+of an isolated constrained minimizer (the claims below are local; the affine
+case is worked out exactly in the companion paper appendix) — each fixed-λ
+problem has an isolated minimizer `x_λ`, and `x_λ → x† = argmin q s.t. r = 0`
+with `O(λ)` error — the minimum-seminorm (min-RKHS-norm) interpolant. No metric solves, no epsilon
 shift on the zero-padded scalars, no whitening.
 
 The design puts the selection in the OBJECTIVE (classical Tikhonov
@@ -85,15 +87,43 @@ Move from `gram_lm.py`, re-export from `gram_lm.py` for compatibility:
   `_accept_converged_or_max_steps`, `_ranking_loss`, `_attempt_success`,
   `_type_spec`, `_check_drawn_types`, `_cold_lm_state`
 
-`_solve_loop_impl` and the multi-start drivers already take the solver as a
-duck-typed argument (`solver.update`, `solver._converged`, ...). Verify the
-exact coupling when moving; if anything reads a gram-specific attribute
-(e.g. `cache_jacobian` fields on `LMState`), parameterize via a method on the
-solver (`solver._initial_info`, `solver._converged`) rather than branching in
-the shared loop. `_cold_lm_state` (multi-start lane reset) must reset
-solver-specific state generically: give each solver a `_cold_state(lm_state)`
-method; the ridge version resets `damping` to `init_damping` AND `ridge` to
-the initial ridge, and invalidates all caches.
+**The shared-loop protocol (audit result — the coupling is wider than
+`update`/`_converged`).** `_solve_loop_impl` and the multi-start drivers
+touch: `solver.has_aux`, `solver._residual_and_aux`, `solver._initial_info`,
+`solver.update`, `solver._apply_action`, `solver._converged`, and they
+directly replace `lm_state.damping` and `.hyper` with dtype-cast values.
+The move list must also include the free-function multi-start
+sequential/parallel implementations and their stable jitted wrappers at the
+bottom of `gram_lm.py` (below line ~3830), with `_solve_impl`,
+`_multi_start_impl`, and `_multi_start_python` remaining thin methods that
+delegate into the shared drivers. Parameterize the loop on an explicit
+informal solver protocol instead of ad-hoc attribute reads:
+
+- `_cast_state(lm_state, dtype)` — replaces the loop's direct
+  damping/hyper casts; the ridge version also casts `ridge` (and `qr_ridge`)
+  to the residual dtype with stable scalar shapes.
+- `_initial_info`, `_converged`, `_residual_and_aux`, `update` — as today.
+- `_apply_action(action, ...)` — solver-specific: the ridge version must
+  treat a callback that changes `lm_state.ridge` as a PROBLEM CHANGE, i.e.
+  suppress the convergence check for that iteration (the diagnostics were
+  computed at the old ridge) and invalidate the ridge-dependent caches
+  (`qr_valid`, and `penalty_valid` if a factory ships). The existing
+  `_apply_action` only knows about `x`/`args` changes — do not inherit that
+  blind spot. Callback-provided ridge contract: scalar, finite, positive.
+- `_ranking_objective(result)` — multi-start ranking hook. The existing
+  `_ranking_loss` recomputes `sum(residual**2)` whenever a callback exists,
+  which would silently drop the penalty term for every continuation run.
+  Gram implementation returns `||r||^2` (unchanged behavior); ridge returns
+  `||r||^2 + ridge * q(x)` at the lane's own final ridge (with a documented
+  comparability caveat: under a shared continuation schedule the lanes'
+  ridges agree in practice).
+- `_cold_state(lm_state)` — multi-start lane reset. Match the EXISTING
+  semantics: invalidate caches and zero factory states, but PRESERVE the
+  caller-supplied `damping`, `hyper`, and (new) `ridge` from the initial
+  state — do NOT reset to constructor defaults (parallel lane 0 uses the
+  cold state while sequential attempt 0 uses the original; constructor
+  resets would make them disagree, and `ridge=None` cannot be resolved
+  without the residual dtype anyway).
 
 `LMState`/`LMInfo` do NOT move — each solver defines its own (`gram_lm` keeps
 its current definitions; `ridge_lm` defines `RidgeLMState`/`RidgeLMInfo`).
@@ -133,24 +163,31 @@ tricks and `quasiseparable`):
   (`num_rows = repeats * N`). `add_scaled` scatter-adds `c*K` into the
   head diagonal blocks of `H` (no blockdiag materialization).
 - `repeated_state_space_penalty(t, h, Pinf, transition, *, repeats,
-  zero_pad_size, parallel=None)` — O(N) Matérn version via
-  `quasiseparable._cholesky` + `_cholesky_transpose_matvec` (the transpose
-  pair already exists; check which of forward/backward substitution
-  corresponds to `L` vs `L'` application and expose both). `add_scaled` is
-  omitted here (dense assembly of a state-space penalty defeats the point);
-  the cholesky linear solver then requires a penalty with `add_scaled` or
-  falls back to materialization — document that state-space penalties pair
-  with `linear_solver="lsmr"`.
+  zero_pad_size, parallel=None)` — O(N) Matérn version. AUDIT RESULT: with
+  `K = C C'`, `quasiseparable._cholesky_transpose_matvec` supplies
+  `sqrt_apply(x) = C'x`, but the companion `sqrt_transpose_apply(y) = C y`
+  does NOT exist yet — `_forward_substitution`/`_backward_substitution` are
+  SOLVES with `C`/`C'`, not factor matvecs. Implement a new
+  `quasiseparable._cholesky_matvec` scan (the direct companion of the
+  existing transpose matvec) as part of this step. `add_scaled` is omitted
+  here (dense assembly of a state-space penalty defeats the point); the
+  cholesky linear solver then requires a penalty with `add_scaled` or falls
+  back to materialization — document that state-space penalties pair with
+  `linear_solver="lsmr"`.
 - `penalty_from_factor(L)` — generic dense factor (k, p).
 - `identity_penalty(size)` — `L = I`, for min-Euclidean-norm problems and
   tests.
 
-Also a `PenaltyFactory` (mirror `MetricFactory`: `prepare(x, args, p, aux)` /
-`build(state)`), carried in state with the same `*_valid` reuse-on-reject
-pattern. Low implementation risk since the pattern is copied; keep it in
-phase 1 only if trivial after the copy, else defer (constructor accepts
-`penalty_factory` but raises `NotImplementedError` — decide at implementation
-time and say so in the PR).
+**`PenaltyFactory` is DEFERRED to phase 2, and its contract must be
+narrower than `MetricFactory`'s.** Copying `prepare(x, args, p, aux)` would
+be mathematically invalid here: the gradient `J'r + λL'Lx` and the implicit
+AD rule treat `L` as constant, so an `x`-dependent factor would silently
+drop the `d/dx [L(x)'L(x)x]` terms and a `p`-dependent factor would drop
+`d(L'Lx)/dp` from the AD right-hand side. Phase 2 may ship a factory whose
+prepared data is restricted to differentiation-inert problem data (e.g.
+rebuilt from `args` under `stop_gradient`), with that restriction validated
+and documented. Phase 1: constructor reserves the `penalty_factory` kwarg
+and raises `NotImplementedError`.
 
 ## 3. `ridge_lm.py` public API
 
@@ -164,15 +201,22 @@ class RidgeLevenbergMarquardt:
         penalty_factory=None,        # exclusive with penalty if kept in phase 1
         ridge=None,                  # initial λ; None -> sqrt(finfo(dtype).eps)
                                      #   resolved at init() from the residual dtype
-                                     #   (float64 ≈ 1.5e-8, float32 ≈ 3.5e-4)
+                                     #   (float64 ≈ 1.5e-8, float32 ≈ 3.5e-4).
+                                     #   STRICTLY POSITIVE by contract: ridge = 0 is
+                                     #   unsupported everywhere (constructor validates,
+                                     #   callbacks must keep it positive, continuation
+                                     #   floors are positive) — so J'J + ridge*L'L is
+                                     #   always PD under ker J ∩ ker L = {0}
         init_damping=1e-3,
         damping_decrease=0.5,
         damping_increase=4.0,
         min_damping=None,            # same underflow-floor semantics as gram_lm
         max_damping=None,
         linear_solver="auto",        # "auto" (= "cholesky") | "cholesky" | "qr" | "lsmr"
-        jacobian_mode="auto",        # "auto" | "fwd" | "rev"; auto: JVP cols when
-                                     #   n_resid <= p else VJP rows (TRUE residual only)
+        jacobian_mode="auto",        # "auto" | "fwd" | "rev"; auto: JVP columns when
+                                     #   p <= n_resid, else VJP rows — vmap over the
+                                     #   SMALLER side, same rule as gram_lm.py:1636
+                                     #   (TRUE residual only; penalty rows never use AD)
         iterative_tol=0.0,           # lsmr stopping, same mapping as gram_lm
         iterative_atol=0.0,
         iterative_maxiter=8,
@@ -180,9 +224,16 @@ class RidgeLevenbergMarquardt:
                                      #   identity_right_preconditioner() to opt out
         ad_solver="auto",            # "auto" | "cholesky" | "normal_cg"
         ad_solver_tol=None, ad_solver_atol=0.0, ad_solver_maxiter=None,
+        ad_solver_preconditioner=None,  # optional SPD preconditioner for the
+                                     #   normal_cg AD solve — kept from gram_lm:
+                                     #   unpreconditioned CG on J'J + λM0 degrades
+                                     #   as λ shrinks, so the hook stays
         linear_solve_dtype=None,     # None | jnp.float64, dense paths only
         has_aux=False,
-        cache_jacobian=True,         # dense paths only, same rule as gram_lm
+        cache_jacobian=True,         # dense paths INCLUDING "qr" (unlike gram_lm,
+                                     #   which disables it for qr — here the qr_R
+                                     #   cache is only useful with cached resid/Jt,
+                                     #   so the two cache under one validity flag)
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=0.75,
     )
@@ -264,7 +315,9 @@ Same skeleton as gram_lm's `update`:
 4. Resolve penalty callbacks (fixed `penalty` or factory build with the
    `penalty_valid` reuse-on-reject `lax.cond` — copy the metric_factory
    pattern verbatim).
-5. Gradient `g = J'r + ridge * sqrt_transpose_apply(sqrt_apply(theta))`;
+5. Gradient direction `g = J'r + ridge * sqrt_transpose_apply(sqrt_apply(theta))`
+   (the HALF-gradient: `∇F = 2g`; the factor cancels in the LM equations but
+   docstrings must not call `g` "the gradient" unqualified);
    `grad_norm = ||g||`.
 6. `solve_step(g_vec)` returning `δ = -(A'A + damping I)^{-1} g_vec` per
    `linear_solver` (below). Velocity: `solve_step(g)`. Geodesic ([TS12]):
@@ -281,11 +334,23 @@ Same skeleton as gram_lm's `update`:
    `RidgeLMState` + `RidgeLMInfo`. `ridge` passes through unchanged —
    only `init()` and callbacks set it.
 
-`atol`/`gtol`/`xtol` in `_converged`: **atol tests `sqrt(resid_loss)` (TRUE
-residual norm — "the model equations are solved")**; gtol tests `grad_norm`
-(ridge stationarity); xtol the accepted Euclidean step norm. All three report
-`CONVERGED`. Document explicitly that at fixed moderate λ only gtol/xtol can
-fire, and atol is the ridgeless-endgame criterion.
+`atol`/`gtol`/`xtol` in `_converged` — **atol is a conjunctive filter, never
+a sufficient condition** (review finding: a pure-residual atol would
+terminate at step 0 from any interpolating start with `Lx != 0`, before any
+seminorm minimization happens — and the kernels/spooky drivers use exactly
+residual-only atol today). Semantics:
+
+- Convergence fires when (`gtol` on `grad_norm` — ridge stationarity — or
+  `xtol` on the accepted Euclidean step norm) **AND** (`atol == 0` or
+  `sqrt(resid_loss) <= atol`). atol alone never stops the solve.
+- `solve` validates `atol > 0` requires `gtol > 0` or `xtol > 0` (loud
+  error, message explains why residual-only stopping is wrong for a ridge
+  objective).
+- Document: gtol/xtol mean "done with the current fixed-λ problem"; atol
+  additionally demands "and the model equations are actually solved" — the
+  ridgeless-endgame check. In a continuation run the callback keeps lowering
+  λ, so intermediate stationarity with a large residual correctly does not
+  stop the loop.
 
 ### Linear solvers
 
@@ -319,15 +384,27 @@ small `λ`/`μ` where forming `H` squares the condition number:
   state with `qr_valid = jacobian_valid`-style reuse; a reject reuses `R`,
   and validity additionally requires `lm_state.ridge == qr_ridge` (callback
   λ-changes invalidate).
-- Per update (every `damping`): `R_mu = qr([R; sqrt(damping) I], mode="r")`
-  — a (2p, p) QR, the MINPACK damping-row update, cheap relative to the full
-  stack when rows >> p.
+- Per update (every `damping`): `R_mu = qr([R; sqrt(damping) I], mode="r")`.
+  Cost honesty: a generic (2p, p) QR is still cubic; MINPACK's actual
+  `qrsolv` eliminates the diagonal damping rows with Givens rotations in
+  O(p²) — implement the plain stacked QR first and note the Givens
+  elimination as a follow-up optimization. Shape caveat: `R` is p×p only
+  when `n + k >= p`; when the stack is wider than tall, `R` is rectangular
+  and the damping rows are what make the final system full rank — size the
+  buffers accordingly.
+- Cache invalidation (beyond ridge equality): a callback that replaces `x`
+  or `args` must clear `qr_valid` (and `penalty_valid`) exactly as it clears
+  `jacobian_valid` today — extend the solver's `_apply_action` accordingly.
 - Solve via **corrected semi-normal equations** ([Bjorck87]; the
   one-refinement-pass prescription is [Bjorck96] Sec. 6.6.5): triangular solves
   `R_mu' R_mu δ = -g_vec`, then ONE fixed iterative-refinement pass
   (`s = -g_vec - (J'(J δ) + ridge*L'(L δ) + damping*δ)` using matvecs;
-  `δ += R_mu^{-1} R_mu^{-T} s`). Deterministic cost, restores QR-level
-  accuracy without storing Q.
+  `δ += R_mu^{-1} R_mu^{-T} s`). Deterministic cost, no stored Q. Accuracy
+  honesty: one correction is the conventional CSNE prescription but does not
+  unconditionally reach full-QR accuracy on ill-conditioned problems; the μ
+  and λ shifts bound the conditioning in practice, and the documented
+  fallback (full stacked QR per update) stays local to `solve_step` if tests
+  demand it.
 
 **`"lsmr"`.** Matrix-free ([FS11]; right preconditioning per [Bjorck96]
 Ch. 7 — a right preconditioner leaves the least-squares objective unchanged,
@@ -345,8 +422,9 @@ branch with the metric stripped and `B → A`:
   construction (`A_aug(z) = [A(Rinv z); sqrt(damping) * Rinv z]`,
   `b_aug = [0; c / sqrt(damping)]` targeting arbitrary RHS `c`), including
   the `custom_linear_solve` wrapper around `N = A'A + damping I` so the
-  forward solve is AD-differentiable, and the `4 * min(m + k, p)` default
-  iteration cap.
+  forward solve is AD-differentiable, and the `4 * min(m + k, p)` cap that
+  applies only when `iterative_maxiter=None` (the constructor default is 8,
+  exactly as in gram_lm — do not advertise the cap as the default).
 - Tolerance mapping `iterative_tol -> atol`, `iterative_atol -> btol`
   unchanged (`lsmr.py` untouched).
 
@@ -359,24 +437,36 @@ Signature and semantics copied verbatim (all of: `p`, `lm_state`,
 
 - `init(x0, args, p=None)` populates `ridge` (constructor value or the
   dtype default) alongside `damping`, plus the caches the configuration
-  needs. `solve` with `lm_state=None` calls `init` under the same
-  conditions gram_lm does (plus always when the qr path or a penalty
-  factory needs state), else builds the minimal
-  `RidgeLMState(damping, ridge)`.
+  needs. `solve` with `lm_state=None` calls `init` UNCONDITIONALLY (unlike
+  gram_lm's conditional shortcut): resolving `ridge=None` needs the residual
+  dtype, so there is no valid minimal-state fast path. A caller-supplied
+  `lm_state` must already carry a positive `ridge`; validated loudly.
 - The **ridge continuation recipe is a documented callback**, not a solver
-  feature. Ship one helper in `ridge_lm.py`:
+  feature. A `lax.while_loop` carry cannot grow `user_state` from `None`
+  mid-loop, so the helper is a FACTORY returning both the callback and its
+  fixed-shape initial tracking state:
 
 ```python
-def ridge_continuation(decrease=0.1, ridge_floor=None, grad_rtol=1e-3):
-    """Callback: multiply lm_state.ridge by `decrease` whenever the inner
+def ridge_continuation(*, decrease=0.1, ridge_floor, grad_rtol=1e-3, dtype=None):
+    """Build (callback, user_state0) implementing ridge continuation.
+
+    The callback multiplies lm_state.ridge by `decrease` whenever the inner
     problem is approximately stationary (grad_norm below grad_rtol relative
-    to its value at the current ridge level), until ridge_floor. Composable:
-    returns an LMSolveAction replacing lm_state only."""
+    to its reference value at the current ridge level), never below
+    ridge_floor. ridge_floor is REQUIRED and strictly positive (ridge = 0 is
+    out of contract). The callback returns an LMSolveAction replacing
+    lm_state AND user_state (the per-level reference grad_norm lives in
+    user_state as fixed-shape scalars).
+
+    Usage: cb, us0 = ridge_continuation(ridge_floor=1e-10)
+           solver.solve(x0, callback=cb, user_state=us0, gtol=..., atol=...)
+    """
 ```
 
-  (Implementation: track the per-level reference grad_norm in `user_state`;
-  pure-JAX, no Python state.) `solve` needs no new parameters — the user's
-  hunch holds. Tests exercise both fixed-λ and continuation runs.
+  `solve` needs no new parameters — the user's hunch holds. A ridge change
+  by the callback is a problem change (see the `_apply_action` contract in
+  Sec. 1): convergence is suppressed for that iteration and the qr/penalty
+  caches invalidate. Tests exercise both fixed-λ and continuation runs.
 
   Theory anchors to cite in the helper's docstring and docs page: the
   solved-out continuation path converges to the minimum-seminorm solution by
@@ -392,29 +482,44 @@ Same `custom_jvp`-on-`solve` skeleton (including multi-start variant, the
 zero-tangent failure policy, `max_steps_is_success` handling, and
 stop-gradient initial-point fallback for failed lanes). The tangent rule is
 **Gauss–Newton implicit differentiation of the ridge stationarity**
-`J'r + λ M0 x = 0` with the second-order term `(∂J'/∂p) r` dropped:
+`J'r + λ M0 x = 0`. Exact differentiation carries TWO extra terms beyond
+GN — `sum_i r_i ∇²_x r_i` inside the left-hand matrix and `(∂J'/∂p)[p_dot] r`
+on the right — and the rule drops BOTH:
 
 ```
 (J'J + λ M0) x_dot = -J' (∂r/∂p) p_dot        # λ frozen at the returned state's ridge,
                                               # stop_gradient'd: λ is inert data
 ```
 
-NO damping in the AD matrix. Exact when the converged TRUE residual is ~0
-(the ridgeless endgame — our regime); `O(||r||)` relative bias at moderate λ.
-Document this contract in the class docstring. Under `ker J ∩ ker L = {0}`
-the matrix is PD — no rank-deficiency, no min-norm-tangent machinery, which
-is why the gram_lm AD menu collapses to two methods:
+NO damping in the AD matrix. Both dropped terms vanish when the converged
+TRUE residual is exactly 0 (the ridgeless endgame — our regime); at moderate
+λ the perturbation is first-order in `||r||`, which translates to a
+first-order tangent error only under conditioning assumptions — state the
+contract that way, not as an unconditional `O(||r||)` relative bound.
+Because ridge = 0 is out of contract, `λ > 0` always holds and the matrix is
+PD under `ker J ∩ ker L = {0}` at every reachable state — no
+rank-deficiency, no min-norm-tangent machinery, which is why the gram_lm AD
+menu collapses to two methods:
 
 - `"cholesky"`: assemble `J'J + λ M0` (wide under `linear_solve_dtype`),
   `cho_solve`. Resolution of `"auto"` for dense forwards.
 - `"normal_cg"`: matrix-free CG on the same operator (matvec =
-  `vjp(jvp(v)) + λ L'(L v)`), unpreconditioned (RHS conditioning is fine at
-  PD; no range-preservation subtleties remain). Resolution of `"auto"` for an
-  lsmr forward. `ad_solver_tol/atol/maxiter` as stopping controls, with the
-  same "maxiter required when both tolerances are zero" validation.
+  `vjp(jvp(v)) + λ L'(L v)`), with the OPTIONAL `ad_solver_preconditioner`
+  hook retained from gram_lm: PD does not mean well-conditioned, and
+  unpreconditioned CG iteration counts grow as λ shrinks. Resolution of
+  `"auto"` for an lsmr forward. `ad_solver_tol/atol/maxiter` as stopping
+  controls, with the same "maxiter required when both tolerances are zero"
+  validation.
 
-`result.aux` tangents, `result.p` identity pass-through, history buffers
-differentiation-inert: copy the existing treatment.
+Threading (skeleton change vs gram_lm): `_ad_result_tangent` reads λ from
+`result.lm_state.ridge` (available on every `LMSolveResult`), stop-gradient
+applied — so the multi-start winner's own final ridge is used. Failed lanes
+evaluate their (masked) tangent program at the stop-gradient INITIAL ridge
+from the pre-loop state, never at a possibly-NaN callback-produced value.
+Document that λ-inertness means the derivative deliberately ignores both the
+continuation schedule's and the multi-start winner-selection's dependence on
+`p`. `result.aux` tangents, `result.p` identity pass-through, history
+buffers differentiation-inert: copy the existing treatment.
 
 ## 4. Exports, docs, and README
 
@@ -519,9 +624,34 @@ penalty = repeated_dense_penalty(K, repeats=3, zero_pad_size=d)   # no epsilon
 solver = RidgeLevenbergMarquardt(residual_fn, penalty=penalty,
                                  ridge=1e-8,                       # or None for dtype default
                                  linear_solve_dtype=jnp.float64, ...)
-result = solver.solve(theta_0, max_steps=..., atol=residual_atol,  # TRUE-residual atol
-                      callback=ridge_continuation(...))            # optional homotopy
+cb, us0 = ridge_continuation(ridge_floor=1e-10)                    # optional homotopy
+result = solver.solve(theta_0, max_steps=..., gtol=..., atol=residual_atol,
+                      callback=cb, user_state=us0)
 ```
+
+Consumer-migration audit (real call sites, checked during review):
+
+- `spooky` reads and ranks by `result.info.loss` in places that mean
+  equation error (e.g. `notebooks/growth_recursive_advanced.py`) — those
+  sites must switch to `resid_loss`, since ridge `info.loss` includes the
+  penalty.
+- Residual-only `atol` stopping (both repos' drivers) must add a `gtol` (or
+  `xtol`) per the conjunctive atol contract above; the solve-time validation
+  makes this loud, not silent.
+- `metric_solve_dtype=jnp.float64` has NO ridge analog; penalty callbacks
+  follow their input dtypes. If a float32 program needs a float64 penalty
+  pipeline, that is a phase-2 `penalty_compute_dtype` knob — note it in the
+  docs rather than silently dropping the capability.
+- LSMR users must now pass `lsmr_preconditioner=` explicitly
+  (`identity_right_preconditioner()` at minimum) — a deliberate breaking
+  difference from gram_lm's optional `whitened_preconditioner=`; both the
+  rename and the requiredness go in the migration notes.
+- The shared `LMSolveContext`/`LMSolveResult` docstrings currently name
+  `LMState`/`LMInfo` — generalize the wording when they move to
+  `utility.py` so they describe both solvers' state/info types.
+- `linear_solve_dtype` policy for ridge assembly: promote BEFORE forming
+  `ridge * K` contributions (a float32-rounded `ridge*K` added into a
+  float64 `H` defeats the promotion).
 
 ## 7. Implementation order
 
@@ -535,7 +665,8 @@ result = solver.solve(theta_0, max_steps=..., atol=residual_atol,  # TRUE-residu
 4. `solve` wiring through the shared loop (callbacks, tolerances with
    TRUE-residual atol, save_steps, multi_start) + `ridge_continuation`.
 5. `"qr"` path (cache, damping-row update, CSNE refinement), then `"lsmr"`
-   (+ `identity_right_preconditioner`, state-space penalty).
+   (+ `identity_right_preconditioner`, state-space penalty including the new
+   `quasiseparable._cholesky_matvec` scan).
 6. Implicit AD (`"cholesky"`, `"normal_cg"`, `"auto"` resolution, failure
    policy) + `test_ridge_ad.py`.
 7. Exports, docs page (`docs/ridge_lm.md` with the algorithm exposition and
@@ -558,9 +689,21 @@ result = solver.solve(theta_0, max_steps=..., atol=residual_atol,  # TRUE-residu
 - **λ in state, not hyper**: parallels `damping`; putting it in
   `LMHyperparams` would break the shared `_cast_hyper` contract for gram_lm.
 - **AD is GN-approximate at moderate λ**: accepted and documented (decision:
-  Gauss–Newton implicit rule; exact in the interpolating limit).
-- **`penalty_factory`** may slip to phase 2; constructor arg reserved either
-  way.
+  Gauss–Newton implicit rule; exact in the interpolating limit; both dropped
+  terms and the conditioning caveat stated in the docstring).
+- **`penalty_factory` deferred to phase 2** with a differentiation-inert
+  data restriction (an `x`- or `p`-dependent `L` invalidates the gradient
+  and AD formulas as written); constructor arg reserved, raises
+  `NotImplementedError` in phase 1.
+- **`M0` materialization fallback is runtime work when penalty data is
+  traced**, not a one-time trace-time cost — the cholesky path's
+  `add_scaled`-missing fallback must say so in its error/warning text, and
+  rejected-step caching saves residual/Jacobian evaluation but NOT the
+  per-update GEMM, penalty assembly, or factorization (same trade gram_lm
+  makes).
+- **ridge = 0 unsupported by contract** (user decision): constructor,
+  callback contract, and continuation floors all enforce strict positivity;
+  no zero-ridge pseudoinverse tangent is ever needed.
 
 ## 8. References
 
