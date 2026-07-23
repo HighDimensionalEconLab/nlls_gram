@@ -1,33 +1,34 @@
-"""Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX.
+"""Levenberg-Marquardt nonlinear least-squares for JAX, built for
+underdetermined interpolation with an explicit selection of which
+interpolant is returned.
 
-LevenbergMarquardt minimizes ||r(x, args, p)||^2 for a
-user-supplied residual function taking (x), (x, args), or
-(x, args, p), where x is any JAX pytree (a flat array, a
-dict, nnx.state(model, nnx.Param), ...). It follows an init/update protocol:
-update(x, lm_state, args=None, p=None) returns the new x pytree (same
-structure), the next lm_state, and an LMInfo. solve(...) runs repeated LM steps with
-optional callback control; solve(multi_start=MultiStart(...)) retries failed
-solves from fresh initial conditions or races them in parallel under vmap,
-returning the single best result. With has_aux=True the residual returns
-(residual, aux) and the aux output is reported on LMInfo. An optional Metric
-defines a positive-definite parameter-space metric for LM damping; a
-MetricFactory instead rebuilds that metric from the current iterate and
-residual aux every accepted step.
-The default linear_solver="auto" resolves at trace time to the smaller dense
-factorization: residual-space Gram Cholesky (gram_cholesky) when n > m, else
-whitened normal Cholesky (normal_cholesky) — the two compute the same step.
-Reduced QR (full row rank) and direct augmented QR cover small direct
-solves. Three matrix-free solvers use only J/J' products: CG on the
-metric-damped residual-space dual (gram_cg, required dual preconditioner),
-CG on the whitened normal system in parameter space (normal_cg, required
-normal preconditioner), and LSMR on the whitened subproblem (optional
-WhitenedPreconditioner right-preconditioner), the last staying accurate at
-small damping where the squared Gram/normal solves degrade. The implicit
-differentiation rule is independently swappable via explicit ad_solver methods:
-direct, svd, qr, augmented_qr, gram_cg, normal_cg, and
-regularized_normal_cg. The solver depends only on JAX.
+Two solvers share one init/update/solve protocol (x is any JAX pytree; the
+residual takes (x), (x, args), or (x, args, p); solve(...) runs a jitted
+loop with callback control, save_steps histories, and multi-start retries or
+parallel races; solve(...).x carries a custom implicit AD rule with respect
+to p):
 
-Tuning heuristics (solver selection, damping, inner-solve scheduling):
+- RidgeLevenbergMarquardt minimizes the ridge objective
+  ||r(x)||^2 + ridge * ||L x||^2 for a RidgePenalty factor L, with the
+  ridge weight carried as traced state that a callback can anneal toward a
+  positive floor (ridge_continuation) — the minimum-seminorm
+  (min-RKHS-norm) selection lives in the OBJECTIVE, per classical nonlinear
+  Tikhonov regularization. Linear solvers: dense cholesky (default, with a
+  reject-step cache of the assembled normal matrix), a damping-row qr path
+  for tiny ridge, and matrix-free lsmr. GN-implicit AD via cholesky or
+  normal_cg.
+- LevenbergMarquardt minimizes ||r(x)||^2 with an optional positive-definite
+  parameter-space Metric (or iterate-aware MetricFactory) defining the
+  damping geometry, so the small-damping Gauss-Newton limit selects
+  minimum-metric-norm corrections. The default linear_solver="auto"
+  resolves to the smaller dense factorization (gram_cholesky /
+  normal_cholesky); QR, augmented QR, gram/normal CG, and LSMR variants
+  cover direct and matrix-free regimes, with a swappable ad_solver menu
+  (direct, svd, qr, augmented_qr, gram_cg, normal_cg,
+  regularized_normal_cg).
+
+The package depends only on JAX. Tuning heuristics (solver selection,
+damping, inner-solve scheduling):
 https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/
 """
 

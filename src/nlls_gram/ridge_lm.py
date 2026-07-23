@@ -1265,6 +1265,15 @@ class RidgeLevenbergMarquardt:
                     "the caller-supplied lm_state.ridge must be strictly "
                     "positive (ridge = 0 is unsupported)"
                 )
+            # Recast a hand-replaced ridge to the carried scalar dtype: a
+            # weak-typed `dataclasses.replace(state, ridge=1e-4)` would
+            # otherwise change the jit input aval and retrace the loop.
+            lm_state = dataclasses.replace(
+                lm_state,
+                ridge=jnp.asarray(
+                    lm_state.ridge, dtype=jnp.asarray(lm_state.damping).dtype
+                ),
+            )
         if lm_state.hyper is None:
             lm_state = dataclasses.replace(lm_state, hyper=self.hyperparams())
         history_len = max_steps + 1 if save_steps else None

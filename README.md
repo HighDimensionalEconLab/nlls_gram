@@ -7,60 +7,30 @@
 [![License: MIT](https://img.shields.io/github/license/HighDimensionalEconLab/nlls_gram)](https://github.com/HighDimensionalEconLab/nlls_gram/blob/main/LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX pytrees, aimed
-at solving systems of equations (i.e., interpolation). The core use cases are
-underdetermined systems — more parameters than residuals — where LM is solved
-in its Gram form, and square or redundant tall nonlinear systems where
-regularization is needed to select among the interpolating solutions, with the
-selection controlled by a user-chosen metric.
+Levenberg-Marquardt nonlinear least-squares for JAX pytrees, aimed at
+solving systems of equations (i.e., interpolation). The core use case is
+underdetermined systems — more parameters than residuals — where something
+must select *which* interpolating solution is returned. The package ships
+two solvers with one shared `init`/`update`/`solve` protocol:
 
-`LevenbergMarquardt` minimizes a user residual taking
-`(x)`, `(x, args)`, or `(x, args, p)`, always in that order. The unknown `x`
-may be any JAX pytree; internally it
-is flattened with `jax.flatten_util.ravel_pytree`. The default solver picks
-the smaller dense factorization from the problem shape — the residual-space
-Gram system or the whitened normal system — with QR, CG, and matrix-free
-LSMR alternatives. Use `update(...)` for a single LM step or `solve(...)`
-for an internally jitted loop.
+- **`RidgeLevenbergMarquardt`** puts the selection in the **objective**: it
+  minimizes \(\|r(x)\|^2 + \lambda\,\|Lx\|^2\) for a user penalty factor
+  \(L\) with the ridge weight \(\lambda\) annealed toward zero, so the
+  limit is the minimum-seminorm (e.g. minimum-RKHS-norm) interpolant by
+  classical nonlinear Tikhonov regularization ([Engl–Hanke–Neubauer 1996;
+  Kaltenbacher–Neubauer–Scherzer 2008](https://highdimensionaleconlab.github.io/nlls_gram/ridge_lm/)).
+  Every inner problem is a well-posed NLLS — plain Gauss-Newton alone would
+  converge to *some* interpolant without selecting the minimal-norm one
+  ([Campbell–Kunkel–Bobinyec 2012](https://highdimensionaleconlab.github.io/nlls_gram/ridge_lm/)).
+- **`LevenbergMarquardt`** is standard damped LM for general nonlinear least
+  squares — square, tall, or underdetermined — with dense, QR, CG, and
+  matrix-free LSMR linear solvers and a swappable implicit-AD rule.
 
-## Problem
-
-At each iteration the solver builds a step \(s\) from the metric-damped
-linearized subproblem
-
-$$
-\min_s \frac12\|r + Js\|_2^2 + \frac{\lambda}{2}s^\top M s,
-\qquad M \succ 0.
-$$
-
-The default is \(M=I\). For kernel/RKHS coefficient problems, if
-
-$$
-f_\alpha(x)=\sum_{j=1}^n \alpha_j K(x,x_j),
-$$
-
-then
-
-$$
-\|f_\alpha\|_{\mathcal H_K}^2 = \alpha^\top K\alpha,
-$$
-
-so the natural parameter metric is \(M=K\), not the Euclidean metric.
-
-Near the interpolation threshold the residuals are small, damping falls, and
-LM becomes metric Gauss-Newton: each step is the minimum-\(M\)-norm correction
-solving the linearized residual equations,
-
-$$
-s = -M^{-1}J^\top\left(JM^{-1}J^\top\right)^{-1}r
-= \arg\min_s \|s\|_M
-\;\;\text{s.t.}\;\;
-r + Js = 0.
-$$
-
-With an RKHS metric this selects minimum-RKHS-norm corrections — kernel
-methods let you control exactly which norm that is. The docs derive this and
-the large-damping limit (metric gradient descent).
+Both take a residual over `(x)`, `(x, args)`, or `(x, args, p)` (always in
+that order), flatten any pytree `x` with `jax.flatten_util.ravel_pytree`,
+expose per-step `update(...)` and an internally jitted `solve(...)` loop
+with callbacks and multi-start, and differentiate `solve(...).x` with
+respect to `p` through a custom implicit rule.
 
 ## Install
 
@@ -75,7 +45,50 @@ example:
 uv add nlls-gram "jax[cuda13]"
 ```
 
-## Minimal Example
+## Ridge Example: Minimum-RKHS-Norm Interpolation
+
+For kernel coefficient problems
+\(f_\alpha(x)=\sum_j \alpha_j K(x, x_j)\), the squared RKHS norm is
+\(\alpha^\top K \alpha\), so the penalty is `repeated_dense_penalty`
+(`repeats` coefficient blocks sharing one Gram matrix `K`, plus unpenalized
+structural scalars — no epsilon shift anywhere):
+
+```python
+import jax.numpy as jnp
+
+from nlls_gram import (
+    RidgeLevenbergMarquardt,
+    repeated_dense_penalty,
+    ridge_continuation,
+)
+
+penalty = repeated_dense_penalty(K, repeats=3, zero_pad_size=d)
+solver = RidgeLevenbergMarquardt(
+    residual_fn,                 # (x) | (x, args) | (x, args, p)
+    penalty=penalty,
+    ridge=1e-8,                  # fixed small ridge; None = dtype default
+    linear_solve_dtype=jnp.float64,
+)
+result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=1e-8)
+
+# optional homotopy (ridge annealed 1e-4 -> 1e-8 on stationarity):
+cb, us0 = ridge_continuation(ridge_floor=1e-8, decrease=0.1)
+result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=1e-8,
+                      callback=cb, user_state=us0)
+```
+
+The solver is stock Euclidean LM on the augmented residual
+\([r;\sqrt{\lambda}Lx]\): the trust-region damping and the selection
+weight are fully decoupled, the assembled normal matrix is cached across
+rejected steps, and a damping-row QR path stays accurate at tiny ridge.
+`info.loss` is the ridge objective; `info.resid_loss` is the equation error.
+Stopping is conjunctive: `gtol` means "stationary at this ridge", `atol`
+additionally demands the equations solved (it never stops the solve alone).
+The [Ridge LM docs](https://highdimensionaleconlab.github.io/nlls_gram/ridge_lm/)
+derive the selection theorem, the continuation schedule, and the solver
+table.
+
+## General Nonlinear Least Squares
 
 ```python
 import jax
@@ -139,46 +152,20 @@ safely at differentiation-inert copies of the caller's original
 aux map, and any metric or preconditioner factory used by the selected AD
 method. This also keeps mixed successful/failed `vmap` lanes finite.
 
-## Metric Example
+### Advanced: metric damping
 
-For a dense SPD metric \(M = LL^\top\), use the Cholesky helper:
+`LevenbergMarquardt` optionally accepts a positive-definite parameter-space
+`metric` (or an iterate-aware `MetricFactory`) that redefines the damping
+geometry, so the small-damping Gauss-Newton limit selects
+minimum-*metric*-norm corrections — the algorithmic-bias alternative to the
+ridge objective, with `repeated_shifted_dense_metric` /
+`repeated_shifted_state_space_metric` covering the kernel geometry
+\(\operatorname{blockdiag}(K,\ldots,K,0_s)+\varepsilon I\). See the
+[metrics](https://highdimensionaleconlab.github.io/nlls_gram/metrics/) and
+[metric Gauss-Newton](https://highdimensionaleconlab.github.io/nlls_gram/gauss_newton/)
+docs pages; for new kernel problems prefer `RidgeLevenbergMarquardt`.
 
-```python
-import jax.numpy as jnp
-
-from nlls_gram import LevenbergMarquardt, metric_from_cholesky
-
-L = jnp.linalg.cholesky(metric_matrix)
-solver = LevenbergMarquardt(
-    residual_fn,
-    init_damping=1e-2,
-    metric=metric_from_cholesky(L),
-)
-```
-
-The `Metric` callbacks act on the flattened parameter vector. Alongside the
-dense Cholesky and diagonal helpers, the library provides specialized
-constructors for the common kernel geometry
-
-$$
-M = \operatorname{blockdiag}(K,\ldots,K,0_s) + \varepsilon I.
-$$
-
-`repeated_shifted_dense_metric` factors `K + epsilon * I` once and batches
-all repeated blocks through that factor. For an ordered one-dimensional
-state-space kernel, `repeated_shifted_state_space_metric` provides the same
-geometry without materializing a dense `K`; `matern_state_space` supplies its
-inputs for half-integer Matérn kernels. Neither constructor stores repeated
-matrices or factors.
-
-For a metric that depends on the current iterate or on residual aux outputs
-(`has_aux=True`), pass `metric_factory=MetricFactory(prepare, build)` instead
-of `metric`: `prepare(x, args, p, aux)` caches a state once per accepted step
-and `build(state)` returns a plain `Metric` — any metric constructor slots in
-directly, e.g.
-`MetricFactory(prepare=lambda x, args, p, aux: aux["L"], build=metric_from_cholesky)`.
-
-## Solvers
+## LevenbergMarquardt Solvers
 
 - `linear_solver="auto"` (the default): resolves at trace time to the
   smaller dense factorization — `gram_cholesky` when `n > m`,
