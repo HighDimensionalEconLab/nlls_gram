@@ -55,8 +55,15 @@ from nlls_gram.metrics import (
     repeated_shifted_dense_metric,
     repeated_shifted_state_space_metric,
 )
+from nlls_gram.penalties import (
+    RidgePenalty,
+    identity_penalty,
+    penalty_from_factor,
+    repeated_dense_penalty,
+)
 from nlls_gram.preconditioners import (
     identity_preconditioner,
+    identity_right_preconditioner,
     nystrom_preconditioner,
     pad_dual_preconditioner,
     sherman_morrison_preconditioner,
@@ -93,9 +100,14 @@ __all__ = [
     "HarvestState",
     "build_coarse_operator",
     "deflated_pcg",
+    "identity_penalty",
     "identity_preconditioner",
+    "identity_right_preconditioner",
     "lsmr",
     "LSMRState",
+    "penalty_from_factor",
+    "repeated_dense_penalty",
+    "RidgePenalty",
     "matern_state_space",
     "metric_from_cholesky",
     "metric_from_diagonal",

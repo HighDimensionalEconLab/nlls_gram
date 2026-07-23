@@ -30,6 +30,91 @@ def identity_preconditioner():
     return preconditioner
 
 
+def identity_right_preconditioner():
+    """The identity map as an explicit "no right-preconditioner" choice.
+
+    ``RidgeLevenbergMarquardt(linear_solver="lsmr")`` requires
+    ``lsmr_preconditioner`` -- nobody should run Krylov methods without
+    thinking about preconditioning, so opting out is an explicit, greppable
+    decision rather than a silent default. Returns a
+    :class:`WhitenedPreconditioner` whose ``solve`` and ``solve_transpose``
+    are both the identity, so LSMR runs unpreconditioned.
+    """
+
+    def solve(v, damping):
+        return v
+
+    def solve_transpose(w, damping):
+        return w
+
+    return WhitenedPreconditioner(solve, solve_transpose)
+
+
+class WhitenedPreconditioner:
+    """Parameter-space right-preconditioner for ``linear_solver="lsmr"``: a
+    value-hashable pair ``(solve, solve_transpose)`` applying ``R^{-1}`` and
+    ``R^{-T}``.
+
+    LSMR then runs in the preconditioned variable ``z = R u`` on the augmented
+    operator ``[B R^{-1}; sqrt(damping) R^{-1}]`` (``B = J S`` for
+    ``LevenbergMarquardt``; ``B = [J; sqrt(ridge) L]`` for
+    ``RidgeLevenbergMarquardt``), and the returned step un-preconditions the
+    final iterate as ``u = R^{-1} z``. A well-chosen ``R`` (a Schur-complement
+    factor of the parameter-space normal operator is the canonical
+    construction) clusters the spectrum of ``B R^{-1}`` and cuts the endgame
+    iteration count by orders of magnitude::
+
+        def solve(v, damping):
+            return jsp_linalg.solve_triangular(R, v)              # R^{-1} v
+
+        def solve_transpose(w, damping):
+            return jsp_linalg.solve_triangular(R.T, w)            # R^{-T} w
+
+        solver = LevenbergMarquardt(
+            residual_fn, linear_solver="lsmr",
+            whitened_preconditioner=WhitenedPreconditioner(solve, solve_transpose),
+        )
+
+    - ``solve(v, damping) -> vector`` applies ``R^{-1}`` on a parameter-space
+      vector; ``solve_transpose(w, damping) -> vector`` applies ``R^{-T}``. Both
+      receive the live ``damping`` (like ``dual_preconditioner(v, damping)``), so
+      a ``damping``-analytic ``R`` folds ``lambda`` in exactly.
+    - **Exact subproblem for any R**: the augmented damping row is
+      ``sqrt(damping) R^{-1} z = sqrt(damping) u``, so every ``damping > 0``
+      subproblem is exactly the ``I``-damped
+      ``min_u ||r + B u||^2 + damping ||u||^2`` -- the computed step is
+      ``u = -(BᵀB + damping I)^{-1} Bᵀ r`` regardless of ``R``. The
+      preconditioner changes the iteration path, never the subproblem, and the
+      ``damping -> 0`` limit is the minimum-metric-norm step for ANY ``R``.
+    - LSMR stopping (``iterative_tol``/``iterative_atol``) is measured on the
+      preconditioned operator -- the well-conditioned ``z`` coordinates.
+
+    ``None`` (the ``LevenbergMarquardt`` default) runs plain LSMR;
+    ``RidgeLevenbergMarquardt`` requires an explicit choice
+    (``identity_right_preconditioner()`` opts out). Value-hashable on
+    ``(solve, solve_transpose)`` with jit's static-key semantics: equal pairs
+    share one compiled solve loop, so define the callables once at setup scope.
+    """
+
+    def __init__(self, solve, solve_transpose):
+        if not callable(solve):
+            raise TypeError("WhitenedPreconditioner.solve must be callable")
+        if not callable(solve_transpose):
+            raise TypeError("WhitenedPreconditioner.solve_transpose must be callable")
+        self.solve = solve
+        self.solve_transpose = solve_transpose
+
+    def __hash__(self):
+        return hash((self.solve, self.solve_transpose))
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, WhitenedPreconditioner)
+            and self.solve == other.solve
+            and self.solve_transpose == other.solve_transpose
+        )
+
+
 def sherman_morrison_preconditioner(solve, u, weight):
     """Preconditioner for ``B = A + weight * u u'`` from a solve with ``A``.
 
