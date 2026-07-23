@@ -828,10 +828,15 @@ class RidgeLevenbergMarquardt:
 
         # Half-gradient g = J'r + ridge L'(L x); grad F = 2 g, the factor
         # cancels in the LM equations. Lx is reused for the pre-step penalty
-        # value (identical to the resolved quadratic's default form).
+        # value (identical to the resolved quadratic's default form). Penalty
+        # callback outputs are pinned to the residual dtype so a wider-typed
+        # penalty (e.g. float64 kernel data under a float32 residual) cannot
+        # promote the gradient and break the loop-carry dtypes.
         factor_x = self._sqrt_apply(theta)
         penalty_value_old = jnp.asarray(jnp.sum(factor_x**2), dtype=resid.dtype)
-        penalty_gradient = self._sqrt_transpose_apply(factor_x)
+        penalty_gradient = jnp.asarray(
+            self._sqrt_transpose_apply(factor_x), dtype=resid.dtype
+        )
 
         resolved_solver = self._resolved_solver()
         dense_dtype = (
@@ -867,12 +872,20 @@ class RidgeLevenbergMarquardt:
                 return self.lsmr_preconditioner.solve_transpose(w, damping)
 
             # Augmented operator A = [J; sqrt(ridge) L] with the penalty rows
-            # applied through the penalty's own factor callbacks.
+            # applied through the penalty's own factor callbacks (outputs
+            # pinned to the residual dtype).
             def A_matvec(u):
-                return jnp.concatenate([jvp_fn(u), sqrt_ridge * self._sqrt_apply(u)])
+                penalty_rows_apply = jnp.asarray(
+                    sqrt_ridge * self._sqrt_apply(u), dtype=resid.dtype
+                )
+                return jnp.concatenate([jvp_fn(u), penalty_rows_apply])
 
             def At_matvec(w):
-                return JT(w[:m]) + sqrt_ridge * self._sqrt_transpose_apply(w[m:])
+                penalty_pullback = jnp.asarray(
+                    sqrt_ridge * self._sqrt_transpose_apply(w[m:]),
+                    dtype=resid.dtype,
+                )
+                return JT(w[:m]) + penalty_pullback
 
             # N = A'A + damping I, the R-free SPD operator that
             # custom_linear_solve differentiates through, posed on u (not z).
@@ -1789,9 +1802,11 @@ class RidgeLevenbergMarquardt:
         ridge_typed = jnp.asarray(ridge, dtype=residual.dtype)
 
         def normal_matvec(u):
-            return JT(theta_jvp(u)) + ridge_typed * self._sqrt_transpose_apply(
-                self._sqrt_apply(u)
+            penalty_apply = jnp.asarray(
+                self._sqrt_transpose_apply(self._sqrt_apply(u)),
+                dtype=residual.dtype,
             )
+            return JT(theta_jvp(u)) + ridge_typed * penalty_apply
 
         cg_tol = self._ad_cg_tol(residual.dtype)
         cg_atol = jnp.asarray(self.ad_solver_atol, dtype=residual.dtype)
