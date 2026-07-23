@@ -179,19 +179,39 @@ class RidgeLMInfo:
     aux: Any = None
 
 
-def ridge_continuation(*, decrease=0.1, ridge_floor, grad_rtol=1e-3, dtype=None):
+def ridge_continuation(
+    *, decrease=0.1, ridge_floor, grad_rtol=1e-2, stall_rtol=0.0, dtype=None
+):
     """Build ``(callback, user_state0)`` implementing ridge continuation.
 
     The callback multiplies ``lm_state.ridge`` by ``decrease`` whenever the
-    inner fixed-ridge problem is approximately stationary -- ``info.grad_norm``
-    below ``grad_rtol`` relative to its reference value at the current ridge
-    level -- never below ``ridge_floor``. ``ridge_floor`` is REQUIRED and
-    strictly positive (``ridge = 0`` is out of the solver's contract). The
-    callback returns an :class:`~nlls_gram.LMSolveAction` replacing
-    ``lm_state`` AND ``user_state`` (the per-level reference ``grad_norm``
-    lives in ``user_state`` as a fixed-shape scalar, since a
-    ``lax.while_loop`` carry cannot grow from ``None`` mid-loop -- hence the
-    factory shape)::
+    current level has yielded what it can, never below ``ridge_floor``:
+
+    - **stationary**: ``info.grad_norm`` fell below ``grad_rtol`` relative to
+      its reference value at the current ridge level (the level's first
+      observed gradient), or
+    - **stalled** (opt-in, ``stall_rtol > 0``): an ACCEPTED step improved
+      the gradient by less than a factor ``stall_rtol``. The escape hatch
+      for a frozen anneal: the per-level references COMPOUND -- with closely
+      spaced levels each new reference is already small, the effective
+      demand approaches ``grad_rtol ** levels`` times the initial gradient,
+      and the anneal can freeze below the problem's noise floor while steps
+      keep being accepted with negligible progress. Enable with
+      ``stall_rtol ~ 0.99`` when that happens (advancing on stagnation is
+      still more conservative than the cited iteratively regularized
+      Gauss-Newton method, which anneals every step). Off by default
+      because it cannot distinguish a converged level from an accepted
+      micro-step under temporarily high damping early in a hard solve --
+      where a false advance collapses the schedule prematurely; widening
+      ``decrease`` (e.g. ``0.01``) is the alternative fix for a frozen
+      anneal, since larger jumps keep the per-level references generous.
+
+    ``ridge_floor`` is REQUIRED and strictly positive (``ridge = 0`` is out
+    of the solver's contract). The callback returns an
+    :class:`~nlls_gram.LMSolveAction` replacing ``lm_state`` AND
+    ``user_state`` (the per-level reference and previous gradient live in
+    ``user_state`` as fixed-shape scalars, since a ``lax.while_loop`` carry
+    cannot grow from ``None`` mid-loop -- hence the factory shape)::
 
         cb, us0 = ridge_continuation(ridge_floor=1e-10)
         result = solver.solve(x0, callback=cb, user_state=us0,
@@ -203,9 +223,14 @@ def ridge_continuation(*, decrease=0.1, ridge_floor, grad_rtol=1e-3, dtype=None)
     rather than per fully solved level is the iteratively regularized
     Gauss-Newton method (Bakushinskii 1992; Blaschke-Neubauer-Scherzer 1997;
     Kaltenbacher-Neubauer-Scherzer 2008), whose theory wants exactly this kind
-    of monotone, boundedly geometric schedule. ``dtype`` types the reference
-    scalar in ``user_state0`` (default: the JAX default float; pass the
-    problem dtype explicitly for a float32 program under enabled x64).
+    of monotone, boundedly geometric schedule. Pair the schedule with the
+    conjunctive stopping rule: choose ``atol`` BETWEEN the ridge-floor
+    residual and the last intermediate level's residual (they differ by
+    roughly ``1 / decrease``), so the solve can only stop at the floor even
+    when ``gtol`` must sit above a variant-dependent stationarity noise
+    floor. ``dtype`` types the ``user_state0`` scalars (default: the JAX
+    default float; pass the problem dtype explicitly for a float32 program
+    under enabled x64).
     """
 
     if not 0 < decrease < 1:
@@ -216,32 +241,54 @@ def ridge_continuation(*, decrease=0.1, ridge_floor, grad_rtol=1e-3, dtype=None)
                          "unsupported by RidgeLevenbergMarquardt)")
     if grad_rtol <= 0:
         raise ValueError("grad_rtol must be positive")
+    if not 0 <= stall_rtol < 1:
+        raise ValueError("stall_rtol must lie in [0, 1)")
     if dtype is None:
         dtype = jnp.result_type(float)
-    user_state0 = jnp.asarray(jnp.inf, dtype=dtype)
+    infinity = jnp.asarray(jnp.inf, dtype=dtype)
+    user_state0 = {"reference": infinity, "previous": infinity}
 
     def callback(ctx):
         ridge = ctx.lm_state.ridge
         grad_norm = jnp.asarray(ctx.info.grad_norm, dtype=ridge.dtype)
-        reference = jnp.asarray(ctx.user_state, dtype=ridge.dtype)
-        # +inf marks "no reference at this level yet": the first observation
-        # after a ridge decrease (or the initial step) sets it.
+        reference = jnp.asarray(ctx.user_state["reference"], dtype=ridge.dtype)
+        previous = jnp.asarray(ctx.user_state["previous"], dtype=ridge.dtype)
+        # +inf marks "no observation at this level yet": the first step after
+        # a ridge decrease (or the initial step) sets the reference and can
+        # never read as stalled.
         reference = jnp.where(jnp.isfinite(reference), reference, grad_norm)
         floor = jnp.asarray(ridge_floor, dtype=ridge.dtype)
         stationary = grad_norm <= jnp.asarray(grad_rtol, ridge.dtype) * reference
+        if stall_rtol > 0:
+            # ACCEPTED steps only: a rejected step leaves x (and so the
+            # gradient) unchanged -- that is the trust region adapting, not
+            # the level converging -- while an accepted step that improved
+            # the gradient by less than the stall factor means the level has
+            # yielded what it can.
+            stalled = ctx.info.accepted & (
+                grad_norm >= jnp.asarray(stall_rtol, ridge.dtype) * previous
+            )
+        else:
+            stalled = jnp.asarray(False)
         new_ridge = jnp.where(
-            stationary, jnp.maximum(ridge * jnp.asarray(decrease, ridge.dtype), floor),
+            stationary | stalled,
+            jnp.maximum(ridge * jnp.asarray(decrease, ridge.dtype), floor),
             ridge,
         )
-        # Reset the reference when the level actually changes; at the floor the
+        # Reset the trackers when the level actually changes; at the floor the
         # ridge is unchanged, so convergence is not suppressed and gtol/atol
         # can fire.
-        new_reference = jnp.where(
-            new_ridge < ridge, jnp.asarray(jnp.inf, ridge.dtype), reference
-        )
+        advanced = new_ridge < ridge
+        fresh_level = jnp.asarray(jnp.inf, ridge.dtype)
+        new_reference = jnp.where(advanced, fresh_level, reference)
+        new_previous = jnp.where(advanced, fresh_level, grad_norm)
+        state_dtype = jnp.asarray(ctx.user_state["reference"]).dtype
         return LMSolveAction(
             lm_state=dataclasses.replace(ctx.lm_state, ridge=new_ridge),
-            user_state=new_reference.astype(jnp.asarray(ctx.user_state).dtype),
+            user_state={
+                "reference": new_reference.astype(state_dtype),
+                "previous": new_previous.astype(state_dtype),
+            },
         )
 
     return callback, user_state0

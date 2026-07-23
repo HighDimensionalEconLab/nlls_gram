@@ -106,7 +106,15 @@ result = solver.solve(x0, callback=cb, user_state=us0,
 The callback multiplies `lm_state.ridge` by `decrease` whenever the inner
 fixed-\(\lambda\) problem is approximately stationary (`info.grad_norm`
 below `grad_rtol` relative to its reference at the current level), never
-below `ridge_floor`. Solving each level out and passing to the limit is the
+below `ridge_floor`. Two pacing notes from production use: the per-level
+references compound (each level's reference is the gradient it *entered*
+with), so a schedule that freezes below the noise floor wants a wider
+`decrease` (e.g. `0.01` — larger jumps keep the references generous) or the
+opt-in `stall_rtol` stagnation advance; and with the conjunctive stopping
+rule, choose `atol` **between** the ridge-floor residual and the last
+intermediate level's residual (they differ by roughly `1 / decrease`), so
+the solve can only stop at the floor even when `gtol` must sit above a
+problem-dependent stationarity noise floor. Solving each level out and passing to the limit is the
 nonlinear Tikhonov path above; annealing per stationarity event is the
 **iteratively regularized Gauss–Newton method** (Bakushinskii 1992;
 Blaschke–Neubauer–Scherzer 1997; Kaltenbacher–Neubauer–Scherzer 2008), whose
