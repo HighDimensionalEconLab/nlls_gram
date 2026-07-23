@@ -1586,9 +1586,9 @@ solve_jaxpr = str(
 )
 assert "f32" not in solve_jaxpr, solve_jaxpr
 
-# A float32 problem under enabled x64 with linear_solve_dtype=float64: the
-# normal/QR pipelines run wide (wide cache buffers), every output stays
-# float32 -- including the qr path's stacked [J; sqrt(ridge) L] assembly.
+# A float32 problem under enabled x64 stays float32 end to end -- the ridge
+# solver runs entirely at the residual dtype (the qr path is the in-dtype
+# conditioning fix; there is no linear_solve_dtype promotion knob).
 x0_f32 = x0.astype(jnp.float32)
 A32, b32, K32 = A.astype(jnp.float32), b.astype(jnp.float32), K.astype(jnp.float32)
 
@@ -1603,14 +1603,13 @@ for name in ("cholesky", "qr"):
         linear_solver=SOLVER_CONFIGS[name],
         penalty=repeated_dense_penalty(K32, repeats=repeats, zero_pad_size=pad),
         ridge=1e-6,
-        linear_solve_dtype=jnp.float64,
     )
     state32 = solver32.init(x0_f32)
     assert state32.ridge.dtype == jnp.float32
     if name == "cholesky":
-        assert state32.solver_cache.G.dtype == jnp.float64
+        assert state32.solver_cache.G.dtype == jnp.float32
     else:
-        assert state32.solver_cache.R.dtype == jnp.float64
+        assert state32.solver_cache.R.dtype == jnp.float32
     assert state32.solver_cache.ridge.dtype == jnp.float32
     x1_32, new_state32, info32 = solver32.update(x0_f32, state32)
     assert x1_32.dtype == jnp.float32
@@ -1619,30 +1618,6 @@ for name in ("cholesky", "qr"):
     result32 = solver32.solve(x0_f32, max_steps=50, gtol=1e-4)
     assert result32.x.dtype == jnp.float32
     assert result32.lm_state.ridge.dtype == jnp.float32
-
-# End-to-end wide-pipeline solve from float32 data at a MODERATE ridge. The
-# comparison against the float64 same-ridge solution is limited by the
-# selection resolution gtol / ridge (the gradient stays at the residual
-# dtype by design, noise floor ~1e-7), so ridge=1e-2 with gtol=1e-6 pins the
-# answer to ~1e-4 -- the promoted assembly/factorization then lands on the
-# float64 answer well inside that.
-x_wide = np.asarray(
-    RidgeLevenbergMarquardt(
-        residual32,
-        penalty=repeated_dense_penalty(K32, repeats=repeats, zero_pad_size=pad),
-        ridge=1e-2,
-        linear_solve_dtype=jnp.float64,
-    )
-    .solve(jnp.zeros(p_dim, jnp.float32), max_steps=300, gtol=1e-6)
-    .x,
-    np.float64,
-)
-x_ref = np.asarray(
-    build("cholesky", ridge=1e-2)
-    .solve(jnp.zeros(p_dim), max_steps=300, gtol=1e-10)
-    .x
-)
-np.testing.assert_allclose(x_wide, x_ref, atol=1e-4)
 """
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],

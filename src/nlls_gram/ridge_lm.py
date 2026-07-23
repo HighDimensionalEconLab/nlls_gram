@@ -481,7 +481,6 @@ class RidgeLevenbergMarquardt:
         jacobian_mode="auto",
         ad_solver=Auto(),  # noqa: B008 -- frozen, immutable default
         selection_rtol=1e-3,
-        linear_solve_dtype=None,
         has_aux=False,
         cache_jacobian=True,
         geodesic_acceleration=True,
@@ -547,23 +546,6 @@ class RidgeLevenbergMarquardt:
                 "an LSMR forward solver nor its cg-resolved ad_solver ever "
                 "consumes it"
             )
-        if linear_solve_dtype is not None:
-            if jnp.dtype(linear_solve_dtype) != jnp.dtype(jnp.float64):
-                raise ValueError("linear_solve_dtype must be None or jnp.float64")
-            if isinstance(linear_solver, LSMR) and not isinstance(
-                ad_solver, Cholesky
-            ):
-                raise ValueError(
-                    "linear_solve_dtype promotes only the dense linear-solve "
-                    "pipelines; it requires a Cholesky, QR, or Auto forward "
-                    "solver, or ad_solver=Cholesky()"
-                )
-            if not jax.config.jax_enable_x64:
-                raise ValueError(
-                    "linear_solve_dtype=jnp.float64 requires x64 support; call "
-                    'jax.config.update("jax_enable_x64", True) at startup '
-                    "(explicitly float32 problem data stays float32)"
-                )
         self.residual_fn = canonical_residual
         self.residual_arity = residual_arity
         self.penalty = penalty
@@ -605,9 +587,6 @@ class RidgeLevenbergMarquardt:
             self.ad_solver_atol = 0.0
             self.ad_solver_maxiter = None
             self.ad_solver_preconditioner = None
-        self.linear_solve_dtype = (
-            None if linear_solve_dtype is None else jnp.dtype(linear_solve_dtype)
-        )
         self.has_aux = has_aux
         # Only the dense paths materialize J' (and the cholesky/qr caches ride
         # on the same reject-reuse lifecycle), so the flag is inert for lsmr.
@@ -657,7 +636,6 @@ class RidgeLevenbergMarquardt:
                 jacobian_mode,
                 ad_solver,
                 selection_rtol,
-                self.linear_solve_dtype,
                 has_aux,
                 self.cache_jacobian,
                 geodesic_acceleration,
@@ -733,9 +711,6 @@ class RidgeLevenbergMarquardt:
         theta, _ = ravel_pytree(x0)
         p_dim = theta.size
         m = residual.size
-        dense_dtype = (
-            dtype if self.linear_solve_dtype is None else self.linear_solve_dtype
-        )
         invalid = jnp.asarray(False, dtype=jnp.bool_)
         common = dict(
             resid=jnp.zeros(residual.shape, dtype=dtype),
@@ -745,14 +720,14 @@ class RidgeLevenbergMarquardt:
         )
         if self._resolved_solver() == "cholesky":
             cache = CholeskyCache(
-                G=jnp.zeros((p_dim, p_dim), dtype=dense_dtype),
+                G=jnp.zeros((p_dim, p_dim), dtype=dtype),
                 valid=invalid,
                 ridge=jnp.zeros((), dtype=dtype),
             )
         else:
             r_rows = min(m + self.penalty.num_rows, p_dim + 1)
             cache = QRCache(
-                R=jnp.zeros((r_rows, p_dim + 1), dtype=dense_dtype),
+                R=jnp.zeros((r_rows, p_dim + 1), dtype=dtype),
                 valid=invalid,
                 ridge=jnp.zeros((), dtype=dtype),
             )
@@ -914,10 +889,6 @@ class RidgeLevenbergMarquardt:
             self._sqrt_transpose_apply(factor_x), dtype=resid.dtype
         )
 
-        dense_dtype = (
-            resid.dtype if self.linear_solve_dtype is None else self.linear_solve_dtype
-        )
-
         if resolved_solver == "lsmr":
             transpose_fn = jax.linear_transpose(jvp_fn, theta)
 
@@ -1009,19 +980,14 @@ class RidgeLevenbergMarquardt:
 
         elif resolved_solver == "cholesky":
             grad = Jt @ resid + ridge * penalty_gradient
-            # Wide pipeline: J' promoted BEFORE the Gram product and the
-            # penalty added in the wide dtype (a narrow-rounded ridge*L'L
-            # added into a wide H would defeat the promotion). The assembled
-            # G = J'J + ridge L'L is cached across rejected steps -- only mu
-            # changed, so the reject pays the p^3/3 refactor without the GEMM
-            # or the penalty assembly; a callback ridge change invalidates
-            # through the cache's ridge key.
-            transposed_jacobian = Jt.astype(dense_dtype)
-            ridge_wide = jnp.asarray(ridge, dtype=dense_dtype)
+            # The assembled G = J'J + ridge L'L is cached across rejected
+            # steps -- only mu changed, so the reject pays the p^3/3 refactor
+            # without the GEMM or the penalty assembly; a callback ridge
+            # change invalidates through the cache's ridge key.
 
             def assemble_normal(_):
-                gram = transposed_jacobian @ transposed_jacobian.T
-                return self._add_scaled(gram, ridge_wide)
+                gram = Jt @ Jt.T
+                return self._add_scaled(gram, ridge)
 
             if self.cache_jacobian:
                 cache = lm_state.solver_cache
@@ -1039,26 +1005,21 @@ class RidgeLevenbergMarquardt:
                 )
             else:
                 normal_matrix = assemble_normal(None)
-            shifted = normal_matrix + jnp.asarray(
-                damping, dtype=dense_dtype
-            ) * jnp.eye(theta.shape[0], dtype=dense_dtype)
+            shifted = normal_matrix + damping * jnp.eye(
+                theta.shape[0], dtype=resid.dtype
+            )
             factor = jsp_linalg.cho_factor(shifted)
 
             def solve_step(rhs):
-                return -jsp_linalg.cho_solve(factor, rhs.astype(dense_dtype)).astype(
-                    resid.dtype
-                )
+                return -jsp_linalg.cho_solve(factor, rhs)
 
             def accel_rhs(f_vv):
                 return Jt @ f_vv
 
         else:  # qr
             grad = Jt @ resid + ridge * penalty_gradient
-            transposed_jacobian = Jt.astype(dense_dtype)
-            ridge_wide = jnp.asarray(ridge, dtype=dense_dtype)
-            damping_wide = jnp.asarray(damping, dtype=dense_dtype)
             penalty_rows = self._penalty_rows(theta.shape[0], resid.dtype).astype(
-                dense_dtype
+                resid.dtype
             )
 
             # One QR of the AUGMENTED stack [A | b] with A = [J; sqrt(ridge) L]
@@ -1073,15 +1034,10 @@ class RidgeLevenbergMarquardt:
             # accuracy exactly in the tiny-ridge regime this path exists for.
             def assemble_r(_):
                 stacked = jnp.concatenate(
-                    [transposed_jacobian.T, jnp.sqrt(ridge_wide) * penalty_rows],
-                    axis=0,
+                    [Jt.T, jnp.sqrt(ridge) * penalty_rows], axis=0
                 )
                 b_stacked = jnp.concatenate(
-                    [
-                        resid.astype(dense_dtype),
-                        jnp.sqrt(ridge_wide)
-                        * jnp.asarray(factor_x, dtype=dense_dtype),
-                    ]
+                    [resid, jnp.sqrt(ridge) * jnp.asarray(factor_x, resid.dtype)]
                 )
                 augmented = jnp.concatenate([stacked, b_stacked[:, None]], axis=1)
                 return jnp.linalg.qr(augmented, mode="r")
@@ -1111,8 +1067,7 @@ class RidgeLevenbergMarquardt:
             damped_stack = jnp.concatenate(
                 [
                     r_factor,
-                    jnp.sqrt(damping_wide)
-                    * jnp.eye(theta.shape[0], dtype=dense_dtype),
+                    jnp.sqrt(damping) * jnp.eye(theta.shape[0], dtype=resid.dtype),
                 ],
                 axis=0,
             )
@@ -1120,9 +1075,9 @@ class RidgeLevenbergMarquardt:
 
             def damped_normal_matvec(v):
                 return (
-                    transposed_jacobian @ (transposed_jacobian.T @ v)
-                    + ridge_wide * (penalty_rows.T @ (penalty_rows @ v))
-                    + damping_wide * v
+                    Jt @ (Jt.T @ v)
+                    + ridge * (penalty_rows.T @ (penalty_rows @ v))
+                    + damping * v
                 )
 
             def solve_step(rhs):
@@ -1131,13 +1086,13 @@ class RidgeLevenbergMarquardt:
                 # then ONE fixed iterative-refinement pass through matvecs
                 # (Bjorck 1996 Sec. 6.6.5). The second-order correction
                 # tolerates the squared conditioning; accept/reject guards it.
-                b = -rhs.astype(dense_dtype)
+                b = -rhs
                 half = jsp_linalg.solve_triangular(R_mu.T, b, lower=True)
                 delta = jsp_linalg.solve_triangular(R_mu, half, lower=False)
                 correction_rhs = b - damped_normal_matvec(delta)
                 half = jsp_linalg.solve_triangular(R_mu.T, correction_rhs, lower=True)
                 delta = delta + jsp_linalg.solve_triangular(R_mu, half, lower=False)
-                return delta.astype(resid.dtype)
+                return delta
 
             def solve_velocity():
                 # min ||[R; sqrt(damping) I] delta + [Q'b; 0]||^2 solved
@@ -1146,13 +1101,12 @@ class RidgeLevenbergMarquardt:
                 rhs_aug = jnp.concatenate(
                     [
                         transformed_rhs,
-                        jnp.zeros(theta.shape[0], dtype=dense_dtype),
+                        jnp.zeros(theta.shape[0], dtype=resid.dtype),
                     ]
                 )
-                delta = -jsp_linalg.solve_triangular(
+                return -jsp_linalg.solve_triangular(
                     R_mu, Q_mu.T @ rhs_aug, lower=False
                 )
-                return delta.astype(resid.dtype)
 
             def accel_rhs(f_vv):
                 return Jt @ f_vv
@@ -1862,26 +1816,17 @@ class RidgeLevenbergMarquardt:
 
     def _ad_tangent_cholesky(self, x, args, p, p_dot, ridge):
         # (J'J + ridge M0) x_dot = -J'(dr/dp) p_dot, no damping: the matrix is
-        # PD under ker J ∩ ker L = {0} because ridge > 0 by contract. Wide
-        # pipeline under linear_solve_dtype, same recipe as the forward path.
+        # PD under ker J ∩ ker L = {0} because ridge > 0 by contract.
         theta, unravel, residual, theta_jvp, residual_p_dot = self._ad_linearization(
             x, args, p, p_dot
         )
         Jt = self._assemble_jt(theta_jvp, theta, residual)
-        ad_dtype = (
-            residual.dtype
-            if self.linear_solve_dtype is None
-            else self.linear_solve_dtype
-        )
-        transposed_jacobian = Jt.astype(ad_dtype)
-        ridge_wide = jnp.asarray(ridge, dtype=ad_dtype)
         normal_matrix = self._add_scaled(
-            transposed_jacobian @ transposed_jacobian.T, ridge_wide
+            Jt @ Jt.T, jnp.asarray(ridge, dtype=residual.dtype)
         )
         factor = jsp_linalg.cho_factor(normal_matrix)
-        rhs = -(transposed_jacobian @ residual_p_dot.astype(ad_dtype))
-        theta_dot = jsp_linalg.cho_solve(factor, rhs)
-        return unravel(theta_dot.astype(residual.dtype))
+        theta_dot = jsp_linalg.cho_solve(factor, -(Jt @ residual_p_dot))
+        return unravel(theta_dot)
 
     def _ad_tangent_normal_cg(self, x, args, p, p_dot, ridge):
         # Matrix-free CG on the same PD operator; matvec =
