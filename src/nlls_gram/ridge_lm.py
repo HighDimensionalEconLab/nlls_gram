@@ -193,6 +193,10 @@ class RidgeLMInfo:
             norm ratio.
         grad_norm: ``()`` ``||J'r + ridge * L'L x||`` at the pre-step ``x`` --
             the ridge stationarity residual, NOT ``||J'r||``.
+        penalty_grad_norm: ``()`` ``||L'L x||`` at the pre-step ``x`` -- the
+            penalty-gradient scale the internal self-scaling stopping test
+            measures ``grad_norm`` against (stationary when ``grad_norm <
+            selection_rtol * ridge * penalty_grad_norm``).
         step_norm: ``()`` Euclidean ``||candidate step||``, reported even when
             the step is rejected.
         aux: residual aux output at the pre-step ``x`` (``has_aux=True``).
@@ -210,6 +214,7 @@ class RidgeLMInfo:
     used_geodesic: jax.Array
     acceleration_ratio: jax.Array
     grad_norm: jax.Array
+    penalty_grad_norm: jax.Array
     step_norm: jax.Array
     aux: Any = None
 
@@ -249,8 +254,7 @@ def ridge_continuation(
     cannot grow from ``None`` mid-loop -- hence the factory shape)::
 
         cb, us0 = ridge_continuation(ridge_floor=1e-10)
-        result = solver.solve(x0, callback=cb, user_state=us0,
-                              gtol=1e-8, atol=1e-8)
+        result = solver.solve(x0, callback=cb, user_state=us0, atol=1e-8)
 
     The solved-out continuation path converges to the minimum-seminorm
     solution by nonlinear Tikhonov theory (Engl-Kunisch-Neubauer 1989;
@@ -261,9 +265,10 @@ def ridge_continuation(
     of monotone, boundedly geometric schedule. Pair the schedule with the
     conjunctive stopping rule: choose ``atol`` BETWEEN the ridge-floor
     residual and the last intermediate level's residual (they differ by
-    roughly ``1 / decrease``), so the solve can only stop at the floor even
-    when ``gtol`` must sit above a variant-dependent stationarity noise
-    floor. ``dtype`` types the ``user_state0`` scalars (default: the JAX
+    roughly ``1 / decrease``), so the self-scaling stationarity test can
+    only stop the solve at the floor -- intermediate levels are stationary
+    too, and ``atol`` is what rules them out. ``dtype`` types the
+    ``user_state0`` scalars (default: the JAX
     default float; pass the problem dtype explicitly for a float32 program
     under enabled x64).
     """
@@ -399,17 +404,25 @@ class RidgeLevenbergMarquardt:
       ``damping > 0`` subproblem is exactly the ``I``-damped problem for any
       right preconditioner (Bjorck 1996 Ch. 7).
 
-    Stopping (``solve``): ``gtol`` bounds ``info.grad_norm = ||J'r + ridge
-    L'L x||`` (ridge stationarity) and ``xtol`` the accepted Euclidean step
-    norm -- they mean "done with the current fixed-ridge problem". ``atol``
-    is a CONJUNCTIVE filter on the TRUE residual: convergence requires
-    (``gtol`` or ``xtol`` fired) AND (``atol == 0`` or ``sqrt(resid_loss) <=
-    atol``). atol alone never stops the solve -- a pure-residual test would
-    stop at step 0 from any interpolating start before the seminorm is
-    minimized -- so ``solve`` rejects ``atol > 0`` without a positive
-    ``gtol`` or ``xtol``. In a continuation run the callback keeps lowering
-    ``ridge``, so intermediate stationarity with a large residual correctly
-    does not stop the loop.
+    Stopping (``solve``): a ridge solve has two phases -- the residual drops
+    to its floor fast, then the iterate slides along the interpolation set
+    resolving the null-space (selection) component while ``||r||`` stays
+    essentially constant. A pure-residual test is blind to phase 2, so the
+    phase-2 stationarity test is INTERNAL and self-scaling: done when
+    ``info.grad_norm = ||J'r + ridge L'L x||`` falls below
+    ``selection_rtol * ridge * ||L'L x||`` -- small relative to the
+    penalty-gradient scale that drives phase 2 (equivalently, the selection
+    is resolved to a relative accuracy ~``selection_rtol``). The normal
+    usage is therefore ``solve(x0, atol=...)`` alone, with ``atol`` a
+    CONJUNCTIVE filter on the TRUE residual: convergence requires (the
+    phase-2 test or ``xtol`` on the accepted step norm) AND (``atol == 0``
+    or ``sqrt(resid_loss) <= atol``). An explicit ``gtol > 0`` REPLACES the
+    auto threshold with an absolute bound -- the expert override, and the
+    escape hatch for the degenerate solution ``L'L x = 0``, where the
+    relative yardstick collapses and only ``gtol`` or ``xtol`` can fire. In
+    a continuation run the callback keeps lowering ``ridge``, so
+    intermediate stationarity with a large residual correctly does not stop
+    the loop.
 
     ``solve(...).x`` has a custom implicit AD rule with respect to ``p``:
     Gauss-Newton implicit differentiation of the ridge stationarity
@@ -467,6 +480,7 @@ class RidgeLevenbergMarquardt:
         linear_solver=Auto(),  # noqa: B008 -- frozen, immutable default
         jacobian_mode="auto",
         ad_solver=Auto(),  # noqa: B008 -- frozen, immutable default
+        selection_rtol=1e-3,
         linear_solve_dtype=None,
         has_aux=False,
         cache_jacobian=True,
@@ -506,6 +520,8 @@ class RidgeLevenbergMarquardt:
                     "use ridge_continuation with a positive ridge_floor to "
                     "approach the ridgeless limit)"
                 )
+        if selection_rtol <= 0:
+            raise ValueError("selection_rtol must be positive")
         if init_damping <= 0:
             raise ValueError("init_damping must be positive")
         if damping_decrease <= 0:
@@ -560,6 +576,7 @@ class RidgeLevenbergMarquardt:
         self.linear_solver = linear_solver
         self.jacobian_mode = jacobian_mode
         self.ad_solver = ad_solver
+        self.selection_rtol = selection_rtol
         # The configs' numeric fields fold into the traced LMHyperparams carry
         # at init exactly as the flat constructor args used to; the config
         # instances themselves sit in the value-based static key, so
@@ -639,6 +656,7 @@ class RidgeLevenbergMarquardt:
                 linear_solver,
                 jacobian_mode,
                 ad_solver,
+                selection_rtol,
                 self.linear_solve_dtype,
                 has_aux,
                 self.cache_jacobian,
@@ -781,9 +799,10 @@ class RidgeLevenbergMarquardt:
         return jnp.ravel(self.residual_fn(x, args, p)), None
 
     def _initial_info(self, x, lm_state, args, p):
-        # grad_norm is a +inf sentinel (computing it would cost a Jacobian
-        # before the first step) and step_norm is zero; neither can satisfy
-        # gtol/xtol before any update has run.
+        # grad_norm and penalty_grad_norm are +inf sentinels (computing them
+        # would cost a Jacobian before the first step) and step_norm is zero;
+        # none can satisfy a stopping rule before any update has run (the
+        # phase-2 comparison inf < inf is strict, hence false).
         residual, aux = self._residual_and_aux(x, args, p)
         resid_loss = jnp.sum(residual**2)
         theta, _ = ravel_pytree(x)
@@ -808,6 +827,7 @@ class RidgeLevenbergMarquardt:
             one,
             jnp.asarray(False, dtype=jnp.bool_),
             zero,
+            jnp.asarray(jnp.inf, dtype=residual.dtype),
             jnp.asarray(jnp.inf, dtype=residual.dtype),
             zero,
             aux,
@@ -1270,6 +1290,7 @@ class RidgeLevenbergMarquardt:
                 used_geodesic,
                 acceleration_ratio,
                 jnp.linalg.norm(grad),
+                jnp.linalg.norm(penalty_gradient),
                 jnp.linalg.norm(step),
                 aux,
             ),
@@ -1299,17 +1320,19 @@ class RidgeLevenbergMarquardt:
         :meth:`LevenbergMarquardt.solve
         <nlls_gram.LevenbergMarquardt.solve>` (callbacks, ``save_steps``,
         ``multi_start``, ``max_steps_is_success``, ``jit``) with two
-        differences. First, the tolerance semantics are conjunctive:
-        ``gtol`` bounds the ridge stationarity ``||J'r + ridge L'L x||`` and
-        ``xtol`` the accepted Euclidean step norm -- either fires "done with
-        the current fixed-ridge problem" -- while ``atol > 0`` ADDITIONALLY
+        differences. First, the stationarity test is internal and
+        self-scaling: the solve stops when ``||J'r + ridge L'L x|| <
+        selection_rtol * ridge * ||L'L x||`` (or ``xtol`` bounds the
+        accepted Euclidean step norm), while ``atol > 0`` ADDITIONALLY
         requires ``sqrt(resid_loss) <= atol`` (the model equations actually
-        solved, the ridgeless-endgame check) and never stops the solve alone;
-        ``atol > 0`` therefore requires a positive ``gtol`` or ``xtol``
-        (validated loudly). Second, ``lm_state=None`` always builds the state
-        with :meth:`init` (resolving ``ridge=None`` needs the residual
-        dtype); a caller-supplied ``lm_state`` must carry a positive
-        ``ridge``.
+        solved, the ridgeless-endgame check) and never stops the solve
+        alone -- ``solve(x0, atol=...)`` is the normal usage, and an
+        explicit ``gtol > 0`` replaces the auto threshold with an absolute
+        bound (the expert override; required when ``L'L x = 0`` at the
+        solution degenerates the relative yardstick). Second,
+        ``lm_state=None`` always builds the state with :meth:`init`
+        (resolving ``ridge=None`` needs the residual dtype); a
+        caller-supplied ``lm_state`` must carry a positive ``ridge``.
 
         For ridge continuation pass the pair returned by
         :func:`ridge_continuation` as ``callback``/``user_state``. A callback
@@ -1332,18 +1355,6 @@ class RidgeLevenbergMarquardt:
             raise ValueError("gtol must be nonnegative")
         if xtol_concrete and xtol < 0:
             raise ValueError("xtol must be nonnegative")
-        if (
-            atol_concrete
-            and atol > 0
-            and (gtol_concrete and gtol == 0)
-            and (xtol_concrete and xtol == 0)
-        ):
-            raise ValueError(
-                "atol > 0 requires a positive gtol or xtol: atol is a "
-                "conjunctive filter on the TRUE residual, never a stopping "
-                "rule by itself -- a residual-only test would stop at any "
-                "interpolating iterate before the seminorm is minimized"
-            )
         if lm_state is None:
             # Unconditional init (no minimal-state fast path): resolving
             # ridge=None needs the residual dtype, and the dense caches need
@@ -1723,12 +1734,19 @@ class RidgeLevenbergMarquardt:
             )
 
     def _converged(self, info, atol, gtol, xtol):
-        # gtol/xtol mean "done with the current fixed-ridge problem"; atol is
-        # a CONJUNCTIVE filter on the TRUE residual, never sufficient alone.
-        gtol_met = (gtol > 0) & (info.grad_norm < gtol)
+        # Phase-2 (selection) stationarity is self-scaling by default: the
+        # ridge stationarity residual small RELATIVE to the penalty-gradient
+        # scale ridge * ||L'L x|| that drives the slide along the
+        # interpolation set. An explicit gtol > 0 REPLACES the auto threshold
+        # with an absolute bound (also the escape hatch when L'L x -> 0
+        # degenerates the yardstick). atol is a CONJUNCTIVE filter on the
+        # TRUE residual, never sufficient alone. Strict < keeps the initial
+        # +inf sentinels (inf < inf) from firing at step 0.
+        auto_threshold = self.selection_rtol * info.ridge * info.penalty_grad_norm
+        grad_met = info.grad_norm < jnp.where(gtol > 0, gtol, auto_threshold)
         xtol_met = (xtol > 0) & info.accepted & (info.step_norm < xtol)
         residual_ok = (atol <= 0) | (jnp.sqrt(info.resid_loss) <= atol)
-        return (gtol_met | xtol_met) & residual_ok
+        return (grad_met | xtol_met) & residual_ok
 
     def _cast_state(self, lm_state, dtype):
         updates = dict(
