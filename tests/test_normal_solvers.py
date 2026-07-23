@@ -14,15 +14,10 @@ from nlls_gram import (
     PreconditionerFactory,
     RecycleConfig,
     WhitenedPreconditioner,
-    blockdiag_metric,
     identity_preconditioner,
-    matern_state_space,
     metric_from_cholesky,
     metric_from_diagonal,
-    metric_from_quasiseparable,
-    metric_from_state_space,
-    metric_from_tridiagonal_precision,
-    repeated_blockdiag_metric,
+    repeated_shifted_dense_metric,
 )
 
 # Rank-2 tall interpolation fixture: row 3 duplicates row 1 AND column 3 is
@@ -663,36 +658,14 @@ assert seen["inv_sqrt"] == jnp.float64, seen
 
 
 def shipped_inv_sqrt_metrics():
-    w2 = jnp.array([2.0, 0.5])
-    tridiag = metric_from_tridiagonal_precision(
-        jnp.array([2.0, 2.5, 2.2, 1.8]), jnp.array([-0.7, 0.4, -0.5])
-    )
-    qs = metric_from_quasiseparable(
-        2.0 * jnp.ones(4),
-        0.5 * jnp.ones((4, 1)),
-        0.5 * jnp.ones((4, 1)),
-        0.9 * jnp.ones((4, 1, 1)),
-    )
-    state_space = metric_from_state_space(
-        jnp.array([0.0, 0.3, 0.8, 1.1, 1.7]), *matern_state_space(1.2, 0.7, 1.5)
-    )
+    K = jnp.array([[2.0, 0.3], [0.3, 1.5]])
     return [
         ("cholesky", metric_from_cholesky(L3), 3),
         ("diagonal", metric_from_diagonal(jnp.array([2.0, 0.5, 1.5])), 3),
-        ("tridiagonal", tridiag, 4),
-        ("quasiseparable", qs, 4),
-        ("state_space", state_space, 5),
         (
-            "blockdiag",
-            blockdiag_metric(
-                [(metric_from_cholesky(L2), 2), (metric_from_diagonal(w2), 2)]
-            ),
-            4,
-        ),
-        (
-            "repeated_blockdiag",
-            repeated_blockdiag_metric(metric_from_cholesky(L2), 2, 3),
-            6,
+            "repeated_shifted_dense",
+            repeated_shifted_dense_metric(K, repeats=2, zero_pad_size=1, epsilon=0.2),
+            5,
         ),
     ]
 
@@ -706,7 +679,6 @@ def test_metric_builders_inv_sqrt_adjoint_consistency(metric, n):
     # The normal forms apply S and S' as a transpose PAIR: <S u, w> = <u, S' w>
     # and S S' = M^{-1} must hold for every shipped builder, or the normal-form
     # steps and the implicit S-transpose rule silently use a wrong adjoint.
-    # (metric_from_shifted_matvec ships no inv_sqrt, so it has no pair to test.)
     u = jax.random.normal(jax.random.key(0), (n,))
     w = jax.random.normal(jax.random.key(1), (n,))
     assert jnp.allclose(

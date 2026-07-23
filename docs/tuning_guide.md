@@ -153,9 +153,8 @@ trouble than any damping adjustment. Three grades, from narrowest to
 widest:
 
 - **`metric_solve_dtype=jnp.float64`** promotes only the resolved metric
-  callbacks (fixed or factory-built), via the
-  [`metric_with_compute_dtype`](utilities.md#compute-dtype-wrapper)
-  mechanics. Kernel Gram factorizations are routinely the worst-conditioned
+  callbacks (fixed or factory-built). Kernel Gram factorizations are routinely
+  the worst-conditioned
   piece of the whole pipeline, so this knob often earns float64 even in
   otherwise-float32 programs — it is the right first move when the metric,
   not the solver algebra, is the fragile part.
@@ -175,12 +174,9 @@ the step is model evaluation (residual + the `m` VJP Jacobian passes, which
 stay float32) versus promoted algebra; when the promoted algebra IS the
 step — trivial residuals, dense-metric-dominated updates — the knobs cost
 about the same wall time as full x64 and their remaining win is halved
-model memory and the unchanged float32 contract. One cost surprise to know
-about: a float64 metric with an iterative solve
-(`metric_from_shifted_matvec`) runs its inner CG in float64 at the tighter
-float64 default tolerance. Neither knob touches the CG solver paths — there
-the remedies remain preconditioning and, when the attainable-residual floor
-binds, full x64.
+model memory and the unchanged float32 contract. Neither knob changes the
+model evaluation dtype. For the solver's CG paths, the remedies remain
+preconditioning and, when the attainable-residual floor binds, full x64.
 
 ## Damping
 
@@ -332,7 +328,7 @@ the step count.
 | damping grows without bound (float32 `inf`) | rejection storm | `max_damping`, or check residual scaling |
 | every `solve` call recompiles | residual/callback/metric object rebuilt per call (solvers compare by configuration, but their pieces key by identity) | define the pieces once at setup scope |
 | implicit `jax.jvp`/`vjp` wrong or zero | `p` not in the residual signature, or perturbing `args` | move perturbed quantities into `p` |
-| NaN or no progress with a quasiseparable Matérn metric | nugget-free Matérn-3/2/5/2 Gram conditioning wall (cond ~1e21 at n=5000) | add an absolute `nugget` — it folds into the metric exactly |
+| NaN or no progress with a state-space Matérn metric | the shift is too small for the resolved grid | increase the positive `epsilon`, which is folded into the structured factorization exactly |
 
 ## The Metric
 
@@ -343,37 +339,29 @@ For kernel parameterizations use `M = K` (coefficients) or `M = K^{-1}`
 If results look right but derivatives look wrong, check the metric before
 anything else.
 
-For kernel blocks plus free scalar parameters, the unified shifted metric
-`blockdiag(K, 0) + eps*I` (see
-[Utilities](utilities.md#unified-shifted-block-metrics)) replaces the
-two-knob `blockdiag(K + jitter*I, m_0*I)` form with one dial. Choosing
-`eps`: the selected solution and its implicit derivative are biased O(eps)
-away from the pure seminorm limit, while the metric inverse is bounded by
-1/eps and the scalar-block dual spike carries weight c²/eps — so smaller
-`eps` buys selection accuracy at the price of a harder dual solve (use the
-Sherman-Morrison/Woodbury spike preconditioner — measured 3.7-4.8x per cg
-step at n=1e3-1e4 with a matrix-free kernel block) and, for the
-matrix-free representation, a harder inner solve. In practice the inner CG cost is
-dominated by the smooth-kernel spectrum, not the worst-case bound: the
-shift clusters the spectral tail, and measured float64 iteration counts
-(~32 at n=1000 for Matérn-5/2) are flat in `eps` from 1e-2 to 1e-8. Two
-budget notes for `linear_solver="gram_cg"` with a matrix-free metric: total
-kernel matvecs = outer CG iterations x inner CG iterations, so the inner
-tolerance is the dominant cost knob; and large LM damping hides metric
-conditioning (the dual operator is G + lambda*I), so problems can look
-easy early and harden near convergence. In float32 the inner CG's
-attainable residual (~machine_eps x cond) can sit ABOVE the default
-tolerance for small `eps` — the solve then silently burns its full
-iteration budget; use float64 or a larger `eps`.
+For repeated kernel blocks plus free scalar parameters, use
+`repeated_shifted_dense_metric` or `repeated_shifted_state_space_metric` for
 
-For Matérn value Grams on sorted 1-D points, pick the constructor by
-structure, not habit:
+\[
+\operatorname{blockdiag}(K,\ldots,K,0_s)+\varepsilon I.
+\]
 
-| kernel / size | use |
-| --- | --- |
-| Matérn-1/2 (any `n`) | `metric_from_tridiagonal_precision` — applies are elementwise shifts |
-| Matérn-3/2, 5/2, `n` below ~256 | `metric_from_cholesky` of the dense Gram — factorization is cheap and exact |
-| Matérn-3/2, 5/2, larger `n` | `metric_from_state_space` with `matern_state_space` — exact O(n) quasiseparable callbacks |
+See [Repeated Shifted Kernel Metrics](utilities.md#repeated-shifted-kernel-metrics).
+Choosing `epsilon`: the selected solution and its implicit derivative are
+biased \(O(\varepsilon)\) away from the pure seminorm limit, while the metric
+inverse is bounded by \(1/\varepsilon\) and the zero-tail dual spike has weight
+proportional to \(1/\varepsilon\). Smaller shifts therefore improve seminorm
+selection at the price of conditioning. Use float64 or a larger shift when the
+metric solve reaches its attainable precision floor.
+
+Choose the representation explicitly. When the model already holds a dense
+kernel Gram, `repeated_shifted_dense_metric` is normally fastest at the
+paper-sized grids: it factors \(K+\varepsilon I\) once and batches all repeated
+blocks. For a sufficiently large ordered one-dimensional state-space kernel,
+`repeated_shifted_state_space_metric` avoids dense \(K\) storage and uses
+`matern_state_space` for Matérn-1/2, 3/2, and 5/2. There is no automatic
+dense/state-space dispatch; benchmark the full solve rather than only a metric
+callback.
 
 On GPU the scan choice dominates everything (measured on an NVIDIA L40S,
 n=1e5, float32): sequential applies take ~3.1–3.6 **seconds** per

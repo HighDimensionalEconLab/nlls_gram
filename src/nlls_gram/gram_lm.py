@@ -12,7 +12,7 @@ import numpy as np
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram.lsmr import lsmr_solve
-from nlls_gram.metrics import Metric, metric_with_compute_dtype
+from nlls_gram.metrics import Metric, _metric_with_compute_dtype
 from nlls_gram.recycled_cg import (
     RecycleConfig,
     RecycleState,
@@ -558,9 +558,9 @@ class MetricFactory:
       move, so the carried state is reused. Expensive setup (Gram assembly, a
       dense Cholesky) belongs here, where it is cached.
     - ``build(state) -> Metric`` assembles the metric from the prepared state:
-      any ``Metric``-returning builder (``metric_from_cholesky``,
-      ``metric_from_tridiagonal_precision``, ``blockdiag_metric``
-      compositions, ...) or hand-rolled unary callbacks closing over ``state``.
+      any ``Metric``-returning builder (for example
+      ``metric_from_cholesky``) or hand-rolled unary callbacks closing over
+      ``state``.
       Called once per ``update`` BEFORE the iterative loops, so builder-internal
       setup (e.g. a tridiagonal Cholesky scan) is loop-invariant -- computed
       once per step, not per inner cg/lsmr iteration.
@@ -1015,8 +1015,8 @@ class LevenbergMarquardt:
     rejects nonsquare systems. ``"svd"``, ``"qr"``, and ``"augmented_qr"``
     factor the whitened Jacobian from its small side (see ``jacobian_mode``)
     and need the metric's ``inv_sqrt``/``inv_sqrt_transpose`` pair. A
-    solve-only metric (for example ``metric_from_shifted_matvec``) must pair
-    with ``ad_solver="direct"`` on a square system or ``"gram_cg"``.
+    solve-only metric must pair with ``ad_solver="direct"`` on a square
+    system or ``"gram_cg"``.
 
     ``"auto"`` resolves from traced shapes before inspecting the forward
     solver: every square system uses ``"direct"``. For a nonsquare system a
@@ -1097,9 +1097,7 @@ class LevenbergMarquardt:
     1.4x per cholesky update measured at m=100, n=2000 with a trivial
     residual (real residual/Jacobian costs dominate and stay float32).
     ``metric.solve`` receives the promoted dtype and must return it
-    (jnp-composed callbacks promote automatically; an iterative callback
-    like ``metric_from_shifted_matvec`` then runs its inner CG in float64
-    with the float64 default tolerance, at callback-dependent cost).
+    (JAX-composed callbacks promote automatically).
     Requires x64 support to be enabled -- which by itself leaves explicitly
     float32 data in float32.
 
@@ -1111,11 +1109,8 @@ class LevenbergMarquardt:
     matrix-free cg/lsmr paths that ``linear_solve_dtype`` cannot touch --
     keeps its own dtype while a stiff metric's internal
     triangular/recurrence solves stop being the float32 accuracy
-    bottleneck. It is the packaged form of
-    :func:`metric_with_compute_dtype` (which stays public for standalone
-    use), requires a custom metric or ``metric_factory``, and requires x64
-    support; often the single float64 knob an otherwise-float32 program
-    needs.
+    bottleneck. It requires a custom metric or ``metric_factory`` and x64
+    support; often the single float64 knob an otherwise-float32 program needs.
     """
 
     def __init__(
@@ -1436,7 +1431,7 @@ class LevenbergMarquardt:
         # since the wrapper's fresh closures would degrade it to identity.
         operative_metric = metric
         if self.metric_solve_dtype is not None and metric_factory is None:
-            operative_metric = metric_with_compute_dtype(
+            operative_metric = _metric_with_compute_dtype(
                 metric, self.metric_solve_dtype
             )
         self.metric_solve = (
@@ -1808,7 +1803,7 @@ class LevenbergMarquardt:
             )
             built_metric = self.metric_factory.build(metric_state)
             if self.metric_solve_dtype is not None:
-                built_metric = metric_with_compute_dtype(
+                built_metric = _metric_with_compute_dtype(
                     built_metric, self.metric_solve_dtype
                 )
             (
@@ -2914,7 +2909,7 @@ class LevenbergMarquardt:
                 self.metric_factory.prepare(x, args, p, aux)
             )
             if self.metric_solve_dtype is not None:
-                built_metric = metric_with_compute_dtype(
+                built_metric = _metric_with_compute_dtype(
                     built_metric, self.metric_solve_dtype
                 )
             # Gram CG accepts either metric.solve or the whitening pair; the
@@ -3177,9 +3172,8 @@ class LevenbergMarquardt:
         )
 
         # The final metric inverse acts on tangent data, so VJP transposes
-        # it. An iterative metric solve (e.g. metric_from_shifted_matvec)
-        # is not transposable by JAX -- its CG captures tol*|b| inside the
-        # linear solve's parameters -- but P is self-adjoint by contract
+        # it. A custom iterative metric solve need not be transposable by JAX,
+        # but P is self-adjoint by contract
         # (for a metric_factory metric: self-adjoint at the fixed prepared
         # state), so declare the application as its own transpose: every
         # rule of this custom_linear_solve routes through `solve` (the

@@ -6,7 +6,7 @@ from nlls_gram import (
     LevenbergMarquardt,
     identity_preconditioner,
     matern_state_space,
-    metric_from_state_space,
+    repeated_shifted_state_space_metric,
 )
 
 
@@ -110,17 +110,31 @@ def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
         assert next(iter(leaf.devices())).platform == "gpu"
 
 
-def test_quasiseparable_matern_metric_runs_on_gpu():
+def test_repeated_shifted_state_space_metric_runs_on_gpu():
     # The parallel and sequential apply paths must both run and agree on
     # the GPU backend (float32 here, so the dtype-aware default picks the
     # sequential path; parallel=True forces the associative scans).
     gpu = _gpu_devices()[0]
     with jax.default_device(gpu):
-        t = jnp.cumsum(jnp.ones(512))
-        x = jnp.sin(jnp.linspace(0.0, 6.0, 512))
+        n, repeats, zero_pad_size = 512, 3, 2
+        t = jnp.cumsum(jnp.ones(n))
+        x = jnp.sin(jnp.linspace(0.0, 6.0, repeats * n + zero_pad_size))
         model = matern_state_space(1.3, 0.8, 2.5)
-        default = metric_from_state_space(t, *model, nugget=1e-6)
-        parallel = metric_from_state_space(t, *model, nugget=1e-6, parallel=True)
+        default = repeated_shifted_state_space_metric(
+            t,
+            *model,
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=1e-6,
+        )
+        parallel = repeated_shifted_state_space_metric(
+            t,
+            *model,
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=1e-6,
+            parallel=True,
+        )
         out = jax.jit(default.solve)(x)
         out_parallel = jax.jit(parallel.solve)(x)
         jax.block_until_ready((out, out_parallel))

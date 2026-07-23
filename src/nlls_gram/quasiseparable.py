@@ -1,6 +1,6 @@
-"""Quasiseparable (rank-m semiseparable) kernel algorithms.
+"""Quasiseparable (rank-m semiseparable) state-space kernel algorithms.
 
-The generator conventions and the Cholesky / substitution / matvec
+The generator conventions and the Cholesky and substitution
 recursions are transcribed from tinygp v0.3.1 (MIT License, Copyright (c)
 2021-2024 Daniel Foreman-Mackey; ``tinygp/kernels/quasisep.py`` and
 ``tinygp/solvers/quasisep/core.py``), which builds on Eidelman & Gohberg
@@ -43,7 +43,7 @@ def matern_state_space(sigma, ell, nu):
     (``sigma`` lives in ``h``, not ``Pinf``), stationary state covariance
     ``Pinf`` (m, m), and ``transition(dt)`` mapping gaps (n,) to stacked
     transition matrices (n, m, m) in the tinygp orientation (transpose of
-    the textbook ``expm(F dt)``), for ``metric_from_state_space``.
+    the textbook ``expm(F dt)``).
 
     With ``f = sqrt(2 nu) / ell``: nu=0.5 has ``h = [sigma]``, ``Pinf = 1``,
     ``transition(dt) = exp(-f dt)``; nu=1.5 has ``h = [sigma, 0]``,
@@ -51,18 +51,22 @@ def matern_state_space(sigma, ell, nu):
     ``Pinf``/transition transcribed from tinygp v0.3.1.
 
     Nugget-free Matern-3/2 and 5/2 Grams on fine grids are extremely
-    ill-conditioned (condition number ~1e21 at n = 5000 — a property of the
-    matrix, not the solver); pass an ABSOLUTE nugget (e.g.
-    ``1e-8 * sigma**2`` in float64) to ``metric_from_state_space``, which
-    folds it into the metric exactly. For nu=0.5 the Gram inverse is exactly
-    tridiagonal and ``metric_from_tridiagonal_precision`` is the specialized
-    alternative whose applies are elementwise shifts.
+    ill-conditioned. Pass a positive ``epsilon`` to
+    ``repeated_shifted_state_space_metric``; the shift is folded into its
+    structured factorization exactly.
     """
 
     if nu not in (0.5, 1.5, 2.5):
         raise ValueError("nu must be one of 0.5, 1.5, or 2.5")
     sigma = jnp.asarray(sigma)
     ell = jnp.asarray(ell)
+    if sigma.ndim != 0 or ell.ndim != 0:
+        raise ValueError("sigma and ell must be scalars")
+    dtype = jnp.result_type(sigma, ell, 1.0)
+    if not jnp.issubdtype(dtype, jnp.floating):
+        raise TypeError("sigma and ell must have a real floating-point dtype")
+    sigma = sigma.astype(dtype)
+    ell = ell.astype(dtype)
     one = jnp.ones_like(ell)
     zero = jnp.zeros_like(ell)
 
@@ -132,7 +136,7 @@ def matern_state_space(sigma, ell, nu):
     return h, Pinf, transition
 
 
-def state_space_generators(points, h, Pinf, transition):
+def _state_space_generators(points, h, Pinf, transition):
     points = jnp.asarray(points)
     if points.ndim != 1:
         raise ValueError("points must be a 1-D array of sorted locations")
@@ -147,7 +151,7 @@ def state_space_generators(points, h, Pinf, transition):
     return d, p, q, A
 
 
-def cholesky(d, p, q, A):
+def _cholesky(d, p, q, A):
     # F_k = sum_{j<k} Phi_{k,j} w_j w_j' Phi_{k,j}', the Riccati-flow carry.
     m = p.shape[1]
 
@@ -164,7 +168,7 @@ def cholesky(d, p, q, A):
     return c, w
 
 
-def scan_affine(M, b, reverse=False):
+def _scan_affine(M, b, reverse=False):
     # Compose G_{k+1} = M_k @ G_k + b_k with G_0 = 0 and return the
     # exclusive-prefix carries G_k (reversed variant runs from the far end).
     def combine(earlier, later):
@@ -182,13 +186,13 @@ def scan_affine(M, b, reverse=False):
     return carries
 
 
-def forward_substitution(c, p, w, A, y, parallel):
+def _forward_substitution(c, p, w, A, y, parallel):
     # Solve L x = y with x[k] = (y[k] - p[k] @ G_k) / c[k],
     # G_{k+1} = A[k] @ G_k + outer(w[k], x[k]).
     if parallel:
         M = A - w[:, :, None] * (p / c[:, None])[:, None, :]
         b = w[:, :, None] * (y / c[:, None])[:, None, :]
-        G = scan_affine(M, b)
+        G = _scan_affine(M, b)
         return (y - jnp.einsum("km,kmr->kr", p, G)) / c[:, None]
 
     def step(G, inputs):
@@ -201,13 +205,13 @@ def forward_substitution(c, p, w, A, y, parallel):
     return x
 
 
-def backward_substitution(c, p, w, A, y, parallel):
+def _backward_substitution(c, p, w, A, y, parallel):
     # Solve L' x = y with x[k] = (y[k] - w[k] @ G_k) / c[k],
     # G_{k-1} = A[k].T @ G_k + outer(p[k], x[k])  (p/w roles swap vs forward).
     if parallel:
         M = jnp.swapaxes(A, -1, -2) - p[:, :, None] * (w / c[:, None])[:, None, :]
         b = p[:, :, None] * (y / c[:, None])[:, None, :]
-        G = scan_affine(M, b, reverse=True)
+        G = _scan_affine(M, b, reverse=True)
         return (y - jnp.einsum("km,kmr->kr", w, G)) / c[:, None]
 
     def step(G, inputs):
@@ -220,29 +224,22 @@ def backward_substitution(c, p, w, A, y, parallel):
     return x
 
 
-def matvec(d, p, q, A, x, parallel):
-    # y = d * x + lower + upper, each contribution read from the carry
-    # BEFORE the update (exclusive prefix): lower_k = p[k] @ G_k with
-    # G_{k+1} = A[k] @ G_k + outer(q[k], x[k]), and the reversed analogue
-    # upper_k = q[k] @ H_k with H_{k-1} = A[k].T @ H_k + outer(p[k], x[k]).
+def _cholesky_transpose_matvec(c, p, w, A, x, parallel):
+    # Apply L' x from the quasiseparable Cholesky generators. The exclusive
+    # reverse carry collects the strictly upper contribution at each index.
     if parallel:
-        G = scan_affine(A, q[:, :, None] * x[:, None, :])
-        H = scan_affine(
-            jnp.swapaxes(A, -1, -2), p[:, :, None] * x[:, None, :], reverse=True
+        H = _scan_affine(
+            jnp.swapaxes(A, -1, -2),
+            p[:, :, None] * x[:, None, :],
+            reverse=True,
         )
-        lower = jnp.einsum("km,kmr->kr", p, G)
-        upper = jnp.einsum("km,kmr->kr", q, H)
-        return d[:, None] * x + lower + upper
+        return c[:, None] * x + jnp.einsum("km,kmr->kr", w, H)
 
-    def lower_step(G, inputs):
-        p_k, q_k, A_k, x_k = inputs
-        return A_k @ G + jnp.outer(q_k, x_k), p_k @ G
+    def step(H, inputs):
+        c_k, p_k, w_k, A_k, x_k = inputs
+        z_k = c_k * x_k + w_k @ H
+        return A_k.T @ H + jnp.outer(p_k, x_k), z_k
 
-    def upper_step(H, inputs):
-        p_k, q_k, A_k, x_k = inputs
-        return A_k.T @ H + jnp.outer(p_k, x_k), q_k @ H
-
-    G0 = jnp.zeros((p.shape[1], x.shape[1]), dtype=x.dtype)
-    _, lower = jax.lax.scan(lower_step, G0, (p, q, A, x))
-    _, upper = jax.lax.scan(upper_step, G0, (p, q, A, x), reverse=True)
-    return d[:, None] * x + lower + upper
+    H0 = jnp.zeros((p.shape[1], x.shape[1]), dtype=x.dtype)
+    _, z = jax.lax.scan(step, H0, (c, p, w, A, x), reverse=True)
+    return z

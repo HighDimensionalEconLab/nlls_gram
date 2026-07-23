@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nlls-gram"
-version = "2.4.0"
+version = "2.5.0"
 description = "Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX"
 readme = "README.md"
 license = "MIT"

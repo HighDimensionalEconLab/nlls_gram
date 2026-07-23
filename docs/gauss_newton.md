@@ -264,7 +264,7 @@ Compared to the two-knob block form \(\operatorname{blockdiag}(K +
 (\(\kappa(K + \varepsilon I) = (\lambda_{\max} + \varepsilon)/\varepsilon\))
 and a larger scalar-block spike \((c^2/\varepsilon)\,uu^\top\) in the dual
 operator — see the [Tuning Guide](tuning_guide.md#the-metric) and
-[Utilities](utilities.md#unified-shifted-block-metrics) for construction
+[Utilities](utilities.md#repeated-shifted-kernel-metrics) for construction
 and preconditioning.
 
 ## Worked Example

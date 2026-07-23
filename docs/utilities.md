@@ -1,276 +1,140 @@
 # Metric and Preconditioner Utilities
 
-The library ships a small set of constructors and helpers so that models can
-assemble metrics and CG preconditioners from structure they already know,
-instead of hand-rolling callback plumbing. Everything here returns plain
-callables or `Metric` objects that the solver sees through the `metric=`,
-`dual_preconditioner=`, `normal_preconditioner=`, and
-`ad_solver_preconditioner=` arguments. The CG forms require explicit
-preconditioners; `identity_preconditioner()` is the explicit opt-out.
+The library keeps its metric constructors focused on dense, diagonal, and the
+repeated shifted kernel geometry used by kernel least-squares models. For any
+other geometry, construct a [`Metric`](metrics.md) directly. Iterative solver
+preconditioners remain separate: they can approximate an operator without
+changing the nonlinear least-squares problem, whereas a metric defines the
+problem itself.
 
-| Helper | Builds | Cost per apply |
+| Helper | Builds | Storage |
 | --- | --- | --- |
 | `metric_from_cholesky(L)` | dense `Metric` from \(M = LL^\top\) | \(O(n^2)\) |
-| `metric_from_tridiagonal_precision(diag, off_diag)` | `Metric` from a tridiagonal \(T = M^{-1}\) | \(O(n)\) |
-| `metric_from_state_space(points, h, Pinf, transition)` | `Metric` for a stationary state-space kernel Gram \(M = K + \eta I\) (Matérn via `matern_state_space`) | \(O(n m^2)\) |
-| `metric_from_quasiseparable(d, p, q, A)` | `Metric` from quasiseparable generators | \(O(n m^2)\) |
-| `metric_from_shifted_matvec(matvec, shift)` | matrix-free `Metric` for \(M = A + \varepsilon I\) via inner CG | \(O(\text{iters} \times \text{matvec})\) |
 | `metric_from_diagonal(weights)` | `Metric` from \(M = \operatorname{diag}(w)\) | \(O(n)\) |
-| `blockdiag_metric(blocks)` | `Metric` over concatenated parameter blocks | sum of blocks |
-| `repeated_blockdiag_metric(block, block_size, repeats, *, additional)` | `Metric` batching `repeats` identical blocks + optional trailing block | one apply per callback (not per copy) |
-| `metric_with_compute_dtype(metric, dtype)` | `Metric` computing in `dtype`, restoring the caller's dtype | same as wrapped metric |
+| `repeated_shifted_dense_metric(K, ...)` | repeated dense kernel blocks plus a common shift | \(O(n^2)+O(1)\) |
+| `repeated_shifted_state_space_metric(t, ...)` | the same geometry for an implicit state-space kernel Gram | \(O(nq^2)+O(1)\) |
+| `matern_state_space(sigma, ell, nu)` | state-space inputs for Matérn-1/2, 3/2, or 5/2 | \(q=1,2,3\) |
 | `sherman_morrison_preconditioner(solve, u, weight)` | `dual_preconditioner` for \(B = A + w\,uu^\top\) | one `solve` |
 | `woodbury_preconditioner(solve, U, weights)` | `dual_preconditioner` for \(B = A + U\operatorname{diag}(w)U^\top\) | one `solve` + \(k \times k\) |
-| `identity_preconditioner()` | the explicit "no preconditioner" choice (both hook signatures) | free |
-| `nystrom_preconditioner(matvec, n, rank, key)` | randomized Nyström `dual_preconditioner` for a PSD operator (FTU) | two \((n, \text{rank})\) GEMVs |
+| `identity_preconditioner()` | the explicit "no preconditioner" choice | free |
+| `nystrom_preconditioner(matvec, n, rank, key)` | randomized Nyström `dual_preconditioner` | two \((n, \text{rank})\) GEMVs |
 | `pad_dual_preconditioner(base, n_real)` | extends a `dual_preconditioner` to a zero-padded residual | base + \(O(k)\) |
 
-## Tridiagonal Precision Metric
+## Dense and Diagonal Metrics
 
-For Markov kernels the Gram inverse is exactly tridiagonal — for the
-Matérn-1/2 / Ornstein-Uhlenbeck kernel on sorted points \(t_1 < \dots < t_n\)
-with \(\rho_i = e^{-(t_{i+1}-t_i)/\ell}\), the precision has closed-form
-entries. Passing the two diagonals gives a `Metric` whose every callback is
-\(O(n)\), with nothing factored densely:
-
-```python
-from nlls_gram import metric_from_tridiagonal_precision
-
-metric = metric_from_tridiagonal_precision(diag, off_diag)
-```
-
-`parallel=None` (the default) runs the one-time bidiagonal Cholesky setup as
-an associative \(O(\log n)\)-depth scan off-CPU in float64 — where a
-sequential scan pays a kernel launch per step — and as the sequential scan
-otherwise. In float32 the default stays sequential even off-CPU: the
-parallel scan's projective \(2\times 2\) products can cancel to non-finite
-values on long, stiff grids (near-unit-correlation AR(1)), while the
-sequential recurrence is stable there.
-
-## State-Space Kernel Metrics (Quasiseparable)
-
-A stationary Gaussian process has an exact O(n) Gram factorization
-precisely when it admits a finite-dimensional **state-space** (linear SDE)
-representation: an \(m\)-dimensional latent Gauss-Markov state observed
-through a row vector \(h\). With stationary state covariance
-\(P_\infty\) and transition matrices \(A_k = \Phi(t_k - t_{k-1})^\top\)
-(transposed matrix exponential of the SDE drift, the tinygp orientation),
-the Gram on sorted points is
-
-\[
-K_{ij} = h^\top P_\infty A_i A_{i-1} \cdots A_{j+1}\, h \quad (i > j),
-\]
-
-\(h^\top P_\infty h\) on the diagonal, symmetric — a **quasiseparable**
-(celerite-style, rank-\(m\) semiseparable) matrix whose Cholesky factor
-shares the same structure, so every callback is one or two O(\(n m^2\))
-scans.
-
-The main application is the half-integer Matérn family, which is exactly
-the CAR(\(m\)) state-space class with \(m = 1, 2, 3\) for
-\(\nu = 1/2, 3/2, 5/2\); `matern_state_space(sigma, ell, nu)` supplies the
-exact \((h, P_\infty, \Phi^\top)\) mapping (with \(f = \sqrt{2\nu}/\ell\):
-\(h = [\sigma, 0, \ldots]\), e.g. \(P_\infty = \operatorname{diag}(1, f^2)\)
-for \(\nu = 3/2\)). This route is necessary for exactness: only the
-Matérn-1/2 value Gram has a sparse inverse. For 3/2 and 5/2 the sampled
-value process is ARMA-like, not Markov — the Gram-inverse off-band entries
-are \(\sim 10^{-2}\) *relative* (versus \(\sim 10^{-16}\) for 1/2), so a
-truncated band would be an approximate metric, and the library's contract
-requires `metric.solve` to be exact (approximations belong in
-`dual_preconditioner`). Only the latent state is Markov; the state-space
-form exploits exactly that.
-
-```python
-from nlls_gram import matern_state_space, metric_from_state_space
-
-metric = metric_from_state_space(
-    points, *matern_state_space(sigma, ell, nu=1.5), nugget=1e-8 * sigma**2
-)
-```
-
-Other stationary state-space kernels (sums of exponentials, CARMA /
-celerite-style terms) drop into the same constructor through their own
-\((h, P_\infty, \Phi^\top)\).
-
-`points` must be 1-D and sorted strictly increasing — **not validated**,
-since it may be traced; unsorted or repeated points silently produce a
-wrong or NaN metric. The metric is \(M = K + \eta I\): the absolute nugget
-\(\eta\) folds into the diagonal generator before factorization, so it is
-part of the metric — exact, not a solver fudge. Nugget-free Matérn-3/2 and
-5/2 Grams on fine grids are extremely ill-conditioned (condition number
-\(\sim 10^{21}\) at \(n = 5000\) — a property of the matrix, not the
-solver); supply a nugget whenever the grid resolves the kernel. For
-\(\nu = 1/2\) the constructor works but
-`metric_from_tridiagonal_precision` is the specialized alternative whose
-applies are elementwise shifts — strictly cheaper than scans on GPU.
-
-`metric_from_quasiseparable(d, p, q, A, nugget=0.0, parallel=None)` is the
-generator-level general API — any stationary state-space kernel (sums of
-exponentials, celerite terms) reduces to it, and banded matrices are
-themselves rank-\(p\) quasiseparable. \(A_k\) is the transition INTO index
-\(k\) (\(A_0\) never enters the products; the state-space builders set it
-to the identity). Positive definiteness is not validated (inputs may be
-traced): a non-PD input silently produces NaN through the Cholesky square
-roots, the same convention as the tridiagonal constructor.
-
-`parallel=None` (the default) picks the apply implementation once at
-construction, from the backend and dtype there: associative
-O(\(\log n\))-depth scans off-CPU in float64 — where a sequential scan pays
-a kernel launch per step — and sequential scans otherwise. Unlike the
-tridiagonal constructor's setup scan, the parallel *substitutions* here
-propagate rank-1-corrected transition matrices \(A_k - w_k p_k^\top / c_k\)
-with no contraction guarantee, so the float32 default stays sequential on
-every backend; the float64 default is backed by the stress-grid agreement
-tests. Pass `parallel=True`/`False` to force either path. The one-time
-Cholesky setup is a sequential scan in this release — cheap for fixed
-metrics reused across solves, but on the hot path when the metric is
-rebuilt from traced \(\sigma, \ell\) inside `jax.grad`/`vmap` sweeps; see
-the [Tuning Guide](tuning_guide.md).
-
-## Unified Shifted Block Metrics
-
-For a kernel-coefficient block \(\alpha\) plus scalar parameters \(\beta\),
-the unified shifted metric \(M = \operatorname{blockdiag}(K, 0) +
-\varepsilon I = \operatorname{blockdiag}(K + \varepsilon I_n,
-\varepsilon I_k)\) completes the RKHS seminorm \(\alpha^\top K \alpha\)
-with a single spectral floor — the theory (spectrum, the
-\(\varepsilon \to 0\) seminorm limit and its uniqueness conditions) is in
-[Metric Gauss-Newton](gauss_newton.md#shifted-metrics-and-the-seminorm-limit).
-It composes from existing constructors; the kernel block has three
-interchangeable representations:
-
-```python
-scalar_block = metric_from_diagonal(eps * jnp.ones(k))
-metric = blockdiag_metric([(kernel_block, n), (scalar_block, k)])
-# kernel_block, by representation of K:
-#   metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n)))   # dense
-#   metric_from_state_space(t, *matern_state_space(sigma, ell, nu), nugget=eps)
-#   metric_from_shifted_matvec(kernel_matvec, eps)      # matvec only; Gram forms
-```
-
-One structural note: the Matérn-1/2 tridiagonal shortcut does not survive
-the shift — `metric_from_tridiagonal_precision` parameterizes
-\(T = M^{-1}\), and \((K + \varepsilon I)^{-1}\) is **not** tridiagonal —
-so a shifted OU metric goes through
-`metric_from_state_space(..., nu=0.5, nugget=eps)` instead.
-
-`metric_from_shifted_matvec(matvec, shift, *, tol=None, atol=0.0,
-maxiter=None, preconditioner=None)` needs only a matvec of a symmetric PSD
-\(A\), accepting `(n,)` and `(n, k)` leading-axis inputs (the same shape
-contract `Metric.solve` carries). The positive `shift` is what makes an
-iterative metric solve viable: \(\kappa(A + \varepsilon I) \le
-(\lambda_{\max} + \varepsilon)/\varepsilon\) regardless of how singular
-\(A\) is — and in practice far better, since the shift *clusters* the
-spectral tail at \(\approx \varepsilon\) and CG resolves a cluster in
-about one iteration (measured: ~32 float64 iterations for a Matérn-5/2
-Gram at n=1000, independent of \(\varepsilon\) from 1e-2 to 1e-8). It
-provides `solve` and `norm` only (no matrix-free square root), so it works
-with the Gram forms (`gram_cholesky`, `gram_cg`) and is rejected for the
-whitened forms (`normal_cholesky`, `normal_cg`, `qr`, `augmented_qr`,
-`lsmr`), which all require `inv_sqrt`, at construction — on a
-square-to-tall problem pin a Gram form explicitly, since the default `auto`
-would resolve to `normal_cholesky`. The SVD and QR AD methods also require the
-square-root pair, so pair a nonsquare solve-only metric with
-`ad_solver="gram_cg"` — the whole pipeline — forward solve, JVP, and
-VJP — then runs matrix-free (see [Implicit AD](implicit_ad.md)). This is the one
-constructor that meets the
-`metric.solve` exactness contract in a limit rather than identically: its
-inner CG tolerance is part of the answer, not of the schedule — the
-residual error perturbs the selected solution and the implicit derivatives
-at order `tol`, and the implicit derivative has no accept/reject
-safeguard. The default tolerance (square root of the dtype's machine
-epsilon) matches typical outer tolerances; never cap `maxiter` as a cost
-control (a truncated CG is not a linear map, which breaks the `gram_cg`
-solver's operator assumptions).
-
-## Diagonal and Block-Diagonal Metrics
-
-Models with a kernel block plus a few scalar parameters can compose
-per-block metrics instead of writing slice/concatenate glue. The blocks are
-laid out in the order the solver flattens the parameter pytree
-(`ravel_pytree` order):
+For a dense positive-definite metric \(M=LL^\top\), pass the lower Cholesky
+factor. A diagonal metric takes its positive weights directly:
 
 ```python
 import jax.numpy as jnp
 
-from nlls_gram import blockdiag_metric, metric_from_cholesky, metric_from_diagonal
+from nlls_gram import metric_from_cholesky, metric_from_diagonal
 
-metric = blockdiag_metric(
-    [
-        (metric_from_cholesky(jnp.linalg.cholesky(K)), n),
-        (metric_from_diagonal(jnp.full(1, m_0)), 1),
-    ]
+dense_metric = metric_from_cholesky(jnp.linalg.cholesky(M))
+diagonal_metric = metric_from_diagonal(jnp.array([2.0, 1.0, 0.5]))
+```
+
+Both constructors provide `solve`, `norm`, `inv_sqrt`, and
+`inv_sqrt_transpose`, including matrix right-hand sides where the callback
+contract permits them.
+
+## Repeated Shifted Kernel Metrics
+
+Both repeated constructors implement exactly
+
+\[
+M = \operatorname{blockdiag}(\underbrace{K,\ldots,K}_{r},0_s)
+    + \varepsilon I
+  = \operatorname{blockdiag}(K+\varepsilon I_n,\ldots,
+      K+\varepsilon I_n,\varepsilon I_s).
+\]
+
+The flattened parameter vector must contain the `r` kernel-coefficient blocks
+first and the `s` zero-block coordinates last. The keyword arguments
+`repeats`, `zero_pad_size`, and `epsilon` are mandatory: `repeats` is a
+positive integer, `zero_pad_size` is a nonnegative integer (use `0` when no
+tail is present), and `epsilon` is a positive scalar. The shift is part of the
+metric, including on the trailing zero block. A nonpositive Python scalar is
+rejected eagerly; a nonpositive traced or device scalar is mapped to `NaN` so
+the solve fails loudly without a host synchronization.
+
+The constructors provide all four metric callbacks and therefore work with
+both Gram and whitened linear solvers. They do not choose a representation
+automatically: call the dense or state-space constructor explicitly.
+
+### Dense Repeated Metric
+
+```python
+from nlls_gram import repeated_shifted_dense_metric
+
+metric = repeated_shifted_dense_metric(
+    K,
+    repeats=5,
+    zero_pad_size=3,
+    epsilon=1e-8,
 )
 ```
 
-`solve`, `inv_sqrt`, and `inv_sqrt_transpose` slice on the leading axis, so
-vector and matrix inputs both work; `norm` combines the block norms in
-quadrature. A fully-default `Metric()` block means the identity metric on
-that block. A block that defines some callbacks but leaves others `None`
-propagates the missing callbacks as `None` on the composite, so the solver's
-construction-time validation applies exactly as it would to that block
-alone.
+For a positive-semidefinite `K`, `repeated_shifted_dense_metric` factors
+\(K+\varepsilon I_n\) once. It stores
+one \(n\times n\) Cholesky factor and the scalar shift, not `repeats` copies,
+a full block diagonal, or a padding vector. Each callback reshapes the
+repeated blocks into columns and applies the shared factor once to that batch;
+in particular, `solve` performs two triangular solves total rather than two
+per block. Matrix inputs add their right-hand sides to the same packed column
+dimension. The tail uses scalar division or scaling by `epsilon`.
 
-### Repeated Block Metric
+Persistent storage is \(O(n^2)+O(1)\), independent of `repeats` and
+`zero_pad_size`. Work still scales with the number of parameter coordinates,
+as it must, but avoids factoring or loading a massive sparse-in-content dense
+matrix. This is the preferred constructor when a dense `K` already exists and
+for the small-to-moderate kernel grids where dense BLAS is fastest.
 
-When many parameter blocks share the *same* metric — a multi-country model
-whose per-country kernel-coefficient block \(K_\varepsilon\) repeats across
-countries, plus a small block of finite-dimensional variables — the layout is
-\(\operatorname{blockdiag}(K_\varepsilon \times 5,\ \varepsilon I_3)\).
-`repeated_blockdiag_metric` batches the identical copies so each callback fires
-**once**, not once per copy:
+### State-Space Repeated Metric
+
+For a stationary kernel with a finite-dimensional state-space representation,
+the same geometry can be applied without constructing a dense \(K\):
 
 ```python
 from nlls_gram import (
-    metric_from_cholesky,
-    metric_from_diagonal,
-    repeated_blockdiag_metric,
+    matern_state_space,
+    repeated_shifted_state_space_metric,
 )
 
-alpha_metric = metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n)))
-metric = repeated_blockdiag_metric(
-    alpha_metric,
-    block_size=n,
+metric = repeated_shifted_state_space_metric(
+    t,
+    *matern_state_space(sigma=1.0, ell=10.0, nu=1.5),
     repeats=5,
-    additional=(metric_from_diagonal(eps * jnp.ones(3)), 3),
+    zero_pad_size=3,
+    epsilon=1e-8,
 )
 ```
 
-This equals `blockdiag_metric([(alpha_metric, n)] * 5 + [(scalar_block, 3)])`,
-but instead of five separate solves the repeated head (leading size \(5n\)) is
-reshaped to \((n, 5k)\) and the base callback runs once — a dense Cholesky
-block does two triangular solves total, not two per copy. The total leading
-size `repeats * block_size + additional_size` is derived, so a layout mismatch
-raises rather than silently consuming the wrong rows. Because it returns a plain
-`Metric` honoring the `(n,)`/`(n, k)` contract, it also composes *inside*
-`blockdiag_metric` for heterogeneous layouts (a repeated country block next to a
-separate aggregate block). Build the metric once at setup scope — like every
-constructor here it returns fresh closures, so rebuilding it inside a
-`jax.grad`/`vmap` sweep keys a new compilation each time.
+Here `t` is the strictly increasing one-dimensional coordinate on which the
+state-space kernel is evaluated; it need not represent calendar time. Ordering
+is semantically required; non-increasing traced or device coordinates map the
+metric shift to `NaN` so the solve fails loudly without a host synchronization.
+The remaining positional inputs are the observation vector `h`, stationary
+covariance `Pinf`, and callable `transition(dt)`. For Matérn-1/2, 3/2, and 5/2,
+`matern_state_space` returns those objects with latent state dimension
+\(q=1,2,3\), respectively.
 
-### Compute-Dtype Wrapper
+The constructor folds `epsilon` into the diagonal before a structured
+Cholesky factorization. It stores one quasiseparable factor and applies all
+repeated blocks as batched right-hand sides through forward or reverse scans.
+The metric norm evaluates \(\lVert L^\top x\rVert\) in one reverse scan. No
+dense \(K\), repeated factor, full block diagonal, or padding vector is
+formed. Persistent storage is \(O(nq^2)+O(1)\), independent of `repeats` and
+`zero_pad_size`, and each apply costs \(O(nq^2b)\) for `b` packed right-hand
+side columns (for a vector input, `b == repeats`).
 
-`metric_with_compute_dtype(metric, dtype)` wraps a metric so each callback
-upcasts its input to `dtype`, applies the wrapped metric, and restores the
-caller's dtype on output. This keeps an ill-conditioned factorization or solve
-in wide precision (float64) while the solver's residual/parameter dtype and
-loop-carried pytrees stay at the problem dtype — the output round-trips to
-`x.dtype`, a no-op once the solver has already promoted its dense pipelines
-to `dtype`. The solver-level
-[`metric_solve_dtype`](index.md#precision-knobs) knob applies exactly this
-wrap for you, to the resolved metric — fixed or factory-built; the helper
-stays public for wrapping a metric by hand:
-
-```python
-from nlls_gram import metric_from_cholesky, metric_with_compute_dtype
-
-metric = metric_with_compute_dtype(
-    metric_from_cholesky(jnp.linalg.cholesky(K)), jnp.float64
-)
-```
-
-`None` callbacks are preserved, so a wrapped partial `Metric` stays partial and
-the solver's construction-time validation is unchanged.
+`parallel=None` selects from the process default backend: associative scans
+only for float64 off CPU and sequential scans otherwise. Pass `True` or
+`False` when arrays use nondefault device placement or to force a path after
+checking numerical agreement on the target grid. State-space structure does
+not imply that it is faster at small `n`: benchmark the end-to-end solve, and
+prefer `repeated_shifted_dense_metric` when a dense Gram is already needed by
+the model. There is deliberately no automatic dense/state-space dispatch.
 
 ## Sherman–Morrison Dual Preconditioner
 
@@ -679,23 +543,15 @@ loudly rather than being clamped.
 
 ::: nlls_gram.WhitenedPreconditioner
 
-::: nlls_gram.metric_from_tridiagonal_precision
-
-::: nlls_gram.metric_from_state_space
-
-::: nlls_gram.matern_state_space
-
-::: nlls_gram.metric_from_quasiseparable
-
-::: nlls_gram.metric_from_shifted_matvec
+::: nlls_gram.metric_from_cholesky
 
 ::: nlls_gram.metric_from_diagonal
 
-::: nlls_gram.blockdiag_metric
+::: nlls_gram.repeated_shifted_dense_metric
 
-::: nlls_gram.repeated_blockdiag_metric
+::: nlls_gram.repeated_shifted_state_space_metric
 
-::: nlls_gram.metric_with_compute_dtype
+::: nlls_gram.matern_state_space
 
 ::: nlls_gram.sherman_morrison_preconditioner
 

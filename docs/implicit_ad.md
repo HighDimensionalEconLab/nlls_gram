@@ -374,11 +374,9 @@ so triangular Cholesky factors differentiate correctly in reverse mode.
 final \(P J_\theta^\top y\) application acts on tangent data, and its
 transpose in the VJP is declared to be \(P\) itself (a symmetric
 `jax.lax.custom_linear_solve`, which also batches under `jax.vmap`). That
-is what lets an iterative, solve-only metric —
-[`metric_from_shifted_matvec`](utilities.md#unified-shifted-block-metrics),
-or any hand-written CG-based `Metric.solve` — participate in both JVP and
-VJP even though transposing through JAX's CG is unsupported: pair such a
-metric with `ad_solver="gram_cg"`.
+is what lets a hand-written iterative, solve-only `Metric.solve` participate
+in both JVP and VJP even though transposing through JAX's CG is unsupported:
+pair such a metric with `ad_solver="gram_cg"`.
 
 Accuracy of the CG forms is controlled separately from the forward
 iterative solve:
@@ -395,8 +393,8 @@ iterative solve:
   forward preconditioner hooks — see
   [above](#the-ad-solver-preconditioner).
 
-Two notes for the
-[unified shifted metric](gauss_newton.md#shifted-metrics-and-the-seminorm-limit)
+For the
+[repeated shifted metric](gauss_newton.md#shifted-metrics-and-the-seminorm-limit)
 \(M = \operatorname{blockdiag}(K, 0) + \varepsilon I\):
 
 - The scalar block injects its rank-\(k\) spike of weight \(c^2/\varepsilon\)
@@ -406,13 +404,6 @@ Two notes for the
   [Sherman–Morrison/Woodbury spike preconditioner](utilities.md#shermanmorrison-dual-preconditioner)
   as the forward solve — pass the helper directly; the AD hook calls
   it with zero damping.
-- With `metric_from_shifted_matvec` the `gram_cg` AD solve nests an
-  inner metric CG inside every operator application, and the outer solve
-  cannot be more accurate than the inner one: for derivative-critical work
-  set the metric's `tol` at or below `ad_solver_tol` (the metric's default,
-  the square root of machine epsilon, is looser than the float64 AD
-  default of `1e-10`).
-
 Example sketch for a large matrix-free residual:
 
 ```python

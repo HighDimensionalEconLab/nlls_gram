@@ -156,18 +156,26 @@ solver = LevenbergMarquardt(
 )
 ```
 
-The `Metric` callbacks act on the flattened parameter vector. The docs give
-the exact callback contract, branch formulas, and validation rules, plus
-structural constructors (`metric_from_tridiagonal_precision`,
-`metric_from_state_space` and `metric_from_quasiseparable` for exact O(n)
-Matérn/state-space kernel Grams, `metric_from_diagonal`,
-`blockdiag_metric`) so common metrics need no callback plumbing.
+The `Metric` callbacks act on the flattened parameter vector. Alongside the
+dense Cholesky and diagonal helpers, the library provides specialized
+constructors for the common kernel geometry
+
+$$
+M = \operatorname{blockdiag}(K,\ldots,K,0_s) + \varepsilon I.
+$$
+
+`repeated_shifted_dense_metric` factors `K + epsilon * I` once and batches
+all repeated blocks through that factor. For an ordered one-dimensional
+state-space kernel, `repeated_shifted_state_space_metric` provides the same
+geometry without materializing a dense `K`; `matern_state_space` supplies its
+inputs for half-integer Matérn kernels. Neither constructor stores repeated
+matrices or factors.
 
 For a metric that depends on the current iterate or on residual aux outputs
 (`has_aux=True`), pass `metric_factory=MetricFactory(prepare, build)` instead
 of `metric`: `prepare(x, args, p, aux)` caches a state once per accepted step
-and `build(state)` returns a plain `Metric` — any of the constructors above
-slots in directly, e.g.
+and `build(state)` returns a plain `Metric` — any metric constructor slots in
+directly, e.g.
 `MetricFactory(prepare=lambda x, args, p, aux: aux["L"], build=metric_from_cholesky)`.
 
 ## Solvers
