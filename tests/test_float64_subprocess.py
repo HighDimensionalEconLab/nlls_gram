@@ -825,113 +825,16 @@ assert jnp.array_equal(hessian, jnp.zeros_like(hessian))
     assert result.returncode == 0, result.stderr + result.stdout
 
 
-def test_quasiseparable_float64_parallel_matches_sequential():
-    # The evidence gating the parallel-apply default (off-CPU + float64):
-    # sequential and associative-scan applies must agree, and the parallel
-    # path must stay finite, on both a well-conditioned grid and a long,
-    # stiff stress grid. Also the tight float64 hyperparameter-gradient
-    # cross-check against a dense metric, with the metric constructed inside
-    # jax.grad and jax.jit(jax.grad(...)).
+def test_repeated_shifted_state_space_float64_parallel_matches_sequential():
     script = r"""
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-
-from nlls_gram import matern_state_space, metric_from_state_space
-
-n = 5000
-sigma, ell = 1.3, 0.8
-x = jax.random.normal(jax.random.PRNGKey(0), (n,))
-X = jax.random.normal(jax.random.PRNGKey(1), (n, 3))
-well = jnp.cumsum(
-    jax.random.uniform(jax.random.PRNGKey(2), (n,), minval=0.6, maxval=1.4)
-)
-stiff = jnp.linspace(0.0, 5.0, n)
-# On the well-conditioned grid the two scan orders agree to machine
-# precision; on the stiff grid (nugget-floored pivots, cond ~1e9) the
-# substitutions are condition-limited to ~cond * eps.
-for (name, t), tol in ((("well", well), 1e-12), (("stiff", stiff), 1e-6)):
-    for nu in (1.5, 2.5):
-        model = matern_state_space(sigma, ell, nu)
-        seq = metric_from_state_space(
-            t, *model, nugget=1e-8 * sigma**2, parallel=False
-        )
-        par = metric_from_state_space(
-            t, *model, nugget=1e-8 * sigma**2, parallel=True
-        )
-        for callback in ("solve", "norm", "inv_sqrt", "inv_sqrt_transpose"):
-            a = getattr(seq, callback)(x)
-            b = getattr(par, callback)(x)
-            assert bool(jnp.all(jnp.isfinite(b))), (name, nu, callback)
-            rel = float(jnp.linalg.norm(a - b) / jnp.linalg.norm(a))
-            assert rel < tol, (name, nu, callback, rel)
-        rel = float(
-            jnp.linalg.norm(seq.solve(X) - par.solve(X)) / jnp.linalg.norm(seq.solve(X))
-        )
-        assert rel < tol, (name, nu, "solve-matrix", rel)
-
-
-def dense_matern_gram(t, sigma, ell, nu):
-    tau = jnp.abs(t[:, None] - t[None, :])
-    ft = jnp.sqrt(2.0 * nu) * tau / ell
-    if nu == 1.5:
-        corr = (1.0 + ft) * jnp.exp(-ft)
-    else:
-        corr = (1.0 + ft + ft**2 / 3.0) * jnp.exp(-ft)
-    return sigma**2 * corr
-
-
-n = 300
-t = jnp.cumsum(jax.random.uniform(jax.random.PRNGKey(3), (n,), minval=0.6, maxval=1.4))
-v = jax.random.normal(jax.random.PRNGKey(4), (n,))
-for nu in (1.5, 2.5):
-
-    def loss_qsm(params, nu=nu):
-        s, l = params
-        model = matern_state_space(s, l, nu)
-        return v @ metric_from_state_space(t, *model, nugget=1e-8).solve(v)
-
-    def loss_dense(params, nu=nu):
-        s, l = params
-        K = dense_matern_gram(t, s, l, nu) + 1e-8 * jnp.eye(n)
-        return v @ jnp.linalg.solve(K, v)
-
-    params = jnp.array([1.3, 0.8])
-    grad_qsm = jax.grad(loss_qsm)(params)
-    grad_jit = jax.jit(jax.grad(loss_qsm))(params)
-    grad_dense = jax.grad(loss_dense)(params)
-    rel = float(jnp.linalg.norm(grad_qsm - grad_dense) / jnp.linalg.norm(grad_dense))
-    assert rel < 1e-9, (nu, rel)
-    rel_jit = float(jnp.linalg.norm(grad_jit - grad_qsm) / jnp.linalg.norm(grad_qsm))
-    assert rel_jit < 1e-12, (nu, rel_jit)
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", textwrap.dedent(script)],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, result.stderr + result.stdout
-
-
-def test_repeated_blockdiag_metric_float64_matches_blockdiag():
-    # In genuine float64: the batched repeated metric matches the expanded
-    # blockdiag metric to machine precision on every callback (vector and
-    # matrix), fires the base callback once, preserves the compute-dtype
-    # round-trip, and stays exact when nested inside blockdiag_metric (the
-    # human_capital composition). Norm AD matches forward and reverse.
-    script = r"""
-import jax
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
 
 from nlls_gram import (
-    Metric,
-    blockdiag_metric,
-    metric_from_cholesky,
-    metric_from_diagonal,
-    metric_with_compute_dtype,
-    repeated_blockdiag_metric,
+    matern_state_space,
+    repeated_shifted_state_space_metric,
 )
 
 
@@ -939,85 +842,113 @@ def rel(a, b):
     return float(jnp.linalg.norm(jnp.ravel(a - b)) / jnp.linalg.norm(jnp.ravel(a)))
 
 
-block_size, repeats = 4, 3
-A = jnp.array(
-    [
-        [2.0, 0.2, 0.1, 0.0],
-        [0.2, 1.8, 0.0, 0.1],
-        [0.1, 0.0, 1.5, 0.2],
-        [0.0, 0.1, 0.2, 1.2],
-    ]
+n, repeats, zero_pad_size = 3000, 3, 2
+sigma, ell, epsilon = 1.3, 0.8, 1e-8
+well = jnp.cumsum(
+    jax.random.uniform(jax.random.PRNGKey(2), (n,), minval=0.6, maxval=1.4)
 )
-weights = jnp.array([0.3, 0.7])
-block = metric_from_cholesky(jnp.linalg.cholesky(A))
-additional = metric_from_diagonal(weights)
-repeated = repeated_blockdiag_metric(
-    block, block_size, repeats, additional=(additional, weights.shape[0])
-)
-reference = blockdiag_metric(
-    [(block, block_size)] * repeats + [(additional, weights.shape[0])]
-)
-total = block_size * repeats + weights.shape[0]
+stiff = jnp.linspace(0.0, 5.0, n)
+total = repeats * n + zero_pad_size
 x = jax.random.normal(jax.random.PRNGKey(0), (total,))
-X = jax.random.normal(jax.random.PRNGKey(1), (total, 5))
+X = jax.random.normal(jax.random.PRNGKey(1), (total, 3))
 
-for callback in ("solve", "inv_sqrt", "inv_sqrt_transpose"):
-    for arg in (x, X):
-        a = getattr(reference, callback)(arg)
-        b = getattr(repeated, callback)(arg)
-        assert rel(a, b) < 1e-12, (callback, arg.ndim, rel(a, b))
-assert rel(reference.norm(x), repeated.norm(x)) < 1e-12
+for (name, t), tol in ((("well", well), 1e-12), (("stiff", stiff), 1e-6)):
+    for nu in (0.5, 1.5, 2.5):
+        model = matern_state_space(sigma, ell, nu)
+        seq = repeated_shifted_state_space_metric(
+            t,
+            *model,
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=epsilon,
+            parallel=False,
+        )
+        par = repeated_shifted_state_space_metric(
+            t,
+            *model,
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=epsilon,
+            parallel=True,
+        )
+        for callback in ("solve", "norm", "inv_sqrt", "inv_sqrt_transpose"):
+            a = getattr(seq, callback)(x)
+            b = getattr(par, callback)(x)
+            assert bool(jnp.all(jnp.isfinite(b))), (name, nu, callback)
+            assert rel(a, b) < tol, (name, nu, callback, rel(a, b))
+        assert rel(seq.solve(X), par.solve(X)) < tol, (name, nu, "matrix")
 
-# The base callback fires exactly once, on the combined (block_size, repeats*k).
-received = []
+
+def dense_matern_gram(t, sigma, ell):
+    tau = jnp.abs(t[:, None] - t[None, :])
+    ft = jnp.sqrt(3.0) * tau / ell
+    return sigma**2 * (1.0 + ft) * jnp.exp(-ft)
 
 
-def record(v):
-    received.append(v.shape)
-    return v
+n, repeats, zero_pad_size = 150, 2, 1
+t = jnp.cumsum(
+    jax.random.uniform(jax.random.PRNGKey(3), (n,), minval=0.6, maxval=1.4)
+)
+v = jax.random.normal(jax.random.PRNGKey(4), (repeats * n + zero_pad_size,))
 
 
-recorded = repeated_blockdiag_metric(Metric(solve=record), block_size, repeats)
-recorded.solve(jnp.ones((block_size * repeats, 5)))
-assert received == [(block_size, repeats * 5)], received
+def structured_loss(params):
+    sigma, ell, epsilon = params
+    metric = repeated_shifted_state_space_metric(
+        t,
+        *matern_state_space(sigma, ell, 1.5),
+        repeats=repeats,
+        zero_pad_size=zero_pad_size,
+        epsilon=epsilon,
+    )
+    return v @ metric.solve(v) + metric.norm(v)
 
-# Compute-dtype wrapper: exact in float64, and a float32 input round-trips.
-wrapped = metric_with_compute_dtype(reference, jnp.float64)
-for callback in ("solve", "inv_sqrt", "inv_sqrt_transpose", "norm"):
-    arg = x if callback == "norm" else X
-    a = getattr(reference, callback)(arg)
-    b = getattr(wrapped, callback)(arg)
-    assert rel(a, b) < 1e-12, (callback, rel(a, b))
-x32 = x.astype(jnp.float32)
-solved32 = wrapped.solve(x32)
-assert solved32.dtype == jnp.float32, solved32.dtype
-wide = reference.solve(x32.astype(jnp.float64))
-assert rel(wide, solved32.astype(jnp.float64)) < 1e-6
 
-# Nested composition (human_capital pattern): a repeated block with no
-# additional term, composed inside blockdiag_metric with a heterogeneous
-# trailing block, equals the fully-expanded blockdiag_metric.
-other = metric_from_diagonal(jnp.array([1.5, 0.4, 2.0]))
-repeated_no_additional = repeated_blockdiag_metric(block, block_size, 2)
-nested = blockdiag_metric([(repeated_no_additional, 2 * block_size), (other, 3)])
-expanded = blockdiag_metric([(block, block_size)] * 2 + [(other, 3)])
-nested_total = 2 * block_size + 3
-y = jax.random.normal(jax.random.PRNGKey(2), (nested_total,))
-Y = jax.random.normal(jax.random.PRNGKey(3), (nested_total, 4))
-for callback in ("solve", "inv_sqrt", "inv_sqrt_transpose"):
-    for arg in (y, Y):
-        a = getattr(expanded, callback)(arg)
-        b = getattr(nested, callback)(arg)
-        assert rel(a, b) < 1e-12, ("nested", callback, arg.ndim, rel(a, b))
-assert rel(expanded.norm(y), nested.norm(y)) < 1e-12
+def dense_loss(params):
+    sigma, ell, epsilon = params
+    K = dense_matern_gram(t, sigma, ell)
+    blocks = [K + epsilon * jnp.eye(n)] * repeats
+    blocks.append(epsilon * jnp.eye(zero_pad_size))
+    M = jsp_linalg.block_diag(*blocks)
+    return v @ jnp.linalg.solve(M, v) + jnp.sqrt(v @ M @ v)
 
-# Norm AD (forward + reverse) through the nested composite matches the
-# expanded reference to machine precision.
-dy = jax.random.normal(jax.random.PRNGKey(4), (nested_total,))
-_, tangent_nested = jax.jvp(nested.norm, (y,), (dy,))
-_, tangent_expanded = jax.jvp(expanded.norm, (y,), (dy,))
-assert rel(tangent_expanded, tangent_nested) < 1e-12
-assert rel(jax.grad(expanded.norm)(y), jax.grad(nested.norm)(y)) < 1e-12
+
+params = jnp.array([1.3, 0.8, 1e-4])
+grad_structured = jax.jit(jax.grad(structured_loss))(params)
+grad_dense = jax.grad(dense_loss)(params)
+assert rel(grad_dense, grad_structured) < 1e-9
+
+sigma, ell, epsilon = params
+metric = repeated_shifted_state_space_metric(
+    t,
+    *matern_state_space(sigma, ell, 1.5),
+    repeats=repeats,
+    zero_pad_size=zero_pad_size,
+    epsilon=epsilon,
+    parallel=False,
+)
+K = dense_matern_gram(t, sigma, ell)
+blocks = [K + epsilon * jnp.eye(n)] * repeats
+blocks.append(epsilon * jnp.eye(zero_pad_size))
+M = jsp_linalg.block_diag(*blocks)
+total = M.shape[0]
+x = jax.random.normal(jax.random.PRNGKey(5), (total,))
+X = jax.random.normal(jax.random.PRNGKey(6), (total, 3))
+assert rel(jnp.linalg.solve(M, x), metric.solve(x)) < 1e-9
+assert rel(jnp.linalg.solve(M, X), metric.solve(X)) < 1e-9
+assert rel(jnp.sqrt(x @ M @ x), metric.norm(x)) < 1e-10
+S = metric.inv_sqrt(jnp.eye(total))
+assert rel(jnp.linalg.inv(M), S @ S.T) < 1e-9
+assert rel(S.T, metric.inv_sqrt_transpose(jnp.eye(total))) < 1e-10
+
+for callback in ("solve", "norm", "inv_sqrt", "inv_sqrt_transpose"):
+    value = x if callback == "norm" else X
+    shapes = [
+        constant.shape
+        for constant in jax.make_jaxpr(getattr(metric, callback))(value).consts
+    ]
+    assert (n, n) not in shapes, (callback, shapes)
+    assert (total, total) not in shapes, (callback, shapes)
 """
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],
@@ -1028,38 +959,96 @@ assert rel(jax.grad(expanded.norm)(y), jax.grad(nested.norm)(y)) < 1e-12
     assert result.returncode == 0, result.stderr + result.stdout
 
 
-def test_shifted_metric_eps_limit_matches_kkt():
-    # The unified shifted metric M = blockdiag(K, 0) + eps I: as eps -> 0
-    # the minimum-M-norm interpolant converges at rate O(eps) to the
-    # bordered-KKT solution of min alpha' K alpha s.t. J theta = b with
-    # beta free -- under the uniqueness conditions (K PD, J full row rank,
-    # J_beta full column rank) that make that solution unique. Also: the
-    # matrix-free composite matches the dense composite, and the implicit
-    # derivative error shrinks with the inner CG tolerance.
+def test_repeated_shifted_dense_metric_float64_matches_explicit_matrix():
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
+
+from nlls_gram import repeated_shifted_dense_metric
+
+
+def rel(a, b):
+    denominator = jnp.maximum(jnp.linalg.norm(jnp.ravel(a)), 1.0)
+    return float(jnp.linalg.norm(jnp.ravel(a - b)) / denominator)
+
+
+n, repeats, zero_pad_size, epsilon = 4, 3, 2, 0.2
+K = jnp.array(
+    [
+        [2.0, 0.2, 0.1, 0.0],
+        [0.2, 1.8, 0.0, 0.1],
+        [0.1, 0.0, 1.5, 0.2],
+        [0.0, 0.1, 0.2, 1.2],
+    ],
+    dtype=jnp.float64,
+)
+metric = repeated_shifted_dense_metric(
+    K,
+    repeats=repeats,
+    zero_pad_size=zero_pad_size,
+    epsilon=epsilon,
+)
+blocks = [K + epsilon * jnp.eye(n)] * repeats
+blocks.append(epsilon * jnp.eye(zero_pad_size))
+M = jsp_linalg.block_diag(*blocks)
+total = M.shape[0]
+x = jax.random.normal(jax.random.PRNGKey(0), (total,))
+X = jax.random.normal(jax.random.PRNGKey(1), (total, 5))
+
+for callback in ("solve", "inv_sqrt", "inv_sqrt_transpose"):
+    for value in (x, X):
+        actual = jax.jit(getattr(metric, callback))(value)
+        if callback == "solve":
+            expected = jnp.linalg.solve(M, value)
+            assert rel(expected, actual) < 1e-12
+        assert actual.dtype == jnp.float64
+
+assert rel(jnp.sqrt(x @ M @ x), metric.norm(x)) < 1e-12
+S = metric.inv_sqrt(jnp.eye(total))
+assert rel(jnp.linalg.inv(M), S @ S.T) < 1e-12
+assert rel(S.T, metric.inv_sqrt_transpose(jnp.eye(total))) < 1e-12
+
+dx = jax.random.normal(jax.random.PRNGKey(2), (total,))
+_, tangent = jax.jvp(metric.norm, (x,), (dx,))
+expected_tangent = (x @ M @ dx) / jnp.sqrt(x @ M @ x)
+assert rel(expected_tangent, tangent) < 1e-12
+assert rel(jax.grad(metric.norm)(x), M @ x / jnp.sqrt(x @ M @ x)) < 1e-12
+
+for callback in ("solve", "norm", "inv_sqrt", "inv_sqrt_transpose"):
+    value = x if callback == "norm" else X
+    constants = jax.make_jaxpr(getattr(metric, callback))(value).consts
+    shapes = [constant.shape for constant in constants]
+    assert (n, n) in shapes, (callback, shapes)
+    assert (total, total) not in shapes, (callback, shapes)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_repeated_shifted_dense_metric_eps_limit_matches_kkt():
     script = r"""
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
-from nlls_gram import (
-    LevenbergMarquardt,
-    blockdiag_metric,
-    identity_preconditioner,
-    metric_from_cholesky,
-    metric_from_diagonal,
-    metric_from_shifted_matvec,
-)
+from nlls_gram import LevenbergMarquardt, repeated_shifted_dense_metric
 
 n, k, m = 12, 2, 4
-t = jnp.arange(n) * 1.0
+t = jnp.arange(n, dtype=jnp.float64)
 ft = jnp.sqrt(3.0) * jnp.abs(t[:, None] - t[None, :]) / 0.8
-K = 1.3**2 * (1.0 + ft) * jnp.exp(-ft) + 1e-8 * jnp.eye(n)  # PD
+K = 1.3**2 * (1.0 + ft) * jnp.exp(-ft) + 1e-8 * jnp.eye(n)
 J_alpha = jax.random.normal(jax.random.PRNGKey(0), (m, n))
-J_beta = jax.random.normal(jax.random.PRNGKey(1), (m, k))  # full column rank
+J_beta = jax.random.normal(jax.random.PRNGKey(1), (m, k))
 J = jnp.concatenate([J_alpha, J_beta], axis=1)
 b = jax.random.normal(jax.random.PRNGKey(2), (m,))
 
-# Bordered KKT: [[2K, 0, J_a'], [0, 0, J_b'], [J_a, J_b, 0]] [a, B, -y] = [0,0,b]
 kkt = jnp.block(
     [
         [2.0 * K, jnp.zeros((n, k)), J_alpha.T],
@@ -1067,8 +1056,8 @@ kkt = jnp.block(
         [J_alpha, J_beta, jnp.zeros((m, m))],
     ]
 )
-kkt_solution = jnp.linalg.solve(kkt, jnp.concatenate([jnp.zeros(n + k), b]))
-theta_kkt = kkt_solution[: n + k]
+rhs = jnp.concatenate([jnp.zeros(n + k), b])
+theta_kkt = jnp.linalg.solve(kkt, rhs)[: n + k]
 assert jnp.allclose(J @ theta_kkt, b, atol=1e-9)
 
 
@@ -1076,108 +1065,38 @@ def residual(theta, _, p):
     return J @ theta - p * b
 
 
-def dense_composite(eps):
-    return blockdiag_metric(
-        [
-            (metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n))), n),
-            (metric_from_diagonal(eps * jnp.ones(k)), k),
-        ]
-    )
-
-
-def solved_x(metric, p):
-    # Use the exact QR rule for a dense metric so a trace-scaled ridge cannot
-    # perturb this limit check. A solve-only (matvec) composite cannot whiten,
-    # so pin its AD rule to gram_cg at a matching tight tolerance.
-    ad_kwargs = (
-        {"ad_solver": "qr"}
-        if metric.inv_sqrt is not None
-        else {
-            "ad_solver": "gram_cg",
-            "ad_solver_tol": 1e-12,
-            "ad_solver_preconditioner": identity_preconditioner(),
-        }
+def solved_x(epsilon, p):
+    metric = repeated_shifted_dense_metric(
+        K, repeats=1, zero_pad_size=k, epsilon=epsilon
     )
     solver = LevenbergMarquardt(
         residual,
         init_damping=1e-6,
         metric=metric,
         geodesic_acceleration=False,
-        **ad_kwargs,
+        ad_solver="qr",
     )
     return solver.solve(jnp.zeros(n + k), p=p, max_steps=200, atol=1e-12).x
 
 
 errors = {}
-for eps in (1e-3, 1e-5, 1e-7):
-    theta_eps = solved_x(dense_composite(eps), jnp.asarray(1.0))
-    assert jnp.allclose(J @ theta_eps, b, atol=1e-8), eps
-    errors[eps] = float(jnp.linalg.norm(theta_eps - theta_kkt))
+for epsilon in (1e-3, 1e-5, 1e-7):
+    theta = solved_x(epsilon, jnp.asarray(1.0))
+    assert jnp.allclose(J @ theta, b, atol=1e-8), epsilon
+    errors[epsilon] = float(jnp.linalg.norm(theta - theta_kkt))
 
-# Convergence to the KKT solution, at first order in eps.
 assert errors[1e-7] < 1e-5, errors
 rate = errors[1e-3] / errors[1e-5]
 assert 30.0 < rate < 300.0, (errors, rate)
 
-# The matrix-free composite matches the dense composite at eps = 1e-5.
-eps = 1e-5
-matvec_metric = blockdiag_metric(
-    [
-        (metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-12), n),
-        (metric_from_diagonal(eps * jnp.ones(k)), k),
-    ]
-)
-theta_matvec = solved_x(matvec_metric, jnp.asarray(1.0))
-theta_dense = solved_x(dense_composite(eps), jnp.asarray(1.0))
-rel = float(jnp.linalg.norm(theta_matvec - theta_dense) / jnp.linalg.norm(theta_dense))
-assert rel < 1e-9, rel
-
-# Implicit-derivative error shrinks with the inner CG tolerance: the final
-# metric solve has no accept/reject safeguard, so tol directly sets it.
+epsilon = 1e-5
 p, p_dot = jnp.asarray(1.0), jnp.asarray(1.0)
-_, dot_dense = jax.jvp(lambda q: solved_x(dense_composite(eps), q), (p,), (p_dot,))
-
-
-def matvec_composite(tol):
-    return blockdiag_metric(
-        [
-            (metric_from_shifted_matvec(lambda x: K @ x, eps, tol=tol), n),
-            (metric_from_diagonal(eps * jnp.ones(k)), k),
-        ]
-    )
-
-
-derivative_errors = {}
-for tol in (1e-4, 1e-12):
-    _, dot_matvec = jax.jvp(
-        lambda q: solved_x(matvec_composite(tol), q), (p,), (p_dot,)
-    )
-    derivative_errors[tol] = float(jnp.linalg.norm(dot_matvec - dot_dense))
-assert derivative_errors[1e-12] < derivative_errors[1e-4], derivative_errors
-assert derivative_errors[1e-12] < 1e-8, derivative_errors
-
-# The matrix-free cg implicit rule (metric tol at or below ad_solver_tol, per
-# the nested-tolerance guidance) reproduces the dense-rule derivative in
-# both directions.
-def solved_x_cg_implicit(p_value):
-    solver = LevenbergMarquardt(
-        residual,
-        init_damping=1e-6,
-        metric=matvec_composite(1e-12),
-        geodesic_acceleration=False,
-        ad_solver="gram_cg",
-        ad_solver_tol=1e-12,
-        ad_solver_preconditioner=identity_preconditioner(),
-    )
-    return solver.solve(jnp.zeros(n + k), p=p_value, max_steps=200, atol=1e-12).x
-
-_, dot_cg_implicit = jax.jvp(solved_x_cg_implicit, (p,), (p_dot,))
-assert float(jnp.linalg.norm(dot_cg_implicit - dot_dense)) < 1e-8
+theta, theta_dot = jax.jvp(lambda q: solved_x(epsilon, q), (p,), (p_dot,))
+assert jnp.allclose(theta_dot, theta, atol=1e-8)
 
 x_bar = jnp.linspace(-1.0, 1.0, n + k)
-_, pull_dense = jax.vjp(lambda q: solved_x(dense_composite(eps), q), p)
-_, pull_cg_implicit = jax.vjp(solved_x_cg_implicit, p)
-assert float(jnp.abs(pull_cg_implicit(x_bar)[0] - pull_dense(x_bar)[0])) < 1e-8
+_, pullback = jax.vjp(lambda q: solved_x(epsilon, q), p)
+assert jnp.allclose(pullback(x_bar)[0], x_bar @ theta, atol=1e-8)
 """
     result = subprocess.run(
         [sys.executable, "-c", textwrap.dedent(script)],

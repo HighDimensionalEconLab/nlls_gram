@@ -12,19 +12,14 @@ from nlls_gram import (
     LMState,
     LMStatus,
     Metric,
-    blockdiag_metric,
     identity_preconditioner,
     matern_state_space,
     metric_from_cholesky,
     metric_from_diagonal,
-    metric_from_quasiseparable,
-    metric_from_shifted_matvec,
-    metric_from_state_space,
-    metric_from_tridiagonal_precision,
-    metric_with_compute_dtype,
     nystrom_preconditioner,
     pad_dual_preconditioner,
-    repeated_blockdiag_metric,
+    repeated_shifted_dense_metric,
+    repeated_shifted_state_space_metric,
     sherman_morrison_preconditioner,
     woodbury_preconditioner,
 )
@@ -3490,441 +3485,12 @@ def test_cg_dual_preconditioner_enables_ill_conditioned_convergence():
     assert int(plain_result.status) != LMStatus.CONVERGED
 
 
-@pytest.mark.parametrize("parallel", [False, True])
-def test_metric_from_tridiagonal_precision_matches_dense(parallel):
-    # M = K with K_ij = rho^|i-j| (Matern-1/2 on a unit grid), whose precision
-    # T = K^{-1} is exactly tridiagonal with closed-form AR(1) entries.
-    n = 15
-    rho = 0.6
-    idx = jnp.arange(n)
-    K = rho ** jnp.abs(idx[:, None] - idx[None, :])
-    scale = 1.0 / (1.0 - rho**2)
-    diag = scale * jnp.concatenate(
-        [jnp.ones(1), (1.0 + rho**2) * jnp.ones(n - 2), jnp.ones(1)]
-    )
-    off_diag = -rho * scale * jnp.ones(n - 1)
-    metric = metric_from_tridiagonal_precision(diag, off_diag, parallel=parallel)
-
-    x = jax.random.normal(jax.random.PRNGKey(0), (n,))
-    X = jax.random.normal(jax.random.PRNGKey(1), (n, 3))
-
-    # The dense float32 references go through matmuls that Ampere GPUs run in
-    # TF32 (~1e-3 precision) by default, while the tridiagonal callbacks are
-    # elementwise-exact; pin full precision so the references are comparable.
-    with jax.default_matmul_precision("highest"):
-        T_dense = jnp.linalg.inv(K)
-
-        assert jnp.allclose(metric.solve(x), T_dense @ x, rtol=1e-4, atol=1e-4)
-        assert jnp.allclose(metric.solve(X), T_dense @ X, rtol=1e-4, atol=1e-4)
-        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ K @ x), rtol=1e-4, atol=1e-4)
-        S = metric.inv_sqrt(jnp.eye(n))
-        assert jnp.allclose(S @ S.T, T_dense, rtol=1e-3, atol=1e-4)
-        assert jnp.allclose(
-            metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-4
-        )
-
-
-def test_metric_from_diagonal_matches_dense():
-    weights = jnp.array([2.0, 0.5, 4.0, 1.5])
-    metric = metric_from_diagonal(weights)
-    M = jnp.diag(weights)
-    x = jax.random.normal(jax.random.PRNGKey(2), (4,))
-    X = jax.random.normal(jax.random.PRNGKey(3), (4, 3))
-
-    assert jnp.allclose(metric.solve(x), jnp.linalg.solve(M, x))
-    assert jnp.allclose(metric.solve(X), jnp.linalg.solve(M, X))
-    assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ M @ x))
-    S = metric.inv_sqrt(jnp.eye(4))
-    assert jnp.allclose(S @ S.T, jnp.linalg.inv(M))
-    assert jnp.allclose(metric.inv_sqrt_transpose(jnp.eye(4)), S.T)
-
-
-def test_blockdiag_metric_matches_dense():
-    # A dense 3x3 block composed with a diagonal 2-block.
-    A = jnp.array([[2.0, 0.5, 0.0], [0.5, 3.0, 0.2], [0.0, 0.2, 1.5]])
-    weights = jnp.array([4.0, 0.25])
-    metric = blockdiag_metric(
-        [
-            (metric_from_cholesky(jnp.linalg.cholesky(A)), 3),
-            (metric_from_diagonal(weights), 2),
-        ]
-    )
-    M = jnp.block(
-        [
-            [A, jnp.zeros((3, 2))],
-            [jnp.zeros((2, 3)), jnp.diag(weights)],
-        ]
-    )
-    x = jax.random.normal(jax.random.PRNGKey(4), (5,))
-    X = jax.random.normal(jax.random.PRNGKey(5), (5, 3))
-
-    assert jnp.allclose(metric.solve(x), jnp.linalg.solve(M, x), atol=1e-5)
-    assert jnp.allclose(metric.solve(X), jnp.linalg.solve(M, X), atol=1e-5)
-    assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ M @ x), atol=1e-5)
-    S = metric.inv_sqrt(jnp.eye(5))
-    assert jnp.allclose(S @ S.T, jnp.linalg.inv(M), atol=1e-5)
-
-    # A partially-specified block (here cg-style: solve and norm only) marks
-    # the callbacks it lacks as missing on the composite rather than filling
-    # identity, so the solver's validation still catches e.g. qr without
-    # inv_sqrt — identity fill would break S S' = M^{-1} consistency.
-    partial = blockdiag_metric(
-        [
-            (
-                Metric(
-                    solve=lambda x: x / 4.0, norm=lambda x: 2.0 * jnp.linalg.norm(x)
-                ),
-                3,
-            ),
-            (metric_from_diagonal(weights), 2),
-        ]
-    )
-    assert partial.inv_sqrt is None
-    assert partial.inv_sqrt_transpose is None
-    x_partial = jax.random.normal(jax.random.PRNGKey(7), (5,))
-    M_partial = jnp.block(
-        [
-            [4.0 * jnp.eye(3), jnp.zeros((3, 2))],
-            [jnp.zeros((2, 3)), jnp.diag(weights)],
-        ]
-    )
-    assert jnp.allclose(
-        partial.solve(x_partial), jnp.linalg.solve(M_partial, x_partial), atol=1e-6
-    )
-    assert jnp.allclose(
-        partial.norm(x_partial), jnp.sqrt(x_partial @ M_partial @ x_partial), atol=1e-5
-    )
-    with pytest.raises(ValueError, match="inv_sqrt"):
-        LevenbergMarquardt(residual_fn, linear_solver="qr", metric=partial)
-
-
-def test_sherman_morrison_preconditioner_matches_dense_inverse():
-    n = 12
-    idx = jnp.arange(n)
-    A = 0.6 ** jnp.abs(idx[:, None] - idx[None, :])
-    L = jnp.linalg.cholesky(A)
-    u = jnp.ones(n)
-    weight = 50.0
-
-    preconditioner = sherman_morrison_preconditioner(
-        metric_from_cholesky(L).solve, u, weight
-    )
-    P = A + weight * jnp.outer(u, u)
-    v = jax.random.normal(jax.random.PRNGKey(6), (n,))
-
-    assert jnp.allclose(
-        preconditioner(v, 0.0), jnp.linalg.solve(P, v), rtol=1e-3, atol=1e-3
-    )
-
-
-def test_metric_from_tridiagonal_precision_float32_default_is_stable():
-    # Long, stiff AR(1) grid (rho near 1) in float32: the parallel Mobius
-    # scan's projective cancellation goes non-finite here, the sequential
-    # recurrence does not. The dtype-aware default must never pick the
-    # unstable path for float32 setups, on any backend.
-    n, rho = 5000, 0.9999
-    scale = 1.0 / (1.0 - rho**2)
-    diag = (
-        scale
-        * jnp.concatenate([jnp.ones(1), (1.0 + rho**2) * jnp.ones(n - 2), jnp.ones(1)])
-    ).astype(jnp.float32)
-    off_diag = (-rho * scale * jnp.ones(n - 1)).astype(jnp.float32)
-
-    metric = metric_from_tridiagonal_precision(diag, off_diag)
-    assert bool(jnp.all(jnp.isfinite(metric.inv_sqrt(jnp.ones(n, jnp.float32)))))
-
-
-def test_metric_from_tridiagonal_precision_single_point():
-    metric = metric_from_tridiagonal_precision(jnp.array([4.0]), jnp.zeros(0))
-    x = jnp.array([3.0])
-
-    assert jnp.allclose(metric.solve(x), 4.0 * x)
-    assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ x / 4.0))
-    assert jnp.allclose(metric.inv_sqrt(x), 2.0 * x)
-
-
-def test_blockdiag_metric_identity_block_defaults():
-    # A bare Metric() block means identity on that block -- the other block's
-    # weighting must survive.
-    weights = jnp.array([4.0, 0.25])
-    metric = blockdiag_metric([(Metric(), 3), (metric_from_diagonal(weights), 2)])
-    M = jnp.block(
-        [
-            [jnp.eye(3), jnp.zeros((3, 2))],
-            [jnp.zeros((2, 3)), jnp.diag(weights)],
-        ]
-    )
-    x = jax.random.normal(jax.random.PRNGKey(9), (5,))
-
-    assert metric.solve is not None
-    assert jnp.allclose(metric.solve(x), jnp.linalg.solve(M, x), atol=1e-6)
-    assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ M @ x), atol=1e-6)
-
-    with pytest.raises(ValueError, match="at least one"):
-        blockdiag_metric([])
-
-
-@pytest.mark.parametrize("linear_solver", ["gram_cholesky", "qr", "augmented_qr"])
-def test_structural_metrics_match_dense_metric_in_solver(linear_solver):
-    # End-to-end: the O(n) tridiagonal metric drives the actual solver (and
-    # its implicit derivative) to the same solution as the equivalent dense
-    # metric — the constructors compose with every callback the solver uses.
-    n = 8
-    rho = 0.6
-    idx = jnp.arange(n)
-    K = rho ** jnp.abs(idx[:, None] - idx[None, :])
-    scale = 1.0 / (1.0 - rho**2)
-    diag = scale * jnp.concatenate(
-        [jnp.ones(1), (1.0 + rho**2) * jnp.ones(n - 2), jnp.ones(1)]
-    )
-    off_diag = -rho * scale * jnp.ones(n - 1)
-    tridiagonal = metric_from_tridiagonal_precision(diag, off_diag)
-    dense = metric_from_cholesky(jnp.linalg.cholesky(K))
-
-    # Underdetermined: 2 residuals, n parameters, external p for implicit AD.
-    A = jnp.stack([jnp.ones(n), idx.astype(jnp.float32)])
-
-    def residual(theta, _, p):
-        return A @ theta - jnp.array([p, 0.5 * p])
-
-    def solved_x(metric, p):
-        solver = LevenbergMarquardt(
-            residual, init_damping=1e-2, linear_solver=linear_solver, metric=metric
-        )
-        return solver.solve(jnp.zeros(n), p=p, max_steps=60, atol=1e-6).x
-
-    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
-    x_tri, x_tri_dot = jax.jvp(lambda q: solved_x(tridiagonal, q), (p,), (p_dot,))
-    x_dense, x_dense_dot = jax.jvp(lambda q: solved_x(dense, q), (p,), (p_dot,))
-
-    assert jnp.allclose(A @ x_tri, jnp.array([p, 0.5 * p]), atol=1e-4)
-    assert jnp.allclose(x_tri, x_dense, atol=1e-4)
-    assert jnp.allclose(x_tri_dot, x_dense_dot, atol=1e-4)
-
-    x_bar = jnp.linspace(-1.0, 1.0, n)
-    _, tri_pullback = jax.vjp(lambda q: solved_x(tridiagonal, q), p)
-    _, dense_pullback = jax.vjp(lambda q: solved_x(dense, q), p)
-    assert jnp.allclose(tri_pullback(x_bar)[0], dense_pullback(x_bar)[0], atol=1e-4)
-
-
-def test_blockdiag_metric_implicit_ad_matches_dense_metric():
-    # A blockdiag composite (dense kernel block + diagonal scalar block)
-    # drives solve() and its implicit JVP/VJP to the same answers as the
-    # equivalent single dense metric.
-    idx = jnp.arange(3)
-    K = 0.6 ** jnp.abs(idx[:, None] - idx[None, :])
-    weights = jnp.array([4.0, 0.25])
-    composite = blockdiag_metric(
-        [
-            (metric_from_cholesky(jnp.linalg.cholesky(K)), 3),
-            (metric_from_diagonal(weights), 2),
-        ]
-    )
-    M = jnp.block(
-        [
-            [K, jnp.zeros((3, 2))],
-            [jnp.zeros((2, 3)), jnp.diag(weights)],
-        ]
-    )
-    dense = metric_from_cholesky(jnp.linalg.cholesky(M))
-    A = jnp.stack([jnp.ones(5), jnp.arange(5, dtype=jnp.float32)])
-
-    def residual(theta, _, p):
-        return A @ theta - jnp.array([p, 0.5 * p])
-
-    def solved_x(metric, p):
-        solver = LevenbergMarquardt(residual, init_damping=1e-2, metric=metric)
-        return solver.solve(jnp.zeros(5), p=p, max_steps=60, atol=1e-6).x
-
-    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
-    x_block, x_block_dot = jax.jvp(lambda q: solved_x(composite, q), (p,), (p_dot,))
-    x_dense, x_dense_dot = jax.jvp(lambda q: solved_x(dense, q), (p,), (p_dot,))
-    assert jnp.allclose(x_block, x_dense, atol=1e-4)
-    assert jnp.allclose(x_block_dot, x_dense_dot, atol=1e-4)
-
-    x_bar = jnp.linspace(-1.0, 1.0, 5)
-    _, block_pullback = jax.vjp(lambda q: solved_x(composite, q), p)
-    _, dense_pullback = jax.vjp(lambda q: solved_x(dense, q), p)
-    assert jnp.allclose(block_pullback(x_bar)[0], dense_pullback(x_bar)[0], atol=1e-4)
-
-
-REPEATED_BLOCK = jnp.array(
-    [
-        [2.0, 0.2, 0.1, 0.0],
-        [0.2, 1.8, 0.0, 0.1],
-        [0.1, 0.0, 1.5, 0.2],
-        [0.0, 0.1, 0.2, 1.2],
-    ]
-)
-
-
-def test_repeated_blockdiag_metric_matches_blockdiag():
-    # repeated_blockdiag_metric must equal the expanded blockdiag_metric of the
-    # same blocks, callback for callback, and match a ground-truth dense metric.
-    block_size, repeats = 4, 3
-    weights = jnp.array([0.3, 0.7])
-    block = metric_from_cholesky(jnp.linalg.cholesky(REPEATED_BLOCK))
-    additional = metric_from_diagonal(weights)
-    repeated = repeated_blockdiag_metric(
-        block, block_size, repeats, additional=(additional, weights.shape[0])
-    )
-    reference = blockdiag_metric(
-        [(block, block_size)] * repeats + [(additional, weights.shape[0])]
-    )
-    total = block_size * repeats + weights.shape[0]
-    M = jsp_linalg.block_diag(*([REPEATED_BLOCK] * repeats), jnp.diag(weights))
-
-    x = jax.random.normal(jax.random.PRNGKey(10), (total,))
-    X = jax.random.normal(jax.random.PRNGKey(11), (total, 3))
-
-    assert jnp.allclose(repeated.solve(x), reference.solve(x), atol=1e-5)
-    assert jnp.allclose(repeated.solve(X), reference.solve(X), atol=1e-5)
-    assert jnp.allclose(repeated.solve(x), jnp.linalg.solve(M, x), atol=1e-5)
-    assert jnp.allclose(repeated.solve(X), jnp.linalg.solve(M, X), atol=1e-5)
-    assert jnp.allclose(repeated.norm(x), reference.norm(x), atol=1e-5)
-    assert jnp.allclose(repeated.norm(x), jnp.sqrt(x @ M @ x), atol=1e-5)
-
-    S = repeated.inv_sqrt(jnp.eye(total))
-    assert jnp.allclose(S, reference.inv_sqrt(jnp.eye(total)), atol=1e-5)
-    assert jnp.allclose(S @ S.T, jnp.linalg.inv(M), atol=1e-5)
-    assert jnp.allclose(
-        repeated.inv_sqrt_transpose(jnp.eye(total)),
-        reference.inv_sqrt_transpose(jnp.eye(total)),
-        atol=1e-5,
-    )
-    assert jnp.allclose(repeated.inv_sqrt_transpose(jnp.eye(total)), S.T, atol=1e-5)
-
-
-def test_repeated_blockdiag_metric_batches_one_call():
-    # The base callback fires exactly once, on the whole repeated head reshaped
-    # to (block_size, repeats * columns) -- the anti-degeneration guard against
-    # regressing to one call per copy.
-    block_size, repeats, rhs_columns = 4, 3, 5
-    received_shapes = []
-
-    def solve(x):
-        received_shapes.append(x.shape)
-        return x
-
-    metric = repeated_blockdiag_metric(Metric(solve=solve), block_size, repeats)
-    metric.solve(jnp.ones((block_size * repeats, rhs_columns)))
-
-    assert received_shapes == [(block_size, repeats * rhs_columns)]
-
-
-def test_repeated_blockdiag_metric_partial_and_identity():
-    block_size, repeats = 4, 3
-    total = block_size * repeats
-
-    # A block defining only solve marks the other callbacks missing on the
-    # composite (same contract as blockdiag_metric).
-    partial = repeated_blockdiag_metric(Metric(solve=lambda x: x), block_size, repeats)
-    assert partial.solve is not None
-    assert partial.norm is None
-    assert partial.inv_sqrt is None
-    assert partial.inv_sqrt_transpose is None
-
-    # A bare Metric() block is the identity on its span; the additional block's
-    # weighting must survive.
-    weights = jnp.array([0.3, 0.7])
-    identity_repeated = repeated_blockdiag_metric(
-        Metric(), block_size, repeats, additional=(metric_from_diagonal(weights), 2)
-    )
-    M = jsp_linalg.block_diag(jnp.eye(total), jnp.diag(weights))
-    x = jax.random.normal(jax.random.PRNGKey(12), (total + 2,))
-    assert identity_repeated.solve is not None
-    assert jnp.allclose(identity_repeated.solve(x), jnp.linalg.solve(M, x), atol=1e-6)
-    assert jnp.allclose(identity_repeated.norm(x), jnp.sqrt(x @ M @ x), atol=1e-5)
-
-    with pytest.raises(ValueError, match="leading size"):
-        identity_repeated.solve(jnp.ones(block_size))
-    with pytest.raises(ValueError, match="positive integer"):
-        repeated_blockdiag_metric(Metric(), block_size, 0)
-
-
-def test_metric_with_compute_dtype_preserves_caller_dtype():
-    # The wrapper restores the caller's dtype and preserves None callbacks; the
-    # genuine wide-precision path is checked in the x64 subprocess suite.
-    factor = jnp.linalg.cholesky(jnp.array([[2.0, 0.2], [0.2, 1.5]]))
-    wrapped = metric_with_compute_dtype(metric_from_cholesky(factor), jnp.float64)
-    value = jnp.array([1.0, -0.5], dtype=jnp.float32)
-
-    solved = wrapped.solve(value)
-    assert solved.dtype == value.dtype
-    assert jnp.allclose(solved, metric_from_cholesky(factor).solve(value), atol=1e-6)
-
-    partial = metric_with_compute_dtype(Metric(solve=lambda x: 2.0 * x), jnp.float64)
-    assert partial.solve is not None
-    assert partial.norm is None
-    assert partial.inv_sqrt is None
-    assert partial.inv_sqrt_transpose is None
-
-
-def test_repeated_blockdiag_metric_norm_ad_matches_blockdiag():
-    # AD through the vmapped block norm must match the expanded blockdiag norm
-    # for both forward (jvp) and reverse (grad) modes, away from zero where
-    # jnp.linalg.norm's gradient is defined.
-    block_size, repeats = 4, 3
-    weights = jnp.array([0.3, 0.7])
-    block = metric_from_cholesky(jnp.linalg.cholesky(REPEATED_BLOCK))
-    additional = metric_from_diagonal(weights)
-    repeated = repeated_blockdiag_metric(
-        block, block_size, repeats, additional=(additional, 2)
-    )
-    reference = blockdiag_metric([(block, block_size)] * repeats + [(additional, 2)])
-    total = block_size * repeats + 2
-    v = jax.random.normal(jax.random.PRNGKey(13), (total,))
-    dv = jax.random.normal(jax.random.PRNGKey(14), (total,))
-
-    val_rep, tangent_rep = jax.jvp(repeated.norm, (v,), (dv,))
-    val_ref, tangent_ref = jax.jvp(reference.norm, (v,), (dv,))
-    assert jnp.allclose(val_rep, val_ref, atol=1e-5)
-    assert jnp.allclose(tangent_rep, tangent_ref, atol=1e-5)
-    assert jnp.allclose(
-        jax.grad(repeated.norm)(v), jax.grad(reference.norm)(v), atol=1e-5
-    )
-
-
-@pytest.mark.parametrize("linear_solver", ["gram_cholesky", "qr", "augmented_qr"])
-@pytest.mark.parametrize("geodesic_acceleration", [False, True])
-def test_repeated_blockdiag_metric_implicit_ad_matches_blockdiag(
-    linear_solver, geodesic_acceleration
-):
-    # End-to-end: the repeated metric drives solve() and its implicit JVP/VJP to
-    # the same answers as the equivalent expanded blockdiag metric, across the
-    # dense solver steps, with geodesic acceleration exercising norm.
-    idx = jnp.arange(3)
-    K = 0.6 ** jnp.abs(idx[:, None] - idx[None, :])
-    weights = jnp.array([4.0, 0.25])
-    block = metric_from_cholesky(jnp.linalg.cholesky(K))
-    additional = metric_from_diagonal(weights)
-    repeated = repeated_blockdiag_metric(block, 3, 2, additional=(additional, 2))
-    reference = blockdiag_metric([(block, 3), (block, 3), (additional, 2)])
-    A = jnp.stack([jnp.ones(8), jnp.arange(8, dtype=jnp.float32)])
-
-    def residual(theta, _, p):
-        return A @ theta - jnp.array([p, 0.5 * p])
-
-    def solved_x(metric, p):
-        solver = LevenbergMarquardt(
-            residual,
-            init_damping=1e-2,
-            linear_solver=linear_solver,
-            geodesic_acceleration=geodesic_acceleration,
-            metric=metric,
-        )
-        return solver.solve(jnp.zeros(8), p=p, max_steps=60, atol=1e-6).x
-
-    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
-    x_rep, x_rep_dot = jax.jvp(lambda q: solved_x(repeated, q), (p,), (p_dot,))
-    x_ref, x_ref_dot = jax.jvp(lambda q: solved_x(reference, q), (p,), (p_dot,))
-    assert jnp.allclose(x_rep, x_ref, atol=1e-4)
-    assert jnp.allclose(x_rep_dot, x_ref_dot, atol=1e-4)
-
-    x_bar = jnp.linspace(-1.0, 1.0, 8)
-    _, rep_pullback = jax.vjp(lambda q: solved_x(repeated, q), p)
-    _, ref_pullback = jax.vjp(lambda q: solved_x(reference, q), p)
-    assert jnp.allclose(rep_pullback(x_bar)[0], ref_pullback(x_bar)[0], atol=1e-4)
+def repeated_shifted_matrix(K, repeats, zero_pad_size, epsilon):
+    n = K.shape[0]
+    blocks = [K + epsilon * jnp.eye(n)] * repeats
+    if zero_pad_size:
+        blocks.append(epsilon * jnp.eye(zero_pad_size))
+    return jsp_linalg.block_diag(*blocks)
 
 
 def dense_matern_gram(t, sigma, ell, nu):
@@ -3939,590 +3505,424 @@ def dense_matern_gram(t, sigma, ell, nu):
     return sigma**2 * corr
 
 
-def dense_from_quasiseparable_generators(d, p, q, A):
-    # K[i, j] = p[i] @ A[i-1] ... A[j+1] @ q[j] for i > j, d on the
-    # diagonal, symmetric — the documented generator convention.
-    n, m = p.shape
+def assert_metric_matches_dense(metric, M, key):
+    total = M.shape[0]
+    key_x, key_X = jax.random.split(key)
+    x = jax.random.normal(key_x, (total,))
+    X = jax.random.normal(key_X, (total, 3))
 
-    def entry(i, j):
-        if i == j:
-            return d[i]
-        lo, hi = min(i, j), max(i, j)
-        Phi = jnp.eye(m, dtype=d.dtype)
-        for k in range(lo + 1, hi):
-            Phi = A[k] @ Phi
-        return p[hi] @ Phi @ q[lo]
+    with jax.default_matmul_precision("highest"):
+        assert jnp.allclose(
+            jax.jit(metric.solve)(x), jnp.linalg.solve(M, x), rtol=3e-4, atol=3e-4
+        )
+        assert jnp.allclose(
+            jax.jit(metric.solve)(X), jnp.linalg.solve(M, X), rtol=3e-4, atol=3e-4
+        )
+        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ M @ x), rtol=3e-4, atol=3e-4)
+        S = jax.jit(metric.inv_sqrt)(jnp.eye(total))
+        ST = jax.jit(metric.inv_sqrt_transpose)(jnp.eye(total))
+        assert jnp.allclose(S @ S.T, jnp.linalg.inv(M), rtol=5e-4, atol=5e-4)
+        assert jnp.allclose(ST, S.T, rtol=3e-4, atol=3e-4)
 
-    return jnp.array([[entry(i, j) for j in range(n)] for i in range(n)])
+
+@pytest.mark.parametrize("zero_pad_size", [0, 2])
+def test_repeated_shifted_dense_metric_matches_explicit_matrix(zero_pad_size):
+    K = jnp.array(
+        [
+            [2.0, 0.2, 0.1, 0.0],
+            [0.2, 1.8, 0.0, 0.1],
+            [0.1, 0.0, 1.5, 0.2],
+            [0.0, 0.1, 0.2, 1.2],
+        ]
+    )
+    repeats, epsilon = 3, 0.2
+    metric = repeated_shifted_dense_metric(
+        K,
+        repeats=repeats,
+        zero_pad_size=zero_pad_size,
+        epsilon=epsilon,
+    )
+    M = repeated_shifted_matrix(K, repeats, zero_pad_size, epsilon)
+    assert_metric_matches_dense(metric, M, jax.random.PRNGKey(zero_pad_size))
+
+
+def test_repeated_shifted_metrics_promote_integer_inputs():
+    integer_K = jnp.array([[2, 1], [1, 2]])
+    epsilon = 0.2
+    dense_metric = repeated_shifted_dense_metric(
+        integer_K,
+        repeats=2,
+        zero_pad_size=1,
+        epsilon=epsilon,
+    )
+    dense_M = repeated_shifted_matrix(integer_K, 2, 1, epsilon)
+    assert_metric_matches_dense(dense_metric, dense_M, jax.random.PRNGKey(17))
+
+    t = jnp.arange(5)
+    state_metric = repeated_shifted_state_space_metric(
+        t,
+        *matern_state_space(1, 2, 0.5),
+        repeats=2,
+        zero_pad_size=1,
+        epsilon=epsilon,
+        parallel=False,
+    )
+    state_K = dense_matern_gram(t, 1.0, 2.0, 0.5)
+    state_M = repeated_shifted_matrix(state_K, 2, 1, epsilon)
+    assert_metric_matches_dense(state_metric, state_M, jax.random.PRNGKey(18))
 
 
 @pytest.mark.parametrize("nu", [0.5, 1.5, 2.5])
 @pytest.mark.parametrize("parallel", [False, True])
-def test_metric_from_state_space_matern_matches_dense(nu, parallel):
-    # nu=0.5 is included even though metric_from_tridiagonal_precision is the
-    # recommended constructor there — the helper claims support for it.
-    n = 300
-    sigma, ell = 1.3, 0.8
-    nugget = 1e-8 * sigma**2
-    uniform = jnp.arange(n) * 1.0
-    nonuniform = jnp.cumsum(
-        jax.random.uniform(jax.random.PRNGKey(0), (n,), minval=0.6, maxval=1.4)
-    )
-    x = jax.random.normal(jax.random.PRNGKey(1), (n,))
-    X = jax.random.normal(jax.random.PRNGKey(2), (n, 3))
-
-    for t in (uniform, nonuniform):
-        metric = metric_from_state_space(
-            t, *matern_state_space(sigma, ell, nu), nugget=nugget, parallel=parallel
-        )
-        # Pin full matmul precision so the dense float32 references are
-        # comparable to the scan-based callbacks (TF32 on Ampere GPUs).
-        with jax.default_matmul_precision("highest"):
-            K = dense_matern_gram(t, sigma, ell, nu) + nugget * jnp.eye(n)
-            K_inv = jnp.linalg.inv(K)
-
-            assert jnp.allclose(metric.solve(x), K_inv @ x, rtol=1e-4, atol=1e-4)
-            assert jnp.allclose(metric.solve(X), K_inv @ X, rtol=1e-4, atol=1e-4)
-            assert jnp.allclose(
-                metric.norm(x), jnp.sqrt(x @ K @ x), rtol=1e-4, atol=1e-4
-            )
-            S = metric.inv_sqrt(jnp.eye(n))
-            assert jnp.allclose(S @ S.T, K_inv, rtol=1e-3, atol=1e-4)
-            assert jnp.allclose(
-                metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-4
-            )
-            # The implicit-AD fallback literally computes this identity.
-            assert jnp.allclose(
-                metric.solve(X),
-                metric.inv_sqrt(metric.inv_sqrt_transpose(X)),
-                rtol=1e-4,
-                atol=1e-5,
-            )
-
-
-@pytest.mark.parametrize("parallel", [False, True])
-def test_metric_from_quasiseparable_rank1_matches_dense(parallel):
-    # Rank-1 exponential generators reproduce the AR(1) Gram rho^|i-j|.
-    n, rho = 40, 0.7
-    d = jnp.ones(n)
-    p = jnp.full((n, 1), rho)
-    q = jnp.ones((n, 1))
-    A = jnp.full((n, 1, 1), rho)
-    metric = metric_from_quasiseparable(d, p, q, A, parallel=parallel)
-
-    idx = jnp.arange(n)
-    K = rho ** jnp.abs(idx[:, None] - idx[None, :])
-    x = jax.random.normal(jax.random.PRNGKey(3), (n,))
-    X = jax.random.normal(jax.random.PRNGKey(4), (n, 3))
-
-    with jax.default_matmul_precision("highest"):
-        K_inv = jnp.linalg.inv(K)
-        assert jnp.allclose(metric.solve(x), K_inv @ x, rtol=1e-4, atol=1e-4)
-        assert jnp.allclose(metric.solve(X), K_inv @ X, rtol=1e-4, atol=1e-4)
-        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ K @ x), rtol=1e-4, atol=1e-4)
-        S = metric.inv_sqrt(jnp.eye(n))
-        assert jnp.allclose(S @ S.T, K_inv, rtol=1e-3, atol=1e-4)
-        assert jnp.allclose(
-            metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-4
-        )
-
-
-@pytest.mark.parametrize("parallel", [False, True])
-def test_metric_from_quasiseparable_noncommuting_generators_match_dense(parallel):
-    # m=1 generators commute and cannot catch product-order, A[k]-vs-A[k+1],
-    # or transpose mistakes; hand-built noncommuting m=2 transitions can.
-    n, m = 12, 2
-    thetas = jnp.linspace(0.3, 2.4, n)
-    scales = jnp.stack(
-        [0.9 - 0.4 * jnp.linspace(0.0, 1.0, n), 0.5 + 0.3 * jnp.linspace(0.0, 1.0, n)],
-        axis=-1,
-    )
-    cos, sin = jnp.cos(thetas), jnp.sin(thetas)
-    rotations = jnp.stack(
-        [jnp.stack([cos, -sin], axis=-1), jnp.stack([sin, cos], axis=-1)], axis=-2
-    )
-    A = rotations * scales[:, None, :]
-    p = 0.4 * jax.random.normal(jax.random.PRNGKey(5), (n, m))
-    q = 0.4 * jax.random.normal(jax.random.PRNGKey(6), (n, m))
-    d = 5.0 * jnp.ones(n)
-
-    K = dense_from_quasiseparable_generators(d, p, q, A)
-    assert jnp.all(jnp.linalg.eigvalsh(K) > 0)
-    metric = metric_from_quasiseparable(d, p, q, A, parallel=parallel)
-
-    x = jax.random.normal(jax.random.PRNGKey(7), (n,))
-    X = jax.random.normal(jax.random.PRNGKey(8), (n, 3))
-    with jax.default_matmul_precision("highest"):
-        K_inv = jnp.linalg.inv(K)
-        assert jnp.allclose(metric.solve(x), K_inv @ x, rtol=1e-4, atol=1e-5)
-        assert jnp.allclose(metric.solve(X), K_inv @ X, rtol=1e-4, atol=1e-5)
-        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ K @ x), rtol=1e-4, atol=1e-5)
-        S = metric.inv_sqrt(jnp.eye(n))
-        assert jnp.allclose(S @ S.T, K_inv, rtol=1e-3, atol=1e-5)
-        assert jnp.allclose(
-            metric.inv_sqrt_transpose(jnp.eye(n)), S.T, rtol=1e-4, atol=1e-5
-        )
-
-
-def test_metric_from_state_space_matern_edge_cases():
-    # n=1: the metric is the scalar sigma^2 + nugget.
-    metric = metric_from_state_space(
-        jnp.array([0.5]), *matern_state_space(2.0, 1.0, 1.5)
-    )
-    x = jnp.array([3.0])
-    assert jnp.allclose(metric.solve(x), x / 4.0)
-    assert jnp.allclose(metric.norm(x), 6.0)
-    assert jnp.allclose(metric.inv_sqrt(x), x / 2.0)
-
-    # n=2, nugget=0 on a well-conditioned grid.
-    t2 = jnp.array([0.0, 1.0])
-    metric2 = metric_from_state_space(t2, *matern_state_space(1.3, 0.8, 2.5))
-    K2 = dense_matern_gram(t2, 1.3, 0.8, 2.5)
-    x2 = jnp.array([1.0, -2.0])
-    assert jnp.allclose(metric2.solve(x2), jnp.linalg.solve(K2, x2), rtol=1e-5)
-    assert jnp.allclose(metric2.norm(x2), jnp.sqrt(x2 @ K2 @ x2), rtol=1e-5)
-
-    # nu is static and validated eagerly.
-    with pytest.raises(ValueError, match="nu"):
-        metric_from_state_space(t2, *matern_state_space(1.0, 1.0, 2.0))
-    with pytest.raises(ValueError, match="1-D"):
-        metric_from_state_space(jnp.zeros((2, 2)), *matern_state_space(1.0, 1.0, 1.5))
-
-
-def test_metric_from_quasiseparable_shape_validation():
-    n, m = 4, 2
-    d = jnp.ones(n)
-    p = jnp.ones((n, m))
-    with pytest.raises(ValueError, match="d must"):
-        metric_from_quasiseparable(jnp.ones((n, 1)), p, p, jnp.ones((n, m, m)))
-    with pytest.raises(ValueError, match="p must"):
-        metric_from_quasiseparable(d, jnp.ones(n), p, jnp.ones((n, m, m)))
-    with pytest.raises(ValueError, match="q must"):
-        metric_from_quasiseparable(d, p, jnp.ones((n, m + 1)), jnp.ones((n, m, m)))
-
-
-def test_metric_from_state_space_matern_float32_default_is_stable():
-    # Long, stiff grid (spacing << ell) in float32: the parallel
-    # substitutions propagate rank-1-corrected transitions with no
-    # contraction guarantee, so the dtype-aware default must stay on the
-    # sequential path for float32 setups, on any backend.
-    n = 5000
-    t = jnp.linspace(0.0, 5.0, n, dtype=jnp.float32)
-    metric = metric_from_state_space(t, *matern_state_space(1.0, 1.0, 2.5), nugget=1e-4)
-    assert bool(jnp.all(jnp.isfinite(metric.inv_sqrt(jnp.ones(n, jnp.float32)))))
-    assert bool(jnp.all(jnp.isfinite(metric.solve(jnp.ones(n, jnp.float32)))))
-
-
-def test_metric_from_state_space_matern_hyperparameter_grad_matches_dense():
-    # The metric is constructed INSIDE jax.grad (and jax.jit(jax.grad)) from
-    # traced (sigma, ell) — the downstream sweep pattern — and the gradient
-    # must match the dense-metric gradient.
-    n = 60
-    t = jnp.cumsum(
-        jax.random.uniform(jax.random.PRNGKey(9), (n,), minval=0.6, maxval=1.4)
-    )
-    v = jax.random.normal(jax.random.PRNGKey(10), (n,))
-    nugget = 1e-6
-
-    def loss_qsm(params):
-        sigma, ell = params
-        metric = metric_from_state_space(
-            t, *matern_state_space(sigma, ell, 1.5), nugget=nugget
-        )
-        return v @ metric.solve(v)
-
-    def loss_dense(params):
-        sigma, ell = params
-        K = dense_matern_gram(t, sigma, ell, 1.5) + nugget * jnp.eye(n)
-        return v @ jnp.linalg.solve(K, v)
-
-    params = jnp.array([1.3, 0.8])
-    with jax.default_matmul_precision("highest"):
-        grad_qsm = jax.grad(loss_qsm)(params)
-        grad_jit = jax.jit(jax.grad(loss_qsm))(params)
-        grad_dense = jax.grad(loss_dense)(params)
-    assert jnp.allclose(grad_qsm, grad_dense, rtol=1e-2)
-    assert jnp.allclose(grad_jit, grad_qsm, rtol=1e-4)
-
-
-def test_metric_from_state_space_matern_small_pivot_grad_is_finite():
-    # Nugget-free stiff grid drives the Schur pivots small; the gradient
-    # through the Cholesky square roots must stay finite there (sqrt has an
-    # AD blowup exactly at zero, so the pivots must not underflow — a truly
-    # degenerate nugget-free grid NaNs, as documented).
-    n = 30
-    t = 0.3 * jnp.arange(n)
-
-    def loss(ell):
-        metric = metric_from_state_space(t, *matern_state_space(1.0, ell, 2.5))
-        return jnp.sum(metric.inv_sqrt_transpose(jnp.ones(n)) ** 2)
-
-    grad = jax.grad(loss)(jnp.asarray(1.0))
-    assert bool(jnp.isfinite(grad))
-
-
-@pytest.mark.parametrize("linear_solver", ["gram_cholesky", "qr", "augmented_qr"])
-def test_metric_from_state_space_matern_matches_dense_metric_in_solver(linear_solver):
-    # End-to-end: the O(n) Matern metric drives the actual solver (and its
-    # implicit derivative) to the same solution as the equivalent dense
-    # metric.
-    n = 8
-    t = jnp.arange(n) * 1.0
-    sigma, ell, nugget = 1.3, 0.8, 1e-6
-    K = dense_matern_gram(t, sigma, ell, 1.5) + nugget * jnp.eye(n)
-    matern = metric_from_state_space(
-        t, *matern_state_space(sigma, ell, 1.5), nugget=nugget
-    )
-    dense = metric_from_cholesky(jnp.linalg.cholesky(K))
-
-    A = jnp.stack([jnp.ones(n), jnp.arange(n, dtype=jnp.float32)])
-
-    def residual(theta, _, p):
-        return A @ theta - jnp.array([p, 0.5 * p])
-
-    solver_kwargs = {"init_damping": 1e-2, "linear_solver": linear_solver}
-
-    def solved_x(metric, p):
-        solver = LevenbergMarquardt(residual, metric=metric, **solver_kwargs)
-        return solver.solve(jnp.zeros(n), p=p, max_steps=60, atol=1e-6).x
-
-    p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
-    x_qsm, x_qsm_dot = jax.jvp(lambda s: solved_x(matern, s), (p,), (p_dot,))
-    x_dense, x_dense_dot = jax.jvp(lambda s: solved_x(dense, s), (p,), (p_dot,))
-
-    assert jnp.allclose(A @ x_qsm, jnp.array([p, 0.5 * p]), atol=1e-4)
-    assert jnp.allclose(x_qsm, x_dense, atol=1e-4)
-    assert jnp.allclose(x_qsm_dot, x_dense_dot, atol=1e-4)
-
-    x_bar = jnp.linspace(-1.0, 1.0, n)
-    _, qsm_pullback = jax.vjp(lambda s: solved_x(matern, s), p)
-    _, dense_pullback = jax.vjp(lambda s: solved_x(dense, s), p)
-    assert jnp.allclose(qsm_pullback(x_bar)[0], dense_pullback(x_bar)[0], atol=1e-4)
-
-
-def test_metric_from_state_space_matern_cg_and_preconditioner_smoke():
-    # cg exercises metric.solve under jax.linear_transpose, and the
-    # Sherman-Morrison preconditioner built from metric.solve is the
-    # downstream consumption shape.
-    n = 8
-    t = jnp.arange(n) * 1.0
-    metric = metric_from_state_space(t, *matern_state_space(1.3, 0.8, 1.5), nugget=1e-6)
-
-    A = jnp.stack([jnp.ones(n), jnp.arange(n, dtype=jnp.float32)])
-
-    def residual(theta, _, p):
-        return A @ theta - jnp.array([2.0, 1.0])
-
-    solver = LevenbergMarquardt(
-        residual,
-        init_damping=1e-2,
-        linear_solver="gram_cg",
-        dual_preconditioner=identity_preconditioner(),
-        ad_solver_preconditioner=identity_preconditioner(),
-        iterative_tol=1e-10,
-        iterative_maxiter=50,
-        metric=metric,
-    )
-    result = solver.solve(jnp.zeros(n), max_steps=60, atol=1e-5)
-    assert int(result.status) == LMStatus.CONVERGED
-    assert jnp.allclose(A @ result.x, jnp.array([2.0, 1.0]), atol=1e-4)
-
-    K = dense_matern_gram(t, 1.3, 0.8, 1.5) + 1e-6 * jnp.eye(n)
-    u, weight = jnp.ones(n), 50.0
-    preconditioner = sherman_morrison_preconditioner(metric.solve, u, weight)
-    B = K + weight * jnp.outer(u, u)
-    v = jax.random.normal(jax.random.PRNGKey(11), (n,))
-    assert jnp.allclose(
-        preconditioner(v, 0.0), jnp.linalg.solve(B, v), rtol=1e-3, atol=1e-3
-    )
-
-
-def shifted_composite_metric(kernel_block, n, k, eps):
-    return blockdiag_metric(
-        [(kernel_block, n), (metric_from_diagonal(eps * jnp.ones(k)), k)]
-    )
-
-
-def test_metric_from_shifted_matvec_matches_dense_metric():
-    n, shift = 30, 0.5
-    t = jnp.arange(n) * 1.0
-    K = dense_matern_gram(t, 1.3, 0.8, 2.5)
-    metric = metric_from_shifted_matvec(lambda x: K @ x, shift, tol=1e-6)
-    x = jax.random.normal(jax.random.PRNGKey(20), (n,))
-    X = jax.random.normal(jax.random.PRNGKey(21), (n, 3))
-
-    with jax.default_matmul_precision("highest"):
-        K_shifted = K + shift * jnp.eye(n)
-        assert jnp.allclose(
-            metric.solve(x), jnp.linalg.solve(K_shifted, x), rtol=1e-4, atol=1e-4
-        )
-        assert jnp.allclose(
-            metric.solve(X), jnp.linalg.solve(K_shifted, X), rtol=1e-4, atol=1e-4
-        )
-        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ K_shifted @ x), rtol=1e-4)
-        # The default tolerance (sqrt of machine eps) also solves correctly,
-        # just less tightly.
-        default_metric = metric_from_shifted_matvec(lambda v: K @ v, shift)
-        assert jnp.allclose(
-            default_metric.solve(x), jnp.linalg.solve(K_shifted, x), rtol=1e-2
-        )
-    assert metric.inv_sqrt is None
-    assert metric.inv_sqrt_transpose is None
-
-
-def test_metric_from_shifted_matvec_solves_ill_conditioned_kernel():
-    # Nugget-free fine-grid Matern-5/2 Gram: numerically singular K, but the
-    # shift floors the spectrum so the iterative solve still matches the
-    # dense shifted factorization -- the floor is the point.
-    n, shift = 120, 1e-2
-    t = 0.05 * jnp.arange(n)
-    K = dense_matern_gram(t, 1.0, 0.8, 2.5)
-    metric = metric_from_shifted_matvec(lambda x: K @ x, shift, tol=1e-6)
-    x = jax.random.normal(jax.random.PRNGKey(22), (n,))
-
-    with jax.default_matmul_precision("highest"):
-        expected = jnp.linalg.solve(K + shift * jnp.eye(n), x)
-        assert jnp.allclose(metric.solve(x), expected, rtol=1e-2, atol=1e-3)
-
-
-def test_metric_from_shifted_matvec_validation_and_solver_requirements():
-    for bad_shift in (0.0, -1.0):
-        with pytest.raises(ValueError, match="shift"):
-            metric_from_shifted_matvec(lambda x: x, bad_shift)
-    with pytest.raises(ValueError, match="tol"):
-        metric_from_shifted_matvec(lambda x: x, 1.0, tol=-1.0)
-    with pytest.raises(ValueError, match="atol"):
-        metric_from_shifted_matvec(lambda x: x, 1.0, atol=-1.0)
-    with pytest.raises(ValueError, match="maxiter"):
-        metric_from_shifted_matvec(lambda x: x, 1.0, maxiter=0)
-
-    metric = metric_from_shifted_matvec(lambda x: 2.0 * x, 1.0)
-    with pytest.raises(ValueError, match="inv_sqrt"):
-        LevenbergMarquardt(residual_fn, linear_solver="qr", metric=metric)
-    # A whitening AD rule rejects a solve-only metric. Auto cannot decide at
-    # construction: a square residual selects direct, which does not use the
-    # metric, while a nonsquare residual selects a whitening rule at trace time.
-    with pytest.raises(ValueError, match="inv_sqrt"):
-        LevenbergMarquardt(residual_fn, metric=metric, ad_solver="svd")
-    LevenbergMarquardt(residual_fn, metric=metric)
-    LevenbergMarquardt(
-        residual_fn,
-        linear_solver="gram_cg",
-        metric=metric,
-        dual_preconditioner=identity_preconditioner(),
-        ad_solver_preconditioner=identity_preconditioner(),
-    )
-    # norm is provided, so geodesic acceleration accepts this metric.
-    LevenbergMarquardt(
-        residual_fn,
-        metric=metric,
-        geodesic_acceleration=True,
-        ad_solver="gram_cg",
-        ad_solver_preconditioner=identity_preconditioner(),
-    )
-
-
-@pytest.mark.parametrize("kernel_block", ["dense", "state_space", "matvec"])
-def test_shifted_blockdiag_metric_matches_dense_metric(kernel_block):
-    # The three representations of blockdiag(K, 0) + eps I are
-    # interchangeable and match the dense factorization of the full M.
-    n, k, eps = 24, 2, 1e-2
-    t = jnp.arange(n) * 1.0
-    sigma, ell = 1.3, 0.8
-    K = dense_matern_gram(t, sigma, ell, 2.5)
-    if kernel_block == "dense":
-        block = metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n)))
-    elif kernel_block == "state_space":
-        block = metric_from_state_space(
-            t, *matern_state_space(sigma, ell, 2.5), nugget=eps
-        )
-    else:
-        block = metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-6)
-    metric = shifted_composite_metric(block, n, k, eps)
-
-    M = jnp.block(
-        [
-            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
-            [jnp.zeros((k, n)), eps * jnp.eye(k)],
-        ]
-    )
-    x = jax.random.normal(jax.random.PRNGKey(23), (n + k,))
-    X = jax.random.normal(jax.random.PRNGKey(24), (n + k, 3))
-    with jax.default_matmul_precision("highest"):
-        assert jnp.allclose(
-            metric.solve(x), jnp.linalg.solve(M, x), rtol=1e-3, atol=1e-4
-        )
-        assert jnp.allclose(
-            metric.solve(X), jnp.linalg.solve(M, X), rtol=1e-3, atol=1e-4
-        )
-        assert jnp.allclose(metric.norm(x), jnp.sqrt(x @ M @ x), rtol=1e-4)
-        if kernel_block == "matvec":
-            assert metric.inv_sqrt is None
-            assert metric.inv_sqrt_transpose is None
-        else:
-            S = metric.inv_sqrt(jnp.eye(n + k))
-            assert jnp.allclose(S @ S.T, jnp.linalg.inv(M), rtol=1e-3, atol=1e-4)
-
-
-SHIFTED_STEP_CASES = [
-    ("dense", "gram_cholesky"),
-    ("dense", "qr"),
-    ("dense", "gram_cg"),
-    ("state_space", "gram_cholesky"),
-    ("state_space", "qr"),
-    ("state_space", "gram_cg"),
-    ("matvec", "gram_cholesky"),
-    ("matvec", "gram_cg"),
-]
-
-
-@pytest.mark.parametrize("kernel_block,linear_solver", SHIFTED_STEP_CASES)
-def test_shifted_metric_step_matches_closed_form_across_solvers(
-    kernel_block, linear_solver
+@pytest.mark.parametrize("zero_pad_size", [0, 2])
+def test_repeated_shifted_state_space_metric_matches_explicit_matrix(
+    nu, parallel, zero_pad_size
 ):
-    n, k, eps = 12, 2, 1e-2
-    t = jnp.arange(n) * 1.0
-    sigma, ell = 1.3, 0.8
-    K = dense_matern_gram(t, sigma, ell, 2.5)
-    if kernel_block == "dense":
-        block = metric_from_cholesky(jnp.linalg.cholesky(K + eps * jnp.eye(n)))
-    elif kernel_block == "state_space":
-        block = metric_from_state_space(
-            t, *matern_state_space(sigma, ell, 2.5), nugget=eps
+    n, repeats = 18, 3
+    t = jnp.cumsum(
+        jax.random.uniform(jax.random.PRNGKey(2), (n,), minval=0.6, maxval=1.4)
+    )
+    sigma, ell, epsilon = 1.3, 0.8, 0.05
+    K = dense_matern_gram(t, sigma, ell, nu)
+    metric = repeated_shifted_state_space_metric(
+        t,
+        *matern_state_space(sigma, ell, nu),
+        repeats=repeats,
+        zero_pad_size=zero_pad_size,
+        epsilon=epsilon,
+        parallel=parallel,
+    )
+    M = repeated_shifted_matrix(K, repeats, zero_pad_size, epsilon)
+    assert_metric_matches_dense(metric, M, jax.random.PRNGKey(3))
+
+
+def test_repeated_shifted_metric_validation_and_callback_shapes():
+    K = jnp.eye(3)
+    for repeats in (0, -1, True):
+        with pytest.raises(ValueError, match="repeats"):
+            repeated_shifted_dense_metric(
+                K, repeats=repeats, zero_pad_size=0, epsilon=0.1
+            )
+    for zero_pad_size in (-1, True):
+        with pytest.raises(ValueError, match="zero_pad_size"):
+            repeated_shifted_dense_metric(
+                K, repeats=1, zero_pad_size=zero_pad_size, epsilon=0.1
+            )
+    with pytest.raises(ValueError, match="nonempty square"):
+        repeated_shifted_dense_metric(
+            jnp.zeros((0, 0)), repeats=1, zero_pad_size=0, epsilon=0.1
         )
-    else:
-        block = metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-8)
-    metric = shifted_composite_metric(block, n, k, eps)
-    M = jnp.block(
-        [
-            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
-            [jnp.zeros((k, n)), eps * jnp.eye(k)],
-        ]
+    with pytest.raises(ValueError, match="nonempty square"):
+        repeated_shifted_dense_metric(
+            jnp.zeros((2, 3)), repeats=1, zero_pad_size=0, epsilon=0.1
+        )
+    with pytest.raises(ValueError, match="scalar"):
+        repeated_shifted_dense_metric(
+            K, repeats=1, zero_pad_size=0, epsilon=jnp.ones(2)
+        )
+    with pytest.raises(ValueError, match="positive"):
+        repeated_shifted_dense_metric(K, repeats=1, zero_pad_size=0, epsilon=0.0)
+    with pytest.raises(ValueError, match="nonempty 1-D"):
+        repeated_shifted_state_space_metric(
+            jnp.zeros((2, 2)),
+            *matern_state_space(1.0, 1.0, 1.5),
+            repeats=1,
+            zero_pad_size=0,
+            epsilon=0.1,
+        )
+    with pytest.raises(ValueError, match="positive"):
+        repeated_shifted_state_space_metric(
+            jnp.arange(3.0),
+            *matern_state_space(1.0, 1.0, 1.5),
+            repeats=1,
+            zero_pad_size=0,
+            epsilon=0.0,
+        )
+    with pytest.raises(ValueError, match="scalars"):
+        matern_state_space(jnp.ones(2), 1.0, 1.5)
+    unordered_metric = repeated_shifted_state_space_metric(
+        jnp.array([0.0, 2.0, 1.0]),
+        *matern_state_space(1.0, 1.0, 1.5),
+        repeats=1,
+        zero_pad_size=0,
+        epsilon=0.1,
+    )
+    assert bool(jnp.all(jnp.isnan(unordered_metric.solve(jnp.ones(3)))))
+
+    metric = repeated_shifted_dense_metric(K, repeats=2, zero_pad_size=1, epsilon=0.1)
+    with pytest.raises(ValueError, match="leading size"):
+        metric.solve(jnp.ones(3))
+    with pytest.raises(ValueError, match="vector or matrix"):
+        metric.solve(jnp.ones((7, 1, 1)))
+    with pytest.raises(ValueError, match="requires a vector"):
+        metric.norm(jnp.ones((7, 1)))
+
+
+def test_repeated_shifted_dense_metric_supports_traced_epsilon():
+    K = jnp.array([[1.5, 0.2], [0.2, 1.0]])
+    repeats, zero_pad_size = 2, 1
+    v = jnp.arange(1.0, repeats * K.shape[0] + zero_pad_size + 1.0)
+
+    def structured_loss(epsilon):
+        metric = repeated_shifted_dense_metric(
+            K,
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=epsilon,
+        )
+        return v @ metric.solve(v) + metric.norm(v)
+
+    def dense_loss(epsilon):
+        M = repeated_shifted_matrix(K, repeats, zero_pad_size, epsilon)
+        return v @ jnp.linalg.solve(M, v) + jnp.sqrt(v @ M @ v)
+
+    epsilon = jnp.asarray(0.2)
+    assert jnp.allclose(jax.jit(structured_loss)(epsilon), dense_loss(epsilon))
+    assert jnp.allclose(
+        jax.jit(jax.grad(structured_loss))(epsilon),
+        jax.grad(dense_loss)(epsilon),
+        rtol=2e-4,
+        atol=2e-4,
     )
 
-    A = jax.random.normal(jax.random.PRNGKey(25), (3, n + k))
-    b = jnp.array([1.0, -0.5, 2.0])
+    @jax.jit
+    def invalid_solve(invalid_epsilon):
+        invalid_metric = repeated_shifted_dense_metric(
+            K,
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=invalid_epsilon,
+        )
+        return invalid_metric.solve(v)
 
-    def residual(theta, _, p):
-        return A @ theta - b
+    assert bool(jnp.all(jnp.isnan(invalid_solve(jnp.asarray(-0.1)))))
 
-    damping = 1e-2
-    preconditioner_kwargs = (
-        {
+
+def test_repeated_shifted_state_space_hyperparameter_grad_matches_dense():
+    n, repeats, zero_pad_size = 16, 2, 1
+    t = jnp.cumsum(
+        jax.random.uniform(jax.random.PRNGKey(4), (n,), minval=0.6, maxval=1.4)
+    )
+    v = jax.random.normal(jax.random.PRNGKey(5), (repeats * n + zero_pad_size,))
+
+    def structured_loss(params):
+        sigma, ell, epsilon = params
+        metric = repeated_shifted_state_space_metric(
+            t,
+            *matern_state_space(sigma, ell, 1.5),
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=epsilon,
+        )
+        return v @ metric.solve(v) + metric.norm(v)
+
+    def dense_loss(params):
+        sigma, ell, epsilon = params
+        K = dense_matern_gram(t, sigma, ell, 1.5)
+        M = repeated_shifted_matrix(K, repeats, zero_pad_size, epsilon)
+        return v @ jnp.linalg.solve(M, v) + jnp.sqrt(v @ M @ v)
+
+    params = jnp.array([1.3, 0.8, 0.05])
+    with jax.default_matmul_precision("highest"):
+        structured_grad = jax.jit(jax.grad(structured_loss))(params)
+        dense_grad = jax.grad(dense_loss)(params)
+    assert jnp.allclose(structured_grad, dense_grad, rtol=3e-3, atol=3e-3)
+    assert bool(jnp.isnan(jax.jit(structured_loss)(params.at[2].set(-params[2]))))
+
+
+def test_repeated_shifted_state_space_float32_default_is_stable():
+    n, repeats = 1000, 2
+    t = jnp.linspace(0.0, 5.0, n, dtype=jnp.float32)
+    metric = repeated_shifted_state_space_metric(
+        t,
+        *matern_state_space(1.0, 1.0, 2.5),
+        repeats=repeats,
+        zero_pad_size=1,
+        epsilon=1e-4,
+    )
+    x = jnp.ones(repeats * n + 1, dtype=jnp.float32)
+    assert bool(jnp.all(jnp.isfinite(metric.inv_sqrt(x))))
+    assert bool(jnp.all(jnp.isfinite(metric.solve(x))))
+
+
+def shifted_solver_kwargs(linear_solver):
+    if linear_solver == "gram_cg":
+        return {
             "dual_preconditioner": identity_preconditioner(),
             "ad_solver_preconditioner": identity_preconditioner(),
         }
-        if linear_solver == "gram_cg"
-        else {}
-    )
-    if metric.inv_sqrt is None:
-        # A solve-only metric cannot serve the SVD AD method (it whitens):
-        # pin the gram_cg AD solve.
-        preconditioner_kwargs["ad_solver"] = "gram_cg"
-        preconditioner_kwargs.setdefault(
-            "ad_solver_preconditioner", identity_preconditioner()
+    if linear_solver == "normal_cg":
+        return {
+            "normal_preconditioner": identity_preconditioner(),
+            "ad_solver_preconditioner": identity_preconditioner(),
+        }
+    return {}
+
+
+@pytest.mark.parametrize("metric_kind", ["dense", "state_space"])
+@pytest.mark.parametrize(
+    "linear_solver",
+    [
+        "auto",
+        "gram_cholesky",
+        "normal_cholesky",
+        "qr",
+        "augmented_qr",
+        "gram_cg",
+        "normal_cg",
+        "lsmr",
+    ],
+)
+def test_repeated_shifted_metric_step_matches_closed_form(metric_kind, linear_solver):
+    n, repeats, zero_pad_size, epsilon = 4, 2, 1, 0.2
+    t = jnp.arange(n, dtype=jnp.float32)
+    K = dense_matern_gram(t, 1.2, 0.9, 1.5)
+    if metric_kind == "dense":
+        metric = repeated_shifted_dense_metric(
+            K,
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=epsilon,
         )
+    else:
+        metric = repeated_shifted_state_space_metric(
+            t,
+            *matern_state_space(1.2, 0.9, 1.5),
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=epsilon,
+        )
+    M = repeated_shifted_matrix(K, repeats, zero_pad_size, epsilon)
+    total = M.shape[0]
+    A = jax.random.normal(jax.random.PRNGKey(6), (3, total))
+    b = jnp.array([1.0, -0.5, 2.0])
+
+    def residual(theta):
+        return A @ theta - b
+
+    damping = 0.1
     solver = LevenbergMarquardt(
         residual,
         init_damping=damping,
         linear_solver=linear_solver,
-        geodesic_acceleration=False,
         metric=metric,
-        iterative_tol=1e-8,
+        geodesic_acceleration=False,
+        iterative_tol=1e-7,
         iterative_maxiter=500,
-        **preconditioner_kwargs,
+        **shifted_solver_kwargs(linear_solver),
     )
-    x0 = jnp.zeros(n + k)
-    x1, _, info = solver.update(x0, solver.init(x0, None))
+    x0 = jnp.zeros(total)
+    x1, _, info = solver.update(x0, solver.init(x0))
+    expected = jnp.linalg.solve(A.T @ A + damping * M, A.T @ b)
     assert bool(info.accepted)
-
-    with jax.default_matmul_precision("highest"):
-        step = jnp.linalg.solve(A.T @ A + damping * M, A.T @ b)
-    assert jnp.allclose(x1, step, rtol=1e-3, atol=1e-4)
+    assert jnp.allclose(x1, expected, rtol=3e-3, atol=3e-3)
 
 
-def test_shifted_metric_implicit_jvp_and_vjp_match_dense():
-    # The matvec composite drives solve() and its implicit JVP/VJP to the
-    # same answers as the dense factorization of the full M -- exercising
-    # the inner CG on the (n, m) Jt inside the implicit rule and its
-    # differentiation.
-    n, k, eps = 10, 2, 1e-2
-    t = jnp.arange(n) * 1.0
-    K = dense_matern_gram(t, 1.3, 0.8, 2.5)
-    composite = shifted_composite_metric(
-        metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-8), n, k, eps
-    )
-    M = jnp.block(
-        [
-            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
-            [jnp.zeros((k, n)), eps * jnp.eye(k)],
-        ]
+def test_repeated_shifted_metric_geodesic_matches_explicit_dense_metric():
+    K = jnp.array([[1.5, 0.2], [0.2, 1.0]])
+    repeats, zero_pad_size, epsilon = 2, 1, 0.2
+    M = repeated_shifted_matrix(K, repeats, zero_pad_size, epsilon)
+    structured = repeated_shifted_dense_metric(
+        K,
+        repeats=repeats,
+        zero_pad_size=zero_pad_size,
+        epsilon=epsilon,
     )
     dense = metric_from_cholesky(jnp.linalg.cholesky(M))
 
-    A = jax.random.normal(jax.random.PRNGKey(26), (3, n + k))
+    def residual(theta):
+        return jnp.array([theta[0] ** 2 - 4.0, theta[1] ** 2 - 1.0, jnp.sum(theta[2:])])
+
+    def update(metric):
+        solver = LevenbergMarquardt(
+            residual,
+            init_damping=1e-3,
+            metric=metric,
+            geodesic_acceleration=True,
+            geodesic_acceptance_ratio=1.0,
+        )
+        x0 = jnp.array([1.9, 0.9, 0.1, -0.1, 0.2])
+        return solver.update(x0, solver.init(x0))
+
+    x_structured, _, info_structured = update(structured)
+    x_dense, _, info_dense = update(dense)
+    assert jnp.allclose(x_structured, x_dense, atol=1e-5)
+    assert jnp.allclose(
+        info_structured.acceleration_ratio,
+        info_dense.acceleration_ratio,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize("metric_kind", ["dense", "state_space"])
+@pytest.mark.parametrize("linear_solver", ["gram_cholesky", "qr"])
+def test_repeated_shifted_metric_implicit_jvp_and_vjp_match_dense(
+    metric_kind, linear_solver
+):
+    n, repeats, zero_pad_size, epsilon = 4, 2, 1, 0.2
+    t = jnp.arange(n, dtype=jnp.float32)
+    K = dense_matern_gram(t, 1.2, 0.9, 1.5)
+    M = repeated_shifted_matrix(K, repeats, zero_pad_size, epsilon)
+    if metric_kind == "dense":
+        metric = repeated_shifted_dense_metric(
+            K,
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=epsilon,
+        )
+    else:
+        metric = repeated_shifted_state_space_metric(
+            t,
+            *matern_state_space(1.2, 0.9, 1.5),
+            repeats=repeats,
+            zero_pad_size=zero_pad_size,
+            epsilon=epsilon,
+        )
+    dense = metric_from_cholesky(jnp.linalg.cholesky(M))
+    total = M.shape[0]
+    A = jax.random.normal(jax.random.PRNGKey(7), (3, total))
 
     def residual(theta, _, p):
-        return A @ theta - jnp.array([p, 0.5 * p, -p])
+        return A @ theta - p * jnp.array([1.0, 0.5, -1.0])
 
-    def solved_x(metric, linear_solver, p):
-        preconditioner_kwargs = (
-            {
-                "dual_preconditioner": identity_preconditioner(),
-                "ad_solver_preconditioner": identity_preconditioner(),
-            }
-            if linear_solver == "gram_cg"
-            else {}
-        )
-        if metric.inv_sqrt is None:
-            # Solve-only composite: SVD/QR whiten, so pin the
-            # gram_cg AD solve (metric.solve serves it exactly).
-            preconditioner_kwargs["ad_solver"] = "gram_cg"
-            preconditioner_kwargs.setdefault(
-                "ad_solver_preconditioner", identity_preconditioner()
-            )
-            preconditioner_kwargs["ad_solver_tol"] = 1e-8
+    def solved_x(chosen_metric, p):
         solver = LevenbergMarquardt(
             residual,
             init_damping=1e-2,
             linear_solver=linear_solver,
-            metric=metric,
-            iterative_tol=1e-8,
-            iterative_maxiter=500,
-            **preconditioner_kwargs,
+            metric=chosen_metric,
         )
-        return solver.solve(jnp.zeros(n + k), p=p, max_steps=80, atol=1e-6).x
+        return solver.solve(jnp.zeros(total), p=p, max_steps=60, atol=1e-6).x
 
     p, p_dot = jnp.asarray(2.0), jnp.asarray(1.0)
-    x_dense, x_dense_dot = jax.jvp(
-        lambda q: solved_x(dense, "gram_cholesky", q), (p,), (p_dot,)
+    x_value, x_dot = jax.jvp(lambda q: solved_x(metric, q), (p,), (p_dot,))
+    dense_value, dense_dot = jax.jvp(lambda q: solved_x(dense, q), (p,), (p_dot,))
+    assert jnp.allclose(x_value, dense_value, atol=2e-4)
+    assert jnp.allclose(x_dot, dense_dot, atol=2e-4)
+
+    x_bar = jnp.linspace(-1.0, 1.0, total)
+    _, pullback = jax.vjp(lambda q: solved_x(metric, q), p)
+    _, dense_pullback = jax.vjp(lambda q: solved_x(dense, q), p)
+    assert jnp.allclose(pullback(x_bar)[0], dense_pullback(x_bar)[0], atol=2e-4)
+
+
+def test_sherman_morrison_preconditioner_matches_dense_inverse():
+    n = 12
+    idx = jnp.arange(n)
+    A = 0.6 ** jnp.abs(idx[:, None] - idx[None, :])
+    L = jnp.linalg.cholesky(A)
+    u = jnp.ones(n)
+    weight = 50.0
+
+    preconditioner = sherman_morrison_preconditioner(
+        metric_from_cholesky(L).solve, u, weight
     )
-    for linear_solver in ("gram_cholesky", "gram_cg"):
-        x_m, x_m_dot = jax.jvp(
-            lambda q, ls=linear_solver: solved_x(composite, ls, q), (p,), (p_dot,)
-        )
-        assert jnp.allclose(x_m, x_dense, atol=1e-4)
-        assert jnp.allclose(x_m_dot, x_dense_dot, atol=1e-4)
+    P = A + weight * jnp.outer(u, u)
+    v = jax.random.normal(jax.random.PRNGKey(8), (n,))
 
-        x_bar = jnp.linspace(-1.0, 1.0, n + k)
-        _, pull_m = jax.vjp(lambda q, ls=linear_solver: solved_x(composite, ls, q), p)
-        _, pull_d = jax.vjp(lambda q: solved_x(dense, "gram_cholesky", q), p)
-        assert jnp.allclose(pull_m(x_bar)[0], pull_d(x_bar)[0], atol=1e-4)
-
-
-def test_metric_from_shifted_matvec_preconditioner_passthrough():
-    # An exact inverse as the inner preconditioner must give the same solve
-    # (pins the M= plumbing into the inner CG).
-    n, shift = 20, 0.5
-    t = jnp.arange(n) * 1.0
-    K = dense_matern_gram(t, 1.3, 0.8, 1.5)
-    K_shifted_inv = jnp.linalg.inv(K + shift * jnp.eye(n))
-    plain = metric_from_shifted_matvec(lambda x: K @ x, shift, tol=1e-6)
-    preconditioned = metric_from_shifted_matvec(
-        lambda x: K @ x, shift, tol=1e-6, preconditioner=lambda v: K_shifted_inv @ v
+    assert jnp.allclose(
+        preconditioner(v, 0.0), jnp.linalg.solve(P, v), rtol=1e-3, atol=1e-3
     )
-    x = jax.random.normal(jax.random.PRNGKey(27), (n,))
-    assert jnp.allclose(preconditioned.solve(x), plain.solve(x), rtol=1e-4, atol=1e-5)
 
 
 def test_woodbury_preconditioner_matches_dense_inverse():
@@ -4540,7 +3940,6 @@ def test_woodbury_preconditioner_matches_dense_inverse():
         preconditioner(v, 0.0), jnp.linalg.solve(B, v), rtol=1e-3, atol=1e-3
     )
 
-    # k=1 reduces exactly to Sherman-Morrison.
     rank1 = woodbury_preconditioner(solve, U[:, :1], weights[:1])
     sherman = sherman_morrison_preconditioner(solve, U[:, 0], weights[0])
     assert jnp.allclose(rank1(v, 0.0), sherman(v, 0.0), rtol=1e-5, atol=1e-6)
@@ -4550,17 +3949,11 @@ def test_woodbury_preconditioner_matches_dense_inverse():
 
 
 def test_cg_with_woodbury_spike_preconditioner_matches_cholesky_step():
-    # Unified-eps metric: the scalar block injects the exactly known rank-k
-    # spike (1/eps) J_beta J_beta' into the dual operator; preconditioning
-    # the cg linear_solver with its Woodbury inverse never changes the
-    # subproblem, so the step matches cholesky.
     n, k, eps = 16, 2, 1e-3
     t = jnp.arange(n) * 1.0
     K = dense_matern_gram(t, 1.3, 0.8, 1.5)
     K_shifted = K + eps * jnp.eye(n)
-    metric = shifted_composite_metric(
-        metric_from_cholesky(jnp.linalg.cholesky(K_shifted)), n, k, eps
-    )
+    metric = repeated_shifted_dense_metric(K, repeats=1, zero_pad_size=k, epsilon=eps)
 
     m = 8
     J_alpha = jax.random.normal(jax.random.PRNGKey(30), (m, n))
@@ -4571,7 +3964,6 @@ def test_cg_with_woodbury_spike_preconditioner_matches_cholesky_step():
     def residual(theta, _, p):
         return A @ theta - b
 
-    # Base = the kernel part of the dual operator, spike = the scalar block.
     base = J_alpha @ jnp.linalg.solve(K_shifted, J_alpha.T)
     base_solve = metric_from_cholesky(jnp.linalg.cholesky(base)).solve
     dual_preconditioner = woodbury_preconditioner(
@@ -4596,9 +3988,6 @@ def test_cg_with_woodbury_spike_preconditioner_matches_cholesky_step():
     x_cg, _, info_cg = cg_solver.update(x0, cg_solver.init(x0, None))
     x_ch, _, info_ch = cholesky_solver.update(x0, cholesky_solver.init(x0, None))
     assert bool(info_cg.accepted) and bool(info_ch.accepted)
-    # The 1/eps spike puts the dual condition number near the float32
-    # attainable-residual floor, so the two paths agree only to ~1e-3 and
-    # the exact gap varies across BLAS/SIMD variants.
     assert jnp.allclose(x_cg, x_ch, rtol=1e-2, atol=1e-3)
 
 
@@ -5027,25 +4416,16 @@ def test_padded_zero_residual_implicit_ad_is_singular_by_design():
     assert jnp.allclose(x_dot_default, x_plain_dot, atol=1e-4)
 
 
-def test_implicit_cg_with_shifted_matvec_metric_matches_dense():
-    # End-to-end matrix-free implicit AD: the cg implicit rule applies
-    # metric.solve to tangent-dependent data, and the VJP handles that
-    # through the self-adjoint declaration -- the cotangent pass
-    # re-EVALUATES the shifted-matvec metric's inner CG rather than
-    # transposing it (which JAX cannot do). Pin both derivative modes
-    # against the dense metric + dense implicit rule.
+def test_implicit_cg_with_repeated_shifted_dense_metric_matches_dense():
+    # The CG implicit rule applies the repeated metric solve to
+    # tangent-dependent data through its self-adjoint declaration.
     n, k, eps = 10, 2, 1e-2
     t = jnp.arange(n) * 1.0
     K = dense_matern_gram(t, 1.3, 0.8, 2.5)
-    composite = shifted_composite_metric(
-        metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-8), n, k, eps
+    composite = repeated_shifted_dense_metric(
+        K, repeats=1, zero_pad_size=k, epsilon=eps
     )
-    M = jnp.block(
-        [
-            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
-            [jnp.zeros((k, n)), eps * jnp.eye(k)],
-        ]
-    )
+    M = repeated_shifted_matrix(K, 1, k, eps)
     dense = metric_from_cholesky(jnp.linalg.cholesky(M))
 
     A = jax.random.normal(jax.random.PRNGKey(33), (3, n + k))
@@ -5081,8 +4461,7 @@ def test_implicit_cg_with_shifted_matvec_metric_matches_dense():
     )
     _, dense_pull = jax.vjp(lambda q: solved_x(dense, "gram_cholesky", "svd", q), p)
 
-    # cg implicit rule with the matvec metric, under both forward solvers
-    # (cholesky forward + cg implicit is the forced-"gram_cg" combination).
+    # Exercise the CG implicit rule under both dense and CG forward solves.
     for linear_solver in ("gram_cholesky", "gram_cg"):
         _, cg_dot = jax.jvp(
             lambda q, ls=linear_solver: solved_x(composite, ls, "gram_cg", q),
@@ -5106,9 +4485,7 @@ def test_implicit_cg_woodbury_preconditioner_with_shifted_metric():
     t = jnp.arange(n) * 1.0
     K = dense_matern_gram(t, 1.3, 0.8, 1.5)
     K_shifted = K + eps * jnp.eye(n)
-    metric = shifted_composite_metric(
-        metric_from_cholesky(jnp.linalg.cholesky(K_shifted)), n, k, eps
-    )
+    metric = repeated_shifted_dense_metric(K, repeats=1, zero_pad_size=k, epsilon=eps)
 
     m = 6
     J_alpha = jax.random.normal(jax.random.PRNGKey(34), (m, n))
@@ -5170,15 +4547,10 @@ def test_implicit_cg_vmap_and_hessian_match_dense():
     n, k, eps = 8, 2, 1e-2
     t = jnp.arange(n) * 1.0
     K = dense_matern_gram(t, 1.3, 0.8, 2.5)
-    composite = shifted_composite_metric(
-        metric_from_shifted_matvec(lambda x: K @ x, eps, tol=1e-8), n, k, eps
+    composite = repeated_shifted_dense_metric(
+        K, repeats=1, zero_pad_size=k, epsilon=eps
     )
-    M = jnp.block(
-        [
-            [K + eps * jnp.eye(n), jnp.zeros((n, k))],
-            [jnp.zeros((k, n)), eps * jnp.eye(k)],
-        ]
-    )
+    M = repeated_shifted_matrix(K, 1, k, eps)
     dense = metric_from_cholesky(jnp.linalg.cholesky(M))
 
     A = jax.random.normal(jax.random.PRNGKey(36), (3, n + k))

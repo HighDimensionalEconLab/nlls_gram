@@ -11,10 +11,9 @@ from nlls_gram import (
     Metric,
     MetricFactory,
     MultiStart,
-    blockdiag_metric,
     identity_preconditioner,
-    metric_from_cholesky,
     metric_from_diagonal,
+    repeated_shifted_dense_metric,
 )
 
 TS = jnp.linspace(0.0, 1.0, 5)
@@ -437,18 +436,16 @@ def test_factory_solves_do_not_retrace_on_new_aux_values():
     assert traces["count"] == count_after_first
 
 
-def test_factory_composes_with_blockdiag_and_cholesky_builders():
+def test_factory_builds_repeated_shifted_dense_metric():
     def residual(x, args, p):
         r = x["a"] * jnp.exp(x["b"] * TS) - p["target"]
-        L = jnp.linalg.cholesky(
-            jnp.diag(1.0 + x["a"] ** 2 + jnp.zeros(1)) + jnp.zeros((1, 1))
-        )
-        return r, {"L": L}
+        K = jnp.diag(1.0 + x["a"] ** 2 + jnp.zeros(1))
+        return r, {"K": K}
 
     factory = MetricFactory(
-        prepare=lambda x, args, p, aux: aux["L"],
-        build=lambda L: blockdiag_metric(
-            [(metric_from_cholesky(L), 1), (metric_from_diagonal(jnp.ones(1)), 1)]
+        prepare=lambda x, args, p, aux: aux["K"],
+        build=lambda K: repeated_shifted_dense_metric(
+            K, repeats=1, zero_pad_size=1, epsilon=1.0
         ),
     )
     solver = LevenbergMarquardt(residual, has_aux=True, metric_factory=factory)

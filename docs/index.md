@@ -154,9 +154,10 @@ limits, the spectral-filter view, and the kernel/RKHS metric choices.
 
 A custom positive-definite parameter-space metric is passed as a single
 `metric=Metric(...)` argument. See [Metrics](metrics.md) for the `Metric`
-callback contract and validation rules, the `metric_from_cholesky` helper,
-and dense and matrix-free examples. For a metric that depends on the current
-iterate or on residual aux outputs, pass a
+callback contract and validation rules. The public constructors cover dense,
+diagonal, and repeated shifted kernel metrics, including a structured
+state-space representation that does not materialize the kernel Gram. For a
+metric that depends on the current iterate or on residual aux outputs, pass a
 `metric_factory=MetricFactory(prepare, build)` instead — the state is
 rebuilt once per accepted step and `build` returns a plain `Metric`
 ([Iterate-Dependent Metrics](metrics.md#iterate-dependent-metrics-metricfactory)).
@@ -534,9 +535,8 @@ data.
   (`direct`, `svd`, `qr`, or `augmented_qr`).
 - **`metric_solve_dtype=jnp.float64`** sets the dtype the resolved metric
   callbacks *compute in*: the solver wraps the metric — a fixed `metric` or
-  a `metric_factory`'s built one, after `build` — with the
-  [`metric_with_compute_dtype`](utilities.md#compute-dtype-wrapper)
-  mechanics, so each callback upcasts its input, computes wide, and
+  a `metric_factory`'s built one, after `build` — so each callback upcasts its
+  input, computes wide, and
   restores the caller's dtype. `None` leaves the metric computing in
   whatever dtype the consuming solve hands it (float64 under
   `linear_solve_dtype`, the residual dtype otherwise). Kernel Gram
@@ -568,7 +568,7 @@ uv run --group benchmark --group gpu pytest \
   benchmarks/test_large_interpolation_benchmark.py --benchmark-only
 ```
 
-For the quasiseparable state-space (Matérn) metric applies and setup (sequential vs
+For the repeated state-space (Matérn) metric applies and setup (sequential vs
 parallel vs dense, n up to 1e5):
 
 ```bash
@@ -576,8 +576,8 @@ uv run --group benchmark --group gpu pytest \
   benchmarks/test_quasiseparable_benchmark.py --benchmark-only
 ```
 
-On CUDA machines, the optional GPU tests (including the quasiseparable
-metric check) are:
+On CUDA machines, the optional GPU tests (including the state-space metric
+check) are:
 
 ```bash
 uv run --group gpu pytest tests/test_gpu.py
@@ -600,19 +600,13 @@ narrower and focuses on underdetermined LM with explicit parameter-space metrics
 
 ::: nlls_gram.metric_from_cholesky
 
-::: nlls_gram.metric_from_tridiagonal_precision
-
-::: nlls_gram.metric_from_state_space
-
-::: nlls_gram.matern_state_space
-
-::: nlls_gram.metric_from_quasiseparable
-
-::: nlls_gram.metric_from_shifted_matvec
-
 ::: nlls_gram.metric_from_diagonal
 
-::: nlls_gram.blockdiag_metric
+::: nlls_gram.repeated_shifted_dense_metric
+
+::: nlls_gram.repeated_shifted_state_space_metric
+
+::: nlls_gram.matern_state_space
 
 ::: nlls_gram.sherman_morrison_preconditioner
 

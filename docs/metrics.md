@@ -18,6 +18,10 @@ Fields left as `None` (and `metric=None` itself) default to the identity
 metric. A fixed `Metric` closes over its data once, at construction; for a
 metric that depends on the current iterate or on residual aux outputs, see
 [Iterate-Dependent Metrics](#iterate-dependent-metrics-metricfactory) below.
+Construct a fixed metric once at problem-setup scope and reuse it. Rebuilding
+an equivalent closure creates new callable identities in the solver's static
+JIT key and therefore retraces; a persistent compilation cache can reuse the
+executable but does not remove that Python tracing work.
 
 Shape requirements:
 
@@ -89,10 +93,9 @@ L = jnp.linalg.cholesky(metric_matrix)
 metric = metric_from_cholesky(L)
 ```
 
-The helper returns a `Metric` with all four callbacks filled in. Further
-constructors — tridiagonal-precision, diagonal, and block-diagonal metrics,
-plus a Sherman–Morrison dual preconditioner — are collected in
-[Utilities](utilities.md).
+The helper returns a `Metric` with all four callbacks filled in. The diagonal
+and repeated shifted kernel constructors, plus the preconditioner helpers,
+are collected in [Utilities](utilities.md).
 
 ## Metric Example
 
@@ -117,40 +120,6 @@ solver = LevenbergMarquardt(
 )
 ```
 
-## Matrix-Free Metric Example
-
-For the Gram forms, the metric only needs `solve` (and `norm` for geodesic
-acceleration). `metric_from_shifted_matvec` builds \(M = A + \varepsilon I\)
-from a matvec alone, running an inner CG to a tight, dtype-aware tolerance:
-
-```python
-from nlls_gram import LevenbergMarquardt, metric_from_shifted_matvec
-
-solver = LevenbergMarquardt(
-    residual_fn,
-    init_damping=1e-2,
-    linear_solver="gram_cg",
-    metric=metric_from_shifted_matvec(kernel_matvec, eps),
-    dual_preconditioner=identity_preconditioner(),
-    ad_solver_preconditioner=identity_preconditioner(),
-)
-```
-
-It has no matrix-free square root, so it serves the Gram forms only
-(`gram_cholesky`, `gram_cg`) — on a square-to-tall problem pin one of them
-explicitly, since the default `auto` would resolve to `normal_cholesky` and
-reject the metric at trace time. The same constraint applies to the AD
-side: pair a nonsquare system with `ad_solver="gram_cg"` (the SVD/QR methods
-need the square-root pair). A square system under the default
-`ad_solver="auto"` resolves to `direct` and does not use the metric.
-
-This changes the LM damping metric. It is not a preconditioner for the inner CG
-iteration; it changes the step being solved for — which is why the inner
-solve must run to convergence (a truncated CG is not even a linear function
-of its input; never cap `maxiter` as a cost control). See
-[Utilities](utilities.md#unified-shifted-block-metrics) for the shift's
-role and the exactness caveat.
-
 ## Iterate-Dependent Metrics (MetricFactory)
 
 A fixed `Metric` freezes its data at construction. `MetricFactory` instead
@@ -166,10 +135,9 @@ rebuilds the metric from the live solve, through a value-hashable
   move, so the carried state is reused. Expensive setup — Gram assembly, a
   dense Cholesky — belongs here, where it is cached.
 - `build(state) -> Metric` assembles the metric from the prepared state,
-  once per `update` and before the inner iterative loops, so builder-internal
-  setup (e.g. the tridiagonal Cholesky scan) runs once per step rather than
-  per cg/lsmr iteration. Any `Metric`-returning builder or composition works
-  directly.
+  once per `update` and before the inner iterative loops, so factorization or
+  structured setup runs once per step rather than per CG/LSMR iteration. Any
+  `Metric`-returning builder works directly.
 
 The canonical use is a factor the residual passes back through its aux
 output — the residual computes it primally, the Jacobian never
@@ -199,15 +167,27 @@ solver = LevenbergMarquardt(
 ```
 
 `prepare` can equally compute from the iterate directly (no `has_aux`
-needed), and `build` can compose the structural constructors — a
-block-diagonal kernel-plus-ridge metric, a state-space Matérn metric on
-moving points, or `metric_with_compute_dtype` for a float64 metric state
-under a float32 residual:
+needed). For example, a moving state-space Matérn metric can rebuild its
+single structured factor from an ordered coordinate `t`:
 
 ```python
+import jax.numpy as jnp
+
+from nlls_gram import (
+    MetricFactory,
+    matern_state_space,
+    repeated_shifted_state_space_metric,
+)
+
 factory = MetricFactory(
-    prepare=lambda x, args, p, aux: jnp.sort(x["points"]),
-    build=lambda pts: metric_from_state_space(pts, h, Pinf, transition),
+    prepare=lambda x, args, p, aux: jnp.sort(x["t"]),
+    build=lambda t: repeated_shifted_state_space_metric(
+        t,
+        *matern_state_space(sigma, ell, nu=1.5),
+        repeats=3,
+        zero_pad_size=2,
+        epsilon=1e-8,
+    ),
 )
 ```
 
