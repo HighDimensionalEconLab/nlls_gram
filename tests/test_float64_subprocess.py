@@ -1714,3 +1714,126 @@ np.testing.assert_allclose(x_ridge, x_metric, atol=1e-6)
         text=True,
     )
     assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_ridge_whitener_float64_agreement_and_tiny_ridge_production():
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+import numpy as np
+
+from nlls_gram import (
+    LSMR,
+    QR,
+    Cholesky,
+    RidgeLevenbergMarquardt,
+    identity_right_preconditioner,
+    repeated_block_whitener,
+    repeated_dense_penalty,
+)
+
+rng = np.random.default_rng(3)
+m, block, repeats, pad = 5, 4, 2, 2
+p_dim = repeats * block + pad
+A = jnp.asarray(rng.normal(size=(m, p_dim)))
+b = jnp.asarray(rng.normal(size=m))
+root = rng.normal(size=(block, block + 2))
+K_np = root @ root.T + 0.5 * np.eye(block)
+K = jnp.asarray(K_np)
+x0 = jnp.asarray(rng.normal(size=p_dim))
+
+
+def residual(theta):
+    return A @ theta - b
+
+
+whitener = repeated_block_whitener(K, repeats=repeats, zero_pad_size=pad)
+SOLVER_CONFIGS = {
+    "cholesky": Cholesky(),
+    "qr": QR(),
+    "lsmr": LSMR(identity_right_preconditioner(), tol=1e-14, maxiter=None),
+}
+
+# Tight three-way whitened step agreement at small ridge/damping, and the
+# whitened compiled update stays float64 end to end.
+steps = {}
+for name, config in SOLVER_CONFIGS.items():
+    solver = RidgeLevenbergMarquardt(
+        residual,
+        penalty=whitener,
+        ridge=1e-8,
+        init_damping=1e-6,
+        geodesic_acceleration=False,
+        linear_solver=config,
+    )
+    lm_state = solver.init(x0)
+    x1, _, info = solver.update(x0, lm_state)
+    steps[name] = np.asarray(x1)
+    assert x1.dtype == jnp.float64
+    assert info.grad_norm.dtype == jnp.float64
+np.testing.assert_allclose(steps["cholesky"], steps["qr"], atol=1e-9)
+# The matrix-free path stops at its bidiagonalization truncation (~3e-9 on
+# this operator), not at direct-solve accuracy.
+np.testing.assert_allclose(steps["cholesky"], steps["lsmr"], atol=1e-8)
+
+chol_solver = RidgeLevenbergMarquardt(
+    residual, penalty=whitener, ridge=1e-8, geodesic_acceleration=False
+)
+jaxpr = str(
+    jax.make_jaxpr(lambda t, s: chol_solver.update(t, s))(x0, chol_solver.init(x0))
+)
+assert "f32" not in jaxpr, jaxpr
+
+# The production scenario this feature exists for: at TINY ridge the
+# whitened CHOLESKY solve matches the unwhitened QR solve (previously the
+# only accurate path there), at the cholesky path's per-step cost. gtol
+# follows the whitened calibration recipe c * ridge * sqrt(q(x*)); c = 1e-5
+# still sits far above the whitened stationarity noise floor here
+# (grad_norm flattens near 2e-16, the residual evaluation's own eps * ||b||
+# noise pulled back through J'), so both solves converge in ~30 steps and
+# meet at ~1e-7 -- while the NUMPY REFERENCE (a 1/ridge-conditioned normal
+# solve) is itself only ~1e-5 accurate, which sets the loose reference
+# tolerance below.
+M0 = np.zeros((p_dim, p_dim))
+for j in range(repeats):
+    M0[j * block : (j + 1) * block, j * block : (j + 1) * block] = K_np
+ridge = 1e-10
+A_np = np.asarray(A)
+x_ridge = np.linalg.solve(A_np.T @ A_np + ridge * M0, A_np.T @ np.asarray(b))
+sqrt_q = float(np.sqrt(x_ridge @ (M0 @ x_ridge)))
+whitened_chol = RidgeLevenbergMarquardt(residual, penalty=whitener, ridge=ridge)
+result_white = whitened_chol.solve(
+    jnp.zeros(p_dim), max_steps=400, gtol=1e-5 * ridge * sqrt_q
+)
+plain_qr = RidgeLevenbergMarquardt(
+    residual,
+    penalty=repeated_dense_penalty(K, repeats=repeats, zero_pad_size=pad),
+    ridge=ridge,
+    linear_solver=QR(),
+)
+grad_scale = float(np.linalg.norm(M0 @ x_ridge))
+result_qr = plain_qr.solve(
+    jnp.zeros(p_dim), max_steps=400, gtol=1e-5 * ridge * grad_scale
+)
+assert int(result_white.status) == 1
+assert int(result_qr.status) == 1
+np.testing.assert_allclose(np.asarray(result_white.x), x_ridge, rtol=1e-4, atol=1e-7)
+np.testing.assert_allclose(
+    np.asarray(result_white.x), np.asarray(result_qr.x), atol=1e-6
+)
+
+# Whitened gtol semantics: penalty_grad_norm reports sqrt(penalty_value) at
+# the converged iterate's pre-step x (both evaluated at x* here).
+info = result_white.info
+np.testing.assert_allclose(
+    float(info.penalty_grad_norm), sqrt_q, rtol=1e-4
+)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout

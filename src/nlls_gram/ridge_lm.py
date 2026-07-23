@@ -31,7 +31,7 @@ import numpy as np
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram.lsmr import lsmr_solve
-from nlls_gram.penalties import RidgePenalty
+from nlls_gram.penalties import RidgePenalty, Whitener
 from nlls_gram.solver_config import LSMR, QR, Auto, Cholesky, NormalCG
 from nlls_gram.utility import (
     LMHyperparams,
@@ -149,8 +149,14 @@ class RidgeLMState:
             structure is fixed by the static ``linear_solver`` config, or
             ``None`` when the path carries no cache (``LSMR``,
             ``cache_jacobian=False``).
-        penalty_state: reserved for a future ``penalty_factory``; ``None``.
-        penalty_valid: reserved for a future ``penalty_factory``; ``None``.
+        penalty_state: reserved for the future ``penalty_factory`` (adaptive
+            whitening): traced data a factory's ``prepare``/``build`` pair --
+            the :class:`~nlls_gram.MetricFactory` shape -- would turn into a
+            :class:`~nlls_gram.Whitener` per step. Always ``None`` today.
+        penalty_valid: reserved alongside ``penalty_state`` with the
+            ``jacobian_valid`` reject-reuse semantics; a state change is a
+            problem change (convergence suppressed, ridge-keyed caches
+            invalidated). Always ``None`` today.
     """
 
     damping: jax.Array
@@ -176,6 +182,14 @@ class RidgeLMInfo:
     report the accept/reject outcome of the step, while ``grad_norm``/
     ``step_norm``/``aux`` are evaluated at the PRE-step ``x``.
 
+    Under a :class:`~nlls_gram.Whitener` penalty the solver runs in the
+    whitened variable ``y = L_bar x`` and ``grad_norm``, ``step_norm``, and
+    ``penalty_grad_norm`` are the WHITENED (y-space) quantities -- the
+    algorithm's own stationarity and step; the per-field notes below state
+    both forms. Objective values (``loss``/``resid_loss``/``penalty_value``)
+    are unchanged: whitening is a pure linear bijection of the same
+    objective.
+
     Attributes:
         loss: ``min(loss_old, loss_candidate)`` ridge objective at the
             retained iterate.
@@ -192,7 +206,9 @@ class RidgeLMInfo:
         acceleration_ratio: ``()`` geodesic acceleration-to-velocity Euclidean
             norm ratio.
         grad_norm: ``()`` ``||J'r + ridge * L'L x||`` at the pre-step ``x`` --
-            the ridge stationarity residual, NOT ``||J'r||``.
+            the ridge stationarity residual, NOT ``||J'r||``. Whitened:
+            ``||L_bar^{-T} J'r + ridge * [y_head; 0]||``, the y-space
+            stationarity.
         penalty_grad_norm: ``()`` ``||L'L x||`` at the pre-step ``x`` -- the
             penalty-gradient scale, reported so ``gtol`` can be CALIBRATED
             instead of guessed: at a ridge minimizer the gradient is the
@@ -200,9 +216,13 @@ class RidgeLMInfo:
             < c * ridge * penalty_grad_norm`` resolves the null-space
             (selection) coordinates to ~``c`` relative accuracy. Run once,
             read ``ridge * penalty_grad_norm`` at convergence, set ``gtol``
-            about three orders below it.
+            about three orders below it. Whitened: ``||[y_head; 0]|| =
+            sqrt(penalty_value)``, so the recipe simplifies to
+            ``gtol ~ 1e-3 * ridge * sqrt(q(x))`` -- the solution's seminorm,
+            usually known to an order of magnitude before any pilot run.
         step_norm: ``()`` Euclidean ``||candidate step||``, reported even when
-            the step is rejected.
+            the step is rejected. Whitened: the y-space ``||delta_y||``
+            (``xtol`` therefore bounds the whitened step).
         aux: residual aux output at the pre-step ``x`` (``has_aux=True``).
     """
 
@@ -410,6 +430,27 @@ class RidgeLevenbergMarquardt:
       ``damping > 0`` subproblem is exactly the ``I``-damped problem for any
       right preconditioner (Bjorck 1996 Ch. 7).
 
+    Whitening: a :class:`~nlls_gram.Whitener` penalty (e.g.
+    :func:`~nlls_gram.repeated_block_whitener`) makes every path above run
+    the damped subproblem in the whitened variable ``y = L_bar x``, where
+    the penalty rows are the constant ``[I_k | 0]`` -- the ``linear_solver``
+    menu is unchanged, the whitener rides with the penalty. Whitening is a
+    pure linear bijection: same objective, same minimizers; only the LM
+    damping geometry changes (``mu ||delta_y||^2 = mu ||L_bar delta_x||^2``,
+    penalty-metric damping), so iterate paths differ while fixed-points
+    match digit for digit. The payoff is at deep ridge on ill-conditioned
+    penalties: the whitened normal matrix ``J~'J~ + ridge I_head`` has a
+    clean spectral floor at ``ridge``, so the default ``Cholesky()`` path
+    stays accurate where the unwhitened one needed ``QR()``, at the
+    cholesky path's per-step cost. The carried iterate stays ``x``
+    everywhere (init/solve/callbacks/histories/multi-start); ``y`` lives
+    inside ``update`` and the AD rule, and ``info.grad_norm`` /
+    ``step_norm`` / ``penalty_grad_norm`` (with ``gtol``/``xtol``) become
+    the whitened quantities -- see :class:`RidgeLMInfo`. The whitener's
+    factorization never involves the ridge weight, so continuation composes
+    unchanged; a right ``LSMR`` preconditioner composes on top (it changes
+    the iteration path, a whitener changes the damping geometry).
+
     Stopping (``solve``): a ridge solve has two phases -- the residual drops
     to its floor fast, then the iterate slides along the interpolation set
     resolving the null-space (selection) component while ``||r||`` stays
@@ -494,9 +535,13 @@ class RidgeLevenbergMarquardt:
         canonical_residual, residual_arity = canonicalize_residual(residual_fn)
         if penalty_factory is not None:
             raise NotImplementedError(
-                "penalty_factory is reserved for a future release (its contract "
-                "must restrict the factor to differentiation-inert data); pass "
-                "a fixed penalty"
+                "penalty_factory is reserved for a future release: its "
+                "documented contract is the MetricFactory prepare/build shape "
+                "producing a Whitener from traced, differentiation-inert "
+                "penalty_state (with penalty_valid reject-step reuse, and a "
+                "state change treated as a problem change -- the same "
+                "convergence-suppression/cache-invalidation machinery as a "
+                "callback ridge change); pass a fixed penalty"
             )
         if not isinstance(penalty, RidgePenalty):
             raise TypeError("penalty must be a RidgePenalty")
@@ -598,6 +643,16 @@ class RidgeLevenbergMarquardt:
         # Resolved penalty callbacks. The defaults derive from sqrt_apply, so
         # the objective's two penalty forms (||L x||^2 at the current iterate,
         # quadratic() at trial points) agree exactly.
+        # Whitened dispatch is a trace-time static: a Whitener penalty poses
+        # the whole damped subproblem on y = L_bar x (every factor use routed
+        # through the penalty's callbacks, so a future penalty_factory can
+        # swap them per state), while a plain penalty keeps the x-space
+        # formulas byte-identical.
+        self._whitened = isinstance(penalty, Whitener)
+        if self._whitened:
+            self._whiten = penalty.whiten
+            self._unwhiten = penalty.unwhiten
+            self._unwhiten_transpose = penalty.unwhiten_transpose
         self._sqrt_apply = penalty.sqrt_apply
         self._sqrt_transpose_apply = penalty.sqrt_transpose_apply
         if penalty.quadratic is not None:
@@ -883,11 +938,23 @@ class RidgeLevenbergMarquardt:
         # callback outputs are pinned to the residual dtype so a wider-typed
         # penalty (e.g. float64 kernel data under a float32 residual) cannot
         # promote the gradient and break the loop-carry dtypes.
-        factor_x = self._sqrt_apply(theta)
-        penalty_value_old = jnp.asarray(jnp.sum(factor_x**2), dtype=resid.dtype)
-        penalty_gradient = jnp.asarray(
-            self._sqrt_transpose_apply(factor_x), dtype=resid.dtype
-        )
+        # Under a Whitener the subproblem is posed on y = L_bar x, where the
+        # penalty rows are the constant [I_k | 0]: the half-gradient becomes
+        # g = L_bar^{-T} J'r + ridge [y_head; 0], and every gradient/step
+        # quantity below (including the reported norms) is the whitened one.
+        head_rows = self.penalty.num_rows
+        if self._whitened:
+            y_head = jnp.asarray(self._whiten(theta), dtype=resid.dtype)[:head_rows]
+            penalty_value_old = jnp.sum(y_head**2)
+            penalty_gradient = jnp.concatenate(
+                [y_head, jnp.zeros(theta.shape[0] - head_rows, dtype=resid.dtype)]
+            )
+        else:
+            factor_x = self._sqrt_apply(theta)
+            penalty_value_old = jnp.asarray(jnp.sum(factor_x**2), dtype=resid.dtype)
+            penalty_gradient = jnp.asarray(
+                self._sqrt_transpose_apply(factor_x), dtype=resid.dtype
+            )
 
         if resolved_solver == "lsmr":
             transpose_fn = jax.linear_transpose(jvp_fn, theta)
@@ -895,7 +962,21 @@ class RidgeLevenbergMarquardt:
             def JT(cotangent):
                 return transpose_fn(cotangent)[0]
 
-            grad = JT(resid) + ridge * penalty_gradient
+            if self._whitened:
+                # Whitened operator J~ = J L_bar^{-1}: products route through
+                # the penalty's unwhiten/unwhiten_transpose callbacks.
+                def J_sub(u):
+                    return jvp_fn(jnp.asarray(self._unwhiten(u), dtype=resid.dtype))
+
+                def JT_sub(w):
+                    return jnp.asarray(
+                        self._unwhiten_transpose(JT(w)), dtype=resid.dtype
+                    )
+            else:
+                J_sub = jvp_fn
+                JT_sub = JT
+
+            grad = JT_sub(resid) + ridge * penalty_gradient
             lsmr_tol = jnp.asarray(hyper.iterative_tol, dtype=resid.dtype)
             lsmr_atol = jnp.asarray(hyper.iterative_atol, dtype=resid.dtype)
             sqrt_damping = jnp.sqrt(damping)
@@ -919,19 +1000,32 @@ class RidgeLevenbergMarquardt:
 
             # Augmented operator A = [J; sqrt(ridge) L] with the penalty rows
             # applied through the penalty's own factor callbacks (outputs
-            # pinned to the residual dtype).
-            def A_matvec(u):
-                penalty_rows_apply = jnp.asarray(
-                    sqrt_ridge * self._sqrt_apply(u), dtype=resid.dtype
-                )
-                return jnp.concatenate([jvp_fn(u), penalty_rows_apply])
+            # pinned to the residual dtype). Whitened, the penalty rows are
+            # the constant [I_k | 0] on y.
+            if self._whitened:
 
-            def At_matvec(w):
-                penalty_pullback = jnp.asarray(
-                    sqrt_ridge * self._sqrt_transpose_apply(w[m:]),
-                    dtype=resid.dtype,
-                )
-                return JT(w[:m]) + penalty_pullback
+                def A_matvec(u):
+                    return jnp.concatenate([J_sub(u), sqrt_ridge * u[:k]])
+
+                def At_matvec(w):
+                    penalty_pullback = sqrt_ridge * jnp.concatenate(
+                        [w[m:], jnp.zeros(n - k, dtype=resid.dtype)]
+                    )
+                    return JT_sub(w[:m]) + penalty_pullback
+            else:
+
+                def A_matvec(u):
+                    penalty_rows_apply = jnp.asarray(
+                        sqrt_ridge * self._sqrt_apply(u), dtype=resid.dtype
+                    )
+                    return jnp.concatenate([jvp_fn(u), penalty_rows_apply])
+
+                def At_matvec(w):
+                    penalty_pullback = jnp.asarray(
+                        sqrt_ridge * self._sqrt_transpose_apply(w[m:]),
+                        dtype=resid.dtype,
+                    )
+                    return JT(w[:m]) + penalty_pullback
 
             # N = A'A + damping I, the R-free SPD operator that
             # custom_linear_solve differentiates through, posed on u (not z).
@@ -976,18 +1070,38 @@ class RidgeLevenbergMarquardt:
                 )
 
             def accel_rhs(f_vv):
-                return JT(f_vv)
+                return JT_sub(f_vv)
 
         elif resolved_solver == "cholesky":
-            grad = Jt @ resid + ridge * penalty_gradient
             # The assembled G = J'J + ridge L'L is cached across rejected
             # steps -- only mu changed, so the reject pays the p^3/3 refactor
             # without the GEMM or the penalty assembly; a callback ridge
-            # change invalidates through the cache's ridge key.
+            # change invalidates through the cache's ridge key. Whitened, the
+            # cache holds G~ = J~'J~ + ridge diag([1]*k + [0]*pad) and the
+            # J~' materialization (a batched triangular solve) is likewise
+            # skipped on reject; the per-step gradient and acceleration RHS
+            # only ever pull vectors back through unwhiten_transpose.
+            if self._whitened:
+                grad = (
+                    jnp.asarray(
+                        self._unwhiten_transpose(Jt @ resid), dtype=resid.dtype
+                    )
+                    + ridge * penalty_gradient
+                )
 
-            def assemble_normal(_):
-                gram = Jt @ Jt.T
-                return self._add_scaled(gram, ridge)
+                def assemble_normal(_):
+                    Jt_sub = jnp.asarray(
+                        self._unwhiten_transpose(Jt), dtype=resid.dtype
+                    )
+                    diag = jnp.arange(head_rows)
+                    return (Jt_sub @ Jt_sub.T).at[diag, diag].add(ridge)
+
+            else:
+                grad = Jt @ resid + ridge * penalty_gradient
+
+                def assemble_normal(_):
+                    gram = Jt @ Jt.T
+                    return self._add_scaled(gram, ridge)
 
             if self.cache_jacobian:
                 cache = lm_state.solver_cache
@@ -1013,15 +1127,19 @@ class RidgeLevenbergMarquardt:
             def solve_step(rhs):
                 return -jsp_linalg.cho_solve(factor, rhs)
 
-            def accel_rhs(f_vv):
-                return Jt @ f_vv
+            if self._whitened:
+
+                def accel_rhs(f_vv):
+                    return jnp.asarray(
+                        self._unwhiten_transpose(Jt @ f_vv), dtype=resid.dtype
+                    )
+
+            else:
+
+                def accel_rhs(f_vv):
+                    return Jt @ f_vv
 
         else:  # qr
-            grad = Jt @ resid + ridge * penalty_gradient
-            penalty_rows = self._penalty_rows(theta.shape[0], resid.dtype).astype(
-                resid.dtype
-            )
-
             # One QR of the AUGMENTED stack [A | b] with A = [J; sqrt(ridge) L]
             # and b = [r; sqrt(ridge) L x], cached per (x, ridge): its first p
             # columns are A's R factor and its last column carries Q'b, so the
@@ -1032,15 +1150,54 @@ class RidgeLevenbergMarquardt:
             # harmless.) The semi-normal route (R'R delta = -g) squares the
             # stack's condition number, which loses the Gauss-Newton step
             # accuracy exactly in the tiny-ridge regime this path exists for.
-            def assemble_r(_):
-                stacked = jnp.concatenate(
-                    [Jt.T, jnp.sqrt(ridge) * penalty_rows], axis=0
+            # Whitened, the stack is [J~; sqrt(ridge) [I_k | 0] | b~] with
+            # b~ = [r; sqrt(ridge) y_head] and the same cache shapes; J~ is
+            # materialized only when the cache refreshes.
+            if self._whitened:
+                grad = (
+                    jnp.asarray(
+                        self._unwhiten_transpose(Jt @ resid), dtype=resid.dtype
+                    )
+                    + ridge * penalty_gradient
                 )
-                b_stacked = jnp.concatenate(
-                    [resid, jnp.sqrt(ridge) * jnp.asarray(factor_x, resid.dtype)]
-                )
-                augmented = jnp.concatenate([stacked, b_stacked[:, None]], axis=1)
-                return jnp.linalg.qr(augmented, mode="r")
+
+                def assemble_r(_):
+                    Jt_sub = jnp.asarray(
+                        self._unwhiten_transpose(Jt), dtype=resid.dtype
+                    )
+                    stacked = jnp.concatenate(
+                        [
+                            Jt_sub.T,
+                            jnp.sqrt(ridge)
+                            * jnp.eye(head_rows, theta.shape[0], dtype=resid.dtype),
+                        ],
+                        axis=0,
+                    )
+                    b_stacked = jnp.concatenate(
+                        [resid, jnp.sqrt(ridge) * y_head]
+                    )
+                    augmented = jnp.concatenate(
+                        [stacked, b_stacked[:, None]], axis=1
+                    )
+                    return jnp.linalg.qr(augmented, mode="r")
+
+            else:
+                grad = Jt @ resid + ridge * penalty_gradient
+                penalty_rows = self._penalty_rows(
+                    theta.shape[0], resid.dtype
+                ).astype(resid.dtype)
+
+                def assemble_r(_):
+                    stacked = jnp.concatenate(
+                        [Jt.T, jnp.sqrt(ridge) * penalty_rows], axis=0
+                    )
+                    b_stacked = jnp.concatenate(
+                        [resid, jnp.sqrt(ridge) * jnp.asarray(factor_x, resid.dtype)]
+                    )
+                    augmented = jnp.concatenate(
+                        [stacked, b_stacked[:, None]], axis=1
+                    )
+                    return jnp.linalg.qr(augmented, mode="r")
 
             if self.cache_jacobian:
                 cache = lm_state.solver_cache
@@ -1073,12 +1230,37 @@ class RidgeLevenbergMarquardt:
             )
             Q_mu, R_mu = jnp.linalg.qr(damped_stack, mode="reduced")
 
-            def damped_normal_matvec(v):
-                return (
-                    Jt @ (Jt.T @ v)
-                    + ridge * (penalty_rows.T @ (penalty_rows @ v))
-                    + damping * v
-                )
+            if self._whitened:
+
+                def damped_normal_matvec(v):
+                    gauss_newton = jnp.asarray(
+                        self._unwhiten_transpose(
+                            Jt
+                            @ (
+                                Jt.T
+                                @ jnp.asarray(self._unwhiten(v), dtype=resid.dtype)
+                            )
+                        ),
+                        dtype=resid.dtype,
+                    )
+                    head_shift = jnp.concatenate(
+                        [
+                            v[:head_rows],
+                            jnp.zeros(
+                                theta.shape[0] - head_rows, dtype=resid.dtype
+                            ),
+                        ]
+                    )
+                    return gauss_newton + ridge * head_shift + damping * v
+
+            else:
+
+                def damped_normal_matvec(v):
+                    return (
+                        Jt @ (Jt.T @ v)
+                        + ridge * (penalty_rows.T @ (penalty_rows @ v))
+                        + damping * v
+                    )
 
             def solve_step(rhs):
                 # Corrected semi-normal equations (Bjorck 1987) for the
@@ -1108,21 +1290,46 @@ class RidgeLevenbergMarquardt:
                     R_mu, Q_mu.T @ rhs_aug, lower=False
                 )
 
-            def accel_rhs(f_vv):
-                return Jt @ f_vv
+            if self._whitened:
 
-        # First-order step (velocity) and its ridge objective.
+                def accel_rhs(f_vv):
+                    return jnp.asarray(
+                        self._unwhiten_transpose(Jt @ f_vv), dtype=resid.dtype
+                    )
+
+            else:
+
+                def accel_rhs(f_vv):
+                    return Jt @ f_vv
+
+        # First-order step (velocity) and its ridge objective. Whitened, the
+        # solves produce the y-space step delta_y: the x-space step maps back
+        # through unwhiten, and the trial penalty uses the linearity of the
+        # change of variables -- whiten(theta + step) = y + delta_y, so no
+        # second whiten is ever applied.
         if resolved_solver == "qr":
-            velocity = solve_velocity()
+            velocity_sub = solve_velocity()
         else:
-            velocity = solve_step(grad)
+            velocity_sub = solve_step(grad)
+        if self._whitened:
+            velocity = jnp.asarray(self._unwhiten(velocity_sub), dtype=resid.dtype)
+
+            def trial_penalty(step_x, step_sub):
+                return jnp.sum((y_head + step_sub[:head_rows]) ** 2)
+
+        else:
+            velocity = velocity_sub
+
+            def trial_penalty(step_x, step_sub):
+                return jnp.asarray(
+                    self._quadratic(theta + step_x), dtype=resid.dtype
+                )
+
         resid_velocity = residual_value(theta + velocity)
         resid_loss_old = jnp.sum(resid**2)
         loss_old = resid_loss_old + ridge * penalty_value_old
         resid_loss_velocity = jnp.sum(resid_velocity**2)
-        penalty_velocity = jnp.asarray(
-            self._quadratic(theta + velocity), dtype=resid.dtype
-        )
+        penalty_velocity = trial_penalty(velocity, velocity_sub)
         loss_velocity = resid_loss_velocity + ridge * penalty_velocity
         zero = jnp.zeros((), dtype=resid.dtype)
 
@@ -1142,12 +1349,24 @@ class RidgeLevenbergMarquardt:
                 ]
 
             f_vv = jax.jvp(first_jvp, (theta,), (velocity,))[1]
-            acceleration = solve_step(accel_rhs(f_vv))
+            acceleration_sub = solve_step(accel_rhs(f_vv))
+            if self._whitened:
+                acceleration = jnp.asarray(
+                    self._unwhiten(acceleration_sub), dtype=resid.dtype
+                )
+            else:
+                acceleration = acceleration_sub
             accelerated_step = velocity + 0.5 * acceleration
+            if self._whitened:
+                accelerated_step_sub = velocity_sub + 0.5 * acceleration_sub
+            else:
+                accelerated_step_sub = accelerated_step
+            # The ratio criterion lives in the damping geometry's norm --
+            # y-space under a Whitener, matching the metric LM's metric_norm.
             acceleration_ratio = (
                 2.0
-                * jnp.linalg.norm(acceleration)
-                / (jnp.linalg.norm(velocity) + jnp.finfo(resid.dtype).eps)
+                * jnp.linalg.norm(acceleration_sub)
+                / (jnp.linalg.norm(velocity_sub) + jnp.finfo(resid.dtype).eps)
             )
             ratio_accepted = (
                 (geodesic_acceptance_ratio > zero)
@@ -1158,9 +1377,7 @@ class RidgeLevenbergMarquardt:
             def accelerated_objective(_):
                 resid_accelerated = residual_value(theta + accelerated_step)
                 accel_resid_loss = jnp.sum(resid_accelerated**2)
-                accel_penalty = jnp.asarray(
-                    self._quadratic(theta + accelerated_step), dtype=resid.dtype
-                )
+                accel_penalty = trial_penalty(accelerated_step, accelerated_step_sub)
                 return accel_resid_loss, accel_penalty
 
             inf = jnp.asarray(jnp.inf, dtype=resid.dtype)
@@ -1173,6 +1390,12 @@ class RidgeLevenbergMarquardt:
             loss_accelerated = resid_loss_accelerated + ridge * penalty_accelerated
             used_geodesic = ratio_accepted & (loss_accelerated <= loss_velocity)
             step = jnp.where(used_geodesic, accelerated_step, velocity)
+            if self._whitened:
+                step_sub = jnp.where(
+                    used_geodesic, accelerated_step_sub, velocity_sub
+                )
+            else:
+                step_sub = step
             loss_candidate = jnp.where(used_geodesic, loss_accelerated, loss_velocity)
             resid_loss_candidate = jnp.where(
                 used_geodesic, resid_loss_accelerated, resid_loss_velocity
@@ -1182,6 +1405,7 @@ class RidgeLevenbergMarquardt:
             )
         else:
             step = velocity
+            step_sub = velocity_sub
             loss_candidate = loss_velocity
             resid_loss_candidate = resid_loss_velocity
             penalty_candidate = penalty_velocity
@@ -1245,7 +1469,7 @@ class RidgeLevenbergMarquardt:
                 acceleration_ratio,
                 jnp.linalg.norm(grad),
                 jnp.linalg.norm(penalty_gradient),
-                jnp.linalg.norm(step),
+                jnp.linalg.norm(step_sub),
                 aux,
             ),
         )
@@ -1278,7 +1502,12 @@ class RidgeLevenbergMarquardt:
         ``gtol`` bounds the ridge stationarity ``||J'r + ridge L'L x||``
         (calibrate it as ~``1e-3 * ridge * info.penalty_grad_norm`` from a
         pilot run) and ``xtol`` the accepted Euclidean step norm -- either
-        fires "done with the current fixed-ridge problem" -- while
+        fires "done with the current fixed-ridge problem". Under a
+        :class:`~nlls_gram.Whitener` penalty both bounds refer to the
+        whitened quantities (``info.grad_norm`` is the y-space stationarity,
+        ``info.step_norm`` the y-space step) and the calibration recipe
+        reads ``gtol ~ 1e-3 * ridge * sqrt(q(x))`` since
+        ``penalty_grad_norm = sqrt(penalty_value)`` there. Meanwhile
         ``atol > 0`` ADDITIONALLY requires ``sqrt(resid_loss) <= atol``
         (the model equations actually solved, the ridgeless-endgame check)
         and never stops the solve alone; ``atol > 0`` therefore requires a
@@ -1823,15 +2052,28 @@ class RidgeLevenbergMarquardt:
     def _ad_tangent_cholesky(self, x, args, p, p_dot, ridge):
         # (J'J + ridge M0) x_dot = -J'(dr/dp) p_dot, no damping: the matrix is
         # PD under ker J ∩ ker L = {0} because ridge > 0 by contract.
+        # Whitened, the same rule is posed on y = L_bar x --
+        # (J~'J~ + ridge diag_head) y_dot = -J~'(dr/dp) p_dot, then
+        # x_dot = unwhiten(y_dot) -- algebraically identical to the x-space
+        # rule through the linear bijection.
         theta, unravel, residual, theta_jvp, residual_p_dot = self._ad_linearization(
             x, args, p, p_dot
         )
         Jt = self._assemble_jt(theta_jvp, theta, residual)
-        normal_matrix = self._add_scaled(
-            Jt @ Jt.T, jnp.asarray(ridge, dtype=residual.dtype)
-        )
-        factor = jsp_linalg.cho_factor(normal_matrix)
-        theta_dot = jsp_linalg.cho_solve(factor, -(Jt @ residual_p_dot))
+        ridge_typed = jnp.asarray(ridge, dtype=residual.dtype)
+        if self._whitened:
+            Jt_sub = jnp.asarray(
+                self._unwhiten_transpose(Jt), dtype=residual.dtype
+            )
+            diag = jnp.arange(self.penalty.num_rows)
+            normal_matrix = (Jt_sub @ Jt_sub.T).at[diag, diag].add(ridge_typed)
+            factor = jsp_linalg.cho_factor(normal_matrix)
+            y_dot = jsp_linalg.cho_solve(factor, -(Jt_sub @ residual_p_dot))
+            theta_dot = jnp.asarray(self._unwhiten(y_dot), dtype=residual.dtype)
+        else:
+            normal_matrix = self._add_scaled(Jt @ Jt.T, ridge_typed)
+            factor = jsp_linalg.cho_factor(normal_matrix)
+            theta_dot = jsp_linalg.cho_solve(factor, -(Jt @ residual_p_dot))
         return unravel(theta_dot)
 
     def _ad_tangent_normal_cg(self, x, args, p, p_dot, ridge):
@@ -1847,12 +2089,42 @@ class RidgeLevenbergMarquardt:
 
         ridge_typed = jnp.asarray(ridge, dtype=residual.dtype)
 
-        def normal_matvec(u):
-            penalty_apply = jnp.asarray(
-                self._sqrt_transpose_apply(self._sqrt_apply(u)),
-                dtype=residual.dtype,
-            )
-            return JT(theta_jvp(u)) + ridge_typed * penalty_apply
+        if self._whitened:
+            # The whitened operator posed on y (see _ad_tangent_cholesky):
+            # matvec = J~'(J~ u) + ridge [u_head; 0].
+            head_rows = self.penalty.num_rows
+
+            def normal_matvec(u):
+                gauss_newton = jnp.asarray(
+                    self._unwhiten_transpose(
+                        JT(
+                            theta_jvp(
+                                jnp.asarray(
+                                    self._unwhiten(u), dtype=residual.dtype
+                                )
+                            )
+                        )
+                    ),
+                    dtype=residual.dtype,
+                )
+                head_shift = jnp.concatenate(
+                    [
+                        u[:head_rows],
+                        jnp.zeros(
+                            theta.shape[0] - head_rows, dtype=residual.dtype
+                        ),
+                    ]
+                )
+                return gauss_newton + ridge_typed * head_shift
+
+        else:
+
+            def normal_matvec(u):
+                penalty_apply = jnp.asarray(
+                    self._sqrt_transpose_apply(self._sqrt_apply(u)),
+                    dtype=residual.dtype,
+                )
+                return JT(theta_jvp(u)) + ridge_typed * penalty_apply
 
         cg_tol = self._ad_cg_tol(residual.dtype)
         cg_atol = jnp.asarray(self.ad_solver_atol, dtype=residual.dtype)
@@ -1868,13 +2140,22 @@ class RidgeLevenbergMarquardt:
             )
             return solution
 
-        rhs = -JT(residual_p_dot)
+        if self._whitened:
+            rhs = -jnp.asarray(
+                self._unwhiten_transpose(JT(residual_p_dot)), dtype=residual.dtype
+            )
+        else:
+            rhs = -JT(residual_p_dot)
         theta_dot = jax.lax.custom_linear_solve(
             normal_matvec,
             rhs,
             solve,
             symmetric=True,
         )
+        if self._whitened:
+            theta_dot = jnp.asarray(
+                self._unwhiten(theta_dot), dtype=residual.dtype
+            )
         return unravel(theta_dot)
 
     def _ad_cg_tol(self, dtype):

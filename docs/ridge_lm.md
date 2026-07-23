@@ -226,7 +226,11 @@ blocks, **no epsilon shift on the scalars** (they carry no penalty rows at
 all, unlike the metric formulation's \(\varepsilon I\)). Each inner LM step
 is then a kernel ridge regression of the relinearized equations, exactly the
 Gauss–Newton scheme of Chen–Hosseini–Owhadi–Stuart (2021) with the ridge
-kept explicit. `penalty_from_factor(L)` and `identity_penalty(size)` cover
+kept explicit. The drop-in variant
+`repeated_block_whitener(K, repeats=J, zero_pad_size=s)` builds the same
+penalty as a `Whitener`, switching every linear solver to the
+[whitened subproblem](#whitening) — the right default at deep ridge.
+`penalty_from_factor(L)` and `identity_penalty(size)` cover
 generic dense factors and the minimum-Euclidean-norm case. An \(O(N)\)
 state-space (Matérn) penalty pairing with the `lsmr` path is planned for a
 later release; at the problem sizes this package targets the dense penalty
@@ -266,7 +270,7 @@ one factorization between the velocity and geodesic-acceleration solves.
 | `linear_solver` | Method | Cost per update | When |
 | --- | --- | --- | --- |
 | `Auto()` = `Cholesky()` | dense normal equations; \(G = J^\top J + \lambda M_0\) assembled via `add_scaled` and **cached across rejected steps** (a reject re-factors in \(p^3/3\) without the GEMM or penalty assembly) | \(mp^2\) GEMM (skipped on reject) + \(p^3/3\) | default; fine for \(\lambda \gtrsim 10^{-8}\) in float64 |
-| `QR()` | QR of \([J;\sqrt{\lambda}L]\) cached per \((x, \lambda)\); each damping update re-factors \([R;\sqrt{\mu}I]\) and solves by corrected semi-normal equations with one refinement pass (Björck 1987; Björck 1996, §6.6.5; the damping-row structure is Moré 1978's) | \((m{+}k)p^2\) QR (skipped on reject) + \(2p^3/3\)-ish refactor | small \(\lambda\)/\(\mu\), where forming \(G\) squares the condition number |
+| `QR()` | QR of \([J;\sqrt{\lambda}L]\) cached per \((x, \lambda)\); each damping update re-factors \([R;\sqrt{\mu}I]\) and solves by corrected semi-normal equations with one refinement pass (Björck 1987; Björck 1996, §6.6.5; the damping-row structure is Moré 1978's) | \((m{+}k)p^2\) QR (skipped on reject) + \(2p^3/3\)-ish refactor | small \(\lambda\)/\(\mu\), where forming \(G\) squares the condition number — but try a [whitened](#whitening) `Cholesky()` first when a square factor exists |
 | `LSMR(preconditioner, ...)` | matrix-free bidiagonalization (Fong–Saunders 2011) on the right-preconditioned augmented operator; the `preconditioner` field is required (`identity_right_preconditioner()` opts out); the damping row is posed in the unpreconditioned variable, so every \(\mu > 0\) subproblem is exactly the \(I\)-damped one for any right preconditioner (Björck 1996, Ch. 7) | iterations × (one J and one Jᵀ product + penalty factor products) | Jacobians too large to materialize |
 
 Everything runs at the **residual dtype** — there is no promotion knob. The
@@ -287,30 +291,89 @@ conditioning as the normal equations, so it fixes neither of the problems
 residuals, low-rank penalty) and would slot into the same typed
 `linear_solver` menu.
 
-### Whitening: the cheap alternative to `QR()` at deep ridge
+## Whitening
 
-When a square (block-)factor \(\bar L\) of the penalty exists, the
-variable change \(y = \bar L x\) (identity-extended on unpenalized
-coordinates) turns the penalty into \(\lambda\|y_{\text{head}}\|^2\) —
-solve the wrapped residual \(r(\bar L^{-1} y)\) with
-`penalty_from_factor([I | 0])` and the plain Cholesky path. The normal
-matrix becomes \(\tilde J^\top \tilde J + \lambda I_{\text{head}}\): a
-clean spectral floor at \(\lambda\), no interaction between the kernel's
-conditioning and the Gram product. Measured on two production DAE kernel
-drivers at \(\lambda = 3{\times}10^{-12}\) (where the unwhitened Cholesky
-path stalls and `QR()` was previously required): whitening converged in
-25–35% fewer LM steps at the Cholesky path's ~9× lower per-step cost —
-1.8–3× faster wall-clock across every parameter variant with identical
-residuals and solution quality. The wrap costs one triangular solve per
-penalized block per residual evaluation and needs no solver support.
+When a square invertible extension \(\bar L\) of the penalty factor
+exists, the solver can run the whole damped subproblem in the **whitened
+variable** \(y = \bar L x\). For the kernel penalty the factor is
 
-The same experiments produced a clear negative result for **dropping
-penalty rows** to shrink the `QR()` stack: on those DAE drivers, deleting
-the penalty blocks whose *levels* are pinned by initial conditions (so
-that formally only the free-offset blocks carry rows) left the residual
-converged but let the unpenalized paths drift enormously between
-collocation points — the dropped blocks' seminorms exploded by 2–80×
-and the solutions failed their ground-truth checks. The
+$$
+\bar L = \operatorname{blockdiag}(C^\top, \ldots, C^\top, I_{\text{tail}}),
+\qquad K = C C^\top ,
+$$
+
+exact identity on the unpenalized tail and factored **once from \(K\)
+alone** — the ridge weight \(\lambda\) never enters the factorization
+(unlike the metric formulation's \(K + \varepsilon I\) factor, where
+\(\varepsilon\) is baked in), so continuation/annealing composes
+unchanged. In \(y\) the penalty is \(\lambda\|y_{\text{head}}\|^2\): the
+penalty rows are the constant \([\,I_k \mid 0\,]\), never materialized.
+
+**The whitener rides with the penalty, not the solver menu.** Construct
+the penalty as a `Whitener` — `repeated_block_whitener(K, repeats=J,
+zero_pad_size=s)` is the kernel workhorse mirroring
+`repeated_dense_penalty`, and `whitener_from_factor(L_bar, num_rows=k)`
+covers general dense factors — and every `linear_solver` config decides
+what to do with it: the Cholesky path assembles and caches
+\(\tilde J^\top \tilde J + \lambda\,\mathrm{diag}([1]^k, [0]^s)\) with
+\(\tilde J = J \bar L^{-1}\), the QR path factors the whitened stack
+\([\tilde J;\ \sqrt\lambda\,[I_k \mid 0]]\), and LSMR wraps its matvecs
+(its right preconditioner composes on top — a preconditioner changes only
+the *iteration path*, a whitener changes the *damping geometry and
+subproblem*). A plain `RidgePenalty` keeps today's formulas byte-identical.
+The carried iterate stays \(x\) everywhere — init, callbacks, histories,
+multi-start; \(y\) lives inside `update()` and the AD rule.
+
+**Same minimizers, different trajectories.** Whitening is a pure linear
+bijection: same objective, same fixed-\(\lambda\) minimizers, digit for
+digit. What changes is the LM damping geometry —
+\(\mu\|\delta y\|^2 = \mu\|\bar L\,\delta x\|^2\), i.e. **penalty-metric
+damping** — so the iterate path differs (measured: consistently *fewer*
+steps on the production drivers). The payoff is at deep ridge on
+ill-conditioned \(K\): the whitened normal matrix
+\(\tilde J^\top \tilde J + \lambda I_{\text{head}}\) has a clean spectral
+floor at \(\lambda\), no interaction between the kernel's conditioning
+and the Gram product, so the default `Cholesky()` path stays accurate
+where the unwhitened one stalls and `QR()` was previously required.
+Measured on the production DAE kernel drivers at
+\(\lambda = 3{\times}10^{-12}\): 25–35% fewer LM steps (open economy 8
+vs 11, its \(r^\ast{=}0.05\) variant 38 vs 57, multicountry 9 vs 13) at
+the Cholesky path's ~8× lower per-step cost (~0.9 ms vs ~7.6 ms at the
+96×5+3 size) — 1.8–3× faster wall-clock on every variant with identical
+residuals and solution quality.
+
+**Whitened stopping semantics.** Under a `Whitener`, `info.grad_norm`
+(and so `gtol`) is the y-space stationarity
+\(\|\bar L^{-\top} J^\top r + \lambda [y_{\text{head}}; 0]\|\) and
+`info.step_norm` (and `xtol`) the y-space step — the algorithm's own
+stationarity. `info.penalty_grad_norm` becomes
+\(\|[y_{\text{head}}; 0]\| = \sqrt{q(x)}\), so the calibration recipe
+simplifies to
+
+```python
+gtol = 1e-3 * ridge * jnp.sqrt(q)   # q = the solution's (RKHS) seminorm
+```
+
+— usually known to an order of magnitude before any pilot run (and
+reported as `info.penalty_value`). Objective values
+(`loss`/`resid_loss`/`penalty_value`) are unchanged.
+
+**Adaptive whitening roadmap.** The reserved `penalty_factory` keyword's
+documented contract is the `MetricFactory` `prepare`/`build` shape
+producing a `Whitener` from traced `penalty_state` (with `penalty_valid`
+reject-step reuse, and a state change treated as a problem change — the
+same convergence-suppression/cache-invalidation machinery as a callback
+ridge change). The implementation keeps that door open: every factor use
+goes through the penalty's callbacks, and cache invalidation stays keyed
+through the existing problem-change machinery.
+
+The experiments that motivated whitening also produced a clear negative
+result for **dropping penalty rows** to shrink the `QR()` stack: on those
+DAE drivers, deleting the penalty blocks whose *levels* are pinned by
+initial conditions (so that formally only the free-offset blocks carry
+rows) left the residual converged but let the unpenalized paths drift
+enormously between collocation points — the dropped blocks' seminorms
+exploded by 2–80× and the solutions failed their ground-truth checks. The
 \(\operatorname{rank}([J;L]) = p\) condition can hold *marginally* while
 the selection still needs every block's seminorm in the objective; verify
 any reduced factor against the full-\(L\) solution before trusting it.
@@ -364,6 +427,8 @@ result = solver.solve(theta_0, max_steps=400, atol=2e-8)
 # after (ridge LM): selection in the objective, no epsilon anywhere;
 # calibrate gtol from a pilot run (~1e-3 * ridge * info.penalty_grad_norm)
 penalty = repeated_dense_penalty(K, repeats=3, zero_pad_size=d)
+# ... or whitened (deep-ridge default; gtol ~ 1e-3 * ridge * sqrt(q)):
+penalty = repeated_block_whitener(K, repeats=3, zero_pad_size=d)
 solver = RidgeLevenbergMarquardt(residual_fn, penalty=penalty,
                                  ridge=1e-8)  # or None for the dtype default
 result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=2e-8)

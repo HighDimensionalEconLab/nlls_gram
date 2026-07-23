@@ -19,7 +19,14 @@ to p):
   gradient must cancel against). Linear solvers are typed configs —
   Auto()/Cholesky() (dense normal equations with a reject-step cache),
   QR() (damping-row QR for tiny ridge), LSMR(preconditioner, ...)
-  (matrix-free) — and the AD side takes Cholesky() or NormalCG(...).
+  (matrix-free) — and the AD side takes Cholesky() or NormalCG(...). A
+  Whitener penalty (repeated_block_whitener / whitener_from_factor) makes
+  every path solve the whitened subproblem y = L_bar x with penalty rows
+  [I | 0] — same minimizers, penalty-metric damping geometry, and a clean
+  spectral floor at the ridge, so the default Cholesky() path stays
+  accurate at deep ridge where QR() was previously required; gtol/xtol and
+  the reported grad/step norms become the whitened quantities
+  (gtol ~ 1e-3 * ridge * sqrt(q)).
 - LevenbergMarquardt minimizes ||r(x)||^2 with an optional positive-definite
   parameter-space Metric (or iterate-aware MetricFactory) defining the
   damping geometry, so the small-damping Gauss-Newton limit selects
@@ -61,9 +68,12 @@ from nlls_gram.metrics import (
 )
 from nlls_gram.penalties import (
     RidgePenalty,
+    Whitener,
     identity_penalty,
     penalty_from_factor,
+    repeated_block_whitener,
     repeated_dense_penalty,
+    whitener_from_factor,
 )
 from nlls_gram.preconditioners import (
     identity_preconditioner,
@@ -134,12 +144,15 @@ __all__ = [
     "lsmr",
     "LSMRState",
     "penalty_from_factor",
+    "repeated_block_whitener",
     "repeated_dense_penalty",
     "ridge_continuation",
+    "whitener_from_factor",
     "RidgeLevenbergMarquardt",
     "RidgeLMInfo",
     "RidgeLMState",
     "RidgePenalty",
+    "Whitener",
     "matern_state_space",
     "metric_from_cholesky",
     "metric_from_diagonal",

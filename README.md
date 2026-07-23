@@ -56,11 +56,14 @@ structural scalars — no epsilon shift anywhere):
 ```python
 from nlls_gram import (
     RidgeLevenbergMarquardt,
+    repeated_block_whitener,
     repeated_dense_penalty,
     ridge_continuation,
 )
 
 penalty = repeated_dense_penalty(K, repeats=3, zero_pad_size=d)
+# deep-ridge variant: whitened subproblem y = L_bar x, cholesky-path cost
+penalty = repeated_block_whitener(K, repeats=3, zero_pad_size=d)
 solver = RidgeLevenbergMarquardt(
     residual_fn,                 # (x) | (x, args) | (x, args, p)
     penalty=penalty,
@@ -78,7 +81,10 @@ The solver is stock Euclidean LM on the augmented residual
 \([r;\sqrt{\lambda}Lx]\): the trust-region damping and the selection
 weight are fully decoupled, the assembled normal matrix is cached across
 rejected steps, and a damping-row QR path (`linear_solver=QR()`) stays
-accurate at tiny ridge.
+accurate at tiny ridge. A `Whitener` penalty runs every path on the
+whitened variable instead — same minimizers, and the default cholesky
+path keeps its accuracy at deep ridge (with the simpler calibration
+`gtol ~ 1e-3 * ridge * sqrt(q)`).
 `info.loss` is the ridge objective; `info.resid_loss` is the equation error.
 Stopping is conjunctive: `gtol` means "stationary at this ridge", `atol`
 additionally demands the equations solved (it never stops the solve alone).

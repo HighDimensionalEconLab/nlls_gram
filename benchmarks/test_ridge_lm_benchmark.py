@@ -16,6 +16,7 @@ from nlls_gram import (
     LevenbergMarquardt,
     RidgeLevenbergMarquardt,
     identity_right_preconditioner,
+    repeated_block_whitener,
     repeated_dense_penalty,
     repeated_shifted_dense_metric,
 )
@@ -67,7 +68,9 @@ def _problem(n, repeats, zero_pad_size, m_resid, device):
 
 @pytest.mark.parametrize("platform", ["cpu", "gpu"])
 @pytest.mark.parametrize(("n", "repeats", "zero_pad_size", "m_resid"), SIZES)
-@pytest.mark.parametrize("configuration", ["cholesky", "qr", "lsmr", "metric"])
+@pytest.mark.parametrize(
+    "configuration", ["cholesky", "qr", "lsmr", "metric", "whitened"]
+)
 def test_update_step(
     benchmark, platform, n, repeats, zero_pad_size, m_resid, configuration
 ):
@@ -82,9 +85,16 @@ def test_update_step(
         )
         solver = LevenbergMarquardt(residual, metric=metric)
     else:
-        penalty = repeated_dense_penalty(
-            K, repeats=repeats, zero_pad_size=zero_pad_size
-        )
+        # "whitened" is the whitened-cholesky path: the Whitener penalty
+        # with the default linear solver -- expect cholesky-class step cost.
+        if configuration == "whitened":
+            penalty = repeated_block_whitener(
+                K, repeats=repeats, zero_pad_size=zero_pad_size
+            )
+        else:
+            penalty = repeated_dense_penalty(
+                K, repeats=repeats, zero_pad_size=zero_pad_size
+            )
         if configuration == "lsmr":
             config = LSMR(identity_right_preconditioner(), maxiter=32)
         elif configuration == "qr":

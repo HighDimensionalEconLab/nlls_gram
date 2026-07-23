@@ -6,6 +6,14 @@ callbacks, so the solver never forms ``M0`` unless a dense path asks for it.
 ``repeated_dense_penalty`` is the kernel workhorse: ``repeats`` copies of a
 Gram matrix ``K`` on the head coordinates with an unpenalized zero-padded
 tail, factored once and applied with batched triangular products.
+
+A :class:`Whitener` extends the penalty with an invertible square extension
+``L_bar`` of the factor (identity on the unpenalized tail), letting the
+solver run the whole subproblem in the whitened variable ``y = L_bar x``
+where the penalty rows are the constant ``[I_k | 0]``.
+``repeated_block_whitener`` is the kernel workhorse mirroring
+``repeated_dense_penalty``; ``whitener_from_factor`` covers general dense
+square factors.
 """
 
 from collections.abc import Callable
@@ -68,6 +76,44 @@ class RidgePenalty:
             value = getattr(self, name)
             if value is not None and not callable(value):
                 raise TypeError(f"RidgePenalty.{name} must be callable or None")
+
+
+@dataclass(frozen=True)
+class Whitener(RidgePenalty):
+    """A :class:`RidgePenalty` whose factor extends to an invertible square
+    ``L_bar`` (identity on the unpenalized tail), enabling the solver's
+    whitened change of variables ``y = L_bar x``.
+
+    The base penalty fields stay fully populated and consistent, so a
+    ``Whitener`` degrades gracefully to a plain penalty anywhere the whitened
+    algebra is not implemented. The extra callbacks act on the flattened
+    parameter vector and accept a vector or a matrix whose LEADING axis is
+    the parameter dimension (columns are batched):
+
+    - ``whiten(v)``: ``L_bar v`` -- its first ``num_rows`` entries must
+      coincide with ``sqrt_apply(v)`` (the head rows ARE the penalty factor)
+      and the tail must pass through unchanged
+    - ``unwhiten(v)``: ``L_bar^{-1} v``
+    - ``unwhiten_transpose(v)``: ``L_bar^{-T} v``
+
+    Under a ``Whitener`` the y-space penalty rows are the constant
+    ``[I_k | 0]`` (never materialized), so
+    :class:`~nlls_gram.RidgeLevenbergMarquardt` damps and factors the
+    whitened subproblem directly -- see the solver's whitening notes for the
+    changed ``grad_norm``/``step_norm`` semantics. The factorization behind
+    the callbacks depends on the penalty alone, never the ridge weight, so
+    continuation/annealing composes unchanged.
+    """
+
+    whiten: Callable | None = None
+    unwhiten: Callable | None = None
+    unwhiten_transpose: Callable | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        for name in ("whiten", "unwhiten", "unwhiten_transpose"):
+            if not callable(getattr(self, name)):
+                raise TypeError(f"Whitener.{name} must be callable")
 
 
 def repeated_dense_penalty(K, *, repeats: int, zero_pad_size: int):
@@ -230,4 +276,184 @@ def identity_penalty(size: int):
         quadratic=quadratic,
         add_scaled=add_scaled,
         sqrt_rows=sqrt_rows,
+    )
+
+
+def repeated_block_whitener(K, *, repeats: int, zero_pad_size: int):
+    """Build the repeated dense kernel penalty as a :class:`Whitener`.
+
+    Same penalty as :func:`repeated_dense_penalty` -- the flattened layout is
+    ``repeats`` head blocks penalized by the square positive-definite Gram
+    matrix ``K`` followed by ``zero_pad_size`` unpenalized scalars, and every
+    base field matches -- plus the whitening callbacks for the square factor
+    ``L_bar = blockdiag(C', ..., C', I_tail)`` with ``K = C C'`` factored
+    once (``jnp.linalg.cholesky``; ``K`` must be numerically positive
+    definite here, since the whitened solve inverts the factor -- add jitter
+    yourself if needed, a NaN factor propagates loudly). All repeated blocks
+    batch into the columns of one triangular product/solve, and the callbacks
+    accept vectors or matrices with the parameter dimension leading. The
+    ridge weight never enters the factorization, so ridge continuation
+    composes unchanged.
+    """
+
+    _validate_repeated_shifted_layout(repeats, zero_pad_size)
+    K = jnp.asarray(K)
+    if K.ndim != 2 or K.shape[0] != K.shape[1] or K.shape[0] == 0:
+        raise ValueError("K must be a nonempty square matrix")
+    dtype = jnp.result_type(K, 1.0)
+    if not jnp.issubdtype(dtype, jnp.floating):
+        raise TypeError("K must have a real floating-point dtype")
+    K = K.astype(dtype)
+    block_size = K.shape[0]
+    repeated_size = repeats * block_size
+    total_size = repeated_size + zero_pad_size
+    C = jnp.linalg.cholesky(K)
+
+    def check_input(x, size, name):
+        if x.ndim not in (1, 2):
+            raise ValueError(f"penalty {name} requires a vector or matrix")
+        if x.shape[0] != size:
+            raise ValueError(
+                f"penalty {name} leading size must be {size}, got {x.shape[0]}"
+            )
+
+    # Head blocks batch as the columns of one (block_size, repeats * cols)
+    # matrix, so every block (and every batched column) shares a single
+    # triangular product or solve.
+    def pack_head(x):
+        trailing_shape = x.shape[1:]
+        return jnp.moveaxis(
+            x[:repeated_size].reshape((repeats, block_size) + trailing_shape),
+            0,
+            1,
+        ).reshape(block_size, -1)
+
+    def unpack_head(matrix, trailing_shape):
+        return jnp.moveaxis(
+            matrix.reshape((block_size, repeats) + trailing_shape), 0, 1
+        ).reshape((repeated_size,) + trailing_shape)
+
+    def head_block_map(block_op, x):
+        check_input(x, total_size, "whitener input")
+        trailing_shape = x.shape[1:]
+        head = unpack_head(block_op(pack_head(x)), trailing_shape)
+        return jnp.concatenate([head, x[repeated_size:]], axis=0)
+
+    def whiten(x):
+        return head_block_map(lambda m: C.T @ m, x)
+
+    def unwhiten(y):
+        return head_block_map(
+            lambda m: jsp_linalg.solve_triangular(C.T, m, lower=False), y
+        )
+
+    def unwhiten_transpose(y):
+        return head_block_map(
+            lambda m: jsp_linalg.solve_triangular(C, m, lower=True), y
+        )
+
+    def sqrt_apply(x):
+        check_input(x, total_size, "sqrt_apply input")
+        trailing_shape = x.shape[1:]
+        return unpack_head(C.T @ pack_head(x), trailing_shape)
+
+    def sqrt_transpose_apply(y):
+        check_input(y, repeated_size, "sqrt_transpose_apply input")
+        trailing_shape = y.shape[1:]
+        head = unpack_head(C @ pack_head(y), trailing_shape)
+        if zero_pad_size == 0:
+            return head
+        zeros = jnp.zeros((zero_pad_size,) + trailing_shape, dtype=head.dtype)
+        return jnp.concatenate([head, zeros], axis=0)
+
+    def add_scaled(H, c):
+        scaled = jnp.asarray(c, dtype=H.dtype) * K.astype(H.dtype)
+        for j in range(repeats):
+            start = j * block_size
+            H = H.at[start : start + block_size, start : start + block_size].add(
+                scaled
+            )
+        return H
+
+    def sqrt_rows():
+        rows = jsp_linalg.block_diag(*([C.T] * repeats))
+        if zero_pad_size == 0:
+            return rows
+        return jnp.concatenate(
+            [rows, jnp.zeros((repeated_size, zero_pad_size), dtype=rows.dtype)],
+            axis=1,
+        )
+
+    return Whitener(
+        sqrt_apply=sqrt_apply,
+        sqrt_transpose_apply=sqrt_transpose_apply,
+        num_rows=repeated_size,
+        add_scaled=add_scaled,
+        sqrt_rows=sqrt_rows,
+        whiten=whiten,
+        unwhiten=unwhiten,
+        unwhiten_transpose=unwhiten_transpose,
+    )
+
+
+def whitener_from_factor(L_bar, *, num_rows: int):
+    """Build a :class:`Whitener` from a dense square invertible factor.
+
+    ``L_bar`` is the full ``(p, p)`` whitening map ``y = L_bar x``; its first
+    ``num_rows`` rows are the penalty factor ``L``, so
+    ``q(x) = ||(L_bar x)[:num_rows]||^2``. Invertibility is not validated
+    (the entries may be traced) -- a singular factor propagates NaN loudly
+    through the triangular/linear solves. Intended for tests and non-kernel
+    uses; the kernel workhorse is :func:`repeated_block_whitener`.
+    """
+
+    L_bar = jnp.asarray(L_bar)
+    if L_bar.ndim != 2 or L_bar.shape[0] != L_bar.shape[1]:
+        raise ValueError("L_bar must be a square matrix")
+    dtype = jnp.result_type(L_bar, 1.0)
+    if not jnp.issubdtype(dtype, jnp.floating):
+        raise TypeError("L_bar must have a real floating-point dtype")
+    L_bar = L_bar.astype(dtype)
+    size = L_bar.shape[0]
+    if (
+        isinstance(num_rows, bool)
+        or not isinstance(num_rows, int)
+        or not 0 <= num_rows <= size
+    ):
+        raise ValueError(
+            f"num_rows must be a Python int in [0, {size}], got {num_rows!r}"
+        )
+    L = L_bar[:num_rows]
+    M0 = L.T @ L
+
+    def sqrt_apply(x):
+        return L @ x
+
+    def sqrt_transpose_apply(y):
+        return L.T @ y
+
+    def add_scaled(H, c):
+        return H + jnp.asarray(c, dtype=H.dtype) * M0.astype(H.dtype)
+
+    def sqrt_rows():
+        return L
+
+    def whiten(v):
+        return L_bar @ v
+
+    def unwhiten(v):
+        return jnp.linalg.solve(L_bar, v)
+
+    def unwhiten_transpose(v):
+        return jnp.linalg.solve(L_bar.T, v)
+
+    return Whitener(
+        sqrt_apply=sqrt_apply,
+        sqrt_transpose_apply=sqrt_transpose_apply,
+        num_rows=num_rows,
+        add_scaled=add_scaled,
+        sqrt_rows=sqrt_rows,
+        whiten=whiten,
+        unwhiten=unwhiten,
+        unwhiten_transpose=unwhiten_transpose,
     )
