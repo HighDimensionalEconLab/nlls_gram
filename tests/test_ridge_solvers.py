@@ -6,6 +6,11 @@ import numpy as np
 import pytest
 
 from nlls_gram import (
+    LSMR,
+    QR,
+    Cholesky,
+    CholeskyCache,
+    QRCache,
     RidgeLevenbergMarquardt,
     WhitenedPreconditioner,
     identity_right_preconditioner,
@@ -36,17 +41,25 @@ def make_penalty():
     return repeated_dense_penalty(K, repeats=REPEATS, zero_pad_size=PAD)
 
 
-def build(linear_solver, **kwargs):
+def solver_config(name, preconditioner=None):
+    if name == "cholesky":
+        return Cholesky()
+    if name == "qr":
+        return QR()
+    return LSMR(
+        preconditioner or identity_right_preconditioner(),
+        tol=1e-10,
+        maxiter=None,
+    )
+
+
+def build(name, preconditioner=None, **kwargs):
     settings = dict(penalty=make_penalty(), geodesic_acceleration=False)
-    if linear_solver == "lsmr":
-        settings.update(
-            lsmr_preconditioner=identity_right_preconditioner(),
-            iterative_tol=1e-10,
-            iterative_maxiter=None,
-        )
     settings.update(kwargs)
     return RidgeLevenbergMarquardt(
-        nonlinear_residual, linear_solver=linear_solver, **settings
+        nonlinear_residual,
+        linear_solver=solver_config(name, preconditioner),
+        **settings,
     )
 
 
@@ -82,28 +95,24 @@ def test_full_solves_agree_across_solvers():
 def test_cholesky_normal_cache_is_reused_and_ridge_keyed():
     # Poisoned-cache probe: a state claiming a valid cached G at the matching
     # ridge must be BELIEVED (garbage in, different step out), and the same
-    # garbage under a mismatched G_ridge must be recomputed (step identical to
-    # the clean one). This pins both the reject-step reuse and the
-    # callback-ridge-change invalidation without instrumenting internals.
+    # garbage under a mismatched cache ridge must be recomputed (step
+    # identical to the clean one). This pins both the reject-step reuse and
+    # the callback-ridge-change invalidation without instrumenting internals.
     solver = build("cholesky", ridge=1e-3)
     fresh = solver.init(X0)
     x_clean, _, _ = solver.update(X0, fresh)
 
-    garbage = jnp.eye(P_DIM, dtype=fresh.G.dtype) * 123.0
+    garbage = jnp.eye(P_DIM, dtype=fresh.solver_cache.G.dtype) * 123.0
     poisoned_matching = dataclasses.replace(
         fresh,
-        G=garbage,
-        G_valid=jnp.asarray(True),
-        G_ridge=fresh.ridge,
+        solver_cache=CholeskyCache(garbage, jnp.asarray(True), fresh.ridge),
     )
     x_poisoned, _, _ = solver.update(X0, poisoned_matching)
     assert not np.allclose(np.asarray(x_poisoned), np.asarray(x_clean))
 
     poisoned_stale_ridge = dataclasses.replace(
         fresh,
-        G=garbage,
-        G_valid=jnp.asarray(True),
-        G_ridge=fresh.ridge * 2.0,
+        solver_cache=CholeskyCache(garbage, jnp.asarray(True), fresh.ridge * 2.0),
     )
     x_recomputed, _, _ = solver.update(X0, poisoned_stale_ridge)
     np.testing.assert_allclose(
@@ -116,30 +125,27 @@ def test_qr_cache_is_reused_and_ridge_keyed():
     fresh = solver.init(X0)
     x_clean, state_clean, _ = solver.update(X0, fresh)
 
-    garbage = jnp.ones_like(fresh.qr_R) + jnp.eye(
-        fresh.qr_R.shape[0], fresh.qr_R.shape[1], dtype=fresh.qr_R.dtype
+    fresh_r = fresh.solver_cache.R
+    garbage = jnp.ones_like(fresh_r) + jnp.eye(
+        fresh_r.shape[0], fresh_r.shape[1], dtype=fresh_r.dtype
     )
     poisoned_matching = dataclasses.replace(
         fresh,
-        qr_R=garbage,
-        qr_valid=jnp.asarray(True),
-        qr_ridge=fresh.ridge,
+        solver_cache=QRCache(garbage, jnp.asarray(True), fresh.ridge),
     )
     x_poisoned, _, _ = solver.update(X0, poisoned_matching)
     assert not np.allclose(np.asarray(x_poisoned), np.asarray(x_clean))
 
     poisoned_stale_ridge = dataclasses.replace(
         fresh,
-        qr_R=garbage,
-        qr_valid=jnp.asarray(True),
-        qr_ridge=fresh.ridge * 2.0,
+        solver_cache=QRCache(garbage, jnp.asarray(True), fresh.ridge * 2.0),
     )
     x_recomputed, _, _ = solver.update(X0, poisoned_stale_ridge)
     np.testing.assert_allclose(
         np.asarray(x_recomputed), np.asarray(x_clean), rtol=1e-6
     )
     # An update after an ACCEPTED step invalidates the cache (x moved).
-    assert not bool(state_clean.qr_valid)
+    assert not bool(state_clean.solver_cache.valid)
     assert not bool(state_clean.jacobian_valid)
 
 
@@ -195,7 +201,7 @@ def test_lsmr_right_preconditioner_changes_nothing():
     preconditioned = build(
         "lsmr",
         ridge=1e-3,
-        lsmr_preconditioner=WhitenedPreconditioner(solve, solve_transpose),
+        preconditioner=WhitenedPreconditioner(solve, solve_transpose),
     )
     identity = build("lsmr", ridge=1e-3)
     state_p = preconditioned.init(X0)

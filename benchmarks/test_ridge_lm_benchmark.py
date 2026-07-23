@@ -10,6 +10,9 @@ import jax.numpy as jnp
 import pytest
 
 from nlls_gram import (
+    LSMR,
+    QR,
+    Cholesky,
     LevenbergMarquardt,
     RidgeLevenbergMarquardt,
     identity_right_preconditioner,
@@ -82,18 +85,17 @@ def test_update_step(
         penalty = repeated_dense_penalty(
             K, repeats=repeats, zero_pad_size=zero_pad_size
         )
-        settings = {}
         if configuration == "lsmr":
-            settings = dict(
-                lsmr_preconditioner=identity_right_preconditioner(),
-                iterative_maxiter=32,
-            )
+            config = LSMR(identity_right_preconditioner(), maxiter=32)
+        elif configuration == "qr":
+            config = QR()
+        else:
+            config = Cholesky()
         solver = RidgeLevenbergMarquardt(
             residual,
             penalty=penalty,
             ridge=RIDGE,
-            linear_solver=configuration,
-            **settings,
+            linear_solver=config,
         )
     lm_state = solver.init(x0)
     step = jax.jit(solver.update)
@@ -122,18 +124,20 @@ def test_rejected_update_step(benchmark, platform, configuration):
     K, residual, x0 = _problem(n, repeats, zero_pad_size, m_resid, device)
     penalty = repeated_dense_penalty(K, repeats=repeats, zero_pad_size=zero_pad_size)
     solver = RidgeLevenbergMarquardt(
-        residual, penalty=penalty, ridge=RIDGE, linear_solver=configuration
+        residual,
+        penalty=penalty,
+        ridge=RIDGE,
+        linear_solver=Cholesky() if configuration == "cholesky" else QR(),
     )
     lm_state = solver.init(x0)
     import dataclasses
 
+    stepped = solver.update(x0, lm_state)[1]
     warm = dataclasses.replace(
-        solver.update(x0, lm_state)[1],
+        stepped,
         jacobian_valid=jnp.asarray(True),
-        **(
-            {"G_valid": jnp.asarray(True)}
-            if configuration == "cholesky"
-            else {"qr_valid": jnp.asarray(True)}
+        solver_cache=dataclasses.replace(
+            stepped.solver_cache, valid=jnp.asarray(True)
         ),
     )
     step = jax.jit(solver.update)

@@ -41,7 +41,7 @@ def counting_identity_penalty(counters):
 def test_rejected_step_skips_normal_matrix_assembly():
     # B1: a rejected step re-factors G + damping*I but must NOT re-run the
     # GEMM + add_scaled assembly of G = J'J + ridge*L'L; a callback ridge
-    # change must force it again through the G_ridge key.
+    # change must force it again through the cache's ridge key.
     counters = []
     penalty = counting_identity_penalty(counters)
 
@@ -65,7 +65,7 @@ def test_rejected_step_skips_normal_matrix_assembly():
     jax.effects_barrier()
     assert len(counters) == 1
     assert not bool(info1.accepted)
-    assert bool(state1.G_valid)
+    assert bool(state1.solver_cache.valid)
 
     # Rejected step: same x, same ridge -- assembly skipped, refactor only.
     counters.clear()
@@ -73,7 +73,7 @@ def test_rejected_step_skips_normal_matrix_assembly():
     jax.effects_barrier()
     assert len(counters) == 0
 
-    # A ridge change at the same x invalidates through the G_ridge key.
+    # A ridge change at the same x invalidates through the cache ridge key.
     counters.clear()
     lowered = dataclasses.replace(state2, ridge=state2.ridge * 0.1)
     solver.update(x2, lowered)

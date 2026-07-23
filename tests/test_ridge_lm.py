@@ -6,6 +6,8 @@ import numpy as np
 import pytest
 
 from nlls_gram import (
+    LSMR,
+    NormalCG,
     RidgeLevenbergMarquardt,
     RidgeLMState,
     identity_penalty,
@@ -231,23 +233,23 @@ def test_constructor_validation():
         RidgeLevenbergMarquardt(linear_residual, penalty=penalty, ridge=0.0)
     with pytest.raises(ValueError, match="strictly positive"):
         RidgeLevenbergMarquardt(linear_residual, penalty=penalty, ridge=-1e-3)
-    with pytest.raises(ValueError, match="unknown linear_solver"):
+    # String solver names are gone: the typed configs are the only spelling.
+    with pytest.raises(TypeError, match="solver config"):
         RidgeLevenbergMarquardt(
-            linear_residual, penalty=penalty, linear_solver="gram_cholesky"
+            linear_residual, penalty=penalty, linear_solver="cholesky"
         )
-    with pytest.raises(ValueError, match="lsmr_preconditioner"):
-        RidgeLevenbergMarquardt(linear_residual, penalty=penalty, linear_solver="lsmr")
+    with pytest.raises(TypeError, match="solver config"):
+        RidgeLevenbergMarquardt(linear_residual, penalty=penalty, ad_solver="auto")
+    # Each config validates its own fields at construction.
+    with pytest.raises(TypeError, match="WhitenedPreconditioner"):
+        LSMR(None)
+    with pytest.raises(ValueError, match="maxiter"):
+        NormalCG(tol=0.0)
+    with pytest.raises(TypeError, match="callable"):
+        NormalCG(preconditioner=object())
     with pytest.raises(NotImplementedError, match="penalty_factory"):
         RidgeLevenbergMarquardt(
             linear_residual, penalty=penalty, penalty_factory=object()
-        )
-    with pytest.raises(ValueError, match="unknown ad_solver"):
-        RidgeLevenbergMarquardt(linear_residual, penalty=penalty, ad_solver="svd")
-    with pytest.raises(ValueError, match="ad_solver_preconditioner"):
-        RidgeLevenbergMarquardt(
-            linear_residual,
-            penalty=penalty,
-            ad_solver_preconditioner=lambda v: v,
         )
 
 

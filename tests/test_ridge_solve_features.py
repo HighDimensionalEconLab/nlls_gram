@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from nlls_gram import (
+    LSMR,
     LMSolveAction,
     LMStatus,
     MultiStart,
@@ -15,7 +16,7 @@ from nlls_gram import (
     ridge_continuation,
 )
 
-IDENTITY_RIGHT = identity_right_preconditioner()
+LSMR_CONFIG = LSMR(identity_right_preconditioner(), maxiter=40)
 
 RNG = np.random.default_rng(11)
 M_RESID, BLOCK, REPEATS, PAD = 4, 4, 2, 2
@@ -250,8 +251,7 @@ def test_equal_settings_solvers_share_the_compiled_solve_loop():
     def build():
         return RidgeLevenbergMarquardt(
             residual, penalty=penalty, ridge=1e-3, cache_jacobian=False,
-            linear_solver="lsmr", iterative_maxiter=40,
-            lsmr_preconditioner=IDENTITY_RIGHT,
+            linear_solver=LSMR_CONFIG,
         )
 
     a, b = build(), build()
@@ -266,10 +266,21 @@ def test_equal_settings_solvers_share_the_compiled_solve_loop():
     assert traces["count"] == count_after_first + 1
     a.solve(jnp.zeros(P_DIM), B, max_steps=10, gtol=1e-4)
     assert traces["count"] == count_after_first + 2
-    # Any static-setting change is a different solver.
+    # Any static-setting change is a different solver -- including a change
+    # buried inside the typed config (an equal-valued fresh config is NOT a
+    # change: value-based hashing shares the compile).
     different = RidgeLevenbergMarquardt(
         residual, penalty=penalty, ridge=1e-4, cache_jacobian=False,
-        linear_solver="lsmr", iterative_maxiter=40,
-        lsmr_preconditioner=IDENTITY_RIGHT,
+        linear_solver=LSMR_CONFIG,
     )
     assert a != different
+    rebuilt_config = RidgeLevenbergMarquardt(
+        residual, penalty=penalty, ridge=1e-3, cache_jacobian=False,
+        linear_solver=LSMR(identity_right_preconditioner(), maxiter=40),
+    )
+    assert a != rebuilt_config  # fresh preconditioner callables hash fresh
+    shared_config = RidgeLevenbergMarquardt(
+        residual, penalty=penalty, ridge=1e-3, cache_jacobian=False,
+        linear_solver=LSMR(LSMR_CONFIG.preconditioner, maxiter=40),
+    )
+    assert a == shared_config

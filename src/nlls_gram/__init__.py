@@ -80,15 +80,33 @@ from nlls_gram.recycled_cg import (
     recycled_cg,
 )
 from nlls_gram.ridge_lm import (
+    CholeskyCache,
+    LSMRCache,
+    QRCache,
     RidgeLevenbergMarquardt,
     RidgeLMInfo,
     RidgeLMState,
     ridge_continuation,
 )
+from nlls_gram.solver_config import (
+    LSMR,
+    QR,
+    Auto,
+    Cholesky,
+    NormalCG,
+)
 
 __all__ = [
+    "Auto",
+    "Cholesky",
+    "CholeskyCache",
+    "LSMR",
+    "LSMRCache",
     "LevenbergMarquardt",
     "LMState",
+    "NormalCG",
+    "QR",
+    "QRCache",
     "LMHyperparams",
     "LMInfo",
     "LMStatus",

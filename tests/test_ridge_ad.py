@@ -4,7 +4,9 @@ import numpy as np
 import pytest
 
 from nlls_gram import (
+    LSMR,
     MultiStart,
+    NormalCG,
     RidgeLevenbergMarquardt,
     identity_penalty,
     identity_right_preconditioner,
@@ -108,22 +110,22 @@ def test_implicit_gradient_nonlinear_tight_at_small_ridge_biased_at_moderate():
 def test_cg_and_cholesky_ad_agree():
     p0 = jnp.asarray(RNG.normal(size=M_RESID), dtype=jnp.float32)
     grads = {}
-    for ad_solver, extra in (
-        ("cholesky", {}),
-        ("normal_cg", {"ad_solver_maxiter": 200, "ad_solver_tol": 1e-8}),
+    for name, ad_solver in (
+        ("cholesky", None),
+        ("normal_cg", NormalCG(maxiter=200, tol=1e-8)),
     ):
+        settings = {} if ad_solver is None else {"ad_solver": ad_solver}
         solver = RidgeLevenbergMarquardt(
             linear_residual,
             penalty=make_penalty(),
             ridge=1e-3,
-            ad_solver=ad_solver,
-            **extra,
+            **settings,
         )
 
         def loss(p, solver=solver):
             return solution_functional(solver, p)
 
-        grads[ad_solver] = np.asarray(jax.grad(loss)(p0))
+        grads[name] = np.asarray(jax.grad(loss)(p0))
     np.testing.assert_allclose(
         grads["cholesky"], grads["normal_cg"], rtol=1e-3, atol=1e-5
     )
@@ -135,11 +137,9 @@ def test_lsmr_forward_auto_resolves_to_matrix_free_ad():
         linear_residual,
         penalty=make_penalty(),
         ridge=1e-3,
-        linear_solver="lsmr",
-        lsmr_preconditioner=identity_right_preconditioner(),
-        iterative_tol=1e-10,
-        iterative_maxiter=None,
-        ad_solver_maxiter=200,
+        linear_solver=LSMR(
+            identity_right_preconditioner(), tol=1e-10, maxiter=None
+        ),
     )
     assert lsmr_solver._resolved_ad_solver() == "normal_cg"
     dense_solver = RidgeLevenbergMarquardt(
@@ -210,18 +210,9 @@ def test_multi_start_gradient_flows_through_the_winner():
 
 
 def test_ad_maxiter_required_when_cg_tolerances_zero():
-    solver = RidgeLevenbergMarquardt(
-        linear_residual,
-        penalty=make_penalty(),
-        ridge=1e-3,
-        linear_solver="lsmr",
-        lsmr_preconditioner=identity_right_preconditioner(),
-        ad_solver_tol=0.0,
-    )
-    p0 = jnp.zeros(M_RESID)
-
-    def loss(p):
-        return solution_functional(solver, p)
-
-    with pytest.raises(ValueError, match="ad_solver_maxiter"):
-        jax.grad(loss)(p0)
+    # An uncapped zero-tolerance CG loop has no stopping rule; the config
+    # rejects it at construction rather than at differentiation time.
+    with pytest.raises(ValueError, match="maxiter"):
+        NormalCG(tol=0.0)
+    NormalCG(tol=0.0, maxiter=50)
+    NormalCG(tol=0.0, atol=1e-10)

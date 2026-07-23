@@ -1517,6 +1517,9 @@ import jax.numpy as jnp
 import numpy as np
 
 from nlls_gram import (
+    LSMR,
+    QR,
+    Cholesky,
     RidgeLevenbergMarquardt,
     identity_right_preconditioner,
     repeated_dense_penalty,
@@ -1536,21 +1539,24 @@ def residual(theta):
     return A @ theta - b
 
 
-def build(linear_solver, **kwargs):
+SOLVER_CONFIGS = {
+    "cholesky": Cholesky(),
+    "qr": QR(),
+    "lsmr": LSMR(identity_right_preconditioner(), tol=1e-14, maxiter=None),
+}
+
+
+def build(name, **kwargs):
     settings = dict(
         penalty=repeated_dense_penalty(K, repeats=repeats, zero_pad_size=pad),
         ridge=1e-8,
         init_damping=1e-6,
         geodesic_acceleration=False,
     )
-    if linear_solver == "lsmr":
-        settings.update(
-            lsmr_preconditioner=identity_right_preconditioner(),
-            iterative_tol=1e-14,
-            iterative_maxiter=None,
-        )
     settings.update(kwargs)
-    return RidgeLevenbergMarquardt(residual, linear_solver=linear_solver, **settings)
+    return RidgeLevenbergMarquardt(
+        residual, linear_solver=SOLVER_CONFIGS[name], **settings
+    )
 
 
 # Tight three-way step agreement at small ridge/damping: float64 keeps even
@@ -1594,7 +1600,7 @@ def residual32(theta):
 for name in ("cholesky", "qr"):
     solver32 = RidgeLevenbergMarquardt(
         residual32,
-        linear_solver=name,
+        linear_solver=SOLVER_CONFIGS[name],
         penalty=repeated_dense_penalty(K32, repeats=repeats, zero_pad_size=pad),
         ridge=1e-6,
         linear_solve_dtype=jnp.float64,
@@ -1602,11 +1608,10 @@ for name in ("cholesky", "qr"):
     state32 = solver32.init(x0_f32)
     assert state32.ridge.dtype == jnp.float32
     if name == "cholesky":
-        assert state32.G.dtype == jnp.float64
-        assert state32.G_ridge.dtype == jnp.float32
+        assert state32.solver_cache.G.dtype == jnp.float64
     else:
-        assert state32.qr_R.dtype == jnp.float64
-        assert state32.qr_ridge.dtype == jnp.float32
+        assert state32.solver_cache.R.dtype == jnp.float64
+    assert state32.solver_cache.ridge.dtype == jnp.float32
     x1_32, new_state32, info32 = solver32.update(x0_f32, state32)
     assert x1_32.dtype == jnp.float32
     assert info32.loss.dtype == jnp.float32
@@ -1656,6 +1661,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from nlls_gram import (
+    QR,
     LevenbergMarquardt,
     RidgeLevenbergMarquardt,
     repeated_dense_penalty,
@@ -1709,7 +1715,7 @@ ridge_solver = RidgeLevenbergMarquardt(
     residual,
     penalty=repeated_dense_penalty(K, repeats=repeats, zero_pad_size=pad),
     ridge=1e-4,
-    linear_solver="qr",
+    linear_solver=QR(),
 )
 ridge_result = ridge_solver.solve(
     jnp.zeros(p_dim),
