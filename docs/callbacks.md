@@ -44,7 +44,10 @@ and `xtol` cannot fire at step zero.
 
 Repeated rejections multiply the damping by `damping_increase` without bound,
 which can overflow in float32. The constructor's `max_damping` clamps the
-damping from above; leave it `None` for uncapped classic behavior.
+damping from above; leave it `None` for uncapped classic behavior. Accepted
+steps cannot underflow damping to zero: `min_damping=None` uses
+`jnp.finfo(residual.dtype).tiny`, while an explicit value selects a larger
+absolute floor.
 
 Status codes are integer constants:
 
@@ -82,10 +85,10 @@ to second-guess a callback's explicit replacement.
 ### Resettable Hyperparameters
 
 `solve()` populates `lm_state.hyper` with an `LMHyperparams` of traced
-per-step values: `damping_decrease`, `damping_increase`, `max_damping`,
-`geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`, and
-`iterative_maxiter`. Because they ride in the lm_state, a
-callback can reset any of them mid-solve — exactly like a damping reset:
+per-step values: `damping_decrease`, `damping_increase`, `min_damping`,
+`max_damping`, `geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`,
+and `iterative_maxiter`. Because they ride in the lm_state, a callback can reset
+any of them mid-solve — exactly like a damping reset:
 
 ```python
 new_hyper = dataclasses.replace(

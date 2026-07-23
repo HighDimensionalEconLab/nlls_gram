@@ -140,7 +140,9 @@ so the natural parameter metric is \(M=K\).
 
 The actual nonlinear step is accepted only if the unregularized residual sum of
 squares decreases. On acceptance, damping is multiplied by `damping_decrease`;
-on rejection, it is multiplied by `damping_increase`.
+on rejection, it is multiplied by `damping_increase`. `min_damping=None`
+clamps it to the smallest positive normal value of the residual dtype, avoiding
+backend flush-to-zero behavior without imposing a larger regularization floor.
 
 Near the interpolation threshold, small-damping LM becomes metric
 Gauss-Newton, whose step is the minimum-\(M\)-norm solution of the linearized

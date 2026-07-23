@@ -192,6 +192,11 @@ few steps. Try them when you see specific signatures:
   descent).
 - Long rejection storms in float32 → set `max_damping` (~`1e6`) so damping
   cannot overflow.
+- Literal damping underflow → the default `min_damping=None` already resolves
+  to the residual dtype's smallest positive normal value. This representation
+  floor prevents flush-to-zero but does not keep the damping numerically active
+  in an ill-conditioned system. A standard scale-aware floor is on the order of
+  `eps * operator_scale`; pass that larger absolute `min_damping` explicitly.
 - Accept/reject oscillation → bring `damping_decrease`/`damping_increase`
   closer to 1 (e.g. 0.7 / 2.0) for smoother adaptation.
 - All steps accepted but progress is slow → lower `init_damping` or decrease

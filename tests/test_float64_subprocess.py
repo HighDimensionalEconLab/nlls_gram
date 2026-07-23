@@ -1552,3 +1552,39 @@ assert float(result.info.grad_norm) < 1e-6, float(result.info.grad_norm)
         capture_output=True,
         text=True,
     )
+
+
+def test_float64_default_min_damping_uses_float64_normal_floor():
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+
+from nlls_gram import LevenbergMarquardt, LMState
+
+
+def residual(theta):
+    return theta
+
+
+solver = LevenbergMarquardt(
+    residual,
+    cache_jacobian=False,
+    geodesic_acceleration=False,
+)
+state = LMState(jnp.asarray(0.0, dtype=jnp.float64))
+x, state, info = solver.update(jnp.ones(1, dtype=jnp.float64), state)
+floor = jnp.asarray(jnp.finfo(jnp.float64).tiny, dtype=jnp.float64)
+
+assert info.accepted
+assert jnp.all(jnp.isfinite(x))
+assert state.damping.dtype == jnp.float64
+assert state.damping == floor, (state.damping, floor)
+assert info.damping == floor, (info.damping, floor)
+"""
+    subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
