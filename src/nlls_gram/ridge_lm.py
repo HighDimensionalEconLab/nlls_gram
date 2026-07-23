@@ -102,7 +102,11 @@ class RidgeLMState:
         G_valid: ``()`` bool -- ``G`` describes the current ``x``.
         G_ridge: ``()`` the ridge the cached ``G`` was assembled with; a
             callback ridge change invalidates the cache through this key.
-        qr_R: cached ``R`` factor of ``[J; sqrt(ridge) L]`` for the qr path.
+        qr_R: cached ``R`` factor of the augmented stack
+            ``[J, sqrt(ridge) L | b]`` for the qr path -- the first ``p``
+            columns are the ``R`` factor of ``[J; sqrt(ridge) L]`` and the
+            last column carries the ``Q``-transformed residual, so the
+            velocity solve is backward stable with no normal equations.
         qr_valid: ``()`` bool -- ``qr_R`` describes the current ``x``.
         qr_ridge: ``()`` the ridge the cached ``qr_R`` was built with.
         penalty_state: reserved for a future ``penalty_factory``; ``None``.
@@ -294,10 +298,15 @@ class RidgeLevenbergMarquardt:
       cached across rejected steps (only the damping shift re-factors).
     - ``"qr"``: MINPACK-structured damping-row QR (More 1978), stable at
       small ``ridge``/``damping`` where forming ``G`` squares the condition
-      number. The ``R`` factor of ``[J; sqrt(ridge) L]`` is cached per
-      ``(x, ridge)``; each update stacks ``[R; sqrt(damping) I]``, re-factors,
-      and solves by corrected semi-normal equations with one fixed
-      iterative-refinement pass (Bjorck 1987; Bjorck 1996 Sec. 6.6.5).
+      number. One QR of the augmented stack ``[J, sqrt(ridge) L | b]`` is
+      cached per ``(x, ridge)`` (the extra column carries the
+      ``Q``-transformed residual); each update re-factors
+      ``[R; sqrt(damping) I]`` with its ``Q`` retained and solves the
+      velocity as a backward-stable least-squares problem at ``cond(A)``,
+      never ``cond(A)^2``. The geodesic-acceleration RHS reuses the damped
+      factor through corrected semi-normal equations with one fixed
+      iterative-refinement pass (Bjorck 1987; Bjorck 1996 Sec. 6.6.5) --
+      the second-order correction tolerates the squared conditioning.
     - ``"lsmr"``: matrix-free bidiagonalization (Fong-Saunders 2011) on the
       right-preconditioned augmented operator, requiring an explicit
       ``lsmr_preconditioner`` (a
@@ -675,12 +684,12 @@ class RidgeLevenbergMarquardt:
                 G_valid=invalid,
                 G_ridge=jnp.zeros((), dtype=dtype),
             )
-        r_rows = min(m + self.penalty.num_rows, p_dim)
+        r_rows = min(m + self.penalty.num_rows, p_dim + 1)
         return RidgeLMState(
             damping,
             ridge,
             **common,
-            qr_R=jnp.zeros((r_rows, p_dim), dtype=dense_dtype),
+            qr_R=jnp.zeros((r_rows, p_dim + 1), dtype=dense_dtype),
             qr_valid=invalid,
             qr_ridge=jnp.zeros((), dtype=dtype),
         )
@@ -985,12 +994,30 @@ class RidgeLevenbergMarquardt:
                 dense_dtype
             )
 
+            # One QR of the AUGMENTED stack [A | b] with A = [J; sqrt(ridge) L]
+            # and b = [r; sqrt(ridge) L x], cached per (x, ridge): its first p
+            # columns are A's R factor and its last column carries Q'b, so the
+            # velocity can be solved as a backward-stable least-squares problem
+            # with NO normal equations anywhere -- More 1978's actual damping-
+            # row structure. (An extra residual-norm row appears when
+            # m + k > p; it is a constant in the least-squares objective and
+            # harmless.) The semi-normal route (R'R delta = -g) squares the
+            # stack's condition number, which loses the Gauss-Newton step
+            # accuracy exactly in the tiny-ridge regime this path exists for.
             def assemble_r(_):
                 stacked = jnp.concatenate(
                     [transposed_jacobian.T, jnp.sqrt(ridge_wide) * penalty_rows],
                     axis=0,
                 )
-                return jnp.linalg.qr(stacked, mode="r")
+                b_stacked = jnp.concatenate(
+                    [
+                        resid.astype(dense_dtype),
+                        jnp.sqrt(ridge_wide)
+                        * jnp.asarray(factor_x, dtype=dense_dtype),
+                    ]
+                )
+                augmented = jnp.concatenate([stacked, b_stacked[:, None]], axis=1)
+                return jnp.linalg.qr(augmented, mode="r")
 
             if self.cache_jacobian:
                 if lm_state.qr_valid is None:
@@ -1006,19 +1033,22 @@ class RidgeLevenbergMarquardt:
                 )
             else:
                 qr_R = assemble_r(None)
-            # Per-update damping-row refactor (More 1978's structure via a
-            # plain stacked QR): R_mu'R_mu = R'R + damping I = A'A + damping I.
-            # When m + k < p the cached R is upper trapezoidal and these
-            # damping rows are what make the final system full rank.
+            r_factor = qr_R[:, :-1]
+            transformed_rhs = qr_R[:, -1]
+            # Per-update damping-row refactor: [R; sqrt(damping) I] = Q2 R2
+            # with R2'R2 = A'A + damping I. When m + k < p the cached R is
+            # upper trapezoidal and these damping rows are what make the
+            # final system full rank. Q2 is retained to transform the
+            # velocity RHS stably.
             damped_stack = jnp.concatenate(
                 [
-                    qr_R,
+                    r_factor,
                     jnp.sqrt(damping_wide)
                     * jnp.eye(theta.shape[0], dtype=dense_dtype),
                 ],
                 axis=0,
             )
-            R_mu = jnp.linalg.qr(damped_stack, mode="r")
+            Q_mu, R_mu = jnp.linalg.qr(damped_stack, mode="reduced")
 
             def damped_normal_matvec(v):
                 return (
@@ -1028,9 +1058,11 @@ class RidgeLevenbergMarquardt:
                 )
 
             def solve_step(rhs):
-                # Corrected semi-normal equations (Bjorck 1987): triangular
-                # solves against R_mu, then ONE fixed iterative-refinement
-                # pass through matvecs (Bjorck 1996 Sec. 6.6.5).
+                # Corrected semi-normal equations (Bjorck 1987) for the
+                # geodesic-acceleration RHS: triangular solves against R_mu,
+                # then ONE fixed iterative-refinement pass through matvecs
+                # (Bjorck 1996 Sec. 6.6.5). The second-order correction
+                # tolerates the squared conditioning; accept/reject guards it.
                 b = -rhs.astype(dense_dtype)
                 half = jsp_linalg.solve_triangular(R_mu.T, b, lower=True)
                 delta = jsp_linalg.solve_triangular(R_mu, half, lower=False)
@@ -1039,11 +1071,29 @@ class RidgeLevenbergMarquardt:
                 delta = delta + jsp_linalg.solve_triangular(R_mu, half, lower=False)
                 return delta.astype(resid.dtype)
 
+            def solve_velocity():
+                # min ||[R; sqrt(damping) I] delta + [Q'b; 0]||^2 solved
+                # through Q2: exact and backward stable at cond(A), never
+                # cond(A)^2.
+                rhs_aug = jnp.concatenate(
+                    [
+                        transformed_rhs,
+                        jnp.zeros(theta.shape[0], dtype=dense_dtype),
+                    ]
+                )
+                delta = -jsp_linalg.solve_triangular(
+                    R_mu, Q_mu.T @ rhs_aug, lower=False
+                )
+                return delta.astype(resid.dtype)
+
             def accel_rhs(f_vv):
                 return Jt @ f_vv
 
         # First-order step (velocity) and its ridge objective.
-        velocity = solve_step(grad)
+        if resolved_solver == "qr":
+            velocity = solve_velocity()
+        else:
+            velocity = solve_step(grad)
         resid_velocity = residual_value(theta + velocity)
         resid_loss_old = jnp.sum(resid**2)
         loss_old = resid_loss_old + ridge * penalty_value_old

@@ -116,8 +116,9 @@ def test_qr_cache_is_reused_and_ridge_keyed():
     fresh = solver.init(X0)
     x_clean, state_clean, _ = solver.update(X0, fresh)
 
-    garbage = jnp.eye(P_DIM, dtype=fresh.qr_R.dtype) * 5.0
-    garbage = garbage[: fresh.qr_R.shape[0], :]
+    garbage = jnp.ones_like(fresh.qr_R) + jnp.eye(
+        fresh.qr_R.shape[0], fresh.qr_R.shape[1], dtype=fresh.qr_R.dtype
+    )
     poisoned_matching = dataclasses.replace(
         fresh,
         qr_R=garbage,
