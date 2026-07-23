@@ -1507,3 +1507,229 @@ assert info.damping == floor, (info.damping, floor)
         capture_output=True,
         text=True,
     )
+
+
+def test_ridge_lm_float64_solver_agreement_and_dtype_policy():
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+import numpy as np
+
+from nlls_gram import (
+    RidgeLevenbergMarquardt,
+    identity_right_preconditioner,
+    repeated_dense_penalty,
+)
+
+rng = np.random.default_rng(3)
+m, block, repeats, pad = 5, 4, 2, 2
+p_dim = repeats * block + pad
+A = jnp.asarray(rng.normal(size=(m, p_dim)))
+b = jnp.asarray(rng.normal(size=m))
+root = rng.normal(size=(block, block + 2))
+K = jnp.asarray(root @ root.T + 0.5 * np.eye(block))
+x0 = jnp.asarray(rng.normal(size=p_dim))
+
+
+def residual(theta):
+    return A @ theta - b
+
+
+def build(linear_solver, **kwargs):
+    settings = dict(
+        penalty=repeated_dense_penalty(K, repeats=repeats, zero_pad_size=pad),
+        ridge=1e-8,
+        init_damping=1e-6,
+        geodesic_acceleration=False,
+    )
+    if linear_solver == "lsmr":
+        settings.update(
+            lsmr_preconditioner=identity_right_preconditioner(),
+            iterative_tol=1e-14,
+            iterative_maxiter=None,
+        )
+    settings.update(kwargs)
+    return RidgeLevenbergMarquardt(residual, linear_solver=linear_solver, **settings)
+
+
+# Tight three-way step agreement at small ridge/damping: float64 keeps even
+# the squared cholesky path accurate enough to meet qr/lsmr at 1e-9.
+steps = {}
+for name in ("cholesky", "qr", "lsmr"):
+    solver = build(name)
+    lm_state = solver.init(x0)
+    x1, new_state, info = solver.update(x0, lm_state)
+    steps[name] = np.asarray(x1)
+    assert x1.dtype == jnp.float64
+    assert info.loss.dtype == jnp.float64
+    assert info.resid_loss.dtype == jnp.float64
+    assert info.penalty_value.dtype == jnp.float64
+    assert info.ridge.dtype == jnp.float64
+    assert new_state.ridge.dtype == jnp.float64
+np.testing.assert_allclose(steps["cholesky"], steps["qr"], atol=1e-9)
+np.testing.assert_allclose(steps["cholesky"], steps["lsmr"], atol=1e-9)
+
+# No float32 leaks anywhere in the compiled update or solve.
+solver = build("cholesky")
+lm_state = solver.init(x0)
+jaxpr = str(jax.make_jaxpr(lambda t, s: solver.update(t, s))(x0, lm_state))
+assert "f32" not in jaxpr, jaxpr
+solve_jaxpr = str(
+    jax.make_jaxpr(lambda t: solver.solve(t, max_steps=20, gtol=1e-10).x)(x0)
+)
+assert "f32" not in solve_jaxpr, solve_jaxpr
+
+# A float32 problem under enabled x64 with linear_solve_dtype=float64: the
+# normal/QR pipelines run wide (wide cache buffers), every output stays
+# float32 -- including the qr path's stacked [J; sqrt(ridge) L] assembly.
+x0_f32 = x0.astype(jnp.float32)
+A32, b32, K32 = A.astype(jnp.float32), b.astype(jnp.float32), K.astype(jnp.float32)
+
+
+def residual32(theta):
+    return A32 @ theta - b32
+
+
+for name in ("cholesky", "qr"):
+    solver32 = RidgeLevenbergMarquardt(
+        residual32,
+        linear_solver=name,
+        penalty=repeated_dense_penalty(K32, repeats=repeats, zero_pad_size=pad),
+        ridge=1e-6,
+        linear_solve_dtype=jnp.float64,
+    )
+    state32 = solver32.init(x0_f32)
+    assert state32.ridge.dtype == jnp.float32
+    if name == "cholesky":
+        assert state32.G.dtype == jnp.float64
+        assert state32.G_ridge.dtype == jnp.float32
+    else:
+        assert state32.qr_R.dtype == jnp.float64
+        assert state32.qr_ridge.dtype == jnp.float32
+    x1_32, new_state32, info32 = solver32.update(x0_f32, state32)
+    assert x1_32.dtype == jnp.float32
+    assert info32.loss.dtype == jnp.float32
+    assert info32.grad_norm.dtype == jnp.float32
+    result32 = solver32.solve(x0_f32, max_steps=50, gtol=1e-4)
+    assert result32.x.dtype == jnp.float32
+    assert result32.lm_state.ridge.dtype == jnp.float32
+
+# End-to-end wide-pipeline solve from float32 data at a MODERATE ridge. The
+# comparison against the float64 same-ridge solution is limited by the
+# selection resolution gtol / ridge (the gradient stays at the residual
+# dtype by design, noise floor ~1e-7), so ridge=1e-2 with gtol=1e-6 pins the
+# answer to ~1e-4 -- the promoted assembly/factorization then lands on the
+# float64 answer well inside that.
+x_wide = np.asarray(
+    RidgeLevenbergMarquardt(
+        residual32,
+        penalty=repeated_dense_penalty(K32, repeats=repeats, zero_pad_size=pad),
+        ridge=1e-2,
+        linear_solve_dtype=jnp.float64,
+    )
+    .solve(jnp.zeros(p_dim, jnp.float32), max_steps=300, gtol=1e-6)
+    .x,
+    np.float64,
+)
+x_ref = np.asarray(
+    build("cholesky", ridge=1e-2)
+    .solve(jnp.zeros(p_dim), max_steps=300, gtol=1e-10)
+    .x
+)
+np.testing.assert_allclose(x_wide, x_ref, atol=1e-4)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_ridge_continuation_matches_metric_lm_min_seminorm_float64():
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+import numpy as np
+
+from nlls_gram import (
+    LevenbergMarquardt,
+    RidgeLevenbergMarquardt,
+    repeated_dense_penalty,
+    repeated_shifted_dense_metric,
+    ridge_continuation,
+)
+
+rng = np.random.default_rng(9)
+m, block, repeats, pad = 4, 4, 2, 2
+p_dim = repeats * block + pad
+A_np = rng.normal(size=(m, p_dim))
+b_np = rng.normal(size=m)
+root = rng.normal(size=(block, block + 2))
+K_np = root @ root.T + 0.5 * np.eye(block)
+M0 = np.zeros((p_dim, p_dim))
+for j in range(repeats):
+    M0[j * block : (j + 1) * block, j * block : (j + 1) * block] = K_np
+
+A = jnp.asarray(A_np)
+b = jnp.asarray(b_np)
+K = jnp.asarray(K_np)
+
+
+def residual(theta):
+    return A @ theta - b
+
+
+# The affine problem's exact minimum-seminorm interpolant from the KKT system.
+kkt = np.block([[M0, A_np.T], [A_np, np.zeros((m, m))]])
+x_dagger = np.linalg.solve(kkt, np.concatenate([np.zeros(p_dim), b_np]))[:p_dim]
+
+# Metric-damped LM with a small epsilon shift selects x_dagger + O(eps).
+metric = repeated_shifted_dense_metric(
+    K, repeats=repeats, zero_pad_size=pad, epsilon=1e-8
+)
+metric_solver = LevenbergMarquardt(residual, metric=metric)
+metric_result = metric_solver.solve(jnp.zeros(p_dim), max_steps=200, atol=1e-12)
+x_metric = np.asarray(metric_result.x)
+
+# Ridge LM with continuation to a small floor selects x_dagger + O(floor).
+# The qr path carries the endgame: below ridge ~ 1e-8 the squared normal
+# system's conditioning (~ 1/ridge) costs the cholesky path float64 digits,
+# while the QR of [J; sqrt(ridge) L] works at the square root of that.
+# Floor choice: the selection is resolved to grad_norm / ridge, and the
+# achievable float64 gradient is ~1e-15, so ridge_floor ~ 1e-8 balances the
+# O(ridge) bias against the eps/ridge stationarity resolution -- pushing the
+# floor lower makes the answer WORSE, not better. gtol must sit well below
+# ridge times the target selection accuracy.
+callback, user_state0 = ridge_continuation(ridge_floor=1e-8, decrease=0.1)
+ridge_solver = RidgeLevenbergMarquardt(
+    residual,
+    penalty=repeated_dense_penalty(K, repeats=repeats, zero_pad_size=pad),
+    ridge=1e-4,
+    linear_solver="qr",
+)
+ridge_result = ridge_solver.solve(
+    jnp.zeros(p_dim),
+    max_steps=500,
+    gtol=1e-15,
+    atol=1e-8,
+    callback=callback,
+    user_state=user_state0,
+)
+assert int(ridge_result.status) == 1
+x_ridge = np.asarray(ridge_result.x)
+
+np.testing.assert_allclose(x_ridge, x_dagger, atol=1e-6)
+np.testing.assert_allclose(x_metric, x_dagger, atol=1e-6)
+np.testing.assert_allclose(x_ridge, x_metric, atol=1e-6)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout

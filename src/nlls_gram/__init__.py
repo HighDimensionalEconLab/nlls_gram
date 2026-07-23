@@ -78,6 +78,12 @@ from nlls_gram.recycled_cg import (
     deflated_pcg,
     recycled_cg,
 )
+from nlls_gram.ridge_lm import (
+    RidgeLevenbergMarquardt,
+    RidgeLMInfo,
+    RidgeLMState,
+    ridge_continuation,
+)
 
 __all__ = [
     "LevenbergMarquardt",
@@ -107,6 +113,10 @@ __all__ = [
     "LSMRState",
     "penalty_from_factor",
     "repeated_dense_penalty",
+    "ridge_continuation",
+    "RidgeLevenbergMarquardt",
+    "RidgeLMInfo",
+    "RidgeLMState",
     "RidgePenalty",
     "matern_state_space",
     "metric_from_cholesky",
