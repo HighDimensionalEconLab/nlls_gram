@@ -66,11 +66,11 @@ solver = RidgeLevenbergMarquardt(
     penalty=penalty,
     ridge=1e-8,                  # fixed small ridge; None = dtype default
 )
-result = solver.solve(theta_0, max_steps=400, atol=1e-8)
+result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=1e-8)
 
 # optional homotopy (ridge annealed 1e-4 -> 1e-8 on stationarity):
 cb, us0 = ridge_continuation(ridge_floor=1e-8, decrease=0.1)
-result = solver.solve(theta_0, max_steps=400, atol=1e-8,
+result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=1e-8,
                       callback=cb, user_state=us0)
 ```
 
@@ -80,10 +80,11 @@ weight are fully decoupled, the assembled normal matrix is cached across
 rejected steps, and a damping-row QR path (`linear_solver=QR()`) stays
 accurate at tiny ridge.
 `info.loss` is the ridge objective; `info.resid_loss` is the equation error.
-Stopping is old-style `atol` on the equation error, conjoined with an
-internal self-scaling stationarity test (done when the ridge gradient is
-small relative to `ridge * ||L'Lx||`); an explicit `gtol` is the absolute
-expert override.
+Stopping is conjunctive: `gtol` means "stationary at this ridge", `atol`
+additionally demands the equations solved (it never stops the solve alone).
+Calibrate `gtol` from a pilot run as `~1e-3 * ridge *
+info.penalty_grad_norm` — the reported `||L'Lx||` is the scale the
+gradient must cancel against.
 The [Ridge LM docs](https://highdimensionaleconlab.github.io/nlls_gram/ridge_lm/)
 derive the selection theorem, the continuation schedule, and the solver
 table.

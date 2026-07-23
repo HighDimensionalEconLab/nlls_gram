@@ -136,50 +136,78 @@ minimizer \((1/(1{+}\lambda),\, 0)\) — is invisible to \(\|r\|\). Stopping
 on the residual alone returns an answer whose second coordinate is wrong by
 3, at machine-perfect residual.
 
-The phase-2 stationarity test is therefore **internal and self-scaling**:
-the solve is done when
+Phase 2 is what `gtol` (on the ridge stationarity
+\(\|J^\top r + \lambda M_0 x\|\)) exists to detect, and it should be
+**calibrated, not guessed**. The right target is relative:
 
 $$
-\|J^\top r + \lambda M_0 x\| \;<\; \texttt{selection\_rtol}
-\cdot \lambda \,\|M_0 x\| ,
+\|J^\top r + \lambda M_0 x\| \;<\; c \cdot \lambda \,\|M_0 x\| ,
+\qquad c \sim 10^{-3},
 $$
 
 the stationarity residual small *relative* to the penalty-gradient scale
-\(\lambda\|M_0x\|\) that drives phase 2. This is the old calibration rule
-"`gtol` must sit well below `ridge` times the selection accuracy you want"
-(a consequence of the stationarity identity
-\(P_{\ker J}(M_0 x) = -g_{\text{null}}/\lambda\): gradient norm \(g\) at
-level \(\lambda\) leaves a selection error of order \(g/\lambda\)) — turned
-into an invariant the solver maintains itself, from quantities it already
-computes every step (`info.grad_norm` and `info.penalty_grad_norm`). The
-default `selection_rtol=1e-3` resolves the selection to ~0.1% relative
-accuracy at every ridge level and every problem scale.
-
-The normal usage is therefore old-style:
+\(\lambda\|M_0x\|\) that drives phase 2. The solver reports that scale as
+`info.penalty_grad_norm` (\(\|M_0x\|\), the norm of a vector the gradient
+computation already produces), so the recipe is one pilot run: solve, read
+`ridge * info.penalty_grad_norm` at convergence, and set
 
 ```python
-result = solver.solve(x0, atol=2e-8, max_steps=400)
+gtol = 1e-3 * ridge * penalty_grad_norm   # selection resolved to ~0.1%
+result = solver.solve(x0, max_steps=400, gtol=gtol, atol=2e-8)
 ```
 
-`atol` is a **conjunctive** filter on the TRUE residual: convergence
-requires the internal phase-2 test (or `xtol` on the accepted step norm)
-AND \(\|r\| \le\) `atol`; `atol` alone never stops the solve. Passing an
-explicit `gtol > 0` **replaces** the auto threshold with an absolute bound
-— the expert override, and the required escape hatch for the degenerate
-solution \(M_0 x^\dagger = 0\) (an unpenalized interpolant), where the
-relative yardstick collapses and only `gtol` or `xtol` can fire.
+**Why this is the right yardstick.** At a ridge minimizer the gradient
+vanishes as an exact cancellation of its two terms,
 
-One floor-choice rule survives from the absolute-`gtol` era: **pushing the
-ridge floor lower makes the answer worse past a point.** The achievable
-gradient norm is bounded by rounding (\(\sim\!10^{-15}\) scale in float64),
-so the total error \(O(\lambda) + O(\varepsilon_{\text{mach}}/\lambda)\) is
-minimized near \(\lambda^* \sim \sqrt{\varepsilon_{\text{mach}}}\) — about
-`1e-8` in float64. Only push \(\lambda\) below that with
-`linear_solver=QR()` (see the solver table), and expect the self-scaling
-test to hold the solve longer per level as \(\lambda\) shrinks — if a
-problem's stationarity noise floor sits above
-\(10^{-3}\lambda\|M_0x\|\), raise that solve's `selection_rtol` (it stays
-scale-free) rather than reverting to an absolute `gtol`.
+$$
+J^\top r \;=\; -\lambda M_0 x ,
+$$
+
+each of magnitude \(\approx \lambda\|M_0 x\|\). The calibrated bound asks
+that the computed sum be below \(c\) times that common magnitude — i.e.
+that the two terms **cancel to relative accuracy** \(c\). It is the
+standard relative-residual criterion of numerical linear algebra
+(\(\|Ax - b\| \le \mathrm{tol}\,\|b\|\)) applied to the stationarity
+equation, with \(\lambda\|M_0x\|\) playing the role of \(\|b\|\). The link
+to the *selection error* is first-order: along null-space directions the
+Hessian is \(\lambda M_0\), so a gradient of norm \(g\) leaves a null-space
+displacement \(\delta x \approx (\lambda M_0)^{-1}g_{\text{null}}\) —
+relative to the penalty scale, exactly the ratio
+\(g / (\lambda\|M_0x\|)\). A `gtol` at \(c\,\lambda\|M_0x\|\) resolves the
+free coordinates to \(\sim c\) relative accuracy; a `gtol` orders of
+magnitude above it leaves them visibly unresolved (measured on the asset
+pricing driver: a loose `gtol` left the free scalar \(p_0\) off by 310%
+at a machine-perfect residual; the calibrated one, 0.1%). The same
+formula is a *scaled dual-feasibility* criterion in the
+constrained-optimization sense — the ridge problem is the
+quadratic-penalty form of \(\min \|Lx\|^2\) s.t. \(r = 0\) with multiplier
+estimate \(\nu = r/\lambda\), and codes like IPOPT scale their KKT-residual
+tests by multiplier magnitudes in exactly this way. Note the consequences:
+`gtol` must be **re-calibrated** when the residual scaling, the penalty
+scaling, or the ridge level changes (all three move \(\lambda\|M_0x\|\)),
+and during continuation a single absolute `gtol` can only be right at one
+level — pair it with `atol` placement (above) so the solve stops only at
+the floor.
+
+**Floors and precision.** The achievable `grad_norm` is bounded by
+\(\varepsilon_{\text{mach}}\) and the conditioning of the augmented stack
+(which grows like \(1/\sqrt{\lambda}\)); `gtol` must sit above that noise
+floor or the solve dies loudly at `MAX_STEPS`. Two regimes follow. On
+well-conditioned problems at \(\lambda \gtrsim \sqrt{\varepsilon}\), the
+calibrated \(10^{-3}\lambda\|M_0x\|\) sits comfortably above the floor and
+the recipe applies as stated (in float32 the same structure holds with
+\(\varepsilon \sim 10^{-7}\); use the `ridge=None` default
+\(\lambda = \sqrt{\varepsilon_{f32}}\) and a looser \(c\)). Deep
+continuation floors on ill-scaled Jacobians (\(\lambda\) far below
+\(\sqrt{\varepsilon}\)) can push the noise floor *above* the calibrated
+value — there `gtol` becomes a measured constant instead: run once, watch
+where `info.grad_norm` flattens, and set `gtol` just above it. And one
+floor-choice rule: **pushing the ridge floor lower makes the answer worse
+past a point** — the total error
+\(O(\lambda) + O(\varepsilon_{\text{mach}}/\lambda)\) is minimized near
+\(\lambda^* \sim \sqrt{\varepsilon_{\text{mach}}}\), about `1e-8` in
+float64; only go below that with `linear_solver=QR()` (see the solver
+table) and a measured `gtol`.
 
 ## Kernel instantiation
 
@@ -305,16 +333,16 @@ solver = LevenbergMarquardt(residual_fn, metric=metric,
                             metric_solve_dtype=jnp.float64)
 result = solver.solve(theta_0, max_steps=400, atol=2e-8)
 
-# after (ridge LM): selection in the objective, no epsilon anywhere,
-# old-style atol-only stopping (the phase-2 stationarity test is internal)
+# after (ridge LM): selection in the objective, no epsilon anywhere;
+# calibrate gtol from a pilot run (~1e-3 * ridge * info.penalty_grad_norm)
 penalty = repeated_dense_penalty(K, repeats=3, zero_pad_size=d)
 solver = RidgeLevenbergMarquardt(residual_fn, penalty=penalty,
                                  ridge=1e-8)  # or None for the dtype default
-result = solver.solve(theta_0, max_steps=400, atol=2e-8)
+result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=2e-8)
 
 # optional homotopy if a fixed ridge converges slowly
 cb, us0 = ridge_continuation(ridge_floor=1e-8, decrease=0.1)
-result = solver.solve(theta_0, max_steps=400, atol=2e-8,
+result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=2e-8,
                       callback=cb, user_state=us0)
 ```
 
@@ -322,9 +350,9 @@ Porting notes:
 
 - **`info.loss` includes the penalty.** Code that means equation error must
   read `info.resid_loss`.
-- **`solve(x0, atol=...)` is the whole stopping story** for typical runs —
-  the internal self-scaling stationarity test replaces the hand-tuned
-  `gtol`, which remains available as an absolute expert override.
+- **Residual-only `atol` stopping must add a `gtol` or `xtol`** — the
+  conjunctive contract makes this loud, not silent; `info.penalty_grad_norm`
+  turns the `gtol` choice into a one-run calibration instead of a guess.
 - **No dtype-promotion knobs**: the solve runs at the residual dtype
   (`QR()` is the small-ridge conditioning fix); the metric solver's
   `linear_solve_dtype`/`metric_solve_dtype` have no ridge analog.

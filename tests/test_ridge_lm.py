@@ -176,84 +176,47 @@ def test_converged_solution_is_ridge_stationary():
     assert np.linalg.norm(stationarity) < 1e-4
 
 
+def test_atol_alone_is_rejected():
+    solver = RidgeLevenbergMarquardt(
+        linear_residual, penalty=make_penalty(), ridge=1e-3
+    )
+    with pytest.raises(ValueError, match="conjunctive"):
+        solver.solve(jnp.zeros(P_DIM), atol=1e-8)
+
+
 def two_phase_residual(x):
     # Depends on x[0] only: after phase 1 (r ~ 0 at x[0] ~ 1) the entire
     # second coordinate is selection, resolved only by phase 2.
     return x[:1] - 1.0
 
 
-def test_two_phase_problem_atol_only_resolves_the_selection():
-    # From (0, 3) the residual floors at x = (1, 3): a pure-residual test
-    # would stop there with x[1] wrong by 3. The internal self-scaling
-    # phase-2 test keeps the solve alive until the iterate slides to the
-    # ridge minimizer (1/(1+ridge), 0) -- atol-only is the whole UX. atol
-    # sits above the fixed-ridge residual floor |x1 - 1| = ridge/(1+ridge).
+def test_penalty_grad_norm_reports_the_gtol_calibration_scale():
+    # info.penalty_grad_norm is ||L'L x|| at the pre-step x -- the scale the
+    # gtol calibration recipe reads (gtol ~ 1e-3 * ridge * penalty_grad_norm).
+    # Identity penalty: ||L'L x|| = ||x||; the init sentinel is +inf.
     ridge = 1e-3
     solver = RidgeLevenbergMarquardt(
         two_phase_residual, penalty=identity_penalty(2), ridge=ridge
     )
-    result = solver.solve(jnp.array([0.0, 3.0]), max_steps=300, atol=1e-2)
+    x = jnp.array([0.0, 3.0])
+    lm_state = solver.init(x)
+    initial_info = solver._initial_info(x, lm_state, None, None)
+    assert not jnp.isfinite(initial_info.penalty_grad_norm)
+    _, _, info = solver.update(x, lm_state)
+    np.testing.assert_allclose(
+        float(info.penalty_grad_norm), float(jnp.linalg.norm(x)), rtol=1e-6
+    )
+    # The calibrated gtol resolves phase 2: from (0, 3) the residual floors
+    # at x = (1, 3) -- a pure-residual test would stop 3 off in the second
+    # coordinate -- while gtol ~ 1e-3 * ridge * ||x*|| holds the solve until
+    # the iterate slides to the ridge minimizer (1/(1+ridge), 0).
+    gtol = 1e-3 * ridge * 1.0
+    result = solver.solve(x, max_steps=300, gtol=gtol, atol=1e-2)
     assert int(result.status) == 1
     np.testing.assert_allclose(
         np.asarray(result.x), [1.0 / (1.0 + ridge), 0.0], atol=2e-3
     )
     assert abs(float(result.x[1])) < 1e-3
-
-
-def test_explicit_gtol_replaces_the_auto_threshold():
-    # A huge explicit gtol fires as soon as a finite gradient exists (one
-    # update), overriding the auto rule that would keep phase 2 running --
-    # under heavy initial damping the returned x[1] is still near its start.
-    solver = RidgeLevenbergMarquardt(
-        two_phase_residual, penalty=identity_penalty(2), ridge=1e-2,
-        init_damping=1e3,
-    )
-    result = solver.solve(jnp.array([0.0, 3.0]), max_steps=300, gtol=1e6)
-    assert int(result.status) == 1
-    assert int(result.steps) == 1
-    assert float(result.x[1]) > 2.0
-    auto = RidgeLevenbergMarquardt(
-        two_phase_residual, penalty=identity_penalty(2), ridge=1e-2,
-        init_damping=1e3,
-    ).solve(jnp.array([0.0, 3.0]), max_steps=300)
-    assert int(auto.steps) > 1
-    assert abs(float(auto.x[1])) < 1e-3
-
-
-def test_selection_rtol_is_static_and_validated():
-    with pytest.raises(ValueError, match="selection_rtol"):
-        RidgeLevenbergMarquardt(
-            two_phase_residual, penalty=identity_penalty(2), selection_rtol=0.0
-        )
-    loose = RidgeLevenbergMarquardt(
-        two_phase_residual, penalty=identity_penalty(2), ridge=1e-2,
-        init_damping=1e2, selection_rtol=1e-1,
-    )
-    tight = RidgeLevenbergMarquardt(
-        two_phase_residual, penalty=identity_penalty(2), ridge=1e-2,
-        init_damping=1e2, selection_rtol=1e-4,
-    )
-    assert loose != tight
-    x0 = jnp.array([0.0, 3.0])
-    steps_loose = int(loose.solve(x0, max_steps=300).steps)
-    steps_tight = int(tight.solve(x0, max_steps=300).steps)
-    assert steps_loose < steps_tight
-
-
-def test_fixed_ridge_auto_stopping_reaches_the_ridge_minimizer():
-    # The analytic linear-Gaussian check under the new default: no explicit
-    # tolerances at all -- the internal phase-2 test stops the solve at the
-    # fixed-ridge minimizer to ~selection_rtol relative selection accuracy.
-    ridge = 1e-2
-    solver = RidgeLevenbergMarquardt(
-        linear_residual, penalty=make_penalty(), ridge=ridge
-    )
-    result = solver.solve(jnp.zeros(P_DIM), max_steps=300)
-    assert int(result.status) == 1
-    assert jnp.isfinite(result.info.penalty_grad_norm)
-    np.testing.assert_allclose(
-        np.asarray(result.x), ridge_minimizer(ridge), rtol=5e-3, atol=5e-3
-    )
 
 
 def test_atol_is_conjunctive_an_interpolating_start_does_not_stop():
