@@ -13,10 +13,13 @@ to p):
   ridge weight carried as traced state that a callback can anneal toward a
   positive floor (ridge_continuation) — the minimum-seminorm
   (min-RKHS-norm) selection lives in the OBJECTIVE, per classical nonlinear
-  Tikhonov regularization. Linear solvers: dense cholesky (default, with a
-  reject-step cache of the assembled normal matrix), a damping-row qr path
-  for tiny ridge, and matrix-free lsmr. GN-implicit AD via cholesky or
-  normal_cg.
+  Tikhonov regularization. Stopping is atol-only in normal use: an internal
+  self-scaling stationarity test (grad_norm below selection_rtol * ridge *
+  ||L'Lx||) resolves the selection phase, with explicit gtol as the
+  absolute override. Linear solvers are typed configs — Auto()/Cholesky()
+  (dense normal equations with a reject-step cache), QR() (damping-row QR
+  for tiny ridge), LSMR(preconditioner, ...) (matrix-free) — and the AD
+  side takes Cholesky() or NormalCG(...).
 - LevenbergMarquardt minimizes ||r(x)||^2 with an optional positive-definite
   parameter-space Metric (or iterate-aware MetricFactory) defining the
   damping geometry, so the small-damping Gauss-Newton limit selects
