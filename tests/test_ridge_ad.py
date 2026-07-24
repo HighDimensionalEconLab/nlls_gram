@@ -9,6 +9,7 @@ from nlls_gram import (
     NormalCG,
     RidgeLevenbergMarquardt,
     identity_penalty,
+    identity_preconditioner,
     identity_right_preconditioner,
     repeated_dense_penalty,
 )
@@ -155,6 +156,35 @@ def test_lsmr_forward_auto_resolves_to_matrix_free_ad():
 
     np.testing.assert_allclose(
         np.asarray(jax.grad(lsmr_loss)(p0)),
+        np.asarray(jax.grad(dense_loss)(p0)),
+        rtol=1e-2,
+        atol=1e-4,
+    )
+
+
+def test_normal_cg_forward_auto_resolves_to_matrix_free_ad():
+    p0 = jnp.asarray(RNG.normal(size=M_RESID), dtype=jnp.float32)
+    cg_solver = RidgeLevenbergMarquardt(
+        linear_residual,
+        penalty=make_penalty(),
+        ridge=1e-3,
+        linear_solver=NormalCG(
+            identity_preconditioner(), tol=1e-10, maxiter=None
+        ),
+    )
+    assert cg_solver._resolved_ad_solver() == "normal_cg"
+    dense_solver = RidgeLevenbergMarquardt(
+        linear_residual, penalty=make_penalty(), ridge=1e-3
+    )
+
+    def cg_loss(p):
+        return solution_functional(cg_solver, p)
+
+    def dense_loss(p):
+        return solution_functional(dense_solver, p)
+
+    np.testing.assert_allclose(
+        np.asarray(jax.grad(cg_loss)(p0)),
         np.asarray(jax.grad(dense_loss)(p0)),
         rtol=1e-2,
         atol=1e-4,

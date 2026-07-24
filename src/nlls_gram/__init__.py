@@ -19,7 +19,9 @@ to p):
   gradient must cancel against). Linear solvers are typed configs —
   Auto()/Cholesky() (dense normal equations with a reject-step cache),
   QR() (damping-row QR for tiny ridge), LSMR(preconditioner, ...)
-  (matrix-free) — and the AD side takes Cholesky() or NormalCG(...). A
+  (matrix-free bidiagonalization), NormalCG(preconditioner, ...)
+  (matrix-free preconditioned CG on the damped normal operator) — and the
+  AD side takes Cholesky() or NormalCG(...). A
   Whitener penalty (repeated_block_whitener / whitener_from_factor) makes
   every path solve the whitened subproblem y = L_bar x with penalty rows
   [I | 0] — same minimizers, penalty-metric damping geometry, and a clean

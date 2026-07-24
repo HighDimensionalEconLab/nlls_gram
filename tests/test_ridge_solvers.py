@@ -10,9 +10,11 @@ from nlls_gram import (
     QR,
     Cholesky,
     CholeskyCache,
+    NormalCG,
     QRCache,
     RidgeLevenbergMarquardt,
     WhitenedPreconditioner,
+    identity_preconditioner,
     identity_right_preconditioner,
     repeated_dense_penalty,
 )
@@ -46,6 +48,12 @@ def solver_config(name, preconditioner=None):
         return Cholesky()
     if name == "qr":
         return QR()
+    if name == "normal_cg":
+        return NormalCG(
+            preconditioner or identity_preconditioner(),
+            tol=1e-10,
+            maxiter=None,
+        )
     return LSMR(
         preconditioner or identity_right_preconditioner(),
         tol=1e-10,
@@ -65,9 +73,9 @@ def build(name, preconditioner=None, **kwargs):
 
 @pytest.mark.parametrize("ridge", [1e-2, 1e-4])
 @pytest.mark.parametrize("init_damping", [1e-2, 1e-5])
-def test_three_solvers_agree_on_a_step(ridge, init_damping):
+def test_solvers_agree_on_a_step(ridge, init_damping):
     steps = {}
-    for name in ("cholesky", "qr", "lsmr"):
+    for name in ("cholesky", "qr", "lsmr", "normal_cg"):
         solver = build(name, ridge=ridge, init_damping=init_damping)
         lm_state = solver.init(X0)
         x_new, _, info = solver.update(X0, lm_state)
@@ -75,21 +83,26 @@ def test_three_solvers_agree_on_a_step(ridge, init_damping):
         assert np.isfinite(steps[name]).all()
     # float32 tolerances: at small ridge/damping the squared normal system's
     # conditioning costs the cholesky path ~1e-3 while qr stays accurate --
-    # the qr path's reason to exist. Tight (1e-9) three-way agreement is
-    # asserted under float64 in test_float64_subprocess.py.
+    # the qr path's reason to exist; normal_cg iterates on the same squared
+    # system. Tight (1e-9) agreement is asserted under float64 in
+    # test_float64_subprocess.py.
     np.testing.assert_allclose(steps["cholesky"], steps["qr"], atol=5e-3)
     np.testing.assert_allclose(steps["cholesky"], steps["lsmr"], atol=5e-3)
+    np.testing.assert_allclose(steps["cholesky"], steps["normal_cg"], atol=5e-3)
 
 
 def test_full_solves_agree_across_solvers():
     solutions = {}
-    for name in ("cholesky", "qr", "lsmr"):
+    for name in ("cholesky", "qr", "lsmr", "normal_cg"):
         solver = build(name, ridge=1e-3)
         result = solver.solve(X0, max_steps=300, gtol=1e-4)
         assert int(result.status) == 1, name
         solutions[name] = np.asarray(result.x)
     np.testing.assert_allclose(solutions["cholesky"], solutions["qr"], atol=1e-3)
     np.testing.assert_allclose(solutions["cholesky"], solutions["lsmr"], atol=5e-3)
+    np.testing.assert_allclose(
+        solutions["cholesky"], solutions["normal_cg"], atol=5e-3
+    )
 
 
 def test_cholesky_normal_cache_is_reused_and_ridge_keyed():
@@ -204,6 +217,40 @@ def test_lsmr_right_preconditioner_changes_nothing():
         preconditioner=WhitenedPreconditioner(solve, solve_transpose),
     )
     identity = build("lsmr", ridge=1e-3)
+    state_p = preconditioned.init(X0)
+    state_i = identity.init(X0)
+    x_p, _, _ = preconditioned.update(X0, state_p)
+    x_i, _, _ = identity.update(X0, state_i)
+    np.testing.assert_allclose(np.asarray(x_p), np.asarray(x_i), atol=2e-3)
+
+
+def test_forward_normal_cg_requires_a_preconditioner():
+    # The AD role keeps preconditioner=None legal; the forward role must
+    # reject it -- nobody runs forward Krylov without an explicit choice.
+    with pytest.raises(TypeError, match="identity_preconditioner"):
+        RidgeLevenbergMarquardt(
+            nonlinear_residual,
+            penalty=make_penalty(),
+            linear_solver=NormalCG(maxiter=100),
+        )
+    # The same config stays valid in its AD role.
+    RidgeLevenbergMarquardt(
+        nonlinear_residual,
+        penalty=make_penalty(),
+        ad_solver=NormalCG(maxiter=100),
+    )
+
+
+def test_normal_cg_preconditioner_changes_nothing():
+    # M changes the CG iteration path, never the solved subproblem: a
+    # Jacobi-style SPD preconditioner must reproduce the identity-M step.
+    scale = jnp.asarray(RNG.uniform(0.5, 2.0, size=P_DIM), dtype=jnp.float32)
+
+    def preconditioner(v, damping):
+        return v / (scale + damping)
+
+    preconditioned = build("normal_cg", ridge=1e-3, preconditioner=preconditioner)
+    identity = build("normal_cg", ridge=1e-3)
     state_p = preconditioned.init(X0)
     state_i = identity.init(X0)
     x_p, _, _ = preconditioned.update(X0, state_p)

@@ -8,14 +8,17 @@ value (standard frozen-dataclass semantics), so equal configs key the same
 compiled solve loop; construct them inline freely.
 
 - ``Auto()``: resolve by context (forward: ``Cholesky``; AD: ``Cholesky``
-  for the dense forwards, ``NormalCG`` under an ``LSMR`` forward).
+  for the dense forwards, ``NormalCG`` under a matrix-free ``LSMR`` or
+  ``NormalCG`` forward).
 - ``Cholesky()``: dense normal equations (forward) or the assembled dense
   implicit-AD solve.
 - ``QR()``: MINPACK-structured damping-row QR, stable at tiny ridge/damping.
 - ``LSMR(preconditioner, ...)``: matrix-free bidiagonalization; the right
   preconditioner is required (``identity_right_preconditioner()`` opts out).
-- ``NormalCG(...)``: matrix-free CG on the undamped normal operator for the
-  implicit-AD rule.
+- ``NormalCG(...)``: matrix-free preconditioned CG on the normal operator --
+  as ``linear_solver`` the damped forward subproblem (``preconditioner``
+  required; ``identity_preconditioner()`` opts out), as ``ad_solver`` the
+  undamped implicit-AD solve (``preconditioner`` optional).
 
 ``LevenbergMarquardt`` (the metric solver) keeps its string-named solver menu
 for now; these types are the configuration surface the solvers are converging
@@ -35,7 +38,8 @@ class Auto:
 
     As ``linear_solver`` it resolves to :class:`Cholesky`. As ``ad_solver``
     it resolves to :class:`Cholesky` when the forward solver is dense and to
-    :class:`NormalCG` (with its defaults) under an :class:`LSMR` forward.
+    :class:`NormalCG` (with its defaults) under a matrix-free
+    (:class:`LSMR` or :class:`NormalCG`) forward.
     """
 
 
@@ -96,15 +100,26 @@ class LSMR:
 
 @dataclass(frozen=True)
 class NormalCG:
-    """Matrix-free CG for the implicit-AD solve on ``J'J + ridge L'L``.
+    """Matrix-free preconditioned CG on the normal operator, in both roles.
 
-    ``preconditioner`` is an optional hook called as ``(v)`` or
-    ``(v, damping)`` (the AD system is undamped, so two-argument helpers are
-    called with zero damping; helpers marked ``requires_positive_damping``
-    are rejected). ``tol=None`` resolves to a dtype default (``1e-10`` in
-    float64, ``1e-6`` in float32); ``maxiter`` must be set when both
-    tolerances are explicitly zero, since an uncapped zero-tolerance CG loop
-    has no stopping rule.
+    As ``ad_solver`` it solves the undamped implicit-AD system
+    ``J'J + ridge L'L``; ``preconditioner`` is an optional hook called as
+    ``(v)`` or ``(v, damping)`` (the AD system is undamped, so two-argument
+    helpers are called with zero damping; helpers marked
+    ``requires_positive_damping`` are rejected).
+
+    As ``linear_solver`` it solves the damped forward subproblem
+    ``(J'J + ridge L'L + damping I) delta = -g`` -- the same SPD system the
+    :class:`Cholesky` path factors, matrix-free (under a
+    :class:`~nlls_gram.Whitener` penalty the whitened one, with its ``ridge``
+    spectral floor). There ``preconditioner`` is REQUIRED: an SPD
+    ``(v, damping) -> vector`` approximation of the damped inverse, applied
+    in CG's ``M`` slot with the live damping
+    (:func:`~nlls_gram.identity_preconditioner` opts out explicitly).
+
+    ``tol=None`` resolves to a dtype default (``1e-10`` in float64, ``1e-6``
+    in float32); ``maxiter`` must be set when both tolerances are explicitly
+    zero, since an uncapped zero-tolerance CG loop has no stopping rule.
     """
 
     preconditioner: object = None

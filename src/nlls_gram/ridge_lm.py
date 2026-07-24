@@ -403,9 +403,10 @@ class RidgeLevenbergMarquardt:
     ``linear_solver`` picks the algebra for
     ``(J'J + ridge L'L + damping I) delta = -g`` through a typed config
     (:class:`~nlls_gram.Auto` / :class:`~nlls_gram.Cholesky` /
-    :class:`~nlls_gram.QR` / :class:`~nlls_gram.LSMR` -- each method's knobs
-    live on its own config); all three share one factorization between the
-    velocity and geodesic-acceleration solves:
+    :class:`~nlls_gram.QR` / :class:`~nlls_gram.LSMR` /
+    :class:`~nlls_gram.NormalCG` -- each method's knobs live on its own
+    config); every path shares its factorization or inner-solve setup between
+    the velocity and geodesic-acceleration solves:
 
     - ``Auto()`` (= ``Cholesky()``, the default): dense normal equations.
       ``J'`` is materialized per ``jacobian_mode``, the penalty added via
@@ -429,6 +430,17 @@ class RidgeLevenbergMarquardt:
       row is posed in the unpreconditioned variable, so every
       ``damping > 0`` subproblem is exactly the ``I``-damped problem for any
       right preconditioner (Bjorck 1996 Ch. 7).
+    - ``NormalCG(preconditioner, ...)``: matrix-free preconditioned CG on the
+      damped normal operator ``J'J + ridge L'L + damping I`` itself -- the
+      same SPD system the ``Cholesky()`` path factors, with products through
+      ``jvp``/``vjp`` and the penalty callbacks instead of an assembled
+      ``G``. The forward role REQUIRES the ``preconditioner`` hook, an SPD
+      ``(v, damping) -> vector`` approximation of the damped inverse
+      (``identity_preconditioner()`` opts out); it is applied in CG's ``M``
+      slot with the live damping. The natural habitat is a
+      :class:`~nlls_gram.Whitener` penalty, where the operator carries the
+      ``ridge`` spectral floor on the penalized head and the preconditioner
+      only has to capture ``J~'J~``'s structure.
 
     Whitening: a :class:`~nlls_gram.Whitener` penalty (e.g.
     :func:`~nlls_gram.repeated_block_whitener`) makes every path above run
@@ -495,7 +507,8 @@ class RidgeLevenbergMarquardt:
     with its optional ``preconditioner`` hook (PD does not mean
     well-conditioned -- unpreconditioned CG degrades as ``ridge`` shrinks).
     ``Auto()`` resolves to ``Cholesky()`` for the dense forwards and
-    ``NormalCG()`` for an ``LSMR`` forward. Failed statuses return exact zero
+    ``NormalCG()`` for a matrix-free (``LSMR`` or ``NormalCG``) forward.
+    Failed statuses return exact zero
     tangents for ``result.x``/``result.aux`` and evaluate the masked tangent
     program at stop-gradient copies of the caller's original inputs and the
     INITIAL ridge (never a possibly-invalid callback-produced value).
@@ -545,10 +558,11 @@ class RidgeLevenbergMarquardt:
             )
         if not isinstance(penalty, RidgePenalty):
             raise TypeError("penalty must be a RidgePenalty")
-        if not isinstance(linear_solver, (Auto, Cholesky, QR, LSMR)):
+        if not isinstance(linear_solver, (Auto, Cholesky, QR, LSMR, NormalCG)):
             raise TypeError(
                 "linear_solver must be a solver config -- Auto(), Cholesky(), "
-                f"QR(), or LSMR(preconditioner, ...); got {linear_solver!r}"
+                "QR(), LSMR(preconditioner, ...), or "
+                f"NormalCG(preconditioner, ...); got {linear_solver!r}"
             )
         if not isinstance(ad_solver, (Auto, Cholesky, NormalCG)):
             raise TypeError(
@@ -582,17 +596,18 @@ class RidgeLevenbergMarquardt:
         if max_damping is not None and max_damping < init_damping:
             raise ValueError("max_damping must be at least init_damping")
         # jacobian_mode is consumed by the dense forward paths and the
-        # cholesky AD method; an lsmr forward with a cg AD rule never
-        # materializes J, so a forced mode is a construction error there.
+        # cholesky AD method; a matrix-free forward (lsmr or normal_cg) with a
+        # cg AD rule never materializes J, so a forced mode is a construction
+        # error there.
         if (
             jacobian_mode != "auto"
-            and isinstance(linear_solver, LSMR)
+            and isinstance(linear_solver, (LSMR, NormalCG))
             and not isinstance(ad_solver, Cholesky)
         ):
             raise ValueError(
                 "jacobian_mode controls dense Jacobian assembly, but neither "
-                "an LSMR forward solver nor its cg-resolved ad_solver ever "
-                "consumes it"
+                "a matrix-free (LSMR / NormalCG) forward solver nor its "
+                "cg-resolved ad_solver ever consumes it"
             )
         self.residual_fn = canonical_residual
         self.residual_arity = residual_arity
@@ -612,11 +627,33 @@ class RidgeLevenbergMarquardt:
         # recompile-on-change behavior is unchanged.
         if isinstance(linear_solver, LSMR):
             self.lsmr_preconditioner = linear_solver.preconditioner
+            self.normal_cg_preconditioner = None
+            self.iterative_tol = linear_solver.tol
+            self.iterative_atol = linear_solver.atol
+            self.iterative_maxiter = linear_solver.maxiter
+        elif isinstance(linear_solver, NormalCG):
+            # The forward role REQUIRES the preconditioner (the AD role keeps
+            # it optional): a hook (v, damping) -> vector applying an SPD
+            # approximation of (J'J + ridge L'L + damping I)^{-1} -- posed on
+            # the whitened variable under a Whitener penalty.
+            # identity_preconditioner() opts out explicitly.
+            if linear_solver.preconditioner is None:
+                raise TypeError(
+                    "a forward NormalCG linear_solver requires preconditioner, "
+                    "an SPD (v, damping) -> vector approximation of "
+                    "(J'J + ridge L'L + damping I)^{-1}; pass "
+                    "identity_preconditioner() to run unpreconditioned CG"
+                )
+            self.lsmr_preconditioner = None
+            self.normal_cg_preconditioner = linear_solver.preconditioner
+            # tol=None resolves per residual dtype in hyperparams(), the
+            # _ad_cg_tol convention.
             self.iterative_tol = linear_solver.tol
             self.iterative_atol = linear_solver.atol
             self.iterative_maxiter = linear_solver.maxiter
         else:
             self.lsmr_preconditioner = None
+            self.normal_cg_preconditioner = None
             self.iterative_tol = 0.0
             self.iterative_atol = 0.0
             self.iterative_maxiter = 8
@@ -636,8 +673,11 @@ class RidgeLevenbergMarquardt:
             self.ad_solver_preconditioner = None
         self.has_aux = has_aux
         # Only the dense paths materialize J' (and the cholesky/qr caches ride
-        # on the same reject-reuse lifecycle), so the flag is inert for lsmr.
-        self.cache_jacobian = cache_jacobian and not isinstance(linear_solver, LSMR)
+        # on the same reject-reuse lifecycle), so the flag is inert for the
+        # matrix-free lsmr and normal_cg forwards.
+        self.cache_jacobian = cache_jacobian and not isinstance(
+            linear_solver, (LSMR, NormalCG)
+        )
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
         # Resolved penalty callbacks. The defaults derive from sqrt_apply, so
@@ -712,6 +752,11 @@ class RidgeLevenbergMarquardt:
 
     def hyperparams(self, dtype=None):
         """``LMHyperparams`` built from the constructor values."""
+        iterative_tol = self.iterative_tol
+        if iterative_tol is None:
+            # NormalCG's tol=None: the _ad_cg_tol dtype-default convention.
+            resolved = jnp.result_type(float) if dtype is None else dtype
+            iterative_tol = 1e-10 if jnp.finfo(resolved).bits > 32 else 1e-6
         return LMHyperparams(
             jnp.asarray(self.damping_decrease, dtype=dtype),
             jnp.asarray(self.damping_increase, dtype=dtype),
@@ -720,7 +765,7 @@ class RidgeLevenbergMarquardt:
             if self.max_damping is None
             else jnp.asarray(self.max_damping, dtype=dtype),
             jnp.asarray(self.geodesic_acceptance_ratio, dtype=dtype),
-            jnp.asarray(self.iterative_tol, dtype=dtype),
+            jnp.asarray(iterative_tol, dtype=dtype),
             jnp.asarray(self.iterative_atol, dtype=dtype),
             None
             if self.iterative_maxiter is None
@@ -730,7 +775,9 @@ class RidgeLevenbergMarquardt:
     def _resolved_solver(self):
         if isinstance(self.linear_solver, (Auto, Cholesky)):
             return "cholesky"
-        return "qr" if isinstance(self.linear_solver, QR) else "lsmr"
+        if isinstance(self.linear_solver, QR):
+            return "qr"
+        return "lsmr" if isinstance(self.linear_solver, LSMR) else "normal_cg"
 
     def _penalty_rows(self, theta_size, dtype):
         # The dense (k, p) factor L: the penalty's own sqrt_rows when
@@ -884,10 +931,11 @@ class RidgeLevenbergMarquardt:
 
             residual_value = residual_flat
 
-        # TRUE-residual linearization: matrix-free closures for lsmr, dense
-        # J' (reused from the cache after a rejected step) otherwise.
+        # TRUE-residual linearization: matrix-free closures for lsmr and
+        # normal_cg, dense J' (reused from the cache after a rejected step)
+        # otherwise.
         resolved_solver = self._resolved_solver()
-        if resolved_solver == "lsmr":
+        if resolved_solver in ("lsmr", "normal_cg"):
             if self.has_aux:
                 resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
             else:
@@ -956,7 +1004,7 @@ class RidgeLevenbergMarquardt:
                 self._sqrt_transpose_apply(factor_x), dtype=resid.dtype
             )
 
-        if resolved_solver == "lsmr":
+        if resolved_solver in ("lsmr", "normal_cg"):
             transpose_fn = jax.linear_transpose(jvp_fn, theta)
 
             def JT(cotangent):
@@ -977,26 +1025,12 @@ class RidgeLevenbergMarquardt:
                 JT_sub = JT
 
             grad = JT_sub(resid) + ridge * penalty_gradient
-            lsmr_tol = jnp.asarray(hyper.iterative_tol, dtype=resid.dtype)
-            lsmr_atol = jnp.asarray(hyper.iterative_atol, dtype=resid.dtype)
-            sqrt_damping = jnp.sqrt(damping)
+            inner_tol = jnp.asarray(hyper.iterative_tol, dtype=resid.dtype)
+            inner_atol = jnp.asarray(hyper.iterative_atol, dtype=resid.dtype)
             sqrt_ridge = jnp.sqrt(ridge)
             m = resid.shape[0]
             k = self.penalty.num_rows
             n = theta.shape[0]
-            # None (uncapped) has no meaning for a fixed-shape loop; min(m+k, n)
-            # is the augmented bidiagonalization's exact-arithmetic bound.
-            lsmr_maxiter = (
-                hyper.iterative_maxiter
-                if hyper.iterative_maxiter is not None
-                else 4 * min(m + k, n)
-            )
-
-            def apply_Rinv(v):
-                return self.lsmr_preconditioner.solve(v, damping)
-
-            def apply_RinvT(w):
-                return self.lsmr_preconditioner.solve_transpose(w, damping)
 
             # Augmented operator A = [J; sqrt(ridge) L] with the penalty rows
             # applied through the penalty's own factor callbacks (outputs
@@ -1027,41 +1061,80 @@ class RidgeLevenbergMarquardt:
                     )
                     return JT(w[:m]) + penalty_pullback
 
-            # N = A'A + damping I, the R-free SPD operator that
+            # N = A'A + damping I, the preconditioner-free SPD operator that
             # custom_linear_solve differentiates through, posed on u (not z).
             def N_matvec(u):
                 return At_matvec(A_matvec(u)) + damping * u
 
-            def solve_N(_, c):
-                # Solve (A'A + damping I) u = c by LSMR on the R-preconditioned
-                # damped-augmented operator [A R^{-1}; sqrt(damping) R^{-1}] in
-                # z = R u: its normal equations read
-                # (A'A + damping I) u = A' b1 + sqrt(damping) b2, so
-                # b_aug = [0_{m+k}; c / sqrt(damping)] targets c exactly, at
-                # condition sqrt(cond(N)).
-                def A_aug(zz):
-                    u_zz = apply_Rinv(zz)
-                    return jnp.concatenate([A_matvec(u_zz), sqrt_damping * u_zz])
+            if resolved_solver == "lsmr":
+                sqrt_damping = jnp.sqrt(damping)
+                # None (uncapped) has no meaning for a fixed-shape loop;
+                # min(m+k, n) is the augmented bidiagonalization's
+                # exact-arithmetic bound.
+                lsmr_maxiter = (
+                    hyper.iterative_maxiter
+                    if hyper.iterative_maxiter is not None
+                    else 4 * min(m + k, n)
+                )
 
-                def At_aug(ww):
-                    return apply_RinvT(
-                        At_matvec(ww[: m + k]) + sqrt_damping * ww[m + k :]
+                def apply_Rinv(v):
+                    return self.lsmr_preconditioner.solve(v, damping)
+
+                def apply_RinvT(w):
+                    return self.lsmr_preconditioner.solve_transpose(w, damping)
+
+                def solve_N(_, c):
+                    # Solve (A'A + damping I) u = c by LSMR on the
+                    # R-preconditioned damped-augmented operator
+                    # [A R^{-1}; sqrt(damping) R^{-1}] in z = R u: its normal
+                    # equations read
+                    # (A'A + damping I) u = A' b1 + sqrt(damping) b2, so
+                    # b_aug = [0_{m+k}; c / sqrt(damping)] targets c exactly,
+                    # at condition sqrt(cond(N)).
+                    def A_aug(zz):
+                        u_zz = apply_Rinv(zz)
+                        return jnp.concatenate(
+                            [A_matvec(u_zz), sqrt_damping * u_zz]
+                        )
+
+                    def At_aug(ww):
+                        return apply_RinvT(
+                            At_matvec(ww[: m + k]) + sqrt_damping * ww[m + k :]
+                        )
+
+                    b_aug = jnp.concatenate(
+                        [jnp.zeros(m + k, resid.dtype), c / sqrt_damping]
                     )
+                    z, _ = lsmr_solve(
+                        A_aug,
+                        At_aug,
+                        b_aug,
+                        jnp.zeros((), resid.dtype),
+                        inner_tol,
+                        inner_atol,
+                        lsmr_maxiter,
+                        n,
+                    )
+                    return apply_Rinv(z)
 
-                b_aug = jnp.concatenate(
-                    [jnp.zeros(m + k, resid.dtype), c / sqrt_damping]
-                )
-                z, _ = lsmr_solve(
-                    A_aug,
-                    At_aug,
-                    b_aug,
-                    jnp.zeros((), resid.dtype),
-                    lsmr_tol,
-                    lsmr_atol,
-                    lsmr_maxiter,
-                    n,
-                )
-                return apply_Rinv(z)
+            else:
+                # Preconditioned CG on N itself -- the same damped SPD system
+                # the cholesky path factors, applied matrix-free. The required
+                # hook is CG's M slot: M^{-1} = preconditioner(., damping),
+                # an SPD approximation of N^{-1} at the live damping.
+                def apply_M(v):
+                    return self.normal_cg_preconditioner(v, damping)
+
+                def solve_N(_, c):
+                    solution, _ = jsp_sparse_linalg.cg(
+                        N_matvec,
+                        c,
+                        tol=inner_tol,
+                        atol=inner_atol,
+                        maxiter=hyper.iterative_maxiter,
+                        M=apply_M,
+                    )
+                    return solution
 
             def solve_step(rhs):
                 return jax.lax.custom_linear_solve(
@@ -2023,8 +2096,11 @@ class RidgeLevenbergMarquardt:
 
     def _resolved_ad_solver(self):
         if isinstance(self.ad_solver, Auto):
+            # Matrix-free forward -> matrix-free AD.
             return (
-                "normal_cg" if self._resolved_solver() == "lsmr" else "cholesky"
+                "normal_cg"
+                if self._resolved_solver() in ("lsmr", "normal_cg")
+                else "cholesky"
             )
         return "cholesky" if isinstance(self.ad_solver, Cholesky) else "normal_cg"
 

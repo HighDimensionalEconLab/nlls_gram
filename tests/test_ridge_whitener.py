@@ -11,9 +11,11 @@ from nlls_gram import (
     QR,
     Cholesky,
     CholeskyCache,
+    NormalCG,
     QRCache,
     RidgeLevenbergMarquardt,
     Whitener,
+    identity_preconditioner,
     identity_right_preconditioner,
     repeated_block_whitener,
     repeated_dense_penalty,
@@ -66,6 +68,8 @@ def solver_config(name):
         return Cholesky()
     if name == "qr":
         return QR()
+    if name == "normal_cg":
+        return NormalCG(identity_preconditioner(), tol=1e-10, maxiter=None)
     return LSMR(identity_right_preconditioner(), tol=1e-10, maxiter=None)
 
 
@@ -173,9 +177,9 @@ def test_whitened_solve_reaches_the_ridge_minimizer():
 
 @pytest.mark.parametrize("ridge", [1e-2, 1e-4])
 @pytest.mark.parametrize("init_damping", [1e-2, 1e-5])
-def test_three_solvers_agree_on_a_whitened_step(ridge, init_damping):
+def test_solvers_agree_on_a_whitened_step(ridge, init_damping):
     steps = {}
-    for name in ("cholesky", "qr", "lsmr"):
+    for name in ("cholesky", "qr", "lsmr", "normal_cg"):
         solver = build(name, ridge=ridge, init_damping=init_damping)
         lm_state = solver.init(X0)
         x_new, _, info = solver.update(X0, lm_state)
@@ -185,21 +189,26 @@ def test_three_solvers_agree_on_a_whitened_step(ridge, init_damping):
     # degrades with RIDGE, but at damping 1e-5 the unpenalized tail
     # directions are damped only by mu, so the squared normal conditioning
     # (~ ||J~||^2 / mu ~ 1e6) still costs the cholesky path ~1e-2 in float32
-    # against the backward-stable qr. Tight (1e-9) three-way agreement is
-    # asserted under float64 in test_float64_subprocess.py.
+    # against the backward-stable qr; normal_cg iterates on that same squared
+    # system. Tight (1e-9) agreement is asserted under float64 in
+    # test_float64_subprocess.py.
     np.testing.assert_allclose(steps["cholesky"], steps["qr"], atol=2e-2)
     np.testing.assert_allclose(steps["cholesky"], steps["lsmr"], atol=2e-2)
+    np.testing.assert_allclose(steps["cholesky"], steps["normal_cg"], atol=2e-2)
 
 
 def test_full_whitened_solves_agree_across_solvers():
     solutions = {}
-    for name in ("cholesky", "qr", "lsmr"):
+    for name in ("cholesky", "qr", "lsmr", "normal_cg"):
         solver = build(name, ridge=1e-3)
         result = solver.solve(X0, max_steps=300, gtol=1e-4)
         assert int(result.status) == 1, name
         solutions[name] = np.asarray(result.x)
     np.testing.assert_allclose(solutions["cholesky"], solutions["qr"], atol=1e-3)
     np.testing.assert_allclose(solutions["cholesky"], solutions["lsmr"], atol=5e-3)
+    np.testing.assert_allclose(
+        solutions["cholesky"], solutions["normal_cg"], atol=5e-3
+    )
 
 
 def test_whitened_gradient_semantics_single_update():
