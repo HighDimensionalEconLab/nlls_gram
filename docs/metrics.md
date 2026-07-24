@@ -1,9 +1,16 @@
-# Metrics
+# Gram Metrics (`LevenbergMarquardt`)
 
-## The Metric Object
+These are the **damping metrics** of the classic
+[`LevenbergMarquardt`](gauss_newton.md) solver, kept under the `GramMetric`
+name. The positive-definite `Metric` of
+[`RidgeLevenbergMarquardt`](ridge_lm.md) — factor callbacks for
+\(W = F^\top F\) on the metric block — is a different contract, documented
+on the [Ridge LM page](ridge_lm.md#the-metric-interface).
 
-A custom metric is passed as a single `metric=Metric(...)` argument. The
-`Metric` dataclass holds up to four callbacks that operate on the flattened
+## The GramMetric Object
+
+A custom metric is passed as a single `metric=GramMetric(...)` argument. The
+`GramMetric` dataclass holds up to four callbacks that operate on the flattened
 parameter vector produced internally by `ravel_pytree`. Let \(P=M^{-1}\), and
 let \(S\) satisfy \(SS^\top=M^{-1}\).
 
@@ -15,7 +22,7 @@ let \(S\) satisfy \(SS^\top=M^{-1}\).
 | `inv_sqrt_transpose(x)` | \(S^\top x\) |
 
 Fields left as `None` (and `metric=None` itself) default to the identity
-metric. A fixed `Metric` closes over its data once, at construction; for a
+metric. A fixed `GramMetric` closes over its data once, at construction; for a
 metric that depends on the current iterate or on residual aux outputs, see
 [Iterate-Dependent Metrics](#iterate-dependent-metrics-metricfactory) below.
 Construct a fixed metric once at problem-setup scope and reuse it. Rebuilding
@@ -79,7 +86,7 @@ Recovering that norm from a black-box \(M^{-1}\) solve would require another
 inverse operation. Likewise, a square-root factor \(S\) is not generally
 recoverable from an arbitrary solve callback.
 
-## Cholesky Metric Helper
+## Cholesky GramMetric Helper
 
 For a dense metric \(M=LL^\top\) with \(L\) lower triangular (the form
 returned by `jnp.linalg.cholesky`), use:
@@ -93,11 +100,11 @@ L = jnp.linalg.cholesky(metric_matrix)
 metric = metric_from_cholesky(L)
 ```
 
-The helper returns a `Metric` with all four callbacks filled in. The diagonal
+The helper returns a `GramMetric` with all four callbacks filled in. The diagonal
 and repeated shifted kernel constructors, plus the preconditioner helpers,
 are collected in [Utilities](utilities.md).
 
-## Metric Example
+## GramMetric Example
 
 ```python
 import jax.numpy as jnp
@@ -122,7 +129,7 @@ solver = LevenbergMarquardt(
 
 ## Iterate-Dependent Metrics (MetricFactory)
 
-A fixed `Metric` freezes its data at construction. `MetricFactory` instead
+A fixed `GramMetric` freezes its data at construction. `MetricFactory` instead
 rebuilds the metric from the live solve, through a value-hashable
 `(prepare, build)` pair passed as `metric_factory=` (pass at most one of
 `metric` or `metric_factory`):
@@ -134,10 +141,10 @@ rebuilds the metric from the live solve, through a value-hashable
   accepted step inside the jitted loop; after a rejected step `x` did not
   move, so the carried state is reused. Expensive setup — Gram assembly, a
   dense Cholesky — belongs here, where it is cached.
-- `build(state) -> Metric` assembles the metric from the prepared state,
+- `build(state) -> GramMetric` assembles the metric from the prepared state,
   once per `update` and before the inner iterative loops, so factorization or
   structured setup runs once per step rather than per CG/LSMR iteration. Any
-  `Metric`-returning builder works directly.
+  `GramMetric`-returning builder works directly.
 
 The canonical use is a factor the residual passes back through its aux
 output — the residual computes it primally, the Jacobian never
@@ -193,7 +200,7 @@ factory = MetricFactory(
 
 Rules and semantics:
 
-- The built `Metric` obeys the same per-solver callback requirements and
+- The built `GramMetric` obeys the same per-solver callback requirements and
   shape contract as a fixed custom metric; validation runs when `build`
   first executes (at trace time), not at construction.
 - The metric defines the subproblem, so `build`'s callbacks must stay exact

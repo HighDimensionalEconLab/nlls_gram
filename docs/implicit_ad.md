@@ -73,7 +73,7 @@ evaluation), so calling it by hand inside a differentiated function, or
 implicitly via `cache_jacobian=True`, contributes exactly zero to any
 derivative. `result.aux` also participates in the implicit rule — see
 [Aux outputs](#aux-outputs) below. One
-construction-time caveat: the solver (including any `Metric` callbacks) is a
+construction-time caveat: the solver (including any `GramMetric` callbacks) is a
 static object — do not build it from traced values. Constructing
 `LevenbergMarquardt` *inside* a jitted function is supported: every
 constructor argument is a static Python value (option strings, floats,
@@ -364,7 +364,7 @@ ridge returns a penalty-inflated finite tangent, and
 `gram_cg` fails loudly (its Krylov solve faces the singular-inconsistent
 dual).
 
-Metric callback requirements follow the factorization each form uses.
+GramMetric callback requirements follow the factorization each form uses.
 `svd`, `qr`, `augmented_qr`, `normal_cg`, and `regularized_normal_cg` work in
 whitened variables and need the
 square-root pair `metric.inv_sqrt`/`inv_sqrt_transpose`; the final
@@ -374,7 +374,7 @@ so triangular Cholesky factors differentiate correctly in reverse mode.
 final \(P J_\theta^\top y\) application acts on tangent data, and its
 transpose in the VJP is declared to be \(P\) itself (a symmetric
 `jax.lax.custom_linear_solve`, which also batches under `jax.vmap`). That
-is what lets a hand-written iterative, solve-only `Metric.solve` participate
+is what lets a hand-written iterative, solve-only `GramMetric.solve` participate
 in both JVP and VJP even though transposing through JAX's CG is unsupported:
 pair such a metric with `ad_solver="gram_cg"`.
 

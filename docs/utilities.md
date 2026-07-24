@@ -1,16 +1,16 @@
-# Metric and Preconditioner Utilities
+# GramMetric and Preconditioner Utilities
 
 The library keeps its metric constructors focused on dense, diagonal, and the
 repeated shifted kernel geometry used by kernel least-squares models. For any
-other geometry, construct a [`Metric`](metrics.md) directly. Iterative solver
+other geometry, construct a [`GramMetric`](metrics.md) directly. Iterative solver
 preconditioners remain separate: they can approximate an operator without
 changing the nonlinear least-squares problem, whereas a metric defines the
 problem itself.
 
 | Helper | Builds | Storage |
 | --- | --- | --- |
-| `metric_from_cholesky(L)` | dense `Metric` from \(M = LL^\top\) | \(O(n^2)\) |
-| `metric_from_diagonal(weights)` | `Metric` from \(M = \operatorname{diag}(w)\) | \(O(n)\) |
+| `metric_from_cholesky(L)` | dense `GramMetric` from \(M = LL^\top\) | \(O(n^2)\) |
+| `metric_from_diagonal(weights)` | `GramMetric` from \(M = \operatorname{diag}(w)\) | \(O(n)\) |
 | `repeated_shifted_dense_metric(K, ...)` | repeated dense kernel blocks plus a common shift | \(O(n^2)+O(1)\) |
 | `repeated_shifted_state_space_metric(t, ...)` | the same geometry for an implicit state-space kernel Gram | \(O(nq^2)+O(1)\) |
 | `matern_state_space(sigma, ell, nu)` | state-space inputs for Matérn-1/2, 3/2, or 5/2 | \(q=1,2,3\) |
@@ -264,7 +264,7 @@ argument, so a single construction serves every damping value. The
 unresolved complement is balanced at \(\rho + \lambda\) rather than
 \(\lambda\); that balance carries the FTU condition-number guarantee for
 fast-decaying spectra. `matvec` must apply a symmetric PSD operator and
-accept `(n, k)` matrices (the `Metric.solve` shape contract). Like every
+accept `(n, k)` matrices (the `GramMetric.solve` shape contract). Like every
 preconditioner it is frozen at construction, so for a nonlinear residual it
 approximates the dual at the linearization point it was built from —
 staleness across LM steps is safe (preconditioner error never moves the

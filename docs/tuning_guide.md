@@ -294,7 +294,7 @@ preconditioner every step, closing the terminal gap a frozen `P` cannot.
 - **Recompiles per value (static):** `linear_solver`, `jacobian_mode`,
   `ad_solver`, the `ad_solver_*` accuracy knobs, `linear_solve_dtype`,
   `metric_solve_dtype`, `geodesic_acceleration`, `cache_jacobian`,
-  `has_aux`, the `Metric` callbacks, `metric_factory`, `dual_preconditioner`,
+  `has_aux`, the `GramMetric` callbacks, `metric_factory`, `dual_preconditioner`,
   `preconditioner_factory`, `normal_preconditioner`,
   `whitened_preconditioner`, `ad_solver_preconditioner`, `recycle` (the
   `RecycleConfig`, whose `rank`/`window` size the carried basis), and the

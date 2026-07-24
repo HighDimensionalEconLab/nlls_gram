@@ -153,14 +153,18 @@ limits, the spectral-filter view, and the kernel/RKHS metric choices.
 ## Metrics
 
 A custom positive-definite parameter-space metric is passed as a single
-`metric=Metric(...)` argument. See [Metrics](metrics.md) for the `Metric`
-callback contract and validation rules. The public constructors cover dense,
-diagonal, and repeated shifted kernel metrics, including a structured
-state-space representation that does not materialize the kernel Gram. For a
-metric that depends on the current iterate or on residual aux outputs, pass a
-`metric_factory=MetricFactory(prepare, build)` instead — the state is
-rebuilt once per accepted step and `build` returns a plain `Metric`
+`metric=GramMetric(...)` argument. See [Gram Metrics](metrics.md) for the
+`GramMetric` callback contract and validation rules. The public
+constructors cover dense, diagonal, and repeated shifted kernel metrics,
+including a structured state-space representation that does not materialize
+the kernel Gram. For a metric that depends on the current iterate or on
+residual aux outputs, pass a `metric_factory=MetricFactory(prepare, build)`
+instead — the state is rebuilt once per accepted step and `build` returns a
+plain `GramMetric`
 ([Iterate-Dependent Metrics](metrics.md#iterate-dependent-metrics-metricfactory)).
+(The ridge solver's `Metric` — factor callbacks for \(W = F^\top F\) on the
+metric block — is a different contract, documented on the
+[Ridge LM page](ridge_lm.md#the-metric-interface).)
 
 ## Linear Solver Formulas
 
@@ -594,7 +598,7 @@ narrower and focuses on underdetermined LM with explicit parameter-space metrics
 
 ::: nlls_gram.LevenbergMarquardt
 
-::: nlls_gram.Metric
+::: nlls_gram.GramMetric
 
 ::: nlls_gram.MetricFactory
 

@@ -14,10 +14,12 @@ must select *which* interpolating solution is returned. The package ships
 two solvers with one shared `init`/`update`/`solve` protocol:
 
 - **`RidgeLevenbergMarquardt`** puts the selection in the **objective**: it
-  minimizes \(\|r(x)\|^2 + \lambda\,\|Lx\|^2\) for a user penalty factor
-  \(L\) with the ridge weight \(\lambda\) annealed toward zero, so the
-  limit is the minimum-seminorm (e.g. minimum-RKHS-norm) interpolant by
-  classical nonlinear Tikhonov regularization ([Engl–Hanke–Neubauer 1996;
+  minimizes \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) for a user
+  positive-definite metric \(W\) on the metric block \(x_m\) of
+  \(x = [x_m; x_f]\) (the free block \(x_f\) stays unpenalized), with the
+  ridge weight \(\lambda\) annealed toward zero, so the limit is the
+  minimum-seminorm (e.g. minimum-RKHS-norm) interpolant by classical
+  nonlinear Tikhonov regularization ([Engl–Hanke–Neubauer 1996;
   Kaltenbacher–Neubauer–Scherzer 2008](https://highdimensionaleconlab.github.io/nlls_gram/ridge_lm/)).
   Every inner problem is a well-posed NLLS — plain Gauss-Newton alone would
   converge to *some* interpolant without selecting the minimal-norm one
@@ -49,24 +51,25 @@ uv add nlls-gram "jax[cuda13]"
 
 For kernel coefficient problems
 \(f_\alpha(x)=\sum_j \alpha_j K(x, x_j)\), the squared RKHS norm is
-\(\alpha^\top K \alpha\), so the penalty is `repeated_dense_penalty`
-(`repeats` coefficient blocks sharing one Gram matrix `K`, plus unpenalized
-structural scalars — no epsilon shift anywhere):
+\(\alpha^\top K \alpha\), so the metric is a `RepeatedFactorMetric`
+(`repeats` coefficient blocks sharing one upper-triangular factor \(F\)
+with \(W = F^\top F\), plus unpenalized structural scalars in the free
+block — no epsilon shift anywhere):
 
 ```python
+import jax.numpy as jnp
+
 from nlls_gram import (
+    RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    repeated_block_whitener,
-    repeated_dense_penalty,
     ridge_continuation,
 )
 
-penalty = repeated_dense_penalty(K, repeats=3, zero_pad_size=d)
-# deep-ridge variant: whitened subproblem y = L_bar x, cholesky-path cost
-penalty = repeated_block_whitener(K, repeats=3, zero_pad_size=d)
+F = jnp.linalg.cholesky(K, upper=True)      # W = F'F per coefficient block
+metric = RepeatedFactorMetric(F, repeats=3)  # free block: len(x) - metric.size
 solver = RidgeLevenbergMarquardt(
     residual_fn,                 # (x) | (x, args) | (x, args, p)
-    penalty=penalty,
+    metric=metric,
     ridge=1e-8,                  # fixed small ridge; None = dtype default
 )
 result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=1e-8)
@@ -77,23 +80,26 @@ result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=1e-8,
                       callback=cb, user_state=us0)
 ```
 
-The solver is stock Euclidean LM on the augmented residual
-\([r;\sqrt{\lambda}Lx]\): the trust-region damping and the selection
-weight are fully decoupled, the assembled normal matrix is cached across
-rejected steps, and a damping-row QR path (`linear_solver=QR()`) stays
-accurate at tiny ridge. A `Whitener` penalty runs every path on the
-whitened variable instead — same minimizers, and the default cholesky
-path keeps its accuracy at deep ridge (with the simpler calibration
-`gtol ~ 1e-3 * ridge * sqrt(q)`).
+The solver runs entirely in the whitened variable
+\(y = \bar F x\) (\(\bar F = \mathrm{blockdiag}(F, I)\)): stock Euclidean
+LM on the augmented residual \([r;\sqrt{\lambda}\,y_m]\), where the
+penalty rows are constant. The trust-region damping and the selection
+weight are fully decoupled, the assembled whitened normal matrix
+\(\tilde J^\top \tilde J + \lambda E\) is cached across rejected steps
+and keeps a clean spectral floor at \(\lambda\) — so the default cholesky
+path stays accurate at deep ridge — and a damping-row QR path
+(`linear_solver=QR()`) covers the extreme tiny-ridge/tiny-damping regime.
+`IdentityMetric(size)` is plain ridge; `jnp.eye` never appears.
 `info.loss` is the ridge objective; `info.resid_loss` is the equation error.
 Stopping is conjunctive: `gtol` means "stationary at this ridge", `atol`
 additionally demands the equations solved (it never stops the solve alone).
-Calibrate `gtol` from a pilot run as `~1e-3 * ridge *
-info.penalty_grad_norm` — the reported `||L'Lx||` is the scale the
-gradient must cancel against.
+Steps are measured in the W-norm and gradients in the dual W⁻¹-norm, which
+makes calibration clean: `gtol ~ 1e-3 * ridge * sqrt(q(x*))` with
+\(q = \|x_m\|_W^2\) the solution's squared seminorm
+(`info.penalty_grad_norm` reports `sqrt(penalty_value)`).
 The [Ridge LM docs](https://highdimensionaleconlab.github.io/nlls_gram/ridge_lm/)
-derive the selection theorem, the continuation schedule, and the solver
-table.
+derive the selection theorem, the whitened change of variables, the
+continuation schedule, and the solver table.
 
 ## General Nonlinear Least Squares
 

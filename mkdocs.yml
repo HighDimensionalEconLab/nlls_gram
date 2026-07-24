@@ -46,7 +46,7 @@ nav:
   - Ridge LM: ridge_lm.md
   - Callbacks and Cookbook: callbacks.md
   - Multi-Start: multi_start.md
-  - Metrics: metrics.md
+  - Gram Metrics: metrics.md
   - Utilities: utilities.md
   - Implicit Differentiation: implicit_ad.md
   - Tuning Guide: tuning_guide.md
