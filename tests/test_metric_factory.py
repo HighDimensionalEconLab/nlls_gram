@@ -5,10 +5,10 @@ import jax.numpy as jnp
 import pytest
 
 from nlls_gram import (
+    GramMetric,
     LevenbergMarquardt,
     LMSolveAction,
     LMStatus,
-    Metric,
     MetricFactory,
     MultiStart,
     identity_preconditioner,
@@ -77,7 +77,7 @@ def solver_kwargs_for(linear_solver):
 def test_factory_update_matches_static_metric_at_same_point(
     linear_solver, geodesic_acceleration
 ):
-    # One update with the factory must equal one update with a fixed Metric
+    # One update with the factory must equal one update with a fixed GramMetric
     # built from the same values the factory prepares at the pre-step x --
     # exercising every solver family's call sites, and with geodesic
     # acceleration both norm applications sharing the pre-step state.
@@ -473,7 +473,7 @@ def test_constructor_rejects_metric_and_factory_together():
         LevenbergMarquardt(
             exp_residual_aux,
             has_aux=True,
-            metric=Metric(solve=lambda v: v),
+            metric=GramMetric(solve=lambda v: v),
             metric_factory=DIAG_FACTORY,
         )
 
@@ -492,17 +492,17 @@ def test_constructor_rejects_non_factory_and_non_callable_hooks():
     [
         (
             "gram_cholesky",
-            lambda w: Metric(inv_sqrt=lambda v: v, inv_sqrt_transpose=lambda v: v),
+            lambda w: GramMetric(inv_sqrt=lambda v: v, inv_sqrt_transpose=lambda v: v),
             "requires metric.solve",
         ),
         (
             "normal_cholesky",
-            lambda w: Metric(solve=lambda v: v / w),
+            lambda w: GramMetric(solve=lambda v: v / w),
             "requires metric.inv_sqrt",
         ),
         (
             "lsmr",
-            lambda w: Metric(solve=lambda v: v / w),
+            lambda w: GramMetric(solve=lambda v: v / w),
             "requires metric.inv_sqrt",
         ),
     ],
@@ -524,7 +524,7 @@ def test_build_output_validated_at_trace_time(linear_solver, build, match):
 def test_build_requiring_norm_under_geodesic_and_non_metric_output():
     no_norm = MetricFactory(
         prepare=lambda x, args, p, aux: aux["w"],
-        build=lambda w: Metric(solve=lambda v: v / w),
+        build=lambda w: GramMetric(solve=lambda v: v / w),
     )
     solver = LevenbergMarquardt(
         exp_residual_aux,
@@ -542,5 +542,5 @@ def test_build_requiring_norm_under_geodesic_and_non_metric_output():
     solver = LevenbergMarquardt(
         exp_residual_aux, has_aux=True, metric_factory=not_a_metric
     )
-    with pytest.raises(TypeError, match="must return a Metric"):
+    with pytest.raises(TypeError, match="must return a GramMetric"):
         solver.solve(X0, p=P, max_steps=2)

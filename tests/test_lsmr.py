@@ -9,10 +9,10 @@ import jax.scipy.linalg as jsp_linalg
 import pytest
 
 from nlls_gram import (
+    GramMetric,
     LevenbergMarquardt,
     LMSolveAction,
     LMStatus,
-    Metric,
     MultiStart,
     RecycleConfig,
     WhitenedPreconditioner,
@@ -418,7 +418,7 @@ def test_lsmr_custom_metric_requires_inv_sqrt():
             lambda x: x,
             linear_solver="lsmr",
             geodesic_acceleration=False,
-            metric=Metric(solve=lambda x: x),
+            metric=GramMetric(solve=lambda x: x),
         )
 
 

@@ -9,8 +9,8 @@ import numpy as np
 import pytest
 
 from nlls_gram import (
+    GramMetric,
     LevenbergMarquardt,
-    Metric,
     PreconditionerFactory,
     RecycleConfig,
     WhitenedPreconditioner,
@@ -532,7 +532,7 @@ import jax.numpy as jnp
 from nlls_gram import (
     LevenbergMarquardt,
     MetricFactory,
-    Metric,
+    GramMetric,
     identity_preconditioner,
     metric_from_cholesky,
 )
@@ -609,7 +609,7 @@ def recording_inv_sqrt_transpose(v):
     return base.inv_sqrt_transpose(v)
 
 
-recording = Metric(
+recording = GramMetric(
     solve=base.solve,
     norm=base.norm,
     inv_sqrt=recording_inv_sqrt,
@@ -1289,7 +1289,7 @@ def test_svd_reverse_mode_through_opaque_inv_sqrt():
     def inv_sqrt_transpose(w):
         return jsp_linalg.solve_triangular(L, w, lower=True)
 
-    opaque_metric = Metric(
+    opaque_metric = GramMetric(
         inv_sqrt=opaque_inv_sqrt, inv_sqrt_transpose=inv_sqrt_transpose
     )
 

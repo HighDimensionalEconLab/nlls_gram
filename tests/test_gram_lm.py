@@ -7,11 +7,11 @@ import pytest
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram import (
+    GramMetric,
     LevenbergMarquardt,
     LMSolveAction,
     LMState,
     LMStatus,
-    Metric,
     identity_preconditioner,
     matern_state_space,
     metric_from_cholesky,
@@ -78,7 +78,7 @@ def test_default_metric_matches_explicit_identity_metric_solve():
         residual_fn,
         init_damping=1e-2,
         linear_solver="gram_cholesky",
-        metric=Metric(
+        metric=GramMetric(
             solve=lambda x: x,
             norm=jnp.linalg.norm,
             inv_sqrt=lambda x: x,
@@ -418,20 +418,20 @@ def test_metric_requirements_per_linear_solver():
         LevenbergMarquardt(
             residual_fn,
             linear_solver="gram_cholesky",
-            metric=Metric(norm=jnp.linalg.norm),
+            metric=GramMetric(norm=jnp.linalg.norm),
         )
     for linear_solver in ("qr", "augmented_qr"):
         with pytest.raises(ValueError, match="metric.inv_sqrt"):
             LevenbergMarquardt(
                 residual_fn,
                 linear_solver=linear_solver,
-                metric=Metric(solve=lambda x: x),
+                metric=GramMetric(solve=lambda x: x),
             )
     with pytest.raises(ValueError, match="metric.norm"):
         LevenbergMarquardt(
             residual_fn,
             geodesic_acceleration=True,
-            metric=Metric(solve=lambda x: x),
+            metric=GramMetric(solve=lambda x: x),
         )
 
 
@@ -1912,7 +1912,7 @@ def test_solve_implicit_jvp_wrt_p_uses_metric(linear_solver):
     metric = (
         full_metric
         if linear_solver == "gram_cholesky"
-        else Metric(
+        else GramMetric(
             inv_sqrt=full_metric.inv_sqrt,
             inv_sqrt_transpose=full_metric.inv_sqrt_transpose,
         )

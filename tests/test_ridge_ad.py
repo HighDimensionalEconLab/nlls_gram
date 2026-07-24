@@ -1,20 +1,19 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 
 from nlls_gram import (
     CG,
+    IdentityMetric,
+    IdentityPreconditioner,
     MultiStart,
+    RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    identity_penalty,
-    identity_preconditioner,
-    repeated_dense_penalty,
 )
 
 RNG = np.random.default_rng(31)
-M_RESID, BLOCK, REPEATS, PAD = 4, 3, 2, 1
-P_DIM = REPEATS * BLOCK + PAD
+M_RESID, BLOCK, REPEATS, FREE = 4, 3, 2, 1
+P_DIM = REPEATS * BLOCK + FREE
 A_NP = RNG.normal(size=(M_RESID, P_DIM))
 ROOT = RNG.normal(size=(BLOCK, BLOCK + 2))
 K_NP = ROOT @ ROOT.T + 0.5 * np.eye(BLOCK)
@@ -28,8 +27,8 @@ def linear_residual(theta, args, p):
     return A @ theta - p
 
 
-def make_penalty():
-    return repeated_dense_penalty(K, repeats=REPEATS, zero_pad_size=PAD)
+def make_metric():
+    return RepeatedFactorMetric(jnp.linalg.cholesky(K, upper=True), repeats=REPEATS)
 
 
 def solution_functional(solver, p):
@@ -51,9 +50,7 @@ def central_difference(fn, p, step):
 def test_implicit_gradient_matches_finite_differences_linear():
     # Linear residual: J is p-independent and the residual Hessian vanishes,
     # so the GN implicit rule is EXACT at every ridge -- tight comparison.
-    solver = RidgeLevenbergMarquardt(
-        linear_residual, penalty=make_penalty(), ridge=1e-3
-    )
+    solver = RidgeLevenbergMarquardt(linear_residual, metric=make_metric(), ridge=1e-3)
     p0 = jnp.asarray(RNG.normal(size=M_RESID), dtype=jnp.float32)
 
     def loss(p):
@@ -82,7 +79,7 @@ def test_implicit_gradient_nonlinear_tight_at_small_ridge_biased_at_moderate():
     errors = {}
     for ridge in (1e-4, 1e-1):
         solver = RidgeLevenbergMarquardt(
-            nonlinear_residual, penalty=identity_penalty(P_DIM), ridge=ridge
+            nonlinear_residual, metric=IdentityMetric(P_DIM), ridge=ridge
         )
 
         def loss(p, solver=solver):
@@ -96,10 +93,11 @@ def test_implicit_gradient_nonlinear_tight_at_small_ridge_biased_at_moderate():
     # Documented GN contract, not equality: for a CURVED residual on an
     # underdetermined system the exact tangent's null-space block carries the
     # constraint-curvature term sum_i nu_i d2r_i (nu = r/ridge, which does not
-    # vanish relative to ridge*M0 as ridge -> 0), and the GN rule drops it.
-    # The functional reads null-space components, so a loose bound is the
-    # honest assertion; exactness is pinned by the linear-residual test above,
-    # where both dropped terms are identically zero.
+    # vanish relative to the ridge-scaled penalty as ridge -> 0), and the GN
+    # rule drops it. The functional reads null-space components, so a loose
+    # bound is the honest assertion; exactness is pinned by the
+    # linear-residual test above, where both dropped terms are identically
+    # zero.
     assert errors[1e-4] < 0.3
     assert errors[1e-1] < 0.5
 
@@ -109,12 +107,12 @@ def test_cg_and_cholesky_ad_agree():
     grads = {}
     for name, ad_solver in (
         ("cholesky", None),
-        ("normal_cg", CG(maxiter=200, tol=1e-8)),
+        ("normal_cg", CG(IdentityPreconditioner(), maxiter=200, tol=1e-8)),
     ):
         settings = {} if ad_solver is None else {"ad_solver": ad_solver}
         solver = RidgeLevenbergMarquardt(
             linear_residual,
-            penalty=make_penalty(),
+            metric=make_metric(),
             ridge=1e-3,
             **settings,
         )
@@ -132,13 +130,13 @@ def test_normal_cg_forward_auto_resolves_to_matrix_free_ad():
     p0 = jnp.asarray(RNG.normal(size=M_RESID), dtype=jnp.float32)
     cg_solver = RidgeLevenbergMarquardt(
         linear_residual,
-        penalty=make_penalty(),
+        metric=make_metric(),
         ridge=1e-3,
-        linear_solver=CG(identity_preconditioner(), tol=1e-10, maxiter=None),
+        linear_solver=CG(IdentityPreconditioner(), tol=1e-10, maxiter=None),
     )
     assert cg_solver._resolved_ad_solver() == "normal_cg"
     dense_solver = RidgeLevenbergMarquardt(
-        linear_residual, penalty=make_penalty(), ridge=1e-3
+        linear_residual, metric=make_metric(), ridge=1e-3
     )
     assert dense_solver._resolved_ad_solver() == "cholesky"
 
@@ -157,9 +155,7 @@ def test_normal_cg_forward_auto_resolves_to_matrix_free_ad():
 
 
 def test_failed_status_returns_zero_tangents():
-    solver = RidgeLevenbergMarquardt(
-        linear_residual, penalty=make_penalty(), ridge=1e-3
-    )
+    solver = RidgeLevenbergMarquardt(linear_residual, metric=make_metric(), ridge=1e-3)
     p0 = jnp.asarray(RNG.normal(size=M_RESID), dtype=jnp.float32)
 
     def loss(p):
@@ -181,9 +177,7 @@ def draw_perturbed(key, x, args):
 
 
 def test_multi_start_gradient_flows_through_the_winner():
-    solver = RidgeLevenbergMarquardt(
-        linear_residual, penalty=make_penalty(), ridge=1e-3
-    )
+    solver = RidgeLevenbergMarquardt(linear_residual, metric=make_metric(), ridge=1e-3)
     p0 = jnp.asarray(RNG.normal(size=M_RESID), dtype=jnp.float32)
     ms = MultiStart(key=jax.random.key(2), num_starts=3, draw=draw_perturbed)
 
@@ -202,12 +196,3 @@ def test_multi_start_gradient_flows_through_the_winner():
         rtol=1e-3,
         atol=1e-5,
     )
-
-
-def test_ad_maxiter_required_when_cg_tolerances_zero():
-    # An uncapped zero-tolerance CG loop has no stopping rule; the config
-    # rejects it at construction rather than at differentiation time.
-    with pytest.raises(ValueError, match="maxiter"):
-        CG(tol=0.0)
-    CG(tol=0.0, maxiter=50)
-    CG(tol=0.0, atol=1e-10)

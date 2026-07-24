@@ -9,27 +9,27 @@ parallel races; solve(...).x carries a custom implicit AD rule with respect
 to p):
 
 - RidgeLevenbergMarquardt minimizes the ridge objective
-  ||r(x)||^2 + ridge * ||L x||^2 for a RidgePenalty factor L, with the
-  ridge weight carried as traced state that a callback can anneal toward a
-  positive floor (ridge_continuation) — the minimum-seminorm
-  (min-RKHS-norm) selection lives in the OBJECTIVE, per classical nonlinear
-  Tikhonov regularization. Stopping is conjunctive gtol + atol; calibrate
-  gtol from a pilot run as ~1e-3 * ridge * info.penalty_grad_norm (the
-  relative-stationarity recipe -- the reported ||L'Lx|| is the scale the
-  gradient must cancel against). Linear solvers are typed configs —
-  Cholesky() (the default: dense normal equations with a reject-step
-  cache), QR() (damping-row QR for tiny ridge), CG(preconditioner, ...)
-  (matrix-free preconditioned CG on the damped normal operator) — and the
-  AD side takes Cholesky() or CG(...), defaulting to the forward family. A
-  Whitener penalty (repeated_block_whitener / whitener_from_factor) makes
-  every path solve the whitened subproblem y = L_bar x with penalty rows
-  [I | 0] — same minimizers, penalty-metric damping geometry, and a clean
-  spectral floor at the ridge, so the default Cholesky() path stays
-  accurate at deep ridge where QR() was previously required; gtol/xtol and
-  the reported grad/step norms become the whitened quantities
-  (gtol ~ 1e-3 * ridge * sqrt(q)).
+  ||r(x)||^2 + ridge * ||x_m||_W^2 for a positive-definite Metric W on the
+  metric block x_m of x = [x_m; x_f] (the free block x_f stays
+  unpenalized), with the ridge weight carried as traced state that a
+  callback can anneal toward a positive floor (ridge_continuation) — the
+  minimum-seminorm (min-RKHS-norm) selection lives in the OBJECTIVE, per
+  classical nonlinear Tikhonov regularization. The metric is supplied
+  through factor callbacks for W = F'F (IdentityMetric is plain ridge,
+  RepeatedFactorMetric the kernel workhorse) and the solver runs entirely
+  in the whitened variable y = F_bar x with constant penalty rows [I 0] —
+  a clean spectral floor at the ridge, so the default Cholesky() path
+  stays accurate at deep ridge. Stopping is conjunctive gtol + atol with
+  the whitened geometry (steps in the W-norm, gradients in the dual
+  W^{-1}-norm); calibrate gtol ~ 1e-3 * ridge * sqrt(q(x*)) since
+  info.penalty_grad_norm = sqrt(penalty_value). Linear solvers are typed
+  configs — Cholesky() (the default: dense normal equations with a
+  reject-step cache), QR() (damping-row QR for tiny ridge),
+  CG(preconditioner, ...) (matrix-free preconditioned CG on the damped
+  whitened normal operator) — and the AD side takes Cholesky() or CG(...),
+  defaulting to the forward family.
 - LevenbergMarquardt minimizes ||r(x)||^2 with an optional positive-definite
-  parameter-space Metric (or iterate-aware MetricFactory) defining the
+  parameter-space GramMetric (or iterate-aware MetricFactory) defining the
   damping geometry, so the small-damping Gauss-Newton limit selects
   minimum-metric-norm corrections. The default linear_solver="auto"
   resolves to the smaller dense factorization (gram_cholesky /
@@ -61,22 +61,19 @@ from nlls_gram.gram_lm import (
 )
 from nlls_gram.lsmr import LSMRState, lsmr
 from nlls_gram.metrics import (
+    GramMetric,
+    IdentityMetric,
     Metric,
+    MetricContext,
+    RepeatedFactorMetric,
     metric_from_cholesky,
     metric_from_diagonal,
     repeated_shifted_dense_metric,
     repeated_shifted_state_space_metric,
 )
-from nlls_gram.penalties import (
-    RidgePenalty,
-    Whitener,
-    identity_penalty,
-    penalty_from_factor,
-    repeated_block_whitener,
-    repeated_dense_penalty,
-    whitener_from_factor,
-)
 from nlls_gram.preconditioners import (
+    IdentityPreconditioner,
+    Preconditioner,
     identity_preconditioner,
     identity_right_preconditioner,
     nystrom_preconditioner,
@@ -121,9 +118,15 @@ __all__ = [
     "LMSolveAction",
     "LMSolveContext",
     "LMSolveResult",
+    "GramMetric",
+    "IdentityMetric",
     "Metric",
+    "MetricContext",
     "MetricFactory",
     "MultiStart",
+    "IdentityPreconditioner",
+    "Preconditioner",
+    "RepeatedFactorMetric",
     "MultiStartInfo",
     "DrawNNXModule",
     "PreconditionerFactory",
@@ -133,21 +136,14 @@ __all__ = [
     "HarvestState",
     "build_coarse_operator",
     "deflated_pcg",
-    "identity_penalty",
     "identity_preconditioner",
     "identity_right_preconditioner",
     "lsmr",
     "LSMRState",
-    "penalty_from_factor",
-    "repeated_block_whitener",
-    "repeated_dense_penalty",
     "ridge_continuation",
-    "whitener_from_factor",
     "RidgeLevenbergMarquardt",
     "RidgeLMInfo",
     "RidgeLMState",
-    "RidgePenalty",
-    "Whitener",
     "matern_state_space",
     "metric_from_cholesky",
     "metric_from_diagonal",

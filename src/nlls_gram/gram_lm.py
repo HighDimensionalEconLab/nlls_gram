@@ -10,7 +10,7 @@ import numpy as np
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram.lsmr import lsmr_solve
-from nlls_gram.metrics import Metric, _metric_with_compute_dtype
+from nlls_gram.metrics import GramMetric, _metric_with_compute_dtype
 from nlls_gram.preconditioners import WhitenedPreconditioner
 from nlls_gram.recycled_cg import (
     RecycleConfig,
@@ -239,7 +239,7 @@ class PreconditionerFactory:
 class MetricFactory:
     """Iterate-aware metric: a value-hashable ``(prepare, build)`` pair.
 
-    Supplies a :class:`~nlls_gram.Metric` REBUILT from the current iterate every
+    Supplies a :class:`~nlls_gram.GramMetric` REBUILT from the current iterate every
     accepted step, replacing the fixed ``metric``. Pass at most one of ``metric``
     or ``metric_factory``. Use it when the metric depends on the current iterate
     or on residual byproducts -- e.g. a kernel Gram factor over state points that
@@ -269,8 +269,8 @@ class MetricFactory:
       recompile), once per accepted step: after a rejected step ``x`` did not
       move, so the carried state is reused. Expensive setup (Gram assembly, a
       dense Cholesky) belongs here, where it is cached.
-    - ``build(state) -> Metric`` assembles the metric from the prepared state:
-      any ``Metric``-returning builder (for example
+    - ``build(state) -> GramMetric`` assembles the metric from the prepared state:
+      any ``GramMetric``-returning builder (for example
       ``metric_from_cholesky``) or hand-rolled unary callbacks closing over
       ``state``.
       Called once per ``update`` BEFORE the iterative loops, so builder-internal
@@ -486,7 +486,7 @@ class LevenbergMarquardt:
     the fixed ``metric`` (pass at most one): ``prepare(x, args, p, aux)``
     rebuilds the metric state from the current iterate and the residual aux once
     per accepted step (a rejected step reuses the carried state), and
-    ``build(state)`` assembles a plain ``Metric`` from it once per ``update``.
+    ``build(state)`` assembles a plain ``GramMetric`` from it once per ``update``.
     The built metric follows the same per-solver callback requirements as a
     fixed custom metric, validated at trace time; under implicit
     differentiation it is frozen at the returned solution WITHIN each
@@ -845,7 +845,7 @@ class LevenbergMarquardt:
             if metric is not None:
                 raise ValueError("pass at most one of metric or metric_factory")
         if metric is None:
-            metric = Metric()
+            metric = GramMetric()
         has_custom_metric = any(
             cb is not None
             for cb in (
@@ -1096,16 +1096,16 @@ class LevenbergMarquardt:
         # Trace-time validation and identity defaulting for a factory-built
         # metric, matching the constructor rules for the fixed ``metric=`` path;
         # ``solver`` is the trace-time-resolved form consuming the callbacks.
-        if not isinstance(metric, Metric):
+        if not isinstance(metric, GramMetric):
             raise TypeError(
-                "metric_factory.build must return a Metric; got "
+                "metric_factory.build must return a GramMetric; got "
                 f"{type(metric).__name__}"
             )
         _validate_metric_requirements(
             metric,
             solver,
             self.geodesic_acceleration,
-            " on the Metric returned by metric_factory.build",
+            " on the GramMetric returned by metric_factory.build",
             keyword=keyword,
         )
         return (
@@ -2898,6 +2898,7 @@ class LevenbergMarquardt:
         gtol_met = (gtol > 0) & (info.grad_norm < gtol)
         xtol_met = (xtol > 0) & info.accepted & (info.step_norm < xtol)
         return atol_met | gtol_met | xtol_met
+
 
 def _cold_lm_state(lm_state):
     # Drawn starts must not reuse a Jacobian cache, a deflation basis, or a

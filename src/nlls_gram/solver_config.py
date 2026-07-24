@@ -10,10 +10,10 @@ compiled solve loop; construct them inline freely.
 - ``Cholesky()`` (the default): dense normal equations (forward) or the
   assembled dense implicit-AD solve.
 - ``QR()``: MINPACK-structured damping-row QR, stable at tiny ridge/damping.
-- ``CG(...)``: matrix-free preconditioned CG on the normal operator --
-  as ``linear_solver`` the damped forward subproblem (``preconditioner``
-  required; ``identity_preconditioner()`` opts out), as ``ad_solver`` the
-  undamped implicit-AD solve (``preconditioner`` optional).
+- ``CG(preconditioner, ...)``: matrix-free preconditioned CG on the normal
+  operator -- as ``linear_solver`` the damped forward subproblem, as
+  ``ad_solver`` the undamped implicit-AD solve. ``preconditioner`` is
+  required in both roles; ``identity_preconditioner()`` opts out.
 
 ``ad_solver=None`` (the default) matches the forward path's family:
 ``Cholesky`` for the dense forwards, ``CG`` under a ``CG`` forward.
@@ -23,6 +23,8 @@ on.
 """
 
 from dataclasses import dataclass
+
+from nlls_gram.preconditioners import Preconditioner
 
 __all__ = ["Cholesky", "CG", "QR"]
 
@@ -50,36 +52,43 @@ class QR:
 
 @dataclass(frozen=True)
 class CG:
-    """Matrix-free preconditioned CG on the normal operator, in both roles.
-
-    As ``ad_solver`` it solves the undamped implicit-AD system
-    ``J'J + ridge L'L``; ``preconditioner`` is an optional hook called as
-    ``(v)`` or ``(v, damping)`` (the AD system is undamped, so two-argument
-    helpers are called with zero damping; helpers marked
-    ``requires_positive_damping`` are rejected).
+    """Matrix-free preconditioned CG on the whitened normal operator, in both
+    roles.
 
     As ``linear_solver`` it solves the damped forward subproblem
-    ``(J'J + ridge L'L + damping I) delta = -g`` -- the same SPD system the
-    :class:`Cholesky` path factors, matrix-free (under a
-    :class:`~nlls_gram.Whitener` penalty the whitened one, with its ``ridge``
-    spectral floor). There ``preconditioner`` is REQUIRED: an SPD
-    ``(v, damping) -> vector`` approximation of the damped inverse, applied
-    in CG's ``M`` slot with the live damping
-    (:func:`~nlls_gram.identity_preconditioner` opts out explicitly).
+    ``(J~'J~ + ridge E + damping I) delta_y = -g`` -- the same SPD system the
+    :class:`Cholesky` path factors, matrix-free, with the ``ridge`` spectral
+    floor on the metric block. The ``preconditioner`` is applied in CG's
+    ``M`` slot with the live damping.
 
-    ``tol=None`` resolves to a dtype default (``1e-10`` in float64, ``1e-6``
-    in float32); ``maxiter`` must be set when both tolerances are explicitly
-    zero, since an uncapped zero-tolerance CG loop has no stopping rule.
+    As ``ad_solver`` it solves the undamped implicit-AD system
+    ``J~'J~ + ridge E``; the preconditioner is applied with zero damping
+    (subclasses marked ``requires_positive_damping`` are rejected for this
+    role).
+
+    ``preconditioner`` is REQUIRED in both roles and must be a
+    :class:`~nlls_gram.Preconditioner` -- nobody should run Krylov methods
+    without a preconditioning decision, so
+    :class:`~nlls_gram.IdentityPreconditioner` is the explicit opt-out and a
+    custom preconditioner is a small subclass implementing
+    ``apply(v, damping, ctx)``. ``tol=None`` resolves to a dtype default
+    (``1e-10`` in float64, ``1e-6`` in float32); ``maxiter`` must be set when
+    both tolerances are explicitly zero, since an uncapped zero-tolerance CG
+    loop has no stopping rule.
     """
 
-    preconditioner: object = None
+    preconditioner: Preconditioner
     tol: float | None = None
     atol: float = 0.0
     maxiter: int | None = None
 
     def __post_init__(self):
-        if self.preconditioner is not None and not callable(self.preconditioner):
-            raise TypeError("CG.preconditioner must be callable or None")
+        if not isinstance(self.preconditioner, Preconditioner):
+            raise TypeError(
+                "CG.preconditioner must be a Preconditioner subclass "
+                "instance; pass IdentityPreconditioner() to run "
+                "unpreconditioned CG"
+            )
         if self.tol is not None and self.tol < 0:
             raise ValueError("CG.tol must be nonnegative or None")
         if self.atol < 0:

@@ -1,5 +1,22 @@
+"""Metric types for the package's two solvers.
+
+:class:`Metric` is the positive-definite metric ``W`` on the metric block of
+:class:`~nlls_gram.RidgeLevenbergMarquardt`'s parameter vector, given through
+factor callbacks for an invertible factor ``F`` with ``W = F'F`` --
+:class:`IdentityMetric` is the plain-ridge case and
+:class:`RepeatedFactorMetric` the kernel workhorse (``repeats`` copies of one
+block factor). Every callback receives a :class:`MetricContext` carrying the
+solver's live state, so exotic metrics can key off the iterate.
+
+:class:`GramMetric` (with :func:`metric_from_cholesky`,
+:func:`metric_from_diagonal`, and the ``repeated_shifted_*`` constructors) is
+the damping metric of the classic :class:`~nlls_gram.LevenbergMarquardt`
+solver -- an unrelated contract kept under its own name.
+"""
+
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -8,9 +25,208 @@ import jax.scipy.linalg as jsp_linalg
 from nlls_gram import quasiseparable
 
 
+@jax.tree_util.register_dataclass
 @dataclass(frozen=True)
+class MetricContext:
+    """Everything the solver knows at a factor-callback call site.
+
+    Passed as the second positional argument of every :class:`Metric` op.
+    The shipped metrics ignore it; a custom metric may key its factor off any
+    field. Fields are ``None`` where the call site has nothing to offer:
+
+    - ``x``: the current FLATTENED iterate (the full parameter vector, not
+      just the metric block).
+    - ``lm_state``: the live :class:`~nlls_gram.RidgeLMState` (damping,
+      ridge, caches). In the implicit-AD rule this is the returned state
+      under ``stop_gradient`` -- inert conditioning data, like the ridge.
+    - ``args`` / ``p``: the residual's auxiliary data and differentiation
+      parameters as passed to ``solve``/``update``.
+    """
+
+    x: Any = None
+    lm_state: Any = None
+    args: Any = None
+    p: Any = None
+
+
 class Metric:
-    """Positive-definite parameter-space metric ``M`` given through callbacks.
+    """Positive-definite metric ``W`` on the metric block, via factor callbacks.
+
+    :class:`~nlls_gram.RidgeLevenbergMarquardt` minimizes
+    ``||r(x)||^2 + ridge * ||x_m||_W^2`` where ``x = [x_m; x_f]`` splits into
+    the metric block ``x_m`` (the leading ``size`` coordinates, covered by
+    ``W``) and the free block ``x_f`` (unpenalized). The metric is supplied
+    through callbacks for an invertible factor ``F`` with ``W = F'F``, the
+    whitened variable being ``x_hat_m = F x_m`` and
+    ``||v||_W = ||F v||_2``. ``F`` should be upper triangular; the canonical
+    example is the upper Cholesky factor,
+    ``F = jnp.linalg.cholesky(K, upper=True)``. The solver runs entirely in
+    the whitened variable and never materializes ``W`` or ``F``.
+
+    Subclasses implement the ops on metric-block vectors (or matrices whose
+    LEADING axis is ``size``; columns are batched), each also receiving a
+    :class:`MetricContext` with the solver's live state:
+
+    - ``factor_apply(v, ctx)``: ``F v``
+    - ``factor_solve(v, ctx)``: ``F^{-1} v``
+    - ``factor_solve_transpose(v, ctx)``: ``F^{-T} v``
+    - ``norm(v, ctx)``: ``||v||_W`` (vectors only; the base default is
+      ``||factor_apply(v)||_2``, and an override must match it to
+      floating-point accuracy -- the solver compares objective values built
+      from both forms)
+
+    Contracts: the factor must be EXACT -- the solver hardcodes the identity
+    penalty block in the whitened variable, so an approximate factor silently
+    changes the objective (unlike a CG preconditioner, which may be sloppy).
+    The ridge weight never enters the factorization, so ridge continuation
+    composes unchanged. How a subclass fulfills the ops (prefactorized
+    storage, factorize-in-``__init__``, fully matrix-free) is its
+    constructor's business; the solver only sees the ops.
+
+    Metrics hash and compare by identity (``eq=False`` frozen dataclasses --
+    array fields make value-hashing impossible): construct one at setup scope
+    and reuse it, since rebuilding an equal-config metric per call would key
+    a fresh solver compilation.
+    """
+
+    size: int
+
+    def factor_apply(self, v, ctx):
+        """``F v`` for a metric-block vector or leading-axis-batched matrix."""
+        raise NotImplementedError
+
+    def factor_solve(self, v, ctx):
+        """``F^{-1} v`` for a metric-block vector or batched matrix."""
+        raise NotImplementedError
+
+    def factor_solve_transpose(self, v, ctx):
+        """``F^{-T} v`` for a metric-block vector or batched matrix."""
+        raise NotImplementedError
+
+    def norm(self, v, ctx):
+        """``||v||_W = ||F v||_2`` for a metric-block vector."""
+        if v.ndim != 1:
+            raise ValueError("Metric.norm requires a vector")
+        return jnp.linalg.norm(self.factor_apply(v, ctx))
+
+
+def _validate_metric_input(v, size):
+    if v.ndim not in (1, 2):
+        raise ValueError("metric factor callbacks require a vector or matrix")
+    if v.shape[0] != size:
+        raise ValueError(
+            f"metric factor input leading size must be {size}, got {v.shape[0]}"
+        )
+
+
+@dataclass(frozen=True, eq=False)
+class IdentityMetric(Metric):
+    """The identity metric ``W = I`` on ``size`` coordinates -- plain ridge.
+
+    ``F = I``: every factor op is the identity and ``norm`` is the Euclidean
+    norm, so ``RidgeLevenbergMarquardt`` reduces to the classical
+    ``||r||^2 + ridge * ||x_m||^2`` objective with no special-casing.
+    """
+
+    size: int
+
+    def __post_init__(self):
+        if (
+            isinstance(self.size, bool)
+            or not isinstance(self.size, int)
+            or self.size <= 0
+        ):
+            raise ValueError("size must be a positive Python int")
+
+    def factor_apply(self, v, ctx):
+        _validate_metric_input(v, self.size)
+        return v
+
+    def factor_solve(self, v, ctx):
+        _validate_metric_input(v, self.size)
+        return v
+
+    def factor_solve_transpose(self, v, ctx):
+        _validate_metric_input(v, self.size)
+        return v
+
+    def norm(self, v, ctx):
+        if v.ndim != 1:
+            raise ValueError("Metric.norm requires a vector")
+        _validate_metric_input(v, self.size)
+        return jnp.linalg.norm(v)
+
+
+@dataclass(frozen=True, eq=False)
+class RepeatedFactorMetric(Metric):
+    """``repeats`` copies of one block factor on the metric block.
+
+    The metric is ``W = blockdiag(F'F, ..., F'F)`` for an upper-triangular
+    invertible block factor ``F`` -- e.g.
+    ``F = jnp.linalg.cholesky(K, upper=True)`` for a positive-definite Gram
+    matrix ``K``, giving the repeated kernel seminorm
+    ``sum_j alpha_j' K alpha_j`` on ``repeats`` coefficient blocks. The
+    constructor takes the FACTOR, not ``K`` (callers typically already hold
+    it); triangularity and positive-definiteness are assumed, not validated
+    (the entries may be traced -- a singular factor propagates NaN loudly
+    through the triangular solves).
+
+    All repeated blocks (and all batched columns) share a single triangular
+    product or solve: the ops reshape the metric block into the columns of
+    one ``(block, repeats * cols)`` matrix. ``size = repeats * F.shape[0]``.
+    """
+
+    F: jax.Array
+    repeats: int = field(default=1, kw_only=True)
+    size: int = field(init=False)
+
+    def __post_init__(self):
+        F = jnp.asarray(self.F)
+        if F.ndim != 2 or F.shape[0] != F.shape[1] or F.shape[0] == 0:
+            raise ValueError("F must be a nonempty square matrix")
+        dtype = jnp.result_type(F, 1.0)
+        if not jnp.issubdtype(dtype, jnp.floating):
+            raise TypeError("F must have a real floating-point dtype")
+        if (
+            isinstance(self.repeats, bool)
+            or not isinstance(self.repeats, int)
+            or self.repeats < 1
+        ):
+            raise ValueError("repeats must be a positive integer")
+        object.__setattr__(self, "F", F.astype(dtype))
+        object.__setattr__(self, "size", self.repeats * F.shape[0])
+
+    def _map_blocks(self, block_op, v):
+        _validate_metric_input(v, self.size)
+        block_size = self.F.shape[0]
+        trailing_shape = v.shape[1:]
+        packed = jnp.moveaxis(
+            v.reshape((self.repeats, block_size) + trailing_shape), 0, 1
+        ).reshape(block_size, -1)
+        return jnp.moveaxis(
+            block_op(packed).reshape((block_size, self.repeats) + trailing_shape),
+            0,
+            1,
+        ).reshape((self.size,) + trailing_shape)
+
+    def factor_apply(self, v, ctx):
+        return self._map_blocks(lambda m: self.F @ m, v)
+
+    def factor_solve(self, v, ctx):
+        return self._map_blocks(
+            lambda m: jsp_linalg.solve_triangular(self.F, m, lower=False), v
+        )
+
+    def factor_solve_transpose(self, v, ctx):
+        return self._map_blocks(
+            lambda m: jsp_linalg.solve_triangular(self.F.T, m, lower=True), v
+        )
+
+
+@dataclass(frozen=True)
+class GramMetric:
+    """Positive-definite parameter-space metric ``M`` given through callbacks,
+    for the classic :class:`~nlls_gram.LevenbergMarquardt` solver.
 
     All callbacks act on the flattened parameter vector. With ``P = M^{-1}``
     and ``S`` satisfying ``S S' = M^{-1}``:
@@ -31,7 +247,7 @@ class Metric:
 
 
 def metric_from_cholesky(L):
-    """Build a dense ``Metric`` from a lower-triangular Cholesky factor.
+    """Build a dense ``GramMetric`` from a lower-triangular Cholesky factor.
 
     ``L`` is the factor of the metric matrix ``M = L @ L.T``, as returned by
     ``jnp.linalg.cholesky``.
@@ -54,7 +270,7 @@ def metric_from_cholesky(L):
     def inv_sqrt_transpose(x):
         return jsp_linalg.solve_triangular(L, x, lower=True)
 
-    return Metric(
+    return GramMetric(
         solve=solve,
         norm=norm,
         inv_sqrt=inv_sqrt,
@@ -63,7 +279,7 @@ def metric_from_cholesky(L):
 
 
 def metric_from_diagonal(weights):
-    """Build a ``Metric`` for the diagonal metric ``M = diag(weights)``.
+    """Build a ``GramMetric`` for the diagonal metric ``M = diag(weights)``.
 
     ``weights`` must be a one-dimensional array of positive values. Positivity
     is not validated because the values may be traced. Every callback is
@@ -87,7 +303,7 @@ def metric_from_diagonal(weights):
     def inv_sqrt(x):
         return x / expand(sqrt_weights, x)
 
-    return Metric(
+    return GramMetric(
         solve=solve,
         norm=norm,
         inv_sqrt=inv_sqrt,
@@ -150,7 +366,7 @@ def _repeated_shifted_metric(block_metric, block_size, repeats, zero_pad_size, e
         tail = x[repeated_size:]
         return jnp.sqrt(head_norm**2 + epsilon * jnp.vdot(tail, tail))
 
-    return Metric(
+    return GramMetric(
         solve=apply(block_metric.solve, epsilon),
         norm=norm,
         inv_sqrt=apply(block_metric.inv_sqrt, sqrt_epsilon),
@@ -245,7 +461,7 @@ def _metric_from_quasiseparable(d, p, q, A, *, epsilon, parallel):
             c, p, w, A, x.reshape(n, -1), parallel
         ).reshape(x.shape)
 
-    return Metric(
+    return GramMetric(
         solve=solve,
         norm=norm,
         inv_sqrt=inv_sqrt,
@@ -326,7 +542,7 @@ def repeated_shifted_state_space_metric(
     )
 
 
-def _metric_with_compute_dtype(metric: Metric, dtype) -> Metric:
+def _metric_with_compute_dtype(metric: GramMetric, dtype) -> GramMetric:
     dtype = jnp.dtype(dtype)
 
     def wrap(callback):
@@ -338,7 +554,7 @@ def _metric_with_compute_dtype(metric: Metric, dtype) -> Metric:
 
         return apply
 
-    return Metric(
+    return GramMetric(
         solve=wrap(metric.solve),
         norm=wrap(metric.norm),
         inv_sqrt=wrap(metric.inv_sqrt),

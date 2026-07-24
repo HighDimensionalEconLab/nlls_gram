@@ -2,7 +2,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nlls_gram import LevenbergMarquardt, Metric, identity_preconditioner
+from nlls_gram import GramMetric, LevenbergMarquardt, identity_preconditioner
 
 A_SQUARE = jnp.array([[2.0, 1.0], [-1.0, 3.0]])
 P0 = jnp.array([1.0, -2.0])
@@ -103,7 +103,7 @@ def test_auto_dispatches_by_shape_before_forward_solver():
 
 
 def test_direct_does_not_require_metric_whitening_callbacks():
-    metric = Metric(solve=lambda value: value)
+    metric = GramMetric(solve=lambda value: value)
     solver = LevenbergMarquardt(
         square_residual,
         metric=metric,

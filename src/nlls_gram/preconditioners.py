@@ -1,27 +1,87 @@
-"""Dual-preconditioner helpers for the ``linear_solver="gram_cg"`` path.
+"""Preconditioner types and helpers for the package's Krylov paths.
 
-A ``dual_preconditioner(v, damping)`` callback supplies an approximation of
-``(J M^{-1} J' + damping I)^{-1} v`` on residual-space vectors. Unlike
-``metric.solve`` -- which defines the converged root and must stay exact -- a
-preconditioner never changes the subproblem being solved, so approximations
-are safe.
+:class:`Preconditioner` (with :class:`IdentityPreconditioner`) is the typed
+hook of :class:`~nlls_gram.RidgeLevenbergMarquardt`'s ``CG`` config: an SPD
+approximation of the damped whitened normal inverse, receiving the live
+solver state through a :class:`~nlls_gram.MetricContext`.
+
+The remaining helpers serve ``LevenbergMarquardt``'s string-named solver
+menu: a ``dual_preconditioner(v, damping)`` callback supplies an
+approximation of ``(J M^{-1} J' + damping I)^{-1} v`` on residual-space
+vectors for ``linear_solver="gram_cg"``. Unlike ``metric.solve`` -- which
+defines the converged root and must stay exact -- a preconditioner never
+changes the subproblem being solved, so approximations are safe.
 """
+
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 
 
+class Preconditioner:
+    """SPD preconditioner for ``RidgeLevenbergMarquardt``'s CG paths.
+
+    ``apply(v, damping, ctx)`` returns an SPD approximation of
+    ``(J~'J~ + ridge E + damping I)^{-1} v`` on whitened parameter-space
+    vectors. In the forward role (``linear_solver=CG(...)``) it sits in CG's
+    ``M`` slot with the live damping; in the AD role (``ad_solver=CG(...)``)
+    the implicit-AD system is undamped and ``damping`` is zero. ``ctx`` is
+    the same :class:`~nlls_gram.MetricContext` the metric factor ops receive
+    (the flat iterate, the live ``RidgeLMState``, ``args``, ``p``), so a
+    preconditioner can key off the solver state. A preconditioner changes
+    the CG iteration path, never the subproblem being solved, so
+    approximations are safe.
+
+    Implement a custom preconditioner as a small dataclass (``eq=False``
+    identity hashing when it holds arrays -- construct once at setup scope
+    and reuse, since the instance enters the solver's compile-cache key)::
+
+        @dataclass(frozen=True, eq=False)
+        class JacobiPreconditioner(Preconditioner):
+            diagonal: jax.Array
+
+            def apply(self, v, damping, ctx):
+                return v / (self.diagonal + damping)
+
+    Subclasses whose ``apply`` divides by the live damping must set
+    ``requires_positive_damping = True``; the constructor rejects them for
+    the AD role, where damping is zero.
+    """
+
+    requires_positive_damping = False
+
+    def apply(self, v, damping, ctx):
+        raise NotImplementedError
+
+
+@dataclass(frozen=True)
+class IdentityPreconditioner(Preconditioner):
+    """The identity map as an explicit "no preconditioner" choice for ``CG``.
+
+    Nobody should run Krylov methods without thinking about preconditioning,
+    so opting out is an explicit, greppable decision rather than a silent
+    default. Stateless and value-equal: two instances compare equal, so
+    equal ``CG`` configs share one compiled solve loop.
+    """
+
+    def apply(self, v, damping, ctx):
+        return v
+
+
 def identity_preconditioner():
-    """The identity map as an explicit "no preconditioner" choice.
+    """The identity map as an explicit "no preconditioner" choice for the
+    ``LevenbergMarquardt`` hooks.
 
     ``linear_solver="gram_cg"`` requires ``dual_preconditioner``, and a
     ``gram_cg``-resolved AD solve requires ``ad_solver_preconditioner`` (under
     ``normal_cg`` the hook is optional) -- nobody should run Krylov methods
     without thinking about preconditioning, so opting out is an explicit,
     greppable decision rather than a silent default. The returned callable
-    accepts every hook signature: ``dual_preconditioner(v, damping)``,
-    ``normal_preconditioner(v, damping)``, and ``ad_solver_preconditioner(v)``.
+    accepts every hook signature: ``dual_preconditioner(v, damping)`` and
+    ``ad_solver_preconditioner(v)``. (The ridge solver's typed opt-out is
+    :class:`IdentityPreconditioner`.)
     """
 
     def preconditioner(v, damping=None):
