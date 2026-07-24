@@ -232,9 +232,9 @@ penalty as a `Whitener`, switching every linear solver to the
 [whitened subproblem](#whitening) — the right default at deep ridge.
 `penalty_from_factor(L)` and `identity_penalty(size)` cover
 generic dense factors and the minimum-Euclidean-norm case. An \(O(N)\)
-state-space (Matérn) penalty pairing with the `lsmr` path is planned for a
-later release; at the problem sizes this package targets the dense penalty
-serves all three linear solvers.
+state-space (Matérn) penalty pairing with the matrix-free `CG` path
+is planned for a later release; at the problem sizes this package targets
+the dense penalty serves all three linear solvers.
 
 **Rectangular \(L\) is fully supported** — `penalty_from_factor` accepts
 any \((k, p)\) factor, including \(k < p\) with rows dropped for
@@ -260,18 +260,19 @@ derivative terms (the reserved `penalty_factory` keyword raises).
 
 ## Linear solvers
 
-`linear_solver` takes a **typed config** — `Auto()`, `Cholesky()`, `QR()`,
-or `LSMR(preconditioner, tol=..., atol=..., maxiter=...)` — so each
+`linear_solver` takes a **typed config** — `Cholesky()`, `QR()`,
+or `CG(preconditioner, tol=..., atol=..., maxiter=...)` — so each
 method's knobs live on its own config and cannot be passed with another
 (the configs hash by value: equal configs share one compiled solve loop).
 All three solve \((J^\top J + \lambda M_0 + \mu I)\,\delta = -g\) and share
-one factorization between the velocity and geodesic-acceleration solves.
+one factorization (or inner-solve setup) between the velocity and
+geodesic-acceleration solves.
 
 | `linear_solver` | Method | Cost per update | When |
 | --- | --- | --- | --- |
-| `Auto()` = `Cholesky()` | dense normal equations; \(G = J^\top J + \lambda M_0\) assembled via `add_scaled` and **cached across rejected steps** (a reject re-factors in \(p^3/3\) without the GEMM or penalty assembly) | \(mp^2\) GEMM (skipped on reject) + \(p^3/3\) | default; fine for \(\lambda \gtrsim 10^{-8}\) in float64 |
+| `Cholesky()` (default) | dense normal equations; \(G = J^\top J + \lambda M_0\) assembled via `add_scaled` and **cached across rejected steps** (a reject re-factors in \(p^3/3\) without the GEMM or penalty assembly) | \(mp^2\) GEMM (skipped on reject) + \(p^3/3\) | default; fine for \(\lambda \gtrsim 10^{-8}\) in float64 |
 | `QR()` | QR of \([J;\sqrt{\lambda}L]\) cached per \((x, \lambda)\); each damping update re-factors \([R;\sqrt{\mu}I]\) and solves by corrected semi-normal equations with one refinement pass (Björck 1987; Björck 1996, §6.6.5; the damping-row structure is Moré 1978's) | \((m{+}k)p^2\) QR (skipped on reject) + \(2p^3/3\)-ish refactor | small \(\lambda\)/\(\mu\), where forming \(G\) squares the condition number — but try a [whitened](#whitening) `Cholesky()` first when a square factor exists |
-| `LSMR(preconditioner, ...)` | matrix-free bidiagonalization (Fong–Saunders 2011) on the right-preconditioned augmented operator; the `preconditioner` field is required (`identity_right_preconditioner()` opts out); the damping row is posed in the unpreconditioned variable, so every \(\mu > 0\) subproblem is exactly the \(I\)-damped one for any right preconditioner (Björck 1996, Ch. 7) | iterations × (one J and one Jᵀ product + penalty factor products) | Jacobians too large to materialize |
+| `CG(preconditioner, ...)` | matrix-free preconditioned CG on the damped normal operator itself — the same SPD system `Cholesky()` factors, with products through jvp/vjp and the penalty callbacks; the `preconditioner` field is required (`identity_preconditioner()` opts out) and is applied in CG's `M` slot as an SPD `(v, damping) -> vector` approximation of the damped inverse | iterations × (one J and one Jᵀ product + one preconditioner apply) | Jacobians too large to materialize, given a structured preconditioner; natural under a whitener (ridge spectral floor) |
 
 Everything runs at the **residual dtype** — there is no promotion knob. The
 selection resolution is bounded by the problem dtype either way (the
@@ -317,8 +318,8 @@ covers general dense factors — and every `linear_solver` config decides
 what to do with it: the Cholesky path assembles and caches
 \(\tilde J^\top \tilde J + \lambda\,\mathrm{diag}([1]^k, [0]^s)\) with
 \(\tilde J = J \bar L^{-1}\), the QR path factors the whitened stack
-\([\tilde J;\ \sqrt\lambda\,[I_k \mid 0]]\), and LSMR wraps its matvecs
-(its right preconditioner composes on top — a preconditioner changes only
+\([\tilde J;\ \sqrt\lambda\,[I_k \mid 0]]\), and `CG` wraps its
+matvecs (its preconditioner composes on top — a preconditioner changes only
 the *iteration path*, a whitener changes the *damping geometry and
 subproblem*). A plain `RidgePenalty` keeps today's formulas byte-identical.
 The carried iterate stays \(x\) everywhere — init, callbacks, histories,
@@ -392,11 +393,11 @@ with \(\lambda\) frozen (stop-gradient) at the returned state's ridge — the
 continuation schedule's and the multi-start selection's dependence on `p`
 are deliberately ignored — and **no damping** in the AD matrix.
 `ad_solver=Cholesky()` assembles and factors;
-`NormalCG(preconditioner=..., tol=..., atol=..., maxiter=...)` is
+`CG(preconditioner=..., tol=..., atol=..., maxiter=...)` is
 matrix-free CG on the same operator with an optional preconditioner hook
 (positive definite does not mean well conditioned — unpreconditioned CG
-degrades as \(\lambda\) shrinks). `Auto()` picks `Cholesky()` for the dense
-forwards and `NormalCG()` for an `LSMR` forward.
+degrades as \(\lambda\) shrinks). `ad_solver=None` (the default) matches the forward path: `Cholesky()`
+for the dense forwards, `CG()` for a `CG` forward.
 
 The contract, stated plainly: exact differentiation carries two extra terms
 (\(\sum_i r_i \nabla^2 r_i\) in the matrix, \((\partial J^\top/\partial p)r\)
@@ -449,9 +450,9 @@ Porting notes:
 - **No dtype-promotion knobs**: the solve runs at the residual dtype
   (`QR()` is the small-ridge conditioning fix); the metric solver's
   `linear_solve_dtype`/`metric_solve_dtype` have no ridge analog.
-- LSMR users pass the preconditioner as a required config field —
-  `LSMR(identity_right_preconditioner())` at minimum — deliberately
-  stricter than the metric solver's optional `whitened_preconditioner=`.
+- Forward `CG` users pass the preconditioner as a required config
+  field — `CG(identity_preconditioner())` at minimum — deliberately
+  stricter than the metric solver's optional preconditioner hooks.
 - Multi-start ranking uses the ridge objective at each lane's own final
   ridge — comparable across lanes when they share a continuation schedule.
 
@@ -480,9 +481,6 @@ Porting notes:
 - Engl, H. W., K. Kunisch, and A. Neubauer (1989). "Convergence rates for
   Tikhonov regularisation of non-linear ill-posed problems." *Inverse
   Problems* 5(4), 523–540.
-- Fong, D. C.-L., and M. A. Saunders (2011). "LSMR: An iterative algorithm
-  for sparse least-squares problems." *SIAM J. Sci. Comput.* 33(5),
-  2950–2971.
 - Izmailov, A. F., and M. V. Solodov (2026). "Local convergence of the
   Gauss–Newton methods for constrained nonlinear equations." *Comput.
   Optim. Appl.* (doi:10.1007/s10589-026-00801-4).

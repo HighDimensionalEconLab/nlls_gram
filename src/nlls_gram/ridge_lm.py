@@ -14,9 +14,7 @@ Blaschke-Neubauer-Scherzer 1997; Kaltenbacher-Neubauer-Scherzer 2008).
 Numerically the solver is stock Euclidean LM on the augmented residual
 ``[r; sqrt(ridge) L x]`` (Marquardt 1963; More 1978) with geodesic
 acceleration (Transtrum-Sethna 2012); the ``qr`` path uses corrected
-semi-normal equations (Bjorck 1987; Bjorck 1996 Sec. 6.6.5) and the ``lsmr``
-path the Fong-Saunders (2011) bidiagonalization with a right preconditioner
-(Bjorck 1996 Ch. 7).
+semi-normal equations (Bjorck 1987; Bjorck 1996 Sec. 6.6.5).
 """
 
 import dataclasses
@@ -30,9 +28,8 @@ import jax.scipy.sparse.linalg as jsp_sparse_linalg
 import numpy as np
 from jax.flatten_util import ravel_pytree
 
-from nlls_gram.lsmr import lsmr_solve
 from nlls_gram.penalties import RidgePenalty, Whitener
-from nlls_gram.solver_config import LSMR, QR, Auto, Cholesky, NormalCG
+from nlls_gram.solver_config import CG, QR, Cholesky
 from nlls_gram.utility import (
     LMHyperparams,
     LMSolveAction,
@@ -60,7 +57,6 @@ from nlls_gram.utility import (
 
 __all__ = [
     "CholeskyCache",
-    "LSMRCache",
     "QRCache",
     "RidgeLevenbergMarquardt",
     "RidgeLMInfo",
@@ -104,17 +100,6 @@ class QRCache:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
-class LSMRCache:
-    """Placeholder cache type for the ``LSMR`` forward path.
-
-    The matrix-free path carries no per-step factorization today
-    (``solver_cache`` stays ``None``); the type reserves the slot a future
-    recycled-subspace cache would occupy.
-    """
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
 class RidgeLMState:
     """Carried solver state threaded through ``init``/``update``/``solve``.
 
@@ -147,7 +132,7 @@ class RidgeLMState:
         solver_cache: the configured forward solver's own reject-step cache
             -- a :class:`CholeskyCache` or :class:`QRCache` whose pytree
             structure is fixed by the static ``linear_solver`` config, or
-            ``None`` when the path carries no cache (``LSMR``,
+            ``None`` when the path carries no cache (``CG``,
             ``cache_jacobian=False``).
         penalty_state: reserved for the future ``penalty_factory`` (adaptive
             whitening): traced data a factory's ``prepare``/``build`` pair --
@@ -303,8 +288,10 @@ def ridge_continuation(
         raise ValueError("decrease must lie strictly between 0 and 1")
     concrete_floor = not isinstance(ridge_floor, (jax.Array, jax.core.Tracer))
     if concrete_floor and float(ridge_floor) <= 0:
-        raise ValueError("ridge_floor must be strictly positive (ridge = 0 is "
-                         "unsupported by RidgeLevenbergMarquardt)")
+        raise ValueError(
+            "ridge_floor must be strictly positive (ridge = 0 is "
+            "unsupported by RidgeLevenbergMarquardt)"
+        )
     if grad_rtol <= 0:
         raise ValueError("grad_rtol must be positive")
     if not 0 <= stall_rtol < 1:
@@ -402,13 +389,12 @@ class RidgeLevenbergMarquardt:
 
     ``linear_solver`` picks the algebra for
     ``(J'J + ridge L'L + damping I) delta = -g`` through a typed config
-    (:class:`~nlls_gram.Auto` / :class:`~nlls_gram.Cholesky` /
-    :class:`~nlls_gram.QR` / :class:`~nlls_gram.LSMR` /
-    :class:`~nlls_gram.NormalCG` -- each method's knobs live on its own
-    config); every path shares its factorization or inner-solve setup between
-    the velocity and geodesic-acceleration solves:
+    (:class:`~nlls_gram.Cholesky` /
+    :class:`~nlls_gram.QR` / :class:`~nlls_gram.CG` -- each method's
+    knobs live on its own config); every path shares its factorization or
+    inner-solve setup between the velocity and geodesic-acceleration solves:
 
-    - ``Auto()`` (= ``Cholesky()``, the default): dense normal equations.
+    - ``Cholesky()`` (the default): dense normal equations.
       ``J'`` is materialized per ``jacobian_mode``, the penalty added via
       ``penalty.add_scaled``, and the assembled ``G = J'J + ridge L'L`` is
       cached across rejected steps (only the damping shift re-factors).
@@ -423,14 +409,7 @@ class RidgeLevenbergMarquardt:
       factor through corrected semi-normal equations with one fixed
       iterative-refinement pass (Bjorck 1987; Bjorck 1996 Sec. 6.6.5) --
       the second-order correction tolerates the squared conditioning.
-    - ``LSMR(preconditioner, ...)``: matrix-free bidiagonalization
-      (Fong-Saunders 2011) on the right-preconditioned augmented operator;
-      the :class:`~nlls_gram.WhitenedPreconditioner` is a required field
-      (``identity_right_preconditioner()`` opts out). The augmented damping
-      row is posed in the unpreconditioned variable, so every
-      ``damping > 0`` subproblem is exactly the ``I``-damped problem for any
-      right preconditioner (Bjorck 1996 Ch. 7).
-    - ``NormalCG(preconditioner, ...)``: matrix-free preconditioned CG on the
+    - ``CG(preconditioner, ...)``: matrix-free preconditioned CG on the
       damped normal operator ``J'J + ridge L'L + damping I`` itself -- the
       same SPD system the ``Cholesky()`` path factors, with products through
       ``jvp``/``vjp`` and the penalty callbacks instead of an assembled
@@ -460,7 +439,7 @@ class RidgeLevenbergMarquardt:
     ``step_norm`` / ``penalty_grad_norm`` (with ``gtol``/``xtol``) become
     the whitened quantities -- see :class:`RidgeLMInfo`. The whitener's
     factorization never involves the ridge weight, so continuation composes
-    unchanged; a right ``LSMR`` preconditioner composes on top (it changes
+    unchanged; a ``CG`` preconditioner composes on top (it changes
     the iteration path, a whitener changes the damping geometry).
 
     Stopping (``solve``): a ridge solve has two phases -- the residual drops
@@ -503,11 +482,11 @@ class RidgeLevenbergMarquardt:
     components read off null-space directions retain an O(1)-in-``ridge``
     Gauss-Newton bias proportional to the residual curvature.
     ``ad_solver=Cholesky()`` assembles and factors;
-    :class:`~nlls_gram.NormalCG` runs matrix-free CG on the same operator
+    :class:`~nlls_gram.CG` runs matrix-free CG on the same operator
     with its optional ``preconditioner`` hook (PD does not mean
     well-conditioned -- unpreconditioned CG degrades as ``ridge`` shrinks).
-    ``Auto()`` resolves to ``Cholesky()`` for the dense forwards and
-    ``NormalCG()`` for a matrix-free (``LSMR`` or ``NormalCG``) forward.
+    ``ad_solver=None`` (the default) matches the forward path: ``Cholesky()``
+    for the dense forwards, ``CG()`` for a matrix-free ``CG`` forward.
     Failed statuses return exact zero
     tangents for ``result.x``/``result.aux`` and evaluate the masked tangent
     program at stop-gradient copies of the caller's original inputs and the
@@ -537,9 +516,9 @@ class RidgeLevenbergMarquardt:
         damping_increase=4.0,
         min_damping=None,
         max_damping=None,
-        linear_solver=Auto(),  # noqa: B008 -- frozen, immutable default
+        linear_solver=Cholesky(),  # noqa: B008 -- frozen, immutable default
         jacobian_mode="auto",
-        ad_solver=Auto(),  # noqa: B008 -- frozen, immutable default
+        ad_solver=None,
         has_aux=False,
         cache_jacobian=True,
         geodesic_acceleration=True,
@@ -558,16 +537,15 @@ class RidgeLevenbergMarquardt:
             )
         if not isinstance(penalty, RidgePenalty):
             raise TypeError("penalty must be a RidgePenalty")
-        if not isinstance(linear_solver, (Auto, Cholesky, QR, LSMR, NormalCG)):
+        if not isinstance(linear_solver, (Cholesky, QR, CG)):
             raise TypeError(
-                "linear_solver must be a solver config -- Auto(), Cholesky(), "
-                "QR(), LSMR(preconditioner, ...), or "
-                f"NormalCG(preconditioner, ...); got {linear_solver!r}"
+                "linear_solver must be a solver config -- Cholesky(), QR(), "
+                f"or CG(preconditioner, ...); got {linear_solver!r}"
             )
-        if not isinstance(ad_solver, (Auto, Cholesky, NormalCG)):
+        if ad_solver is not None and not isinstance(ad_solver, (Cholesky, CG)):
             raise TypeError(
-                "ad_solver must be a solver config -- Auto(), Cholesky(), or "
-                f"NormalCG(...); got {ad_solver!r}"
+                "ad_solver must be None (match the forward path), Cholesky(), "
+                f"or CG(...); got {ad_solver!r}"
             )
         if jacobian_mode not in ("auto", "fwd", "rev"):
             raise ValueError(f"unknown jacobian_mode: {jacobian_mode}")
@@ -596,18 +574,18 @@ class RidgeLevenbergMarquardt:
         if max_damping is not None and max_damping < init_damping:
             raise ValueError("max_damping must be at least init_damping")
         # jacobian_mode is consumed by the dense forward paths and the
-        # cholesky AD method; a matrix-free forward (lsmr or normal_cg) with a
-        # cg AD rule never materializes J, so a forced mode is a construction
+        # cholesky AD method; a matrix-free normal_cg forward with a cg AD
+        # rule never materializes J, so a forced mode is a construction
         # error there.
         if (
             jacobian_mode != "auto"
-            and isinstance(linear_solver, (LSMR, NormalCG))
+            and isinstance(linear_solver, CG)
             and not isinstance(ad_solver, Cholesky)
         ):
             raise ValueError(
                 "jacobian_mode controls dense Jacobian assembly, but neither "
-                "a matrix-free (LSMR / NormalCG) forward solver nor its "
-                "cg-resolved ad_solver ever consumes it"
+                "a matrix-free CG forward solver nor its cg-resolved "
+                "ad_solver ever consumes it"
             )
         self.residual_fn = canonical_residual
         self.residual_arity = residual_arity
@@ -625,13 +603,7 @@ class RidgeLevenbergMarquardt:
         # at init exactly as the flat constructor args used to; the config
         # instances themselves sit in the value-based static key, so
         # recompile-on-change behavior is unchanged.
-        if isinstance(linear_solver, LSMR):
-            self.lsmr_preconditioner = linear_solver.preconditioner
-            self.normal_cg_preconditioner = None
-            self.iterative_tol = linear_solver.tol
-            self.iterative_atol = linear_solver.atol
-            self.iterative_maxiter = linear_solver.maxiter
-        elif isinstance(linear_solver, NormalCG):
+        if isinstance(linear_solver, CG):
             # The forward role REQUIRES the preconditioner (the AD role keeps
             # it optional): a hook (v, damping) -> vector applying an SPD
             # approximation of (J'J + ridge L'L + damping I)^{-1} -- posed on
@@ -639,12 +611,11 @@ class RidgeLevenbergMarquardt:
             # identity_preconditioner() opts out explicitly.
             if linear_solver.preconditioner is None:
                 raise TypeError(
-                    "a forward NormalCG linear_solver requires preconditioner, "
+                    "a forward CG linear_solver requires preconditioner, "
                     "an SPD (v, damping) -> vector approximation of "
                     "(J'J + ridge L'L + damping I)^{-1}; pass "
                     "identity_preconditioner() to run unpreconditioned CG"
                 )
-            self.lsmr_preconditioner = None
             self.normal_cg_preconditioner = linear_solver.preconditioner
             # tol=None resolves per residual dtype in hyperparams(), the
             # _ad_cg_tol convention.
@@ -652,12 +623,11 @@ class RidgeLevenbergMarquardt:
             self.iterative_atol = linear_solver.atol
             self.iterative_maxiter = linear_solver.maxiter
         else:
-            self.lsmr_preconditioner = None
             self.normal_cg_preconditioner = None
             self.iterative_tol = 0.0
             self.iterative_atol = 0.0
             self.iterative_maxiter = 8
-        if isinstance(ad_solver, NormalCG):
+        if isinstance(ad_solver, CG):
             self.ad_solver_tol = ad_solver.tol
             self.ad_solver_atol = ad_solver.atol
             self.ad_solver_maxiter = ad_solver.maxiter
@@ -674,10 +644,8 @@ class RidgeLevenbergMarquardt:
         self.has_aux = has_aux
         # Only the dense paths materialize J' (and the cholesky/qr caches ride
         # on the same reject-reuse lifecycle), so the flag is inert for the
-        # matrix-free lsmr and normal_cg forwards.
-        self.cache_jacobian = cache_jacobian and not isinstance(
-            linear_solver, (LSMR, NormalCG)
-        )
+        # matrix-free normal_cg forward.
+        self.cache_jacobian = cache_jacobian and not isinstance(linear_solver, CG)
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
         # Resolved penalty callbacks. The defaults derive from sqrt_apply, so
@@ -754,7 +722,7 @@ class RidgeLevenbergMarquardt:
         """``LMHyperparams`` built from the constructor values."""
         iterative_tol = self.iterative_tol
         if iterative_tol is None:
-            # NormalCG's tol=None: the _ad_cg_tol dtype-default convention.
+            # CG's tol=None: the _ad_cg_tol dtype-default convention.
             resolved = jnp.result_type(float) if dtype is None else dtype
             iterative_tol = 1e-10 if jnp.finfo(resolved).bits > 32 else 1e-6
         return LMHyperparams(
@@ -773,11 +741,9 @@ class RidgeLevenbergMarquardt:
         )
 
     def _resolved_solver(self):
-        if isinstance(self.linear_solver, (Auto, Cholesky)):
+        if isinstance(self.linear_solver, Cholesky):
             return "cholesky"
-        if isinstance(self.linear_solver, QR):
-            return "qr"
-        return "lsmr" if isinstance(self.linear_solver, LSMR) else "normal_cg"
+        return "qr" if isinstance(self.linear_solver, QR) else "normal_cg"
 
     def _penalty_rows(self, theta_size, dtype):
         # The dense (k, p) factor L: the penalty's own sqrt_rows when
@@ -805,9 +771,7 @@ class RidgeLevenbergMarquardt:
         residual, aux = self._residual_and_aux(x0, args, p)
         dtype = residual.dtype
         min_damping = _damping_floor(self.min_damping, dtype)
-        damping = jnp.maximum(
-            jnp.asarray(self.init_damping, dtype=dtype), min_damping
-        )
+        damping = jnp.maximum(jnp.asarray(self.init_damping, dtype=dtype), min_damping)
         ridge = self._resolve_ridge(dtype)
         if not self.cache_jacobian:
             return RidgeLMState(damping, ridge)
@@ -931,11 +895,10 @@ class RidgeLevenbergMarquardt:
 
             residual_value = residual_flat
 
-        # TRUE-residual linearization: matrix-free closures for lsmr and
-        # normal_cg, dense J' (reused from the cache after a rejected step)
-        # otherwise.
+        # TRUE-residual linearization: matrix-free closures for normal_cg,
+        # dense J' (reused from the cache after a rejected step) otherwise.
         resolved_solver = self._resolved_solver()
-        if resolved_solver in ("lsmr", "normal_cg"):
+        if resolved_solver == "normal_cg":
             if self.has_aux:
                 resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
             else:
@@ -1004,7 +967,7 @@ class RidgeLevenbergMarquardt:
                 self._sqrt_transpose_apply(factor_x), dtype=resid.dtype
             )
 
-        if resolved_solver in ("lsmr", "normal_cg"):
+        if resolved_solver == "normal_cg":
             transpose_fn = jax.linear_transpose(jvp_fn, theta)
 
             def JT(cotangent):
@@ -1066,79 +1029,30 @@ class RidgeLevenbergMarquardt:
             def N_matvec(u):
                 return At_matvec(A_matvec(u)) + damping * u
 
-            if resolved_solver == "lsmr":
-                sqrt_damping = jnp.sqrt(damping)
-                # None (uncapped) has no meaning for a fixed-shape loop;
-                # min(m+k, n) is the augmented bidiagonalization's
-                # exact-arithmetic bound.
-                lsmr_maxiter = (
-                    hyper.iterative_maxiter
-                    if hyper.iterative_maxiter is not None
-                    else 4 * min(m + k, n)
+            # Preconditioned CG on N itself -- the same damped SPD system
+            # the cholesky path factors, applied matrix-free. The required
+            # hook is CG's M slot: M^{-1} = preconditioner(., damping),
+            # an SPD approximation of N^{-1} at the live damping.
+            def apply_M(v):
+                return self.normal_cg_preconditioner(v, damping)
+
+            def solve_N(_, c):
+                solution, _ = jsp_sparse_linalg.cg(
+                    N_matvec,
+                    c,
+                    tol=inner_tol,
+                    atol=inner_atol,
+                    maxiter=hyper.iterative_maxiter,
+                    M=apply_M,
                 )
-
-                def apply_Rinv(v):
-                    return self.lsmr_preconditioner.solve(v, damping)
-
-                def apply_RinvT(w):
-                    return self.lsmr_preconditioner.solve_transpose(w, damping)
-
-                def solve_N(_, c):
-                    # Solve (A'A + damping I) u = c by LSMR on the
-                    # R-preconditioned damped-augmented operator
-                    # [A R^{-1}; sqrt(damping) R^{-1}] in z = R u: its normal
-                    # equations read
-                    # (A'A + damping I) u = A' b1 + sqrt(damping) b2, so
-                    # b_aug = [0_{m+k}; c / sqrt(damping)] targets c exactly,
-                    # at condition sqrt(cond(N)).
-                    def A_aug(zz):
-                        u_zz = apply_Rinv(zz)
-                        return jnp.concatenate(
-                            [A_matvec(u_zz), sqrt_damping * u_zz]
-                        )
-
-                    def At_aug(ww):
-                        return apply_RinvT(
-                            At_matvec(ww[: m + k]) + sqrt_damping * ww[m + k :]
-                        )
-
-                    b_aug = jnp.concatenate(
-                        [jnp.zeros(m + k, resid.dtype), c / sqrt_damping]
-                    )
-                    z, _ = lsmr_solve(
-                        A_aug,
-                        At_aug,
-                        b_aug,
-                        jnp.zeros((), resid.dtype),
-                        inner_tol,
-                        inner_atol,
-                        lsmr_maxiter,
-                        n,
-                    )
-                    return apply_Rinv(z)
-
-            else:
-                # Preconditioned CG on N itself -- the same damped SPD system
-                # the cholesky path factors, applied matrix-free. The required
-                # hook is CG's M slot: M^{-1} = preconditioner(., damping),
-                # an SPD approximation of N^{-1} at the live damping.
-                def apply_M(v):
-                    return self.normal_cg_preconditioner(v, damping)
-
-                def solve_N(_, c):
-                    solution, _ = jsp_sparse_linalg.cg(
-                        N_matvec,
-                        c,
-                        tol=inner_tol,
-                        atol=inner_atol,
-                        maxiter=hyper.iterative_maxiter,
-                        M=apply_M,
-                    )
-                    return solution
+                return solution
 
             def solve_step(rhs):
                 return jax.lax.custom_linear_solve(
-                    N_matvec, -rhs, solve=solve_N, transpose_solve=solve_N,
+                    N_matvec,
+                    -rhs,
+                    solve=solve_N,
+                    transpose_solve=solve_N,
                     symmetric=True,
                 )
 
@@ -1156,9 +1070,7 @@ class RidgeLevenbergMarquardt:
             # only ever pull vectors back through unwhiten_transpose.
             if self._whitened:
                 grad = (
-                    jnp.asarray(
-                        self._unwhiten_transpose(Jt @ resid), dtype=resid.dtype
-                    )
+                    jnp.asarray(self._unwhiten_transpose(Jt @ resid), dtype=resid.dtype)
                     + ridge * penalty_gradient
                 )
 
@@ -1228,9 +1140,7 @@ class RidgeLevenbergMarquardt:
             # materialized only when the cache refreshes.
             if self._whitened:
                 grad = (
-                    jnp.asarray(
-                        self._unwhiten_transpose(Jt @ resid), dtype=resid.dtype
-                    )
+                    jnp.asarray(self._unwhiten_transpose(Jt @ resid), dtype=resid.dtype)
                     + ridge * penalty_gradient
                 )
 
@@ -1246,19 +1156,15 @@ class RidgeLevenbergMarquardt:
                         ],
                         axis=0,
                     )
-                    b_stacked = jnp.concatenate(
-                        [resid, jnp.sqrt(ridge) * y_head]
-                    )
-                    augmented = jnp.concatenate(
-                        [stacked, b_stacked[:, None]], axis=1
-                    )
+                    b_stacked = jnp.concatenate([resid, jnp.sqrt(ridge) * y_head])
+                    augmented = jnp.concatenate([stacked, b_stacked[:, None]], axis=1)
                     return jnp.linalg.qr(augmented, mode="r")
 
             else:
                 grad = Jt @ resid + ridge * penalty_gradient
-                penalty_rows = self._penalty_rows(
-                    theta.shape[0], resid.dtype
-                ).astype(resid.dtype)
+                penalty_rows = self._penalty_rows(theta.shape[0], resid.dtype).astype(
+                    resid.dtype
+                )
 
                 def assemble_r(_):
                     stacked = jnp.concatenate(
@@ -1267,9 +1173,7 @@ class RidgeLevenbergMarquardt:
                     b_stacked = jnp.concatenate(
                         [resid, jnp.sqrt(ridge) * jnp.asarray(factor_x, resid.dtype)]
                     )
-                    augmented = jnp.concatenate(
-                        [stacked, b_stacked[:, None]], axis=1
-                    )
+                    augmented = jnp.concatenate([stacked, b_stacked[:, None]], axis=1)
                     return jnp.linalg.qr(augmented, mode="r")
 
             if self.cache_jacobian:
@@ -1309,19 +1213,14 @@ class RidgeLevenbergMarquardt:
                     gauss_newton = jnp.asarray(
                         self._unwhiten_transpose(
                             Jt
-                            @ (
-                                Jt.T
-                                @ jnp.asarray(self._unwhiten(v), dtype=resid.dtype)
-                            )
+                            @ (Jt.T @ jnp.asarray(self._unwhiten(v), dtype=resid.dtype))
                         ),
                         dtype=resid.dtype,
                     )
                     head_shift = jnp.concatenate(
                         [
                             v[:head_rows],
-                            jnp.zeros(
-                                theta.shape[0] - head_rows, dtype=resid.dtype
-                            ),
+                            jnp.zeros(theta.shape[0] - head_rows, dtype=resid.dtype),
                         ]
                     )
                     return gauss_newton + ridge * head_shift + damping * v
@@ -1359,9 +1258,7 @@ class RidgeLevenbergMarquardt:
                         jnp.zeros(theta.shape[0], dtype=resid.dtype),
                     ]
                 )
-                return -jsp_linalg.solve_triangular(
-                    R_mu, Q_mu.T @ rhs_aug, lower=False
-                )
+                return -jsp_linalg.solve_triangular(R_mu, Q_mu.T @ rhs_aug, lower=False)
 
             if self._whitened:
 
@@ -1394,9 +1291,7 @@ class RidgeLevenbergMarquardt:
             velocity = velocity_sub
 
             def trial_penalty(step_x, step_sub):
-                return jnp.asarray(
-                    self._quadratic(theta + step_x), dtype=resid.dtype
-                )
+                return jnp.asarray(self._quadratic(theta + step_x), dtype=resid.dtype)
 
         resid_velocity = residual_value(theta + velocity)
         resid_loss_old = jnp.sum(resid**2)
@@ -1464,9 +1359,7 @@ class RidgeLevenbergMarquardt:
             used_geodesic = ratio_accepted & (loss_accelerated <= loss_velocity)
             step = jnp.where(used_geodesic, accelerated_step, velocity)
             if self._whitened:
-                step_sub = jnp.where(
-                    used_geodesic, accelerated_step_sub, velocity_sub
-                )
+                step_sub = jnp.where(used_geodesic, accelerated_step_sub, velocity_sub)
             else:
                 step_sub = step
             loss_candidate = jnp.where(used_geodesic, loss_accelerated, loss_velocity)
@@ -2095,13 +1988,9 @@ class RidgeLevenbergMarquardt:
         return dataclasses.replace(zero_result, x=x_dot, p=p_dot, aux=aux_dot)
 
     def _resolved_ad_solver(self):
-        if isinstance(self.ad_solver, Auto):
+        if self.ad_solver is None:
             # Matrix-free forward -> matrix-free AD.
-            return (
-                "normal_cg"
-                if self._resolved_solver() in ("lsmr", "normal_cg")
-                else "cholesky"
-            )
+            return "normal_cg" if self._resolved_solver() == "normal_cg" else "cholesky"
         return "cholesky" if isinstance(self.ad_solver, Cholesky) else "normal_cg"
 
     def _ad_x_tangent_from_p(self, x, args, p, p_dot, ridge):
@@ -2138,9 +2027,7 @@ class RidgeLevenbergMarquardt:
         Jt = self._assemble_jt(theta_jvp, theta, residual)
         ridge_typed = jnp.asarray(ridge, dtype=residual.dtype)
         if self._whitened:
-            Jt_sub = jnp.asarray(
-                self._unwhiten_transpose(Jt), dtype=residual.dtype
-            )
+            Jt_sub = jnp.asarray(self._unwhiten_transpose(Jt), dtype=residual.dtype)
             diag = jnp.arange(self.penalty.num_rows)
             normal_matrix = (Jt_sub @ Jt_sub.T).at[diag, diag].add(ridge_typed)
             factor = jsp_linalg.cho_factor(normal_matrix)
@@ -2175,9 +2062,7 @@ class RidgeLevenbergMarquardt:
                     self._unwhiten_transpose(
                         JT(
                             theta_jvp(
-                                jnp.asarray(
-                                    self._unwhiten(u), dtype=residual.dtype
-                                )
+                                jnp.asarray(self._unwhiten(u), dtype=residual.dtype)
                             )
                         )
                     ),
@@ -2186,9 +2071,7 @@ class RidgeLevenbergMarquardt:
                 head_shift = jnp.concatenate(
                     [
                         u[:head_rows],
-                        jnp.zeros(
-                            theta.shape[0] - head_rows, dtype=residual.dtype
-                        ),
+                        jnp.zeros(theta.shape[0] - head_rows, dtype=residual.dtype),
                     ]
                 )
                 return gauss_newton + ridge_typed * head_shift
@@ -2229,9 +2112,7 @@ class RidgeLevenbergMarquardt:
             symmetric=True,
         )
         if self._whitened:
-            theta_dot = jnp.asarray(
-                self._unwhiten(theta_dot), dtype=residual.dtype
-            )
+            theta_dot = jnp.asarray(self._unwhiten(theta_dot), dtype=residual.dtype)
         return unravel(theta_dot)
 
     def _ad_cg_tol(self, dtype):

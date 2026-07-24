@@ -6,16 +6,13 @@ import numpy as np
 import pytest
 
 from nlls_gram import (
-    LSMR,
+    CG,
     QR,
     Cholesky,
     CholeskyCache,
-    NormalCG,
     QRCache,
     RidgeLevenbergMarquardt,
-    WhitenedPreconditioner,
     identity_preconditioner,
-    identity_right_preconditioner,
     repeated_dense_penalty,
 )
 
@@ -34,9 +31,7 @@ X0 = jnp.asarray(RNG.normal(size=P_DIM), dtype=jnp.float32)
 
 
 def nonlinear_residual(theta):
-    return jnp.concatenate(
-        [A @ theta - B, jnp.array([theta[0] * theta[1] - 0.4])]
-    )
+    return jnp.concatenate([A @ theta - B, jnp.array([theta[0] * theta[1] - 0.4])])
 
 
 def make_penalty():
@@ -48,14 +43,8 @@ def solver_config(name, preconditioner=None):
         return Cholesky()
     if name == "qr":
         return QR()
-    if name == "normal_cg":
-        return NormalCG(
-            preconditioner or identity_preconditioner(),
-            tol=1e-10,
-            maxiter=None,
-        )
-    return LSMR(
-        preconditioner or identity_right_preconditioner(),
+    return CG(
+        preconditioner or identity_preconditioner(),
         tol=1e-10,
         maxiter=None,
     )
@@ -75,7 +64,7 @@ def build(name, preconditioner=None, **kwargs):
 @pytest.mark.parametrize("init_damping", [1e-2, 1e-5])
 def test_solvers_agree_on_a_step(ridge, init_damping):
     steps = {}
-    for name in ("cholesky", "qr", "lsmr", "normal_cg"):
+    for name in ("cholesky", "qr", "normal_cg"):
         solver = build(name, ridge=ridge, init_damping=init_damping)
         lm_state = solver.init(X0)
         x_new, _, info = solver.update(X0, lm_state)
@@ -87,22 +76,18 @@ def test_solvers_agree_on_a_step(ridge, init_damping):
     # system. Tight (1e-9) agreement is asserted under float64 in
     # test_float64_subprocess.py.
     np.testing.assert_allclose(steps["cholesky"], steps["qr"], atol=5e-3)
-    np.testing.assert_allclose(steps["cholesky"], steps["lsmr"], atol=5e-3)
     np.testing.assert_allclose(steps["cholesky"], steps["normal_cg"], atol=5e-3)
 
 
 def test_full_solves_agree_across_solvers():
     solutions = {}
-    for name in ("cholesky", "qr", "lsmr", "normal_cg"):
+    for name in ("cholesky", "qr", "normal_cg"):
         solver = build(name, ridge=1e-3)
         result = solver.solve(X0, max_steps=300, gtol=1e-4)
         assert int(result.status) == 1, name
         solutions[name] = np.asarray(result.x)
     np.testing.assert_allclose(solutions["cholesky"], solutions["qr"], atol=1e-3)
-    np.testing.assert_allclose(solutions["cholesky"], solutions["lsmr"], atol=5e-3)
-    np.testing.assert_allclose(
-        solutions["cholesky"], solutions["normal_cg"], atol=5e-3
-    )
+    np.testing.assert_allclose(solutions["cholesky"], solutions["normal_cg"], atol=5e-3)
 
 
 def test_cholesky_normal_cache_is_reused_and_ridge_keyed():
@@ -128,9 +113,7 @@ def test_cholesky_normal_cache_is_reused_and_ridge_keyed():
         solver_cache=CholeskyCache(garbage, jnp.asarray(True), fresh.ridge * 2.0),
     )
     x_recomputed, _, _ = solver.update(X0, poisoned_stale_ridge)
-    np.testing.assert_allclose(
-        np.asarray(x_recomputed), np.asarray(x_clean), rtol=1e-6
-    )
+    np.testing.assert_allclose(np.asarray(x_recomputed), np.asarray(x_clean), rtol=1e-6)
 
 
 def test_qr_cache_is_reused_and_ridge_keyed():
@@ -154,9 +137,7 @@ def test_qr_cache_is_reused_and_ridge_keyed():
         solver_cache=QRCache(garbage, jnp.asarray(True), fresh.ridge * 2.0),
     )
     x_recomputed, _, _ = solver.update(X0, poisoned_stale_ridge)
-    np.testing.assert_allclose(
-        np.asarray(x_recomputed), np.asarray(x_clean), rtol=1e-6
-    )
+    np.testing.assert_allclose(np.asarray(x_recomputed), np.asarray(x_clean), rtol=1e-6)
     # An update after an ACCEPTED step invalidates the cache (x moved).
     assert not bool(state_clean.solver_cache.valid)
     assert not bool(state_clean.jacobian_valid)
@@ -202,28 +183,6 @@ def test_rejected_step_reuses_residual_and_jacobian():
     assert len(calls) == 1  # trial point only: cached resid/Jt reused
 
 
-def test_lsmr_right_preconditioner_changes_nothing():
-    scale = jnp.asarray(RNG.uniform(0.5, 2.0, size=P_DIM), dtype=jnp.float32)
-
-    def solve(v, damping):
-        return v / scale
-
-    def solve_transpose(w, damping):
-        return w / scale
-
-    preconditioned = build(
-        "lsmr",
-        ridge=1e-3,
-        preconditioner=WhitenedPreconditioner(solve, solve_transpose),
-    )
-    identity = build("lsmr", ridge=1e-3)
-    state_p = preconditioned.init(X0)
-    state_i = identity.init(X0)
-    x_p, _, _ = preconditioned.update(X0, state_p)
-    x_i, _, _ = identity.update(X0, state_i)
-    np.testing.assert_allclose(np.asarray(x_p), np.asarray(x_i), atol=2e-3)
-
-
 def test_forward_normal_cg_requires_a_preconditioner():
     # The AD role keeps preconditioner=None legal; the forward role must
     # reject it -- nobody runs forward Krylov without an explicit choice.
@@ -231,13 +190,13 @@ def test_forward_normal_cg_requires_a_preconditioner():
         RidgeLevenbergMarquardt(
             nonlinear_residual,
             penalty=make_penalty(),
-            linear_solver=NormalCG(maxiter=100),
+            linear_solver=CG(maxiter=100),
         )
     # The same config stays valid in its AD role.
     RidgeLevenbergMarquardt(
         nonlinear_residual,
         penalty=make_penalty(),
-        ad_solver=NormalCG(maxiter=100),
+        ad_solver=CG(maxiter=100),
     )
 
 

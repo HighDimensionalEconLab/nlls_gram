@@ -7,19 +7,16 @@ for one method cannot be passed with another. Instances compare and hash by
 value (standard frozen-dataclass semantics), so equal configs key the same
 compiled solve loop; construct them inline freely.
 
-- ``Auto()``: resolve by context (forward: ``Cholesky``; AD: ``Cholesky``
-  for the dense forwards, ``NormalCG`` under a matrix-free ``LSMR`` or
-  ``NormalCG`` forward).
-- ``Cholesky()``: dense normal equations (forward) or the assembled dense
-  implicit-AD solve.
+- ``Cholesky()`` (the default): dense normal equations (forward) or the
+  assembled dense implicit-AD solve.
 - ``QR()``: MINPACK-structured damping-row QR, stable at tiny ridge/damping.
-- ``LSMR(preconditioner, ...)``: matrix-free bidiagonalization; the right
-  preconditioner is required (``identity_right_preconditioner()`` opts out).
-- ``NormalCG(...)``: matrix-free preconditioned CG on the normal operator --
+- ``CG(...)``: matrix-free preconditioned CG on the normal operator --
   as ``linear_solver`` the damped forward subproblem (``preconditioner``
   required; ``identity_preconditioner()`` opts out), as ``ad_solver`` the
   undamped implicit-AD solve (``preconditioner`` optional).
 
+``ad_solver=None`` (the default) matches the forward path's family:
+``Cholesky`` for the dense forwards, ``CG`` under a ``CG`` forward.
 ``LevenbergMarquardt`` (the metric solver) keeps its string-named solver menu
 for now; these types are the configuration surface the solvers are converging
 on.
@@ -27,20 +24,7 @@ on.
 
 from dataclasses import dataclass
 
-from nlls_gram.preconditioners import WhitenedPreconditioner
-
-__all__ = ["Auto", "Cholesky", "LSMR", "NormalCG", "QR"]
-
-
-@dataclass(frozen=True)
-class Auto:
-    """Context-resolved solver choice.
-
-    As ``linear_solver`` it resolves to :class:`Cholesky`. As ``ad_solver``
-    it resolves to :class:`Cholesky` when the forward solver is dense and to
-    :class:`NormalCG` (with its defaults) under a matrix-free
-    (:class:`LSMR` or :class:`NormalCG`) forward.
-    """
+__all__ = ["Cholesky", "CG", "QR"]
 
 
 @dataclass(frozen=True)
@@ -65,41 +49,7 @@ class QR:
 
 
 @dataclass(frozen=True)
-class LSMR:
-    """Matrix-free LSMR (Fong-Saunders 2011) on the augmented operator.
-
-    ``preconditioner`` is REQUIRED: a
-    :class:`~nlls_gram.WhitenedPreconditioner` applying a parameter-space
-    right preconditioner (``identity_right_preconditioner()`` opts out
-    explicitly -- nobody should run Krylov methods without thinking about
-    preconditioning). ``tol``/``atol`` are the LSMR stopping tolerances
-    (traced per-step data, adjustable through ``LMHyperparams``);
-    ``maxiter=None`` caps the inner iteration at ``4 * min(m + k, p)``, the
-    augmented bidiagonalization's exact-arithmetic bound.
-    """
-
-    preconditioner: WhitenedPreconditioner
-    tol: float = 0.0
-    atol: float = 0.0
-    maxiter: int | None = 8
-
-    def __post_init__(self):
-        if not isinstance(self.preconditioner, WhitenedPreconditioner):
-            raise TypeError(
-                "LSMR requires preconditioner, a WhitenedPreconditioner "
-                "applying a parameter-space right preconditioner; pass "
-                "identity_right_preconditioner() to run unpreconditioned LSMR"
-            )
-        if self.tol < 0:
-            raise ValueError("LSMR.tol must be nonnegative")
-        if self.atol < 0:
-            raise ValueError("LSMR.atol must be nonnegative")
-        if self.maxiter is not None and self.maxiter <= 0:
-            raise ValueError("LSMR.maxiter must be positive or None")
-
-
-@dataclass(frozen=True)
-class NormalCG:
+class CG:
     """Matrix-free preconditioned CG on the normal operator, in both roles.
 
     As ``ad_solver`` it solves the undamped implicit-AD system
@@ -129,14 +79,12 @@ class NormalCG:
 
     def __post_init__(self):
         if self.preconditioner is not None and not callable(self.preconditioner):
-            raise TypeError("NormalCG.preconditioner must be callable or None")
+            raise TypeError("CG.preconditioner must be callable or None")
         if self.tol is not None and self.tol < 0:
-            raise ValueError("NormalCG.tol must be nonnegative or None")
+            raise ValueError("CG.tol must be nonnegative or None")
         if self.atol < 0:
-            raise ValueError("NormalCG.atol must be nonnegative")
+            raise ValueError("CG.atol must be nonnegative")
         if self.maxiter is not None and self.maxiter <= 0:
-            raise ValueError("NormalCG.maxiter must be positive or None")
+            raise ValueError("CG.maxiter must be positive or None")
         if self.tol == 0 and self.atol == 0 and self.maxiter is None:
-            raise ValueError(
-                "NormalCG.maxiter must be set when both tolerances are zero"
-            )
+            raise ValueError("CG.maxiter must be set when both tolerances are zero")

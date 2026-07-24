@@ -17,11 +17,10 @@ to p):
   gtol from a pilot run as ~1e-3 * ridge * info.penalty_grad_norm (the
   relative-stationarity recipe -- the reported ||L'Lx|| is the scale the
   gradient must cancel against). Linear solvers are typed configs —
-  Auto()/Cholesky() (dense normal equations with a reject-step cache),
-  QR() (damping-row QR for tiny ridge), LSMR(preconditioner, ...)
-  (matrix-free bidiagonalization), NormalCG(preconditioner, ...)
+  Cholesky() (the default: dense normal equations with a reject-step
+  cache), QR() (damping-row QR for tiny ridge), CG(preconditioner, ...)
   (matrix-free preconditioned CG on the damped normal operator) — and the
-  AD side takes Cholesky() or NormalCG(...). A
+  AD side takes Cholesky() or CG(...), defaulting to the forward family. A
   Whitener penalty (repeated_block_whitener / whitener_from_factor) makes
   every path solve the whitened subproblem y = L_bar x with penalty rows
   [I | 0] — same minimizers, penalty-metric damping geometry, and a clean
@@ -96,7 +95,6 @@ from nlls_gram.recycled_cg import (
 )
 from nlls_gram.ridge_lm import (
     CholeskyCache,
-    LSMRCache,
     QRCache,
     RidgeLevenbergMarquardt,
     RidgeLMInfo,
@@ -104,22 +102,17 @@ from nlls_gram.ridge_lm import (
     ridge_continuation,
 )
 from nlls_gram.solver_config import (
-    LSMR,
+    CG,
     QR,
-    Auto,
     Cholesky,
-    NormalCG,
 )
 
 __all__ = [
-    "Auto",
     "Cholesky",
     "CholeskyCache",
-    "LSMR",
-    "LSMRCache",
     "LevenbergMarquardt",
     "LMState",
-    "NormalCG",
+    "CG",
     "QR",
     "QRCache",
     "LMHyperparams",

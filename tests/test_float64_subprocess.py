@@ -1517,11 +1517,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from nlls_gram import (
-    LSMR,
     QR,
     Cholesky,
+    CG,
     RidgeLevenbergMarquardt,
-    identity_right_preconditioner,
+    identity_preconditioner,
     repeated_dense_penalty,
 )
 
@@ -1542,7 +1542,7 @@ def residual(theta):
 SOLVER_CONFIGS = {
     "cholesky": Cholesky(),
     "qr": QR(),
-    "lsmr": LSMR(identity_right_preconditioner(), tol=1e-14, maxiter=None),
+    "normal_cg": CG(identity_preconditioner(), tol=1e-14, maxiter=None),
 }
 
 
@@ -1560,9 +1560,9 @@ def build(name, **kwargs):
 
 
 # Tight three-way step agreement at small ridge/damping: float64 keeps even
-# the squared cholesky path accurate enough to meet qr/lsmr at 1e-9.
+# the squared cholesky path accurate enough to meet qr/normal_cg at 1e-9.
 steps = {}
-for name in ("cholesky", "qr", "lsmr"):
+for name in ("cholesky", "qr", "normal_cg"):
     solver = build(name)
     lm_state = solver.init(x0)
     x1, new_state, info = solver.update(x0, lm_state)
@@ -1574,7 +1574,7 @@ for name in ("cholesky", "qr", "lsmr"):
     assert info.ridge.dtype == jnp.float64
     assert new_state.ridge.dtype == jnp.float64
 np.testing.assert_allclose(steps["cholesky"], steps["qr"], atol=1e-9)
-np.testing.assert_allclose(steps["cholesky"], steps["lsmr"], atol=1e-9)
+np.testing.assert_allclose(steps["cholesky"], steps["normal_cg"], atol=1e-9)
 
 # No float32 leaks anywhere in the compiled update or solve.
 solver = build("cholesky")
@@ -1724,11 +1724,11 @@ import jax.numpy as jnp
 import numpy as np
 
 from nlls_gram import (
-    LSMR,
     QR,
     Cholesky,
+    CG,
     RidgeLevenbergMarquardt,
-    identity_right_preconditioner,
+    identity_preconditioner,
     repeated_block_whitener,
     repeated_dense_penalty,
 )
@@ -1752,7 +1752,7 @@ whitener = repeated_block_whitener(K, repeats=repeats, zero_pad_size=pad)
 SOLVER_CONFIGS = {
     "cholesky": Cholesky(),
     "qr": QR(),
-    "lsmr": LSMR(identity_right_preconditioner(), tol=1e-14, maxiter=None),
+    "normal_cg": CG(identity_preconditioner(), tol=1e-14, maxiter=None),
 }
 
 # Tight three-way whitened step agreement at small ridge/damping, and the
@@ -1773,9 +1773,9 @@ for name, config in SOLVER_CONFIGS.items():
     assert x1.dtype == jnp.float64
     assert info.grad_norm.dtype == jnp.float64
 np.testing.assert_allclose(steps["cholesky"], steps["qr"], atol=1e-9)
-# The matrix-free path stops at its bidiagonalization truncation (~3e-9 on
-# this operator), not at direct-solve accuracy.
-np.testing.assert_allclose(steps["cholesky"], steps["lsmr"], atol=1e-8)
+# The matrix-free path stops at its CG tolerance on this operator, not at
+# direct-solve accuracy.
+np.testing.assert_allclose(steps["cholesky"], steps["normal_cg"], atol=1e-8)
 
 chol_solver = RidgeLevenbergMarquardt(
     residual, penalty=whitener, ridge=1e-8, geodesic_acceleration=False

@@ -6,17 +6,17 @@ import numpy as np
 import pytest
 
 from nlls_gram import (
-    LSMR,
+    CG,
     LMSolveAction,
     LMStatus,
     MultiStart,
     RidgeLevenbergMarquardt,
-    identity_right_preconditioner,
+    identity_preconditioner,
     repeated_dense_penalty,
     ridge_continuation,
 )
 
-LSMR_CONFIG = LSMR(identity_right_preconditioner(), maxiter=40)
+CG_CONFIG = CG(identity_preconditioner(), maxiter=40)
 
 RNG = np.random.default_rng(11)
 M_RESID, BLOCK, REPEATS, PAD = 4, 4, 2, 2
@@ -54,9 +54,7 @@ def min_seminorm_solution():
 
 def test_ridge_continuation_beats_any_single_moderate_ridge():
     x_dagger = min_seminorm_solution()
-    fixed = RidgeLevenbergMarquardt(
-        linear_residual, penalty=make_penalty(), ridge=1e-2
-    )
+    fixed = RidgeLevenbergMarquardt(linear_residual, penalty=make_penalty(), ridge=1e-2)
     fixed_result = fixed.solve(jnp.zeros(P_DIM), max_steps=300, gtol=1e-5)
     fixed_error = np.linalg.norm(np.asarray(fixed_result.x) - x_dagger)
 
@@ -84,9 +82,7 @@ def test_callback_ridge_change_suppresses_convergence():
     # a gtol that would otherwise fire never stops the loop.
     def always_shrink(ctx):
         return LMSolveAction(
-            lm_state=dataclasses.replace(
-                ctx.lm_state, ridge=ctx.lm_state.ridge * 0.5
-            )
+            lm_state=dataclasses.replace(ctx.lm_state, ridge=ctx.lm_state.ridge * 0.5)
         )
 
     solver = RidgeLevenbergMarquardt(
@@ -96,9 +92,7 @@ def test_callback_ridge_change_suppresses_convergence():
         jnp.zeros(P_DIM), max_steps=25, gtol=1e3, callback=always_shrink
     )
     assert int(result.status) == int(LMStatus.MAX_STEPS)
-    np.testing.assert_allclose(
-        float(result.lm_state.ridge), 1e-2 * 0.5**25, rtol=1e-4
-    )
+    np.testing.assert_allclose(float(result.lm_state.ridge), 1e-2 * 0.5**25, rtol=1e-4)
     # Without the callback the huge gtol converges immediately after one step.
     plain = solver.solve(jnp.zeros(P_DIM), max_steps=25, gtol=1e3)
     assert int(plain.status) == int(LMStatus.CONVERGED)
@@ -109,9 +103,7 @@ def test_callback_weak_typed_ridge_is_recast():
     # while_loop carry aval (weak-type float64 scalar under x64 disabled is
     # a plain float32 weak array; the solver recasts to the carried dtype).
     def clumsy(ctx):
-        return LMSolveAction(
-            lm_state=dataclasses.replace(ctx.lm_state, ridge=5e-3)
-        )
+        return LMSolveAction(lm_state=dataclasses.replace(ctx.lm_state, ridge=5e-3))
 
     solver = RidgeLevenbergMarquardt(
         linear_residual, penalty=make_penalty(), ridge=1e-2
@@ -128,9 +120,7 @@ def test_save_steps_histories():
     )
     x0 = jnp.zeros(P_DIM)
     max_steps = 40
-    result = solver.solve(
-        x0, args, max_steps=max_steps, gtol=1e-5, save_steps=True
-    )
+    result = solver.solve(x0, args, max_steps=max_steps, gtol=1e-5, save_steps=True)
     assert int(result.status) == 1
     steps = int(result.steps)
     assert result.x_history.shape == (max_steps + 1, P_DIM)
@@ -250,8 +240,11 @@ def test_equal_settings_solvers_share_the_compiled_solve_loop():
 
     def build():
         return RidgeLevenbergMarquardt(
-            residual, penalty=penalty, ridge=1e-3, cache_jacobian=False,
-            linear_solver=LSMR_CONFIG,
+            residual,
+            penalty=penalty,
+            ridge=1e-3,
+            cache_jacobian=False,
+            linear_solver=CG_CONFIG,
         )
 
     a, b = build(), build()
@@ -270,17 +263,26 @@ def test_equal_settings_solvers_share_the_compiled_solve_loop():
     # buried inside the typed config (an equal-valued fresh config is NOT a
     # change: value-based hashing shares the compile).
     different = RidgeLevenbergMarquardt(
-        residual, penalty=penalty, ridge=1e-4, cache_jacobian=False,
-        linear_solver=LSMR_CONFIG,
+        residual,
+        penalty=penalty,
+        ridge=1e-4,
+        cache_jacobian=False,
+        linear_solver=CG_CONFIG,
     )
     assert a != different
     rebuilt_config = RidgeLevenbergMarquardt(
-        residual, penalty=penalty, ridge=1e-3, cache_jacobian=False,
-        linear_solver=LSMR(identity_right_preconditioner(), maxiter=40),
+        residual,
+        penalty=penalty,
+        ridge=1e-3,
+        cache_jacobian=False,
+        linear_solver=CG(identity_preconditioner(), maxiter=40),
     )
     assert a != rebuilt_config  # fresh preconditioner callables hash fresh
     shared_config = RidgeLevenbergMarquardt(
-        residual, penalty=penalty, ridge=1e-3, cache_jacobian=False,
-        linear_solver=LSMR(LSMR_CONFIG.preconditioner, maxiter=40),
+        residual,
+        penalty=penalty,
+        ridge=1e-3,
+        cache_jacobian=False,
+        linear_solver=CG(CG_CONFIG.preconditioner, maxiter=40),
     )
     assert a == shared_config

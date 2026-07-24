@@ -7,16 +7,14 @@ import numpy as np
 import pytest
 
 from nlls_gram import (
-    LSMR,
+    CG,
     QR,
     Cholesky,
     CholeskyCache,
-    NormalCG,
     QRCache,
     RidgeLevenbergMarquardt,
     Whitener,
     identity_preconditioner,
-    identity_right_preconditioner,
     repeated_block_whitener,
     repeated_dense_penalty,
     whitener_from_factor,
@@ -50,9 +48,7 @@ def linear_residual(theta):
 
 
 def nonlinear_residual(theta):
-    return jnp.concatenate(
-        [A @ theta - B, jnp.array([theta[0] * theta[1] - 0.4])]
-    )
+    return jnp.concatenate([A @ theta - B, jnp.array([theta[0] * theta[1] - 0.4])])
 
 
 def make_whitener():
@@ -68,9 +64,7 @@ def solver_config(name):
         return Cholesky()
     if name == "qr":
         return QR()
-    if name == "normal_cg":
-        return NormalCG(identity_preconditioner(), tol=1e-10, maxiter=None)
-    return LSMR(identity_right_preconditioner(), tol=1e-10, maxiter=None)
+    return CG(identity_preconditioner(), tol=1e-10, maxiter=None)
 
 
 def build(name, penalty=None, **kwargs):
@@ -102,9 +96,7 @@ def test_whitener_construction_validation():
 def test_repeated_block_whitener_matches_dense_factor():
     whitener = make_whitener()
     C = jnp.linalg.cholesky(K)
-    L_bar = jsp_linalg.block_diag(
-        *([C.T] * REPEATS), jnp.eye(PAD, dtype=K.dtype)
-    )
+    L_bar = jsp_linalg.block_diag(*([C.T] * REPEATS), jnp.eye(PAD, dtype=K.dtype))
     v = jnp.asarray(RNG.normal(size=P_DIM), dtype=jnp.float32)
     matrix = jnp.asarray(RNG.normal(size=(P_DIM, 3)), dtype=jnp.float32)
     np.testing.assert_allclose(
@@ -179,7 +171,7 @@ def test_whitened_solve_reaches_the_ridge_minimizer():
 @pytest.mark.parametrize("init_damping", [1e-2, 1e-5])
 def test_solvers_agree_on_a_whitened_step(ridge, init_damping):
     steps = {}
-    for name in ("cholesky", "qr", "lsmr", "normal_cg"):
+    for name in ("cholesky", "qr", "normal_cg"):
         solver = build(name, ridge=ridge, init_damping=init_damping)
         lm_state = solver.init(X0)
         x_new, _, info = solver.update(X0, lm_state)
@@ -193,22 +185,18 @@ def test_solvers_agree_on_a_whitened_step(ridge, init_damping):
     # system. Tight (1e-9) agreement is asserted under float64 in
     # test_float64_subprocess.py.
     np.testing.assert_allclose(steps["cholesky"], steps["qr"], atol=2e-2)
-    np.testing.assert_allclose(steps["cholesky"], steps["lsmr"], atol=2e-2)
     np.testing.assert_allclose(steps["cholesky"], steps["normal_cg"], atol=2e-2)
 
 
 def test_full_whitened_solves_agree_across_solvers():
     solutions = {}
-    for name in ("cholesky", "qr", "lsmr", "normal_cg"):
+    for name in ("cholesky", "qr", "normal_cg"):
         solver = build(name, ridge=1e-3)
         result = solver.solve(X0, max_steps=300, gtol=1e-4)
         assert int(result.status) == 1, name
         solutions[name] = np.asarray(result.x)
     np.testing.assert_allclose(solutions["cholesky"], solutions["qr"], atol=1e-3)
-    np.testing.assert_allclose(solutions["cholesky"], solutions["lsmr"], atol=5e-3)
-    np.testing.assert_allclose(
-        solutions["cholesky"], solutions["normal_cg"], atol=5e-3
-    )
+    np.testing.assert_allclose(solutions["cholesky"], solutions["normal_cg"], atol=5e-3)
 
 
 def test_whitened_gradient_semantics_single_update():
@@ -218,15 +206,11 @@ def test_whitened_gradient_semantics_single_update():
     # hand-built references.
     ridge = 3e-2
     whitener = make_whitener()
-    solver = RidgeLevenbergMarquardt(
-        nonlinear_residual, penalty=whitener, ridge=ridge
-    )
+    solver = RidgeLevenbergMarquardt(nonlinear_residual, penalty=whitener, ridge=ridge)
     lm_state = solver.init(X0)
     _, _, info = solver.update(X0, lm_state)
     q_x = float(jnp.sum(whitener.sqrt_apply(X0) ** 2))
-    np.testing.assert_allclose(
-        float(info.penalty_grad_norm), np.sqrt(q_x), rtol=1e-5
-    )
+    np.testing.assert_allclose(float(info.penalty_grad_norm), np.sqrt(q_x), rtol=1e-5)
     C = np.linalg.cholesky(np.asarray(K, np.float64))
     L_bar = np.zeros((P_DIM, P_DIM))
     for j in range(REPEATS):
@@ -256,9 +240,7 @@ def test_whitened_gtol_calibration_resolves_selection():
     # until the selection coordinate x1 is resolved.
     ridge = 1e-3
     whitener = whitener_from_factor(jnp.diag(jnp.array([2.0, 3.0])), num_rows=2)
-    solver = RidgeLevenbergMarquardt(
-        two_phase_residual, penalty=whitener, ridge=ridge
-    )
+    solver = RidgeLevenbergMarquardt(two_phase_residual, penalty=whitener, ridge=ridge)
     x = jnp.array([0.0, 3.0])
     gtol = 1e-3 * ridge * 2.0
     result = solver.solve(x, max_steps=300, gtol=gtol, atol=1e-2)
@@ -290,9 +272,7 @@ def test_whitened_cholesky_cache_is_reused_and_ridge_keyed():
         solver_cache=CholeskyCache(garbage, jnp.asarray(True), fresh.ridge * 2.0),
     )
     x_recomputed, _, _ = solver.update(X0, poisoned_stale_ridge)
-    np.testing.assert_allclose(
-        np.asarray(x_recomputed), np.asarray(x_clean), rtol=1e-6
-    )
+    np.testing.assert_allclose(np.asarray(x_recomputed), np.asarray(x_clean), rtol=1e-6)
 
 
 def test_whitened_qr_cache_is_reused_and_ridge_keyed():
@@ -316,9 +296,7 @@ def test_whitened_qr_cache_is_reused_and_ridge_keyed():
         solver_cache=QRCache(garbage, jnp.asarray(True), fresh.ridge * 2.0),
     )
     x_recomputed, _, _ = solver.update(X0, poisoned_stale_ridge)
-    np.testing.assert_allclose(
-        np.asarray(x_recomputed), np.asarray(x_clean), rtol=1e-6
-    )
+    np.testing.assert_allclose(np.asarray(x_recomputed), np.asarray(x_clean), rtol=1e-6)
     assert not bool(state_clean.solver_cache.valid)
     assert not bool(state_clean.jacobian_valid)
 
@@ -409,9 +387,7 @@ def test_whitened_implicit_ad_linear_matches_fd_and_unwhitened():
         ("whitened", make_whitener()),
         ("plain", repeated_dense_penalty(K, repeats=REPEATS, zero_pad_size=PAD)),
     ):
-        solver = RidgeLevenbergMarquardt(
-            linear_residual_p, penalty=penalty, ridge=1e-3
-        )
+        solver = RidgeLevenbergMarquardt(linear_residual_p, penalty=penalty, ridge=1e-3)
 
         def loss(p, solver=solver):
             result = solver.solve(jnp.zeros(P_DIM), p=p, max_steps=300, gtol=1e-5)

@@ -6,8 +6,7 @@ import numpy as np
 import pytest
 
 from nlls_gram import (
-    LSMR,
-    NormalCG,
+    CG,
     RidgeLevenbergMarquardt,
     RidgeLMState,
     identity_penalty,
@@ -48,9 +47,7 @@ def ridge_minimizer(ridge):
 def min_seminorm_solution():
     # KKT system for argmin x' M0 x s.t. A x = b; nonsingular because A has
     # full row rank and ker A ∩ ker M0 = {0} (generic random data).
-    kkt = np.block(
-        [[M0_NP, A_NP.T], [A_NP, np.zeros((M_RESID, M_RESID))]]
-    )
+    kkt = np.block([[M0_NP, A_NP.T], [A_NP, np.zeros((M_RESID, M_RESID))]])
     rhs = np.concatenate([np.zeros(P_DIM), B_NP])
     return np.linalg.solve(kkt, rhs)[:P_DIM]
 
@@ -68,8 +65,7 @@ def test_fixed_ridge_reaches_the_ridge_minimizer():
     # info.loss is the ridge objective; resid_loss and penalty_value decompose it.
     np.testing.assert_allclose(
         float(result.info.loss),
-        float(result.info.resid_loss)
-        + ridge * float(result.info.penalty_value),
+        float(result.info.resid_loss) + ridge * float(result.info.penalty_value),
         rtol=1e-5,
     )
 
@@ -226,9 +222,7 @@ def test_atol_is_conjunctive_an_interpolating_start_does_not_stop():
     x_particular = jnp.asarray(
         np.linalg.lstsq(A_NP, B_NP, rcond=None)[0], dtype=jnp.float32
     )
-    null_basis = jnp.asarray(
-        np.linalg.svd(A_NP)[2][M_RESID:].T, dtype=jnp.float32
-    )
+    null_basis = jnp.asarray(np.linalg.svd(A_NP)[2][M_RESID:].T, dtype=jnp.float32)
     x0 = x_particular + null_basis @ jnp.ones(P_DIM - M_RESID)
     assert float(jnp.linalg.norm(A @ x0 - B)) < 1e-4
     solver = RidgeLevenbergMarquardt(
@@ -273,15 +267,13 @@ def test_constructor_validation():
         RidgeLevenbergMarquardt(
             linear_residual, penalty=penalty, linear_solver="cholesky"
         )
-    with pytest.raises(TypeError, match="solver config"):
+    with pytest.raises(TypeError, match="ad_solver must be None"):
         RidgeLevenbergMarquardt(linear_residual, penalty=penalty, ad_solver="auto")
     # Each config validates its own fields at construction.
-    with pytest.raises(TypeError, match="WhitenedPreconditioner"):
-        LSMR(None)
     with pytest.raises(ValueError, match="maxiter"):
-        NormalCG(tol=0.0)
+        CG(tol=0.0)
     with pytest.raises(TypeError, match="callable"):
-        NormalCG(preconditioner=object())
+        CG(preconditioner=object())
     with pytest.raises(NotImplementedError, match="penalty_factory"):
         RidgeLevenbergMarquardt(
             linear_residual, penalty=penalty, penalty_factory=object()

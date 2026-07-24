@@ -4,13 +4,11 @@ import numpy as np
 import pytest
 
 from nlls_gram import (
-    LSMR,
+    CG,
     MultiStart,
-    NormalCG,
     RidgeLevenbergMarquardt,
     identity_penalty,
     identity_preconditioner,
-    identity_right_preconditioner,
     repeated_dense_penalty,
 )
 
@@ -35,9 +33,7 @@ def make_penalty():
 
 
 def solution_functional(solver, p):
-    result = solver.solve(
-        jnp.zeros(P_DIM), p=p, max_steps=300, gtol=1e-5
-    )
+    result = solver.solve(jnp.zeros(P_DIM), p=p, max_steps=300, gtol=1e-5)
     return jnp.vdot(WEIGHTS, result.x)
 
 
@@ -113,7 +109,7 @@ def test_cg_and_cholesky_ad_agree():
     grads = {}
     for name, ad_solver in (
         ("cholesky", None),
-        ("normal_cg", NormalCG(maxiter=200, tol=1e-8)),
+        ("normal_cg", CG(maxiter=200, tol=1e-8)),
     ):
         settings = {} if ad_solver is None else {"ad_solver": ad_solver}
         solver = RidgeLevenbergMarquardt(
@@ -132,50 +128,19 @@ def test_cg_and_cholesky_ad_agree():
     )
 
 
-def test_lsmr_forward_auto_resolves_to_matrix_free_ad():
-    p0 = jnp.asarray(RNG.normal(size=M_RESID), dtype=jnp.float32)
-    lsmr_solver = RidgeLevenbergMarquardt(
-        linear_residual,
-        penalty=make_penalty(),
-        ridge=1e-3,
-        linear_solver=LSMR(
-            identity_right_preconditioner(), tol=1e-10, maxiter=None
-        ),
-    )
-    assert lsmr_solver._resolved_ad_solver() == "normal_cg"
-    dense_solver = RidgeLevenbergMarquardt(
-        linear_residual, penalty=make_penalty(), ridge=1e-3
-    )
-    assert dense_solver._resolved_ad_solver() == "cholesky"
-
-    def lsmr_loss(p):
-        return solution_functional(lsmr_solver, p)
-
-    def dense_loss(p):
-        return solution_functional(dense_solver, p)
-
-    np.testing.assert_allclose(
-        np.asarray(jax.grad(lsmr_loss)(p0)),
-        np.asarray(jax.grad(dense_loss)(p0)),
-        rtol=1e-2,
-        atol=1e-4,
-    )
-
-
 def test_normal_cg_forward_auto_resolves_to_matrix_free_ad():
     p0 = jnp.asarray(RNG.normal(size=M_RESID), dtype=jnp.float32)
     cg_solver = RidgeLevenbergMarquardt(
         linear_residual,
         penalty=make_penalty(),
         ridge=1e-3,
-        linear_solver=NormalCG(
-            identity_preconditioner(), tol=1e-10, maxiter=None
-        ),
+        linear_solver=CG(identity_preconditioner(), tol=1e-10, maxiter=None),
     )
     assert cg_solver._resolved_ad_solver() == "normal_cg"
     dense_solver = RidgeLevenbergMarquardt(
         linear_residual, penalty=make_penalty(), ridge=1e-3
     )
+    assert dense_solver._resolved_ad_solver() == "cholesky"
 
     def cg_loss(p):
         return solution_functional(cg_solver, p)
@@ -243,6 +208,6 @@ def test_ad_maxiter_required_when_cg_tolerances_zero():
     # An uncapped zero-tolerance CG loop has no stopping rule; the config
     # rejects it at construction rather than at differentiation time.
     with pytest.raises(ValueError, match="maxiter"):
-        NormalCG(tol=0.0)
-    NormalCG(tol=0.0, maxiter=50)
-    NormalCG(tol=0.0, atol=1e-10)
+        CG(tol=0.0)
+    CG(tol=0.0, maxiter=50)
+    CG(tol=0.0, atol=1e-10)

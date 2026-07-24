@@ -33,12 +33,10 @@ def identity_preconditioner():
 def identity_right_preconditioner():
     """The identity map as an explicit "no right-preconditioner" choice.
 
-    ``RidgeLevenbergMarquardt(linear_solver="lsmr")`` requires
-    ``lsmr_preconditioner`` -- nobody should run Krylov methods without
-    thinking about preconditioning, so opting out is an explicit, greppable
-    decision rather than a silent default. Returns a
-    :class:`WhitenedPreconditioner` whose ``solve`` and ``solve_transpose``
-    are both the identity, so LSMR runs unpreconditioned.
+    Returns a :class:`WhitenedPreconditioner` whose ``solve`` and
+    ``solve_transpose`` are both the identity, so the metric solver's
+    ``linear_solver="lsmr"`` path runs unpreconditioned -- an explicit,
+    greppable opt-out rather than a silent default.
     """
 
     def solve(v, damping):
@@ -57,8 +55,7 @@ class WhitenedPreconditioner:
 
     LSMR then runs in the preconditioned variable ``z = R u`` on the augmented
     operator ``[B R^{-1}; sqrt(damping) R^{-1}]`` (``B = J S`` for
-    ``LevenbergMarquardt``; ``B = [J; sqrt(ridge) L]`` for
-    ``RidgeLevenbergMarquardt``), and the returned step un-preconditions the
+    ``LevenbergMarquardt``), and the returned step un-preconditions the
     final iterate as ``u = R^{-1} z``. A well-chosen ``R`` (a Schur-complement
     factor of the parameter-space normal operator is the canonical
     construction) clusters the spectrum of ``B R^{-1}`` and cuts the endgame
@@ -89,11 +86,10 @@ class WhitenedPreconditioner:
     - LSMR stopping (``iterative_tol``/``iterative_atol``) is measured on the
       preconditioned operator -- the well-conditioned ``z`` coordinates.
 
-    ``None`` (the ``LevenbergMarquardt`` default) runs plain LSMR;
-    ``RidgeLevenbergMarquardt`` requires an explicit choice
-    (``identity_right_preconditioner()`` opts out). Value-hashable on
-    ``(solve, solve_transpose)`` with jit's static-key semantics: equal pairs
-    share one compiled solve loop, so define the callables once at setup scope.
+    ``None`` (the ``LevenbergMarquardt`` default) runs plain LSMR.
+    Value-hashable on ``(solve, solve_transpose)`` with jit's static-key
+    semantics: equal pairs share one compiled solve loop, so define the
+    callables once at setup scope.
     """
 
     def __init__(self, solve, solve_transpose):
