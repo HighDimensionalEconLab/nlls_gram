@@ -260,27 +260,11 @@ def test_atol_is_conjunctive_an_interpolating_start_does_not_stop():
 
 def test_constructor_and_state_validation():
     metric = make_metric()
-    with pytest.raises(TypeError, match="Metric"):
-        RidgeLevenbergMarquardt(linear_residual, metric=object())
     with pytest.raises(ValueError, match="strictly positive"):
         RidgeLevenbergMarquardt(linear_residual, metric=metric, ridge=0.0)
     with pytest.raises(ValueError, match="strictly positive"):
         RidgeLevenbergMarquardt(linear_residual, metric=metric, ridge=-1e-3)
-    # String solver names are gone: the typed configs are the only spelling.
-    with pytest.raises(TypeError, match="solver config"):
-        RidgeLevenbergMarquardt(
-            linear_residual, metric=metric, linear_solver="cholesky"
-        )
-    with pytest.raises(TypeError, match="ad_solver must be None"):
-        RidgeLevenbergMarquardt(linear_residual, metric=metric, ad_solver="auto")
-    with pytest.raises(NotImplementedError, match="metric_factory"):
-        RidgeLevenbergMarquardt(linear_residual, metric=metric, metric_factory=object())
-    # Each config validates its own fields at construction; the CG
-    # preconditioner is a required typed Preconditioner in both roles.
-    with pytest.raises(TypeError):
-        CG(maxiter=100)
-    with pytest.raises(TypeError, match="Preconditioner"):
-        CG(preconditioner=lambda v, damping: v)
+    # An uncapped zero-tolerance CG loop has no stopping rule.
     with pytest.raises(ValueError, match="maxiter"):
         CG(IdentityPreconditioner(), tol=0.0)
     # The metric must cover no more than the flattened iterate.

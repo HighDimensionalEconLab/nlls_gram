@@ -49,6 +49,7 @@ from nlls_gram.gram_lm import (
     PreconditionerFactory,
     WhitenedPreconditioner,
 )
+from nlls_gram.linear_solvers import CG, QR, Cholesky, CholeskyCache, QRCache
 from nlls_gram.lm_types import (
     LMHyperparams,
     LMInfo,
@@ -92,17 +93,7 @@ from nlls_gram.recycled_cg import (
     deflated_pcg,
     recycled_cg,
 )
-from nlls_gram.ridge_lm import (
-    CholeskyCache,
-    QRCache,
-    RidgeLevenbergMarquardt,
-    ridge_continuation,
-)
-from nlls_gram.solver_config import (
-    CG,
-    QR,
-    Cholesky,
-)
+from nlls_gram.ridge_lm import RidgeLevenbergMarquardt, ridge_continuation
 
 __all__ = [
     "BlockEigenPreconditioner",
