@@ -141,14 +141,15 @@ identification condition at every reachable state.
 
 ### Ridge continuation
 
-The homotopy \(\lambda \downarrow \lambda_{\min}\) is a **documented
-callback recipe**, not solver machinery:
+The homotopy \(\lambda \downarrow \lambda_{\min}\) is a **callback**, not
+solver machinery — `AnnealRidge` is the shipped schedule, and its docstring
+documents the mechanics for composing it into a callback of your own:
 
 ```python
-from nlls_gram import ridge_continuation
+from nlls_gram import AnnealRidge
 
-cb, us0 = ridge_continuation(ridge_floor=1e-8, decrease=0.1)
-result = solver.solve(x0, callback=cb, user_state=us0,
+anneal = AnnealRidge(ridge_floor=1e-8, decrease=0.1)
+result = solver.solve(x0, callback=anneal, user_state=anneal.init_state(),
                       atol=1e-8, max_steps=500)
 ```
 
@@ -299,13 +300,13 @@ Shipped metrics:
   already hold it): `F = jnp.linalg.cholesky(K, upper=True)`. All repeated
   blocks and all batched columns share a single triangular product/solve.
 
-An `x`- or `p`-dependent metric is deliberately unsupported in this
-release: the gradient and the implicit-AD rule treat \(F\) as constant, and
-a dependent factor would silently drop derivative terms (the reserved
-`metric_factory` keyword raises; its documented contract is a
-`prepare`/`build` pair producing a `Metric` from traced `metric_state`,
-with `metric_valid` reject-step reuse and a state change treated as a
-problem change).
+The metric instance rides in `lm_state.metric`, so a callback may replace
+it mid-solve by constructing a new instance of the same type (see
+[Callbacks](callbacks.md)); the solver treats the change as a problem
+change — the metric defines this objective — suppressing that step's
+convergence test and invalidating the whitened caches. The gradient and
+the implicit-AD rule treat \(F\) as constant between callback actions: the
+state-dependence of a callback-refreshed factor is not differentiated.
 
 ### Kernel instantiation
 
@@ -389,65 +390,63 @@ A preconditioner changes the CG iteration path, never the subproblem —
 approximations are safe (unlike the metric factor, which must be exact).
 
 For repeated interacting blocks (multiple "agents" coupled through shared
-equations), `BlockEigenPreconditioner` is the shipped workhorse: a
-block-diagonal approximation over a chosen grouping of the whitened
-coordinates, eigendecomposed once per build and applied with the
-damping-analytic shift \(\Lambda + \texttt{ridge\_weight}\cdot\lambda +
-\mu\) (metric-block families carry the live ridge, free-block families are
-damping-only). The instance is stateless and value-hashable; its numeric
-state — built by `block_eigen_state` from stacked SPD diagonal blocks and a
-family-major permutation — rides in the residual `args` under a fixed key
-and is read through `ctx.args` at apply time.
+equations), `BlockEigenPreconditioner(families, permutation)` is the
+shipped workhorse: a block-diagonal approximation over a chosen grouping of
+the whitened coordinates, eigendecomposed in the constructor and applied
+with the damping-analytic shift \(\Lambda +
+\texttt{ridge\_weight}\cdot\lambda + \mu\) (metric-block families carry the
+live ridge read from `ctx.lm_state.ridge`, free-block families are
+damping-only). The eigenbasis rides in the carried instance
+(`lm_state.preconditioner`).
 
-**Adaptive rebuilds through the solve callback.** Because the state lives
-in `args`, a callback can rebuild it from the live iterate with no solver
-support: staleness detection is a traced value comparison, so returning
-identical values suppresses nothing, and a real swap suppresses only that
-step's convergence check. The natural policy pairs rebuilds with
-`ridge_continuation` — rebuild exactly when the anneal advances a level,
-which already suppresses that step:
+**Adaptive refreshes through the solve callback.** A callback rebuilds the
+instance from the live iterate by calling the constructor; staleness only
+moves the CG iteration path, so a refresh is never a problem change. The
+natural policy pairs refreshes with `AnnealRidge` — rebuild exactly when
+the anneal advances a level, gated with `lax.cond` so the
+eigendecomposition is paid only when it fires (a `jnp.where` merge would
+pay it every step):
 
 ```python
-continuation, user_state0 = ridge_continuation(ridge_floor=1e-11)
+anneal = AnnealRidge(ridge_floor=1e-11)
 
 def callback(ctx):
-    action = continuation(ctx)
+    action = anneal(ctx)
     advanced = action.lm_state.ridge < ctx.lm_state.ridge
-    fresh = build_state(ctx.x)          # model-side analytic assembly
-    state = jax.tree_util.tree_map(
-        lambda old, new: jnp.where(advanced, new, old),
-        ctx.args["preconditioner"], fresh,
+    precond = jax.lax.cond(
+        advanced,
+        lambda: BlockEigenPreconditioner(build_families(ctx.x), PERMUTATION),
+        lambda: ctx.lm_state.preconditioner,
     )
-    return LMSolveAction(
-        lm_state=action.lm_state, user_state=action.user_state,
-        args={**ctx.args, "preconditioner": state},
+    return dataclasses.replace(
+        action,
+        lm_state=dataclasses.replace(action.lm_state, preconditioner=precond),
     )
 
 solver = RidgeLevenbergMarquardt(
     residual_fn, metric=metric,
-    linear_solver=CG(BlockEigenPreconditioner(), tol=1e-10, maxiter=2500),
+    linear_solver=CG(BlockEigenPreconditioner(build_families(x0), PERMUTATION),
+                     tol=1e-10, maxiter=2500),
 )
-result = solver.solve(x0, {"preconditioner": build_state(x0)},
-                      callback=callback, user_state=user_state0,
+result = solver.solve(x0, callback=callback, user_state=anneal.init_state(),
                       max_steps=120, gtol=1e-11)
 ```
 
-The AD-role CG reads the state from `result.args` at zero damping — a
-callback-rebuilt state is exactly the near-solution build the tangent solve
-wants. `ad_solver=None` inherits the forward CG's preconditioner for the
-undamped tangent solve (applied at zero damping; hooks marked
-`requires_positive_damping` fall back to unpreconditioned) while keeping
-the AD-default tolerance and unbounded iteration budget — pass
-`ad_solver=CG(...)` explicitly to pin `tol`/`maxiter` instead. One
-measured calibration note: with a family layout
-whose blocks carry the same ridge floor as the operator, the CG iteration
-count SATURATES as the ridge anneals down (it does not grow like
-\(1/\sqrt{\lambda}\)) — budget `maxiter` for the saturated count, since a
-truncated inner solve stalls the endgame. Two scope cautions for
-args-carried state: `save_steps=True` records a full copy of `args` per
-step (the whole eigenbasis, every step), and a parallel `multi_start`
-vmaps the callback so a `where`-gated rebuild evaluates BOTH branches in
-every lane — keep both out of preconditioned-CG production runs.
+The AD-role CG applies the **carried** instance at zero damping — a
+callback-refreshed eigenbasis is exactly the near-solution build the
+tangent solve wants. `ad_solver=None` inherits it at the AD-default
+tolerance and unbounded iteration budget; `ad_solver=CG(None, tol=...,
+maxiter=...)` inherits it while pinning the knobs; an explicit
+`ad_solver=CG(instance, ...)` uses that instance as-is (hooks marked
+`requires_positive_damping` fall back to unpreconditioned). One measured
+calibration note: with a family layout whose blocks carry the same ridge
+floor as the operator, the CG iteration count SATURATES as the ridge
+anneals down (it does not grow like \(1/\sqrt{\lambda}\)) — budget
+`maxiter` for the saturated count, since a truncated inner solve stalls the
+endgame. Two scope cautions: `save_steps=True` records a full copy of
+`args` per step, and a parallel `multi_start` vmaps the callback so a
+`lax.cond` rebuild lowers to a select that evaluates BOTH branches in every
+lane — keep both out of preconditioned-CG production runs.
 
 ## Implicit differentiation
 
@@ -506,8 +505,6 @@ original inputs and the *initial* ridge.
 ::: nlls_gram.IdentityPreconditioner
 
 ::: nlls_gram.BlockEigenPreconditioner
-
-::: nlls_gram.block_eigen_state
 
 ## References
 

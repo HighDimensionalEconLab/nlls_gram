@@ -4,8 +4,7 @@
 
 ::: nlls_gram.RidgeLevenbergMarquardt
 ::: nlls_gram.LevenbergMarquardt
-::: nlls_gram.RidgeContinuation
-::: nlls_gram.ridge_continuation
+::: nlls_gram.AnnealRidge
 
 ## Linear solvers
 
@@ -28,7 +27,6 @@
 ::: nlls_gram.Preconditioner
 ::: nlls_gram.IdentityPreconditioner
 ::: nlls_gram.BlockEigenPreconditioner
-::: nlls_gram.block_eigen_state
 ::: nlls_gram.NystromPreconditioner
 ::: nlls_gram.ShermanMorrisonPreconditioner
 ::: nlls_gram.WoodburyPreconditioner
@@ -40,10 +38,11 @@
 ::: nlls_gram.LMInfo
 ::: nlls_gram.LMStatus
 ::: nlls_gram.LMHyperparams
-::: nlls_gram.LMSolveContext
-::: nlls_gram.LMSolveAction
+::: nlls_gram.LMContext
+::: nlls_gram.LMAction
 ::: nlls_gram.LMSolveResult
 ::: nlls_gram.SolverContext
+::: nlls_gram.register_pytree_dataclass
 
 ## Multi-start
 

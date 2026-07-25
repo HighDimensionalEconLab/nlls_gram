@@ -40,12 +40,16 @@ which rule is valid where. The short version:
 A Krylov rule used outside its valid shape raises rather than returning a
 quietly wrong tangent.
 
-## Frozen hooks
+## Frozen instances
 
-Under differentiation the metric's and preconditioner's `prepare` run **once,
-at the returned solution**, and their state-dependence is not differentiated —
-the same contract as a fixed metric closing over constants. The solver state
-rides along as inert conditioning data under `stop_gradient`.
+Under differentiation the **carried** metric and preconditioner instances —
+the geometry the solve actually converged under, callback refreshes included
+— are frozen inputs to the implicit system: their leaves ride along as inert
+conditioning data under `stop_gradient`, and the state-dependence of a
+callback-refreshed instance is not differentiated. An iterate-tracking
+metric that wants the tangent taken at the exact solution geometry refreshes
+on every accepted step, which makes the carried instance current at
+convergence.
 
 ## Failed solves
 

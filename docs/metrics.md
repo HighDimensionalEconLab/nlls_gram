@@ -7,6 +7,13 @@ things:
 - a **`Preconditioner`** only changes the CG iteration path, so it may
   approximate freely.
 
+Instances of both are **JAX pytrees**: array fields are traced leaves, the
+type plus its static fields are structure. They ride inside the solver state
+(`lm_state.metric`, `lm_state.preconditioner`), so a `solve` callback adapts
+one by **calling the constructor again** with fresh arrays — same type, same
+leaf shapes and dtypes, pure traced ops, no recompilation. See
+[Callbacks](callbacks.md) for the adaptation rules.
+
 ## `Metric`
 
 A positive-definite \(W\) given through callbacks for an invertible factor
@@ -15,8 +22,8 @@ never materializes either.
 
 ```python
 class Metric:
-    size: int             # the metric block: the leading coordinates of x
-    free_scale = 1.0      # damping weight on everything past it
+    size: int             # static: the metric block, the leading coordinates of x
+    free_scale = 1.0      # traced leaf: damping weight on everything past it
 
     def factor_apply(v, ctx): ...           # F v
     def factor_solve(v, ctx): ...           # F^-1 v
@@ -24,8 +31,10 @@ class Metric:
     def norm(v, ctx): ...                   # ||F v||, defaulted
 ```
 
-Ops act on metric-block vectors, or matrices whose *leading* axis is `size`
-(columns are batched). Shipped implementations:
+Ops read `self` and act on metric-block vectors, or matrices whose *leading*
+axis is `size` (columns are batched). `ctx` is a `SolverContext` carrying the
+flat iterate and the live `LMState`, so an exotic metric can key off either.
+Shipped implementations:
 
 | | \(W\) |
 |---|---|
@@ -55,11 +64,17 @@ choice, not a default.
 | | approximates |
 |---|---|
 | `IdentityPreconditioner()` | \(I\) |
-| `BlockEigenPreconditioner(blocks_fn, permutation)` | a block-diagonal eigenbasis, analytic in both ridge and damping |
+| `BlockEigenPreconditioner(families, permutation)` | a block-diagonal eigenbasis, analytic in both ridge and damping |
 | `NystromPreconditioner(matvec, n, rank, key)` | a randomized rank-\(k\) sketch (Frangella-Tropp-Udell) |
 | `ShermanMorrisonPreconditioner(solve, u, weight)` | \(A + wuu^\top\) from a solve with \(A\) |
 | `WoodburyPreconditioner(solve, U, weights)` | the rank-\(k\) generalization |
 | `PaddedPreconditioner(base, n_real)` | a base extended over exactly-zero padded rows |
+
+Expensive derived state (`BlockEigen`'s eigendecompositions, `Nystrom`'s
+sketch) is computed once in the constructor and stored as leaves; refreshing
+mid-solve means constructing a new instance in the callback, usually behind
+`jax.lax.cond` so the cost is paid only when the refresh fires. Staleness is
+always safe — it moves the CG iteration path, never the converged step.
 
 **Range preservation.** On rank-deficient problems the minimum-norm selection
 rests on the CG iterates staying in \(\operatorname{range}(B^\top)\).
@@ -73,31 +88,37 @@ Safe: the identity, polynomials in the operator, an exact \((B^\top B + \tau
 I)^{-1}\) at fixed \(\tau > 0\). On full-column-rank problems the condition is
 vacuous.
 
-## Iterate-dependent state
+## Custom types
 
-Both types take the same optional pair when their numbers must track the
-iterate:
+A custom metric or preconditioner is a small frozen dataclass registered with
+`register_pytree_dataclass` — the solvers reject unregistered instances:
 
 ```python
-def prepare(self, theta, ctx): ...   # -> traced pytree, or None (the default)
-def rebuild(self, ctx): ...          # -> traced bool, True by default
+from dataclasses import dataclass
+
+@dataclass(frozen=True, eq=False)
+class JacobiPreconditioner(Preconditioner):
+    diagonal: jax.Array
+
+    def apply(self, v, damping, ctx):
+        return v / (self.diagonal + damping)
+
+register_pytree_dataclass(JacobiPreconditioner, data_fields=("diagonal",))
 ```
 
-The output rides on the solver state and comes back as `ctx.metric_state` /
-`ctx.preconditioner_state`. It is rebuilt on accepted steps and reused across
-rejected ones (where `x` did not move), runs inside the jitted loop as traced
-ops, and is **frozen at the solution** under implicit AD. Its pytree structure
-must not change between rebuilds. Override `rebuild` to decline a refresh —
-for a preconditioner that is always safe and often much cheaper.
-
-Setup that does *not* depend on the iterate belongs in `__init__`, where it is
-paid once.
+`data_fields` become traced leaves; `meta_fields` (compile-time structure —
+sizes, block counts) must be hashable. The constructor may validate and
+compute derived leaves eagerly: reconstruction inside jit or a loop carry
+restores the stored fields verbatim without re-running it. Constructors must
+be traceable when the instance is rebuilt inside a jitted callback. Metrics
+also support `dataclasses.replace` (their constructors are cheap);
+preconditioners are rebuilt by constructor only.
 
 ## Compilation
 
-The solver is a jit **static** argument, so its hooks enter the compile cache
-key. Types holding arrays (every metric above, most preconditioners) hash by
-identity: **build them once at setup scope and reuse them**, or every
-construction keys a fresh compilation of the whole solve loop. Stateless
-value-equal types (`IdentityPreconditioner`) are free to construct inline.
+Instances key compilation by pytree **structure** — the type plus its static
+fields — while their arrays are threaded through the carried state. Two
+solvers around equal-config instances with fresh arrays share one compiled
+loop, so constructing a metric per solve call is free; a changed static
+field (a different `repeats`, a different family layout) keys a new program.
 `tests/test_compilation.py` pins this.

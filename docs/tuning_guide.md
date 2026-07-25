@@ -49,7 +49,7 @@ the standard schedule. Reach for the others only on evidence:
 ## The ridge schedule
 
 For `RidgeLevenbergMarquardt`, a fixed ridge leaves an \(O(\text{ridge})\)
-bias. `ridge_continuation(ridge_floor=...)` anneals toward the interpolating
+bias. `AnnealRidge(ridge_floor=...)` anneals toward the interpolating
 limit, advancing a level whenever the current one is stationary.
 
 Calibrate `gtol` as roughly `1e-3 * ridge * sqrt(q(x*))` — the reported
@@ -68,12 +68,14 @@ Traced, so changing them reuses the compiled loop: `atol`/`gtol`/`xtol`, the
 damping and ridge values, `p`, `args`, `max_steps` (without `save_steps`), and
 every `LMHyperparams` field.
 
-Static, so changing them compiles a new program: the residual, the metric and
-preconditioner objects, the linear-solver config, `has_aux`,
-`cache_jacobian`, `geodesic_acceleration`, the callback, and any shape.
+Traced too: every metric and preconditioner **array** — the instances ride
+in the carried state, so a fresh equal-config instance (and a callback
+rebuild) reuses the compiled loop.
 
-Build metrics and preconditioners **once at setup scope** — they hold arrays,
-so they hash by identity and a rebuild keys a fresh compilation.
+Static, so changing them compiles a new program: the residual, the
+linear-solver config, `has_aux`, `cache_jacobian`, `geodesic_acceleration`,
+the callback, any shape, and any instance **static field** (a metric's
+`size`, a block-eigen family layout).
 
 ## Failure signatures
 

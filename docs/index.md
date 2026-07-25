@@ -53,7 +53,7 @@ result.x, result.status, result.steps
 
 ```python
 import jax.numpy as jnp
-from nlls_gram import RidgeLevenbergMarquardt, RepeatedFactorMetric, ridge_continuation
+from nlls_gram import AnnealRidge, RidgeLevenbergMarquardt, RepeatedFactorMetric
 
 # W = blockdiag(K, K) for a kernel Gram matrix K: the RKHS seminorm over two
 # coefficient blocks. The constructor takes the FACTOR.
@@ -62,8 +62,8 @@ metric = RepeatedFactorMetric(jnp.linalg.cholesky(K, upper=True), repeats=2)
 solver = RidgeLevenbergMarquardt(collocation_residual, metric=metric, ridge=1e-4)
 
 # Anneal the ridge toward the interpolating limit on stationarity.
-callback, user_state = ridge_continuation(ridge_floor=1e-10)
-result = solver.solve(x0, callback=callback, user_state=user_state,
+anneal = AnnealRidge(ridge_floor=1e-10)
+result = solver.solve(x0, callback=anneal, user_state=anneal.init_state(),
                       gtol=1e-8, atol=1e-8)
 ```
 
