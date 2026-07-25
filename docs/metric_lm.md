@@ -41,8 +41,8 @@ Under a kernel model \(f(t) = \sum_j \alpha_j k(t, c_j)\), the RKHS norm is
 \(\alpha^\top K \alpha\) with \(K\) the Gram matrix over centers, so
 `W = K` and the factor is `jnp.linalg.cholesky(K, upper=True)`. A
 positive-*semi*definite \(K\) needs a shift to be invertible:
-`RepeatedFactorMetric.from_gram(K, repeats=r, epsilon=1e-8)` factors
-\(K + \varepsilon I\) once and repeats it.
+`RepeatedFactorMetric(jnp.linalg.cholesky(K + 1e-8 * I, upper=True), repeats=r)`
+factors \(K + \varepsilon I\) once and repeats it.
 
 Parameters the metric should not weight (a scalar coefficient, a bias) go past
 `metric.size` into the **free block**, whose damping weight is

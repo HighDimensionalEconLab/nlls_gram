@@ -515,8 +515,10 @@ x_dagger = np.linalg.solve(kkt, np.concatenate([np.zeros(p_dim), b_np]))[:p_dim]
 # Metric-damped LM with a small epsilon shift selects x_dagger + O(eps).
 # free_scale weights the zero-padded tail, the role epsilon used to play
 # there; the metric block carries K + epsilon I.
-metric = RepeatedFactorMetric.from_gram(
-    K, repeats=repeats, epsilon=1e-8, free_scale=1e-8
+metric = RepeatedFactorMetric(
+    jnp.linalg.cholesky(K + 1e-8 * jnp.eye(K.shape[0], dtype=K.dtype), upper=True),
+    repeats=repeats,
+    free_scale=1e-8,
 )
 metric_solver = LevenbergMarquardt(residual, metric=metric)
 metric_result = metric_solver.solve(jnp.zeros(p_dim), max_steps=200, atol=1e-12)

@@ -85,8 +85,11 @@ def test_update_step(
     device = devices[0]
     K, residual, x0 = _problem(n, repeats, free_size, m_resid, device)
     if configuration == "metric":
-        metric = RepeatedFactorMetric.from_gram(
-            K, repeats=repeats, epsilon=EPSILON, free_scale=EPSILON
+        shifted = K + EPSILON * jnp.eye(K.shape[0], dtype=K.dtype)
+        metric = RepeatedFactorMetric(
+            jnp.linalg.cholesky(shifted, upper=True),
+            repeats=repeats,
+            free_scale=EPSILON,
         )
         solver = LevenbergMarquardt(residual, metric=metric)
     else:

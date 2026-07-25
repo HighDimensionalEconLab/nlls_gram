@@ -52,8 +52,11 @@ def test_repeated_factor_metric_apply(
     device = devices[0]
     t = jax.device_put(jnp.linspace(0.0, 40.0, n), device)
     K = _matern_gram(t, nu)
-    metric = RepeatedFactorMetric.from_gram(
-        K, repeats=repeats, epsilon=EPSILON, free_scale=EPSILON
+    shifted = K + EPSILON * jnp.eye(K.shape[0], dtype=K.dtype)
+    metric = RepeatedFactorMetric(
+        jnp.linalg.cholesky(shifted, upper=True),
+        repeats=repeats,
+        free_scale=EPSILON,
     )
     total_size = repeats * n
     shape = (total_size,) if rhs_columns == 1 else (total_size, rhs_columns)

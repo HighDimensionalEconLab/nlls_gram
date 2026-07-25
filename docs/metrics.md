@@ -33,7 +33,6 @@ Ops act on metric-block vectors, or matrices whose *leading* axis is `size`
 | `CholeskyMetric(L)` | \(LL^\top\) |
 | `DiagonalMetric(weights)` | \(\operatorname{diag}(w)\) |
 | `RepeatedFactorMetric(F, repeats=r)` | \(\operatorname{blockdiag}(F^\top F, \ldots)\) |
-| `RepeatedFactorMetric.from_gram(K, repeats=r, epsilon=e)` | \(\operatorname{blockdiag}(K + eI, \ldots)\) |
 
 `RepeatedFactorMetric` shares one triangular solve across every repeated block
 by packing them into the columns of a single right-hand side, so no repeated

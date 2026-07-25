@@ -242,9 +242,9 @@ class RepeatedFactorMetric(Metric):
     ``jnp.linalg.cholesky(K, upper=True)`` for a positive-definite Gram matrix
     ``K``, giving the repeated kernel seminorm ``sum_j alpha_j' K alpha_j``
     over ``repeats`` coefficient blocks. The constructor takes the FACTOR, not
-    ``K`` (callers typically already hold it); :meth:`from_gram` shifts and
-    factors a ``K`` instead. Triangularity and positive definiteness are
-    assumed, not validated.
+    ``K`` (callers typically already hold it); a positive-SEMIdefinite ``K``
+    needs a shift first: ``jnp.linalg.cholesky(K + epsilon * I, upper=True)``.
+    Triangularity and positive definiteness are assumed, not validated.
 
     All repeated blocks (and all batched columns) share a single triangular
     product or solve: the ops reshape the metric block into the columns of one
@@ -269,26 +269,6 @@ class RepeatedFactorMetric(Metric):
         _check_free_scale(self.free_scale)
         object.__setattr__(self, "F", F.astype(dtype))
         object.__setattr__(self, "size", self.repeats * F.shape[0])
-
-    @classmethod
-    def from_gram(cls, K, *, repeats=1, epsilon, free_scale=1.0):
-        """Factor ``K + epsilon I`` once and repeat it ``repeats`` times.
-
-        The shift makes a positive-SEMIdefinite kernel Gram matrix invertible.
-        ``epsilon`` must be positive; non-positive values propagate NaN rather
-        than silently defining a singular factor.
-        """
-        K = jnp.asarray(K)
-        if K.ndim != 2 or K.shape[0] != K.shape[1] or K.shape[0] == 0:
-            raise ValueError("K must be a nonempty square matrix")
-        epsilon = jnp.asarray(epsilon, dtype=jnp.result_type(K, 1.0))
-        epsilon = jnp.where(epsilon > 0.0, epsilon, jnp.nan)
-        shifted = K + epsilon * jnp.eye(K.shape[0], dtype=K.dtype)
-        return cls(
-            jnp.linalg.cholesky(shifted, upper=True),
-            repeats=repeats,
-            free_scale=free_scale,
-        )
 
     def _map_blocks(self, block_op, v):
         _check_leading_size(v, self.size)
