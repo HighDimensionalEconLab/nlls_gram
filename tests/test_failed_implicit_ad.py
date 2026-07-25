@@ -3,14 +3,36 @@ import jax.numpy as jnp
 import pytest
 
 from nlls_gram import (
+    SVD,
+    DiagonalMetric,
+    GramCG,
+    IdentityPreconditioner,
     LevenbergMarquardt,
     LMSolveAction,
     LMStatus,
-    MetricFactory,
+    Metric,
     MultiStart,
-    PreconditionerFactory,
-    metric_from_diagonal,
 )
+
+
+class AuxWeightedMetric(Metric):
+    """An iterate-dependent metric: the diagonal weights ride on prepare's
+    traced state, rebuilt from the live iterate and frozen at the solution
+    under implicit AD."""
+
+    size = 1
+
+    def prepare(self, theta, ctx):
+        return 1.0 + jnp.sqrt(jnp.abs(theta))
+
+    def factor_apply(self, v, ctx):
+        return jnp.sqrt(ctx.metric_state) * v
+
+    def factor_solve(self, v, ctx):
+        return v / jnp.sqrt(ctx.metric_state)
+
+    def factor_solve_transpose(self, v, ctx):
+        return self.factor_solve(v, ctx)
 
 
 def test_failed_lane_uses_initial_point_under_vmap_jvp_and_vjp():
@@ -63,20 +85,16 @@ def test_failed_lane_uses_initial_point_under_vmap_jvp_and_vjp():
     assert jnp.allclose(cotangent, jnp.asarray([1.0, 0.0]), atol=1e-6)
 
 
-def test_invalid_failed_result_uses_initial_aux_for_metric_factory():
+def test_invalid_failed_result_uses_initial_point_for_a_prepared_metric():
     def residual(x, _, p):
         root = jnp.sqrt(x)
         return root - p, {"weight": 1.0 + root}
 
-    factory = MetricFactory(
-        prepare=lambda x, args, p, aux: aux["weight"],
-        build=metric_from_diagonal,
-    )
     solver = LevenbergMarquardt(
         residual,
         has_aux=True,
-        metric_factory=factory,
-        ad_solver="svd",
+        metric=AuxWeightedMetric(),
+        ad_solver=SVD(),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )
@@ -117,15 +135,10 @@ def test_failed_gram_cg_rebuilds_aux_for_preconditioner_factory():
         value = jnp.asarray([jnp.sum(x) - p])
         return value, {"scale": 1.0 + 0.1 * jnp.sum(x**2)}
 
-    factory = PreconditionerFactory(
-        prepare=lambda x, args, p, aux: aux["scale"],
-        apply=lambda state, value, damping: value / (state + damping),
-    )
     solver = LevenbergMarquardt(
         residual,
         has_aux=True,
-        linear_solver="gram_cg",
-        preconditioner_factory=factory,
+        linear_solver=GramCG(IdentityPreconditioner(), maxiter=8),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )
@@ -235,8 +248,8 @@ def test_failed_fixed_metric_tangent_and_cotangent_are_zero():
 
     solver = LevenbergMarquardt(
         residual,
-        metric=metric_from_diagonal(jnp.asarray([2.0, 3.0])),
-        ad_solver="svd",
+        metric=DiagonalMetric(jnp.asarray([2.0, 3.0])),
+        ad_solver=SVD(),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )
@@ -263,14 +276,10 @@ def test_successful_direct_aux_does_not_rebuild_aux_for_ad():
         jax.debug.callback(lambda _: calls.append(None), x, ordered=True)
         return x - p, {"value": x + p}
 
-    factory = MetricFactory(
-        prepare=lambda x, args, p, aux: jnp.ones_like(x),
-        build=metric_from_diagonal,
-    )
     solver = LevenbergMarquardt(
         residual,
         has_aux=True,
-        metric_factory=factory,
+        metric=DiagonalMetric(jnp.ones(1)),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )

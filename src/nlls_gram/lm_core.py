@@ -11,10 +11,14 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
 
 from nlls_gram.lm_types import (
+    LMHyperparams,
     LMSolveAction,
     LMStatus,
+    SolverContext,
+    _damping_floor,
 )
 from nlls_gram.multi_start import (
     MultiStart,
@@ -25,6 +29,7 @@ from nlls_gram.multi_start import (
     _multi_start_python_impl,
     _multi_start_sequential_jit,
 )
+from nlls_gram.preconditioners import Preconditioner
 from nlls_gram.solve_loop import _solve_loop_jit, _solve_python_impl
 from nlls_gram.utilities import (
     _hashable_hook,
@@ -93,6 +98,138 @@ class LevenbergMarquardtBase:
                 "p was passed but residual_fn takes no p argument; "
                 "use residual_fn(x, args, p)"
             )
+
+    def hyperparams(self, dtype=None):
+        """``LMHyperparams`` built from the constructor values."""
+        iterative_tol = self.iterative_tol
+        if iterative_tol is None:
+            # CG's tol=None: the _ad_cg_tol dtype-default convention.
+            resolved = jnp.result_type(float) if dtype is None else dtype
+            iterative_tol = 1e-10 if jnp.finfo(resolved).bits > 32 else 1e-6
+        return LMHyperparams(
+            jnp.asarray(self.damping_decrease, dtype=dtype),
+            jnp.asarray(self.damping_increase, dtype=dtype),
+            _damping_floor(self.min_damping, dtype),
+            None
+            if self.max_damping is None
+            else jnp.asarray(self.max_damping, dtype=dtype),
+            jnp.asarray(self.geodesic_acceptance_ratio, dtype=dtype),
+            jnp.asarray(iterative_tol, dtype=dtype),
+            jnp.asarray(self.iterative_atol, dtype=dtype),
+            None
+            if self.iterative_maxiter is None
+            else jnp.asarray(self.iterative_maxiter, dtype=jnp.int32),
+        )
+
+    def _block_sizes(self, theta_size):
+        # The free-block size is inferred from the flattened iterate: the
+        # metric covers the leading metric.size coordinates, the rest is free.
+        n_f = theta_size - self.metric.size
+        if n_f < 0:
+            raise ValueError(
+                f"the metric covers {self.metric.size} leading coordinates "
+                f"but x flattens to only {theta_size}; the free block is "
+                "len(x) - metric.size and must be nonnegative"
+            )
+        return self.metric.size, n_f
+
+    # The solver-internal extension F_bar = blockdiag(F, sqrt(free_scale) I):
+    # the metric's factor op on the metric block, a scalar on the free block.
+    # Applied to vectors or leading-axis-batched matrices; F_bar itself is
+    # never materialized, and the free block drops out entirely when it is
+    # empty or unscaled.
+    def _free_scale(self, v):
+        scale = self.metric.free_scale
+        return v if scale == 1.0 else v / jnp.sqrt(jnp.asarray(scale, v.dtype))
+
+    def _extended_solve(self, v, ctx):
+        n_m = self.metric.size
+        if n_m == 0:
+            return self._free_scale(v)
+        if v.shape[0] == n_m:
+            return self.metric.factor_solve(v, ctx)
+        return jnp.concatenate(
+            [self.metric.factor_solve(v[:n_m], ctx), self._free_scale(v[n_m:])], axis=0
+        )
+
+    def _extended_solve_transpose(self, v, ctx):
+        n_m = self.metric.size
+        if n_m == 0:
+            return self._free_scale(v)
+        if v.shape[0] == n_m:
+            return self.metric.factor_solve_transpose(v, ctx)
+        return jnp.concatenate(
+            [
+                self.metric.factor_solve_transpose(v[:n_m], ctx),
+                self._free_scale(v[n_m:]),
+            ],
+            axis=0,
+        )
+
+    def _hook_state(self, theta, lm_state, args, p):
+        """The metric's and preconditioner's prepared state for this step:
+        reused while still valid (a rejected step left ``x`` in place, or the
+        hook declined to rebuild), rebuilt from the live iterate otherwise."""
+        bare = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
+        metric_state = precond_state = None
+        if self._metric_prepares:
+            metric_state = jax.lax.cond(
+                lm_state.metric_valid | ~jnp.asarray(self.metric.rebuild(bare)),
+                lambda _: lm_state.metric_state,
+                lambda _: self.metric.prepare(theta, bare),
+                operand=None,
+            )
+        if self._precond_prepares:
+            precond_state = jax.lax.cond(
+                lm_state.precond_valid
+                | ~jnp.asarray(self.preconditioner.rebuild(bare)),
+                lambda _: lm_state.precond,
+                lambda _: self.preconditioner.prepare(theta, bare),
+                operand=None,
+            )
+        return metric_state, precond_state
+
+    def _carried_ctx(self, theta, lm_state, args, p):
+        return SolverContext(
+            x=theta,
+            lm_state=lm_state,
+            args=args,
+            p=p,
+            metric_state=lm_state.metric_state,
+            preconditioner_state=lm_state.precond,
+        )
+
+    def _frozen_ctx(self, theta, lm_state, args, p, preconditioner):
+        # Under implicit AD the hooks are FROZEN at the returned solution:
+        # prepare runs once there and the state-dependence is not
+        # differentiated, the same contract as a fixed metric closing over
+        # constants.
+        bare = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
+        metric_state = (
+            self.metric.prepare(theta, bare) if self._metric_prepares else None
+        )
+        precond_state = None
+        if preconditioner is not None and (
+            type(preconditioner).prepare is not Preconditioner.prepare
+        ):
+            precond_state = preconditioner.prepare(theta, bare)
+        return dataclasses.replace(
+            bare, metric_state=metric_state, preconditioner_state=precond_state
+        )
+
+    def _ad_linearization(self, x, args, p, p_dot):
+        theta, unravel = ravel_pytree(x)
+
+        def residual_from_theta(theta_value):
+            return self._residual_and_aux(unravel(theta_value), args, p)[0]
+
+        residual, theta_jvp = jax.linearize(residual_from_theta, theta)
+
+        def residual_from_p(p_value):
+            return self._residual_and_aux(x, args, p_value)[0]
+
+        residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
+        return theta, unravel, residual, theta_jvp, residual_p_dot
 
     def _ad_cg_tol(self, dtype):
         if self.ad_solver_tol is not None:

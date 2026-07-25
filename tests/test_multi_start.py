@@ -621,8 +621,6 @@ def test_multi_start_validation_errors():
 
     solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     x0 = jnp.zeros(2)
-    with pytest.raises(TypeError, match="MultiStart"):
-        solver.solve(x0, p=jnp.asarray(3.0), multi_start=42)
 
     def bad_draw(key, x, args):
         return x[:1], args

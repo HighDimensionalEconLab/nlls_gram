@@ -3,11 +3,14 @@ import jax.numpy as jnp
 import pytest
 
 from nlls_gram import (
+    CG,
+    QR,
+    Cholesky,
+    GramCG,
+    IdentityPreconditioner,
     LevenbergMarquardt,
-    identity_preconditioner,
-    matern_state_space,
-    repeated_shifted_state_space_metric,
 )
+from nlls_gram.experimental import StateSpaceMetric, matern_state_space
 
 
 def _gpu_devices():
@@ -24,22 +27,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-# Matrix-free params (cg with an explicit identity preconditioner, plain lsmr)
-# ride alongside the dense ones; they auto-skip without a GPU like the rest.
-_MATRIX_FREE_GPU_KWARGS = {
-    "gram_cg": {
-        "iterative_tol": 1e-7,
-        "iterative_maxiter": 10,
-        "dual_preconditioner": identity_preconditioner(),
-        "ad_solver_preconditioner": identity_preconditioner(),
-    },
-    "lsmr": {"iterative_tol": 1e-8, "iterative_maxiter": 10},
-}
+# The matrix-free configs ride alongside the dense ones; all auto-skip
+# without a GPU.
+GPU_SOLVERS = [
+    Cholesky(form="gram"),
+    Cholesky(form="normal"),
+    QR(),
+    CG(IdentityPreconditioner(), tol=1e-7, maxiter=10),
+    GramCG(IdentityPreconditioner(), tol=1e-7, maxiter=10),
+]
 
 
-@pytest.mark.parametrize(
-    "linear_solver", ["gram_cholesky", "qr", "augmented_qr", "gram_cg", "lsmr"]
-)
+@pytest.mark.parametrize("linear_solver", GPU_SOLVERS)
 def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
     def residual(theta, target, p):
         return jnp.array([theta[0] ** 2 - target])
@@ -51,7 +50,6 @@ def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
         linear_solver=linear_solver,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
-        **_MATRIX_FREE_GPU_KWARGS.get(linear_solver, {}),
     )
 
     with jax.default_device(gpu):
@@ -75,9 +73,7 @@ def test_jitted_geodesic_update_runs_on_gpu(linear_solver):
     assert jnp.isfinite(info.acceleration_ratio)
 
 
-@pytest.mark.parametrize(
-    "linear_solver", ["gram_cholesky", "qr", "augmented_qr", "gram_cg", "lsmr"]
-)
+@pytest.mark.parametrize("linear_solver", GPU_SOLVERS)
 def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
     def residual(theta, target, p):
         return jnp.array([theta[0] ** 2 - target])
@@ -89,7 +85,6 @@ def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
         linear_solver=linear_solver,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=1.0,
-        **_MATRIX_FREE_GPU_KWARGS.get(linear_solver, {}),
     )
 
     with jax.default_device(gpu):
@@ -110,39 +105,28 @@ def test_jitted_geodesic_update_does_not_transfer_to_host(linear_solver):
         assert next(iter(leaf.devices())).platform == "gpu"
 
 
-def test_repeated_shifted_state_space_metric_runs_on_gpu():
-    # The parallel and sequential apply paths must both run and agree on
-    # the GPU backend (float32 here, so the dtype-aware default picks the
+def test_state_space_metric_runs_on_gpu():
+    # The parallel and sequential apply paths must both run and agree on the
+    # GPU backend (float32 here, so the dtype-aware default picks the
     # sequential path; parallel=True forces the associative scans).
     gpu = _gpu_devices()[0]
     with jax.default_device(gpu):
-        n, repeats, zero_pad_size = 512, 3, 2
+        n, repeats = 512, 3
         t = jnp.cumsum(jnp.ones(n))
-        x = jnp.sin(jnp.linspace(0.0, 6.0, repeats * n + zero_pad_size))
+        x = jnp.sin(jnp.linspace(0.0, 6.0, repeats * n))
         model = matern_state_space(1.3, 0.8, 2.5)
-        default = repeated_shifted_state_space_metric(
-            t,
-            *model,
-            repeats=repeats,
-            zero_pad_size=zero_pad_size,
-            epsilon=1e-6,
+        default = StateSpaceMetric(t, *model, repeats=repeats, epsilon=1e-6)
+        parallel = StateSpaceMetric(
+            t, *model, repeats=repeats, epsilon=1e-6, parallel=True
         )
-        parallel = repeated_shifted_state_space_metric(
-            t,
-            *model,
-            repeats=repeats,
-            zero_pad_size=zero_pad_size,
-            epsilon=1e-6,
-            parallel=True,
-        )
-        out = jax.jit(default.solve)(x)
-        out_parallel = jax.jit(parallel.solve)(x)
+        out = jax.jit(lambda v: default.factor_solve(v, None))(x)
+        out_parallel = jax.jit(lambda v: parallel.factor_solve(v, None))(x)
         jax.block_until_ready((out, out_parallel))
 
     assert next(iter(out.devices())).platform == "gpu"
     assert bool(jnp.all(jnp.isfinite(out)))
     assert jnp.allclose(out, out_parallel, rtol=1e-4, atol=1e-5)
-    assert jnp.allclose(default.norm(x), parallel.norm(x), rtol=1e-4)
+    assert jnp.allclose(default.norm(x, None), parallel.norm(x, None), rtol=1e-4)
 
 
 def multi_start_residual(theta, args, p):

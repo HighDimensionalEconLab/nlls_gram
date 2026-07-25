@@ -114,6 +114,10 @@ class Subproblem:
     cache_enabled: bool
     hyper: Any
     ctx: Any
+    # Static: the ridge solver carries penalty rows, the metric solver
+    # does not. ridge is zero when unpenalized, so only the structural
+    # choices (extra QR rows, the diagonal shift) key on this.
+    penalized: bool = True
 
     @property
     def dtype(self):
@@ -156,17 +160,21 @@ class Subproblem:
 class StepSolver(NamedTuple):
     """What a linear solver returns for one LM step.
 
-    ``grad`` is the whitened half-gradient; ``velocity()`` the first-order
-    step in the whitened variable; ``solve(rhs)`` the same damped system
-    against an arbitrary right-hand side (the geodesic correction);
-    ``accel_rhs(f_vv)`` the correction's right-hand side; and
-    ``make_cache(valid)`` the pytree to carry, or ``None``.
+    ``grad`` is the whitened half-gradient (reported as ``info.grad_norm``);
+    ``velocity()`` the first-order step in the whitened variable;
+    ``correction(f_vv)`` the geodesic second-order correction from the
+    directional second derivative, also whitened; and ``make_cache(valid)``
+    the pytree to carry, or ``None``.
+
+    The two solves are one method rather than a ``solve(rhs)`` the caller
+    feeds: the Gram forms pose their right-hand side in residual space and the
+    normal forms in parameter space, and nothing outside the config needs to
+    know which.
     """
 
     grad: jax.Array
     velocity: Any
-    solve: Any
-    accel_rhs: Any
+    correction: Any
     make_cache: Any
 
 
@@ -176,7 +184,7 @@ class LinearSolver:
 
     materializes_jacobian = True
 
-    def new_cache(self, m, n, n_m, dtype):
+    def new_cache(self, m, n, n_m, dtype, penalized):
         """The reject-step cache pytree at ``init``, or ``None``."""
         return None
 
@@ -186,43 +194,88 @@ class LinearSolver:
 
 @dataclass(frozen=True)
 class Cholesky(LinearSolver):
-    """Dense normal equations.
+    """Dense factorization of the damped subproblem.
 
-    Assembles ``G = J~'J~ + ridge E`` -- cached across rejected steps, where
-    only the damping changed, so a reject pays the ``n^3/3`` refactor without
-    the GEMM and without re-materializing ``J~'`` -- and factors
-    ``G + damping I`` per step. No knobs.
+    ``form="normal"`` factors the ``n x n`` whitened normal system
+    ``G = J~'J~ + ridge E`` (cached across rejected steps, where only the
+    damping changed, so a reject pays the ``n^3/3`` refactor without the GEMM
+    and without re-materializing ``J~'``) and solves
+    ``(G + damping I) u = -g``.
+
+    ``form="gram"`` factors the ``m x m`` dual ``D = J~ J~'`` instead and
+    takes the step ``u = -J~'(D + damping I)^{-1} r``. For ``damping > 0`` the
+    two produce the SAME step, by the push-through identity
+    ``B'(BB' + lam I)^{-1} = (B'B + lam I)^{-1}B'``; they differ only in which
+    dimension they factor in. ``form="auto"`` (the default) picks the smaller
+    at trace time -- gram when ``n > m``, normal otherwise -- so it is a cost
+    choice, not a semantics choice, and it keys on shape alone, never on
+    numerical rank.
     """
 
-    def new_cache(self, m, n, n_m, dtype):
+    form: str = "auto"
+
+    def _resolved_form(self, m, n, penalized):
+        # The ridge solver's penalty rows have no dual analogue -- the dual
+        # operator J~J~' never sees them -- so a penalized subproblem is
+        # always the normal form. The ridge constructor rejects an explicit
+        # form="gram" rather than silently ignoring it.
+        if penalized:
+            return "normal"
+        if self.form != "auto":
+            return self.form
+        return "gram" if n > m else "normal"
+
+    def new_cache(self, m, n, n_m, dtype, penalized):
+        size = m if self._resolved_form(m, n, penalized) == "gram" else n
         return CholeskyCache(
-            G=jnp.zeros((n, n), dtype=dtype),
+            G=jnp.zeros((size, size), dtype=dtype),
             valid=jnp.asarray(False, dtype=jnp.bool_),
             ridge=jnp.zeros((), dtype=dtype),
         )
 
     def prepare(self, sub):
         n_m, ridge, dtype = sub.n_m, sub.ridge, sub.dtype
-        grad = sub.whitened_transpose(sub.Jt @ sub.resid) + ridge * sub.penalty_gradient
+        # B' = F_bar^{-T} J', shape (n, m). Every form below is built from it.
+        grad = sub.whitened_transpose(sub.Jt @ sub.resid)
+        if sub.penalized:
+            grad = grad + ridge * sub.penalty_gradient
+        gram = self._resolved_form(sub.m, sub.n, sub.penalized) == "gram"
 
         def assemble():
-            Jt_sub = sub.whitened_transpose(sub.Jt)
+            Bt = sub.whitened_transpose(sub.Jt)
+            if gram:
+                return Bt.T @ Bt
+            normal = Bt @ Bt.T
+            if not sub.penalized:
+                return normal
             diagonal = jnp.arange(n_m)
-            return (Jt_sub @ Jt_sub.T).at[diagonal, diagonal].add(ridge)
+            return normal.at[diagonal, diagonal].add(ridge)
 
-        normal_matrix = sub.cached(assemble)
-        shifted = normal_matrix + sub.damping * jnp.eye(sub.n, dtype=dtype)
-        factor = jsp_linalg.cho_factor(shifted)
+        matrix = sub.cached(assemble)
+        size = sub.m if gram else sub.n
+        factor = jsp_linalg.cho_factor(
+            matrix + sub.damping * jnp.eye(size, dtype=dtype)
+        )
+        if gram:
+            # u = -B'(D + damping I)^{-1} c on residual-space right-hand sides.
+            def dual_step(c):
+                return -sub.whitened_transpose(sub.Jt @ jsp_linalg.cho_solve(factor, c))
 
-        def solve(rhs):
-            return -jsp_linalg.cho_solve(factor, rhs)
+            velocity, correction = (lambda: dual_step(sub.resid)), dual_step
+        else:
 
+            def normal_step(c):
+                return -jsp_linalg.cho_solve(factor, c)
+
+            velocity = lambda: normal_step(grad)  # noqa: E731
+            correction = lambda f_vv: normal_step(  # noqa: E731
+                sub.whitened_transpose(sub.Jt @ f_vv)
+            )
         return StepSolver(
             grad=grad,
-            velocity=lambda: solve(grad),
-            solve=solve,
-            accel_rhs=lambda f_vv: sub.whitened_transpose(sub.Jt @ f_vv),
-            make_cache=lambda valid: CholeskyCache(normal_matrix, valid, ridge),
+            velocity=velocity,
+            correction=correction,
+            make_cache=lambda valid: CholeskyCache(matrix, valid, ridge),
         )
 
 
@@ -230,17 +283,21 @@ class Cholesky(LinearSolver):
 class QR(LinearSolver):
     """Damping-row QR of the augmented whitened stack.
 
-    One QR of ``[J~; sqrt(ridge) [I 0] | b~]`` with ``b~ = [r; sqrt(ridge)
-    y_m]`` is cached per ``(x, ridge)``: its leading columns are the stack's R
-    factor and its last column carries ``Q'b``, so the velocity is a
-    backward-stable least-squares solve with NO normal equations -- More
-    1978's damping-row structure, accurate at ``cond(A)`` rather than
-    ``cond(A)^2``. Each step re-factors only the damping rows. No knobs.
+    One QR of ``[J~; sqrt(ridge) [I 0] | b~]`` (the penalty rows and the
+    ``b~`` tail only for the ridge solver) is cached per ``(x, ridge)``: its
+    leading columns are the stack's R factor and its last column carries
+    ``Q'b``, so the velocity is a backward-stable least-squares solve with NO
+    normal equations -- More 1978's damping-row structure, accurate at
+    ``cond(A)`` rather than ``cond(A)^2``. Each step re-factors only the
+    damping rows, and those rows keep the system full rank for any
+    ``damping > 0``, so a rank-deficient Jacobian is handled rather than
+    producing a non-finite step. No knobs.
     """
 
-    def new_cache(self, m, n, n_m, dtype):
+    def new_cache(self, m, n, n_m, dtype, penalized):
+        rows = min(m + n_m, n + 1) if penalized else min(m, n + 1)
         return QRCache(
-            R=jnp.zeros((min(m + n_m, n + 1), n + 1), dtype=dtype),
+            R=jnp.zeros((rows, n + 1), dtype=dtype),
             valid=jnp.asarray(False, dtype=jnp.bool_),
             ridge=jnp.zeros((), dtype=dtype),
         )
@@ -248,14 +305,18 @@ class QR(LinearSolver):
     def prepare(self, sub):
         n, n_m, ridge, dtype = sub.n, sub.n_m, sub.ridge, sub.dtype
         sqrt_ridge = jnp.sqrt(ridge)
-        grad = sub.whitened_transpose(sub.Jt @ sub.resid) + ridge * sub.penalty_gradient
+        grad = sub.whitened_transpose(sub.Jt @ sub.resid)
+        if sub.penalized:
+            grad = grad + ridge * sub.penalty_gradient
 
         def assemble():
-            Jt_sub = sub.whitened_transpose(sub.Jt)
-            stacked = jnp.concatenate(
-                [Jt_sub.T, sqrt_ridge * jnp.eye(n_m, n, dtype=dtype)], axis=0
-            )
-            b_stacked = jnp.concatenate([sub.resid, sqrt_ridge * sub.y_m])
+            Bt = sub.whitened_transpose(sub.Jt)
+            rows, rhs = [Bt.T], [sub.resid]
+            if sub.penalized:
+                rows.append(sqrt_ridge * jnp.eye(n_m, n, dtype=dtype))
+                rhs.append(sqrt_ridge * sub.y_m)
+            stacked = jnp.concatenate(rows, axis=0)
+            b_stacked = jnp.concatenate(rhs)
             return jnp.linalg.qr(
                 jnp.concatenate([stacked, b_stacked[:, None]], axis=1), mode="r"
             )
@@ -263,9 +324,9 @@ class QR(LinearSolver):
         qr_R = sub.cached(assemble)
         r_factor, transformed_rhs = qr_R[:, :-1], qr_R[:, -1]
         # Per-step damping-row refactor: [R; sqrt(damping) I] = Q2 R2 with
-        # R2'R2 = A'A + damping I. When m + n_m < n the cached R is upper
-        # trapezoidal and these rows are what make the system full rank. Q2 is
-        # retained to transform the velocity right-hand side stably.
+        # R2'R2 = A'A + damping I. When the cached R is upper trapezoidal these
+        # rows are what make the system full rank. Q2 is retained to transform
+        # the velocity right-hand side stably.
         damped_stack = jnp.concatenate(
             [r_factor, jnp.sqrt(sub.damping) * jnp.eye(n, dtype=dtype)], axis=0
         )
@@ -273,16 +334,19 @@ class QR(LinearSolver):
 
         def damped_normal_matvec(v):
             gauss_newton = sub.whitened_transpose(sub.Jt @ (sub.Jt.T @ sub.whitened(v)))
-            metric_shift = jnp.concatenate([v[:n_m], jnp.zeros(sub.n_f, dtype=dtype)])
-            return gauss_newton + ridge * metric_shift + sub.damping * v
+            shift = sub.damping * v
+            if sub.penalized:
+                shift = shift + ridge * jnp.concatenate(
+                    [v[:n_m], jnp.zeros(sub.n_f, dtype=dtype)]
+                )
+            return gauss_newton + shift
 
-        def solve(rhs):
-            # Corrected semi-normal equations (Bjorck 1987) for the geodesic
-            # right-hand side: triangular solves against R_mu, then ONE fixed
-            # iterative-refinement pass through matvecs (Bjorck 1996 Sec.
-            # 6.6.5). The second-order correction tolerates the squared
-            # conditioning; accept/reject guards it.
-            b = -rhs
+        def correction(f_vv):
+            # Corrected semi-normal equations (Bjorck 1987): triangular solves
+            # against R_mu, then ONE fixed iterative-refinement pass through
+            # matvecs (Bjorck 1996 Sec. 6.6.5). The second-order correction
+            # tolerates the squared conditioning; accept/reject guards it.
+            b = -sub.whitened_transpose(sub.Jt @ f_vv)
             half = jsp_linalg.solve_triangular(R_mu.T, b, lower=True)
             delta = jsp_linalg.solve_triangular(R_mu, half, lower=False)
             correction_rhs = b - damped_normal_matvec(delta)
@@ -298,28 +362,59 @@ class QR(LinearSolver):
         return StepSolver(
             grad=grad,
             velocity=velocity,
-            solve=solve,
-            accel_rhs=lambda f_vv: sub.whitened_transpose(sub.Jt @ f_vv),
+            correction=correction,
             make_cache=lambda valid: QRCache(qr_R, valid, ridge),
         )
 
 
+class _KrylovConfig(LinearSolver):
+    """Shared field validation for the matrix-free configs."""
+
+    materializes_jacobian = False
+
+    def __post_init__(self):
+        if self.tol is not None and self.tol < 0:
+            raise ValueError("tol must be nonnegative or None")
+        if self.atol < 0:
+            raise ValueError("atol must be nonnegative")
+        if self.maxiter is not None and self.maxiter <= 0:
+            raise ValueError("maxiter must be positive or None")
+        if self.tol == 0 and self.atol == 0 and self.maxiter is None:
+            raise ValueError("maxiter must be set when both tolerances are zero")
+
+    def _cg(self, matvec, c, sub, apply_M):
+        solution, _ = jsp_sparse_linalg.cg(
+            matvec,
+            c,
+            tol=jnp.asarray(sub.hyper.iterative_tol, dtype=sub.dtype),
+            atol=jnp.asarray(sub.hyper.iterative_atol, dtype=sub.dtype),
+            maxiter=sub.hyper.iterative_maxiter,
+            M=apply_M,
+        )
+        return solution
+
+
 @dataclass(frozen=True)
-class CG(LinearSolver):
-    """Matrix-free preconditioned CG on the whitened normal operator.
+class CG(_KrylovConfig):
+    """Matrix-free preconditioned CG on the whitened NORMAL operator, in
+    parameter space.
 
     As ``linear_solver`` it solves the damped forward subproblem
     ``(J~'J~ + ridge E + damping I) delta_y = -g`` -- the same SPD system
-    :class:`Cholesky` factors -- with the ``preconditioner`` in CG's ``M``
-    slot at the live damping. As ``ad_solver`` it solves the undamped
-    implicit-AD system ``J~'J~ + ridge E``, with the preconditioner applied at
-    zero damping (subclasses marked ``requires_positive_damping`` are rejected
-    for that role).
+    :class:`Cholesky` factors -- with the ``preconditioner`` in CG's ``M`` slot
+    at the live damping. As ``ad_solver`` it solves the undamped implicit-AD
+    system, with the preconditioner applied at zero damping (subclasses marked
+    ``requires_positive_damping`` are rejected for that role) and ``penalty``
+    optionally adding a small ridge that stabilizes a rank-deficient tangent.
 
-    ``preconditioner`` is REQUIRED in both roles -- nobody should run Krylov
-    methods without a preconditioning decision, so
-    :class:`~nlls_gram.IdentityPreconditioner` is the explicit opt-out and a
-    custom one is a small subclass implementing ``apply(v, damping, ctx)``.
+    ``preconditioner`` is REQUIRED -- nobody should run Krylov methods without
+    a preconditioning decision, so :class:`~nlls_gram.IdentityPreconditioner`
+    is the explicit opt-out and a custom one is a small subclass implementing
+    ``apply(v, damping, ctx)``. On rank-deficient problems it must map
+    ``range(B')`` into itself or the minimum-norm selection is silently lost;
+    the identity, polynomials in the operator, and exact shifted inverses are
+    safe, and on full-column-rank problems the condition is vacuous.
+
     ``tol=None`` resolves to a dtype default (``1e-10`` in float64, ``1e-6``
     in float32); ``maxiter`` must be set when both tolerances are explicitly
     zero, since an uncapped zero-tolerance CG loop has no stopping rule.
@@ -329,22 +424,11 @@ class CG(LinearSolver):
     tol: float | None = None
     atol: float = 0.0
     maxiter: int | None = None
-
-    materializes_jacobian = False
-
-    def __post_init__(self):
-        if self.tol is not None and self.tol < 0:
-            raise ValueError("CG.tol must be nonnegative or None")
-        if self.atol < 0:
-            raise ValueError("CG.atol must be nonnegative")
-        if self.maxiter is not None and self.maxiter <= 0:
-            raise ValueError("CG.maxiter must be positive or None")
-        if self.tol == 0 and self.atol == 0 and self.maxiter is None:
-            raise ValueError("CG.maxiter must be set when both tolerances are zero")
+    penalty: float | None = None
 
     def prepare(self, sub):
         n_m, n_f, ridge, dtype = sub.n_m, sub.n_f, sub.ridge, sub.dtype
-        m, damping, ctx = sub.m, sub.damping, sub.ctx
+        damping, ctx = sub.damping, sub.ctx
         sqrt_ridge = jnp.sqrt(ridge)
 
         # Whitened operator J~ = J F_bar^{-1}: products route through the
@@ -355,47 +439,109 @@ class CG(LinearSolver):
         def JT_sub(w):
             return sub.whitened_transpose(sub.JT(w))
 
-        grad = JT_sub(sub.resid) + ridge * sub.penalty_gradient
+        grad = JT_sub(sub.resid)
+        if sub.penalized:
+            grad = grad + ridge * sub.penalty_gradient
 
-        # Augmented operator A = [J~; sqrt(ridge) [I 0]]: the penalty rows are
-        # the constant metric-block identity on y.
-        def A_matvec(u):
-            return jnp.concatenate([J_sub(u), sqrt_ridge * u[:n_m]])
-
-        def At_matvec(w):
-            pullback = sqrt_ridge * jnp.concatenate(
-                [w[m:], jnp.zeros(n_f, dtype=dtype)]
-            )
-            return JT_sub(w[:m]) + pullback
-
-        # N = A'A + damping I, the preconditioner-free SPD operator that
-        # custom_linear_solve differentiates through, posed on u.
+        # N = A'A + damping I for the augmented A = [J~; sqrt(ridge) [I 0]] --
+        # the preconditioner-free SPD operator that custom_linear_solve
+        # differentiates through, posed on u.
         def N_matvec(u):
-            return At_matvec(A_matvec(u)) + damping * u
+            normal = JT_sub(J_sub(u))
+            if sub.penalized:
+                pullback = sqrt_ridge * jnp.concatenate(
+                    [sqrt_ridge * u[:n_m], jnp.zeros(n_f, dtype=dtype)]
+                )
+                normal = normal + pullback
+            return normal + damping * u
 
         def apply_M(v):
             return self.preconditioner.apply(v, damping, ctx)
 
         def solve_N(_, c):
-            solution, _ = jsp_sparse_linalg.cg(
-                N_matvec,
-                c,
-                tol=jnp.asarray(sub.hyper.iterative_tol, dtype=dtype),
-                atol=jnp.asarray(sub.hyper.iterative_atol, dtype=dtype),
-                maxiter=sub.hyper.iterative_maxiter,
-                M=apply_M,
-            )
-            return solution
+            return self._cg(N_matvec, c, sub, apply_M)
 
-        def solve(rhs):
+        def solve(c):
             return jax.lax.custom_linear_solve(
-                N_matvec, -rhs, solve=solve_N, transpose_solve=solve_N, symmetric=True
+                N_matvec, -c, solve=solve_N, transpose_solve=solve_N, symmetric=True
             )
 
         return StepSolver(
             grad=grad,
             velocity=lambda: solve(grad),
-            solve=solve,
-            accel_rhs=JT_sub,
+            correction=lambda f_vv: solve(JT_sub(f_vv)),
             make_cache=lambda valid: None,
         )
+
+
+@dataclass(frozen=True)
+class GramCG(_KrylovConfig):
+    """Matrix-free preconditioned CG on the DUAL operator, in residual space.
+
+    Applies ``y -> J~ J~' y + damping y`` on ``m``-vectors and takes the step
+    ``u = -J~'y``, so the Krylov iteration lives in residual dimension -- the
+    matrix-free form for the ``m << n`` regime this package targets, where
+    :class:`CG`'s ``n``-dimensional iteration is the expensive one. At inner
+    convergence the step matches :class:`CG`'s, and a budget-truncated step
+    still lies in ``range(J~')``, so the minimum-metric-norm structure
+    survives truncation.
+
+    ``preconditioner`` acts on residual-space vectors -- an SPD approximation
+    of ``(J~J~' + damping I)^{-1}`` -- which is the only difference from
+    :class:`CG`'s contract, and the reason the two are separate configs rather
+    than one with a flag. Only the ridge solver has penalty rows, and they
+    have no dual analogue, so this config serves
+    :class:`~nlls_gram.LevenbergMarquardt` alone.
+    """
+
+    preconditioner: Preconditioner
+    tol: float | None = None
+    atol: float = 0.0
+    maxiter: int | None = None
+
+    def prepare(self, sub):
+        damping, ctx = sub.damping, sub.ctx
+
+        def dual_matvec(y):
+            return sub.jvp_fn(sub.whitened(sub.whitened_transpose(sub.JT(y)))) + (
+                damping * y
+            )
+
+        def apply_M(v):
+            return self.preconditioner.apply(v, damping, ctx)
+
+        def solve_dual(_, c):
+            return self._cg(dual_matvec, c, sub, apply_M)
+
+        def step(c):
+            y = jax.lax.custom_linear_solve(
+                dual_matvec,
+                c,
+                solve=solve_dual,
+                transpose_solve=solve_dual,
+                symmetric=True,
+            )
+            return -sub.whitened_transpose(sub.JT(y))
+
+        return StepSolver(
+            grad=sub.whitened_transpose(sub.JT(sub.resid)),
+            velocity=lambda: step(sub.resid),
+            correction=step,
+            make_cache=lambda valid: None,
+        )
+
+
+@dataclass(frozen=True)
+class SVD(LinearSolver):
+    """Spectral-filter pseudoinverse, for the ``ad_solver`` role only.
+
+    The implicit-AD system is UNDAMPED, so it is singular whenever the
+    whitened Jacobian is rank deficient -- padded zero residuals make it so by
+    construction. This rule truncates at ``max(m, n) * eps * sigma_max`` and
+    returns the minimum-metric-norm tangent, which is the right answer there
+    rather than a NaN or a silent pseudo-solve. It assembles, so it is the
+    dense fallback rather than the default.
+    """
+
+    def prepare(self, sub):
+        raise NotImplementedError("SVD is an ad_solver, not a forward solver")

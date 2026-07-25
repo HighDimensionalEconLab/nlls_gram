@@ -36,7 +36,6 @@ from nlls_gram.linear_solvers import (
 )
 from nlls_gram.lm_core import LevenbergMarquardtBase
 from nlls_gram.lm_types import (
-    LMHyperparams,
     LMInfo,
     LMSolveAction,
     LMState,
@@ -386,6 +385,12 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             raise ValueError("min_damping must be positive and at most init_damping")
         if max_damping is not None and max_damping < init_damping:
             raise ValueError("max_damping must be at least init_damping")
+        if getattr(linear_solver, "form", "normal") == "gram":
+            raise ValueError(
+                "Cholesky(form='gram') factors the dual J~J~', which never "
+                "sees the ridge penalty rows; the ridge objective needs the "
+                "normal form"
+            )
         self.residual_fn = canonical_residual
         self.residual_arity = residual_arity
         self.metric = metric
@@ -492,56 +497,6 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         )
         self._static_hash = hash(self._static_key)
 
-    def hyperparams(self, dtype=None):
-        """``LMHyperparams`` built from the constructor values."""
-        iterative_tol = self.iterative_tol
-        if iterative_tol is None:
-            # CG's tol=None: the _ad_cg_tol dtype-default convention.
-            resolved = jnp.result_type(float) if dtype is None else dtype
-            iterative_tol = 1e-10 if jnp.finfo(resolved).bits > 32 else 1e-6
-        return LMHyperparams(
-            jnp.asarray(self.damping_decrease, dtype=dtype),
-            jnp.asarray(self.damping_increase, dtype=dtype),
-            _damping_floor(self.min_damping, dtype),
-            None
-            if self.max_damping is None
-            else jnp.asarray(self.max_damping, dtype=dtype),
-            jnp.asarray(self.geodesic_acceptance_ratio, dtype=dtype),
-            jnp.asarray(iterative_tol, dtype=dtype),
-            jnp.asarray(self.iterative_atol, dtype=dtype),
-            None
-            if self.iterative_maxiter is None
-            else jnp.asarray(self.iterative_maxiter, dtype=jnp.int32),
-        )
-
-    def _block_sizes(self, theta_size):
-        # The free-block size is inferred from the flattened iterate: the
-        # metric covers the leading metric.size coordinates, the rest is free.
-        n_f = theta_size - self.metric.size
-        if n_f < 0:
-            raise ValueError(
-                f"the metric covers {self.metric.size} leading coordinates "
-                f"but x flattens to only {theta_size}; the free block is "
-                "len(x) - metric.size and must be nonnegative"
-            )
-        return self.metric.size, n_f
-
-    # The solver-internal identity extension F_bar = blockdiag(F, I_{n_f}):
-    # the metric's factor op on the metric block, passthrough on the free
-    # block. Applied to vectors or leading-axis-batched matrices; F_bar
-    # itself is never materialized.
-    def _extended_solve(self, v, ctx):
-        n_m = self.metric.size
-        return jnp.concatenate(
-            [self.metric.factor_solve(v[:n_m], ctx), v[n_m:]], axis=0
-        )
-
-    def _extended_solve_transpose(self, v, ctx):
-        n_m = self.metric.size
-        return jnp.concatenate(
-            [self.metric.factor_solve_transpose(v[:n_m], ctx), v[n_m:]], axis=0
-        )
-
     def _resolve_ridge(self, dtype):
         if self.ridge is None:
             return jnp.asarray(jnp.sqrt(jnp.finfo(dtype).eps), dtype=dtype)
@@ -586,59 +541,8 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             Jt=jnp.zeros((p_dim, m), dtype=dtype),
             jacobian_valid=jnp.asarray(False, dtype=jnp.bool_),
             aux=jax.tree.map(jnp.zeros_like, aux),
-            solver_cache=self.linear_solver.new_cache(m, p_dim, n_m, dtype),
+            solver_cache=self.linear_solver.new_cache(m, p_dim, n_m, dtype, True),
             **hooks,
-        )
-
-    def _hook_state(self, theta, lm_state, args, p):
-        """The metric's and preconditioner's prepared state for this step:
-        reused while still valid (a rejected step left ``x`` in place, or the
-        hook declined to rebuild), rebuilt from the live iterate otherwise."""
-        bare = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
-        metric_state = precond_state = None
-        if self._metric_prepares:
-            metric_state = jax.lax.cond(
-                lm_state.metric_valid | ~jnp.asarray(self.metric.rebuild(bare)),
-                lambda _: lm_state.metric_state,
-                lambda _: self.metric.prepare(theta, bare),
-                operand=None,
-            )
-        if self._precond_prepares:
-            precond_state = jax.lax.cond(
-                lm_state.precond_valid
-                | ~jnp.asarray(self.preconditioner.rebuild(bare)),
-                lambda _: lm_state.precond,
-                lambda _: self.preconditioner.prepare(theta, bare),
-                operand=None,
-            )
-        return metric_state, precond_state
-
-    def _carried_ctx(self, theta, lm_state, args, p):
-        return SolverContext(
-            x=theta,
-            lm_state=lm_state,
-            args=args,
-            p=p,
-            metric_state=lm_state.metric_state,
-            preconditioner_state=lm_state.precond,
-        )
-
-    def _frozen_ctx(self, theta, lm_state, args, p, preconditioner):
-        # Under implicit AD the hooks are FROZEN at the returned solution:
-        # prepare runs once there and the state-dependence is not
-        # differentiated, the same contract as a fixed metric closing over
-        # constants.
-        bare = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
-        metric_state = (
-            self.metric.prepare(theta, bare) if self._metric_prepares else None
-        )
-        precond_state = None
-        if preconditioner is not None and (
-            type(preconditioner).prepare is not Preconditioner.prepare
-        ):
-            precond_state = preconditioner.prepare(theta, bare)
-        return dataclasses.replace(
-            bare, metric_state=metric_state, preconditioner_state=precond_state
         )
 
     def _initial_info(self, x, lm_state, args, p):
@@ -820,7 +724,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
                 ]
 
             f_vv = jax.jvp(first_jvp, (theta,), (velocity,))[1]
-            acceleration_sub = step_solver.solve(step_solver.accel_rhs(f_vv))
+            acceleration_sub = step_solver.correction(f_vv)
             acceleration = jnp.asarray(
                 self._extended_solve(acceleration_sub, ctx), dtype=resid.dtype
             )
@@ -1094,20 +998,6 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         if self._resolved_ad_solver() == "cholesky":
             return self._ad_tangent_cholesky(x, args, p, p_dot, ridge, lm_state)
         return self._ad_tangent_normal_cg(x, args, p, p_dot, ridge, lm_state)
-
-    def _ad_linearization(self, x, args, p, p_dot):
-        theta, unravel = ravel_pytree(x)
-
-        def residual_from_theta(theta_value):
-            return self._residual_and_aux(unravel(theta_value), args, p)[0]
-
-        residual, theta_jvp = jax.linearize(residual_from_theta, theta)
-
-        def residual_from_p(p_value):
-            return self._residual_and_aux(x, args, p_value)[0]
-
-        residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
-        return theta, unravel, residual, theta_jvp, residual_p_dot
 
     def _ad_tangent_cholesky(self, x, args, p, p_dot, ridge, lm_state):
         # The GN implicit rule posed on the whitened variable y = F_bar x:

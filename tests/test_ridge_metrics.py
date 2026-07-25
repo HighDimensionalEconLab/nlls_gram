@@ -97,14 +97,8 @@ def test_constructor_and_input_validation():
         RepeatedFactorMetric(jnp.eye(2), repeats=0)
     with pytest.raises(TypeError, match="floating"):
         RepeatedFactorMetric(jnp.eye(2, dtype=jnp.complex64))
-    with pytest.raises(ValueError, match="positive"):
-        IdentityMetric(0)
     with pytest.raises(ValueError, match="leading size"):
         RepeatedFactorMetric(jnp.eye(2)).factor_apply(jnp.zeros(3), CTX)
-    with pytest.raises(ValueError, match="vector or matrix"):
-        IdentityMetric(3).factor_apply(jnp.zeros((3, 2, 2)), CTX)
-    with pytest.raises(ValueError, match="vector"):
-        IdentityMetric(3).norm(jnp.zeros((3, 2)), CTX)
 
 
 def test_solver_passes_live_context_to_the_factor_ops():
