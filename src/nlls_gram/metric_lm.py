@@ -119,7 +119,6 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         self.residual_fn = canonical_residual
         self.residual_arity = residual_arity
         self.metric = _EuclideanMetric() if metric is None else metric
-        self.ridge = None
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
@@ -128,6 +127,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         self.linear_solver = linear_solver
         self.jacobian_mode = jacobian_mode
         self.ad_solver = ad_solver
+        self._validate_configuration(linear_solver, ad_solver, penalized=False)
         krylov = isinstance(linear_solver, (CG, GramCG))
         if krylov:
             self.preconditioner = linear_solver.preconditioner
@@ -198,16 +198,6 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         )
         self._static_hash = hash(self._static_key)
 
-    def _block_sizes(self, theta_size):
-        # The Euclidean default has size 0, so the whole vector is free block.
-        n_m = self.metric.size
-        if n_m > theta_size:
-            raise ValueError(
-                f"the metric covers {n_m} leading coordinates but x flattens "
-                f"to only {theta_size}"
-            )
-        return n_m, theta_size - n_m
-
     def init(self, x0, args=None, *, p=None):
         """Build the initial :class:`~nlls_gram.LMState` at ``x0``.
 
@@ -222,15 +212,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         dtype = residual.dtype
         min_damping = _damping_floor(self.min_damping, dtype)
         damping = jnp.maximum(jnp.asarray(self.init_damping, dtype=dtype), min_damping)
-        hooks = {}
-        ctx = SolverContext(x=theta, args=args, p=p)
-        valid = jnp.asarray(True, dtype=jnp.bool_)
-        if self._metric_prepares:
-            hooks["metric_state"] = self.metric.prepare(theta, ctx)
-            hooks["metric_valid"] = valid
-        if self._precond_prepares:
-            hooks["precond"] = self.preconditioner.prepare(theta, ctx)
-            hooks["precond_valid"] = valid
+        hooks = self._init_hook_state(theta, LMState(damping), args, p)
         if not self.cache_jacobian:
             return LMState(damping, **hooks)
         return LMState(
@@ -485,19 +467,6 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             hyper=_cast_hyper(lm_state.hyper, dtype),
         )
 
-    def _cold_state(self, lm_state):
-        # Drawn multi-start lanes must not reuse caches or hook state built at
-        # another (x, args); damping and hyper stay inherited.
-        updates = {}
-        for flag in ("jacobian_valid", "metric_valid", "precond_valid"):
-            if getattr(lm_state, flag) is not None:
-                updates[flag] = jnp.zeros_like(getattr(lm_state, flag))
-        if lm_state.solver_cache is not None:
-            updates["solver_cache"] = jax.tree.map(
-                jnp.zeros_like, lm_state.solver_cache
-            )
-        return dataclasses.replace(lm_state, **updates) if updates else lm_state
-
     def _ranking_objective(self, result, p, callback):
         # Without a callback info.loss already reports the objective at the
         # retained iterate; a callback can replace x/args after the last
@@ -639,14 +608,14 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             def apply_M(v):
                 return self.ad_solver_preconditioner.apply(v, zero_damping, ctx)
 
-        def cg(matvec, rhs):
+        def cg(matvec, rhs, preconditioner=apply_M):
             solution, _ = jsp_sparse_linalg.cg(
                 matvec,
                 rhs,
                 tol=self._ad_cg_tol(dtype),
                 atol=jnp.asarray(self.ad_solver_atol, dtype=dtype),
                 maxiter=self.ad_solver_maxiter,
-                M=apply_M,
+                M=preconditioner,
             )
             return solution
 
@@ -689,7 +658,12 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
                 return Bt(dual_solve(dual_solve(B(c))))
 
             def dual_solve(y):
-                return cg(lambda w: B(Bt(w)), y)
+                # UNPRECONDITIONED: this solve is posed on residual-space
+                # m-vectors, while self.ad_solver_preconditioner is the
+                # parameter-space one CG's own operator takes. Handing it an
+                # m-vector is a shape error at best and a wrong tangent at
+                # worst.
+                return cg(lambda w: B(Bt(w)), y, preconditioner=None)
 
         rhs = -Bt(residual_p_dot)
         return jax.lax.custom_linear_solve(

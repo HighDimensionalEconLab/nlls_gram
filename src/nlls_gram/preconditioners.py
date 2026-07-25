@@ -1,16 +1,13 @@
-"""Preconditioner types and helpers for the package's Krylov paths.
+"""Preconditioners for the Krylov configs of both solvers.
 
-:class:`Preconditioner` (with :class:`IdentityPreconditioner`) is the typed
-hook of :class:`~nlls_gram.RidgeLevenbergMarquardt`'s ``CG`` config: an SPD
-approximation of the damped whitened normal inverse, receiving the live
-solver state through a :class:`~nlls_gram.SolverContext`.
+``apply(v, damping, ctx)`` returns an SPD approximation of the damped
+operator's inverse. Which space ``v`` lives in is named by the config that
+consumes it: :class:`~nlls_gram.CG` is parameter space,
+:class:`~nlls_gram.GramCG` residual space.
 
-The remaining helpers serve ``LevenbergMarquardt``'s string-named solver
-menu: a ``dual_preconditioner(v, damping)`` callback supplies an
-approximation of ``(J M^{-1} J' + damping I)^{-1} v`` on residual-space
-vectors for ``linear_solver="gram_cg"``. Unlike ``metric.solve`` -- which
-defines the converged root and must stay exact -- a preconditioner never
-changes the subproblem being solved, so approximations are safe.
+Unlike a :class:`~nlls_gram.Metric` -- which defines the converged root and
+must stay exact -- a preconditioner only changes the CG iteration path, so
+approximations and staleness are safe.
 """
 
 from dataclasses import dataclass, field
@@ -24,20 +21,18 @@ import jax.scipy.linalg as jsp_linalg
 class Preconditioner:
     """SPD preconditioner for ``RidgeLevenbergMarquardt``'s CG paths.
 
-    ``apply(v, damping, ctx)`` returns an SPD approximation of
-    ``(J~'J~ + ridge E + damping I)^{-1} v`` on whitened parameter-space
-    vectors. In the forward role (``linear_solver=CG(...)``) it sits in CG's
-    ``M`` slot with the live damping; in the AD role (``ad_solver=CG(...)``)
-    the implicit-AD system is undamped and ``damping`` is zero. ``ctx`` is
-    the same :class:`~nlls_gram.SolverContext` the metric factor ops receive
-    (the flat iterate, the live ``LMState``, ``args``, ``p``), so a
-    preconditioner can key off the solver state. A preconditioner changes
-    the CG iteration path, never the subproblem being solved, so
-    approximations are safe.
+    ``apply(v, damping, ctx)`` returns an SPD approximation of the damped
+    operator's inverse -- ``(J~'J~ + ridge E + damping I)^{-1}`` in parameter
+    space under :class:`~nlls_gram.CG`, ``(J~J~' + damping I)^{-1}`` in
+    residual space under :class:`~nlls_gram.GramCG`. In the forward role it
+    sits in CG's ``M`` slot with the live damping; in the ``ad_solver`` role
+    the implicit system is undamped and ``damping`` is zero. ``ctx`` is the
+    same :class:`~nlls_gram.SolverContext` the metric factor ops receive, so a
+    preconditioner can key off the solver state.
 
-    Implement a custom preconditioner as a small dataclass (``eq=False``
-    identity hashing when it holds arrays -- construct once at setup scope
-    and reuse, since the instance enters the solver's compile-cache key)::
+    Implement a custom one as a small dataclass (``eq=False`` identity hashing
+    when it holds arrays -- construct once at setup scope and reuse, since the
+    instance enters the solver's compile-cache key)::
 
         @dataclass(frozen=True, eq=False)
         class JacobiPreconditioner(Preconditioner):
@@ -145,7 +140,14 @@ class BlockEigenPreconditioner(Preconditioner):
 
     def apply(self, v, damping, ctx):
         state = ctx.preconditioner_state
-        ridge = jnp.asarray(ctx.lm_state.ridge, dtype=v.dtype)
+        # LevenbergMarquardt carries no ridge, so its metric-block families
+        # shift by the damping alone.
+        carried = ctx.lm_state.ridge
+        ridge = (
+            jnp.zeros((), v.dtype)
+            if carried is None
+            else jnp.asarray(carried, dtype=v.dtype)
+        )
         permuted = v[state["permutation"]]
         pieces = []
         offset = 0

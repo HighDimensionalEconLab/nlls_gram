@@ -7,6 +7,8 @@ multi-start) are covered once, in test_ridge_solve_features.py and
 test_multi_start.py.
 """
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -207,28 +209,36 @@ def test_geodesic_correction_matches_its_closed_form(name):
     )
 
 
-def test_rejected_step_leaves_x_and_reuses_the_cached_jacobian():
-    calls = []
-
-    def counting_residual(x):
-        calls.append(None)
-        return quadratic_residual(x)
-
-    # A tiny max_damping forces the first step to overshoot and be rejected.
+def test_rejected_step_leaves_x_and_marks_the_cache_reusable():
+    # A wildly overshooting Gauss-Newton step from tiny damping on a curved
+    # residual: the trial point is worse, so the step is rejected, x is
+    # unchanged, and the Jacobian cache is marked valid for the retry.
     solver = LevenbergMarquardt(
-        counting_residual, init_damping=1e-8, geodesic_acceleration=False
+        lambda x: jnp.array([jnp.exp(x[0]) - 1.0, x[1]]),
+        init_damping=1e-10,
+        geodesic_acceleration=False,
     )
-    x0 = jnp.asarray([8.0, 8.0], jnp.float32)
+    x0 = jnp.asarray([-6.0, 0.0], jnp.float32)
     state = solver.init(x0)
-    x1, state1, info1 = solver.update(x0, state)
-    if bool(info1.accepted):
-        pytest.skip("fixture no longer produces a rejected first step")
+    x1, state1, info = solver.update(x0, state)
+    assert not bool(info.accepted)
     np.testing.assert_array_equal(np.asarray(x1), np.asarray(x0))
     assert bool(state1.jacobian_valid)
-    before = len(calls)
-    solver.update(x1, state1)
-    # The reused cache costs one trial evaluation, not a fresh linearization.
-    assert len(calls) - before <= 2
+    # The retry reuses that cache and reaches the same place as a solver told
+    # to recompute, so reuse is an optimization and not a semantic change.
+    fresh = LevenbergMarquardt(
+        lambda x: jnp.array([jnp.exp(x[0]) - 1.0, x[1]]),
+        init_damping=1e-10,
+        geodesic_acceleration=False,
+        cache_jacobian=False,
+    )
+    cached_next = solver.update(x1, state1)[0]
+    fresh_next = fresh.update(
+        x1, dataclasses.replace(fresh.init(x0), damping=state1.damping)
+    )[0]
+    np.testing.assert_allclose(
+        np.asarray(cached_next), np.asarray(fresh_next), rtol=1e-6, atol=1e-7
+    )
 
 
 def test_solve_and_manual_update_loop_agree():
@@ -372,6 +382,17 @@ def test_padded_zero_residual_matches_the_unpadded_solve():
     np.testing.assert_allclose(
         np.asarray(padded_result.x), np.asarray(unpadded.x), rtol=2e-3, atol=2e-4
     )
+    # The point of SVD() here is the TANGENT: padding makes the undamped dual
+    # singular, and the spectral filter recovers the unpadded tangent anyway.
+    p_dot = {"b": jnp.asarray(RNG.normal(size=M), jnp.float32)}
+    padded_solver = LevenbergMarquardt(padded, ad_solver=SVD(), min_damping=1e-12)
+    tangent = jax.jvp(
+        lambda pv: padded_solver.solve(jnp.zeros(N), p=pv, max_steps=200, atol=1e-6).x,
+        (p,),
+        (p_dot,),
+    )[1]
+    expected = min_norm_solution(np.eye(N), np.asarray(p_dot["b"], np.float64))
+    np.testing.assert_allclose(np.asarray(tangent), expected, rtol=2e-3, atol=2e-4)
 
 
 def test_has_aux_reports_pre_step_aux_and_a_final_value():
@@ -388,7 +409,8 @@ def test_has_aux_reports_pre_step_aux_and_a_final_value():
     )
 
 
-def test_equal_configs_share_one_compilation():
+def test_solver_identity_is_value_based():
+    # The jitted loop keys on this; test_compilation.py checks what it buys.
     def build():
         return LevenbergMarquardt(
             linear_residual, linear_solver=Cholesky(), init_damping=1e-3
@@ -396,3 +418,43 @@ def test_equal_configs_share_one_compilation():
 
     assert build() == build() and hash(build()) == hash(build())
     assert build() != LevenbergMarquardt(linear_residual, linear_solver=QR())
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        (dict(linear_solver=SVD()), "linear_solver"),
+        (dict(ad_solver=QR()), "ad_solver"),
+    ],
+)
+def test_a_config_in_a_role_it_cannot_fill_is_rejected(kwargs, message):
+    # Without this the combination silently resolves to a DIFFERENT algorithm.
+    with pytest.raises(ValueError, match=message):
+        LevenbergMarquardt(linear_residual, **kwargs)
+
+
+def test_free_scale_changes_the_step_and_its_tangent():
+    # free_scale is the free block's damping weight, so it must move both the
+    # forward step and the implicit tangent -- not be quietly ignored.
+    def residual(x, args, p):
+        return A @ x - p["b"]
+
+    p = {"b": B}
+    p_dot = {"b": jnp.asarray(RNG.normal(size=M), jnp.float32)}
+    solutions, tangents = [], []
+    for free_scale in (1.0, 100.0):
+        metric = RepeatedFactorMetric(
+            jnp.linalg.cholesky(jnp.asarray(W_NP[:4, :4], jnp.float32), upper=True),
+            free_scale=free_scale,
+        )
+        solver = LevenbergMarquardt(residual, metric=metric, min_damping=1e-12)
+        run = lambda pv: (
+            solver.solve(  # noqa: B023
+                jnp.zeros(N), p=pv, max_steps=200, atol=1e-6
+            ).x
+        )
+        solutions.append(np.asarray(run(p)))
+        tangents.append(np.asarray(jax.jvp(run, (p,), (p_dot,))[1]))
+    # A heavier free block is pulled toward zero relative to the metric block.
+    assert np.linalg.norm(solutions[1][4:]) < np.linalg.norm(solutions[0][4:])
+    assert np.linalg.norm(tangents[1] - tangents[0]) > 1e-3

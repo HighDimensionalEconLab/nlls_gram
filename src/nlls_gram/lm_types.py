@@ -159,7 +159,6 @@ class LMState:
         metric_valid: ``()`` bool, ``jacobian_valid`` reuse semantics.
         precond: the preconditioner's ``prepare`` output at the current ``x``.
         precond_valid: ``()`` bool, ``jacobian_valid`` reuse semantics.
-        recycle: Krylov recycling state.
     """
 
     damping: jax.Array
@@ -174,7 +173,6 @@ class LMState:
     metric_valid: jax.Array | None = None
     precond: Any = None
     precond_valid: jax.Array | None = None
-    recycle: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -192,11 +190,12 @@ class LMInfo:
     ``RidgeLevenbergMarquardt`` -- ridge code that means equation error must
     read ``resid_loss``.
 
-    The ridge solver runs in the whitened variable ``y = F_bar x``, so its
+    BOTH solvers run in the whitened variable ``y = F_bar x``, so
     ``grad_norm``, ``step_norm``, and ``penalty_grad_norm`` are Euclidean in
     ``y``: steps measured in the W-norm, gradients in the dual W^{-1}-norm.
-    Objective values are unaffected -- whitening is a linear bijection of the
-    same objective.
+    With the default Euclidean metric they are the plain quantities. Objective
+    values are unaffected -- whitening is a linear bijection of the same
+    objective.
 
     Attributes:
         loss: objective at the retained iterate, ``min(loss_old,
@@ -209,9 +208,9 @@ class LMInfo:
         used_geodesic: ``()`` bool, whether the geodesic correction entered the
             accepted step.
         acceleration_ratio: ``()`` acceleration-to-velocity norm ratio.
-        grad_norm: ``()`` stationarity residual at the pre-step ``x``:
-            ``||J' r||`` for the metric solver, and the whitened
-            ``||F_bar^{-T} J'r + ridge [y_m; 0]||`` for the ridge solver.
+        grad_norm: ``()`` whitened stationarity residual at the pre-step
+            ``x``: ``||F_bar^{-T} J'r||``, plus ``ridge [y_m; 0]`` for the
+            ridge solver.
         step_norm: ``()`` norm of the candidate step, reported even when the
             step is rejected.
         ridge: ``()`` the ridge weight used this step (ridge solver only).

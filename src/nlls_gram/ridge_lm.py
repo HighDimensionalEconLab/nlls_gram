@@ -13,7 +13,8 @@ algorithmic implicit bias, and the per-accepted-step annealed limit is the
 iteratively regularized Gauss-Newton method (Bakushinskii 1992;
 Blaschke-Neubauer-Scherzer 1997; Kaltenbacher-Neubauer-Scherzer 2008).
 Numerically the solver runs entirely in the whitened variable
-``y = F_bar x`` (``W = F'F``, ``F_bar = blockdiag(F, I)``): stock Euclidean
+``y = F_bar x`` (``W = F'F``, ``F_bar = blockdiag(F, sqrt(free_scale) I)``):
+stock Euclidean
 LM on the augmented residual ``[r; sqrt(ridge) y_m]`` (Marquardt 1963; More
 1978) with geodesic acceleration (Transtrum-Sethna 2012); the ``qr`` path
 uses corrected semi-normal equations (Bjorck 1987; Bjorck 1996 Sec. 6.6.5).
@@ -417,12 +418,6 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             raise ValueError("min_damping must be positive and at most init_damping")
         if max_damping is not None and max_damping < init_damping:
             raise ValueError("max_damping must be at least init_damping")
-        if getattr(linear_solver, "form", "normal") == "gram":
-            raise ValueError(
-                "Cholesky(form='gram') factors the dual J~J~', which never "
-                "sees the ridge penalty rows; the ridge objective needs the "
-                "normal form"
-            )
         self.residual_fn = canonical_residual
         self.residual_arity = residual_arity
         self.metric = metric
@@ -435,6 +430,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         self.linear_solver = linear_solver
         self.jacobian_mode = jacobian_mode
         self.ad_solver = ad_solver
+        self._validate_configuration(linear_solver, ad_solver, penalized=True)
         # The configs' numeric fields fold into the traced LMHyperparams carry
         # at init exactly as the flat constructor args used to; the config
         # instances themselves sit in the value-based static key, so
@@ -551,17 +547,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         min_damping = _damping_floor(self.min_damping, dtype)
         damping = jnp.maximum(jnp.asarray(self.init_damping, dtype=dtype), min_damping)
         ridge = self._resolve_ridge(dtype)
-        # Hook state is built at x0 and VALID there, so the first update
-        # reuses it; the flags stay None when the hooks are stateless.
-        hooks = {}
-        ctx = SolverContext(x=theta, args=args, p=p)
-        valid = jnp.asarray(True, dtype=jnp.bool_)
-        if self._metric_prepares:
-            hooks["metric_state"] = self.metric.prepare(theta, ctx)
-            hooks["metric_valid"] = valid
-        if self._precond_prepares:
-            hooks["precond"] = self.preconditioner.prepare(theta, ctx)
-            hooks["precond_valid"] = valid
+        hooks = self._init_hook_state(theta, LMState(damping, ridge), args, p)
         if not self.cache_jacobian:
             return LMState(damping, ridge, **hooks)
         p_dim = theta.size
@@ -963,27 +949,6 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             updates["solver_cache"] = dataclasses.replace(
                 cache, ridge=jnp.asarray(cache.ridge, dtype=dtype)
             )
-        return dataclasses.replace(lm_state, **updates)
-
-    def _cold_state(self, lm_state):
-        # Drawn multi-start lanes must not reuse caches built at another
-        # (x, args); damping, hyper, and ridge stay inherited from the
-        # caller's initial state (never reset to constructor defaults --
-        # parallel lane 0 uses the cold state while sequential attempt 0 uses
-        # the original, and ridge=None cannot be resolved without the
-        # residual dtype anyway).
-        updates = {}
-        if lm_state.jacobian_valid is not None:
-            updates["jacobian_valid"] = jnp.zeros_like(lm_state.jacobian_valid)
-        if lm_state.solver_cache is not None:
-            updates["solver_cache"] = jax.tree.map(
-                jnp.zeros_like, lm_state.solver_cache
-            )
-        for flag in ("metric_valid", "precond_valid"):
-            if getattr(lm_state, flag) is not None:
-                updates[flag] = jnp.zeros_like(getattr(lm_state, flag))
-        if not updates:
-            return lm_state
         return dataclasses.replace(lm_state, **updates)
 
     def _ranking_objective(self, result, p, callback):

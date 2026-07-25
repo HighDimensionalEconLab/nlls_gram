@@ -118,6 +118,13 @@ class Metric:
         return jnp.linalg.norm(self.factor_apply(v, ctx))
 
 
+def _check_free_scale(free_scale):
+    # F_bar = blockdiag(F, sqrt(free_scale) I), so a non-positive scale makes
+    # the whitening noninvertible or complex.
+    if free_scale <= 0:
+        raise ValueError("free_scale must be positive")
+
+
 def _check_leading_size(v, size):
     if v.shape[0] != size:
         raise ValueError(
@@ -136,6 +143,11 @@ class IdentityMetric(Metric):
 
     size: int
     free_scale: float = 1.0
+
+    def __post_init__(self):
+        if self.size < 0:
+            raise ValueError("size must be nonnegative")
+        _check_free_scale(self.free_scale)
 
     def factor_apply(self, v, ctx):
         _check_leading_size(v, self.size)
@@ -172,6 +184,7 @@ class CholeskyMetric(Metric):
         L = jnp.asarray(self.L)
         if L.ndim != 2 or L.shape[0] != L.shape[1] or L.shape[0] == 0:
             raise ValueError("L must be a nonempty square matrix")
+        _check_free_scale(self.free_scale)
         object.__setattr__(self, "L", L)
         object.__setattr__(self, "size", L.shape[0])
 
@@ -204,6 +217,7 @@ class DiagonalMetric(Metric):
         weights = jnp.asarray(self.weights)
         if weights.ndim != 1:
             raise ValueError("weights must be 1-D")
+        _check_free_scale(self.free_scale)
         object.__setattr__(self, "weights", weights)
         object.__setattr__(self, "size", weights.shape[0])
 
@@ -253,6 +267,7 @@ class RepeatedFactorMetric(Metric):
             raise TypeError("F must have a real floating-point dtype")
         if self.repeats < 1:
             raise ValueError("repeats must be a positive integer")
+        _check_free_scale(self.free_scale)
         object.__setattr__(self, "F", F.astype(dtype))
         object.__setattr__(self, "size", self.repeats * F.shape[0])
 

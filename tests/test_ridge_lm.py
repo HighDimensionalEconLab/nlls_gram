@@ -9,8 +9,10 @@ import pytest
 from nlls_gram import (
     CG,
     QR,
+    SVD,
     Cholesky,
     CholeskyCache,
+    GramCG,
     IdentityMetric,
     IdentityPreconditioner,
     LMState,
@@ -267,6 +269,17 @@ def test_constructor_and_state_validation():
     # An uncapped zero-tolerance CG loop has no stopping rule.
     with pytest.raises(ValueError, match="maxiter"):
         CG(IdentityPreconditioner(), tol=0.0)
+    # The dual operator never sees the penalty rows, so a Gram form would
+    # silently solve the UNPENALIZED subproblem.
+    for gram in (Cholesky(form="gram"), GramCG(IdentityPreconditioner(), maxiter=8)):
+        with pytest.raises(ValueError, match="penalty rows"):
+            RidgeLevenbergMarquardt(linear_residual, metric=metric, linear_solver=gram)
+    # QR has no AD rule (the implicit system is undamped, where its damping
+    # rows vanish); SVD has no forward rule.
+    with pytest.raises(ValueError, match="ad_solver"):
+        RidgeLevenbergMarquardt(linear_residual, metric=metric, ad_solver=QR())
+    with pytest.raises(ValueError, match="linear_solver"):
+        RidgeLevenbergMarquardt(linear_residual, metric=metric, linear_solver=SVD())
     # The metric must cover no more than the flattened iterate.
     small = RidgeLevenbergMarquardt(
         lambda theta: theta[:1], metric=IdentityMetric(3), ridge=1e-3

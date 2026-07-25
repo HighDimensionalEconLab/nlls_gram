@@ -223,7 +223,7 @@ def test_failed_pytree_tangent_and_cotangent_are_zero():
 
     solver = LevenbergMarquardt(
         residual,
-        ad_solver="svd",
+        ad_solver=SVD(),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )

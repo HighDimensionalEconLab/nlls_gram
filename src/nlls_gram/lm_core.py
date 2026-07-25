@@ -55,6 +55,57 @@ class LevenbergMarquardtBase:
     def __hash__(self):
         return self._static_hash
 
+    def _validate_configuration(self, linear_solver, ad_solver, penalized):
+        """Reject a config in a role it cannot fill, at construction.
+
+        Without this an unsupported combination resolves to a DIFFERENT
+        algorithm -- ``ad_solver=QR()`` quietly running dense Cholesky, or the
+        ridge solver handing its penalized subproblem to a dual form that
+        never sees the penalty rows.
+        """
+        role = [(linear_solver, "linear_solver", "supports_forward")]
+        if ad_solver is not None:
+            role.append((ad_solver, "ad_solver", "supports_ad"))
+        for config, keyword, attribute in role:
+            if not getattr(config, attribute):
+                raise ValueError(
+                    f"{config!r} cannot serve as {keyword}: it does not "
+                    f"implement that role"
+                )
+            if penalized and not config.supports_penalty:
+                raise ValueError(
+                    f"{config!r} cannot serve as {keyword} for the ridge "
+                    "objective: its operator never sees the penalty rows"
+                )
+        if self.jacobian_mode not in ("auto", "fwd", "rev"):
+            raise ValueError(f"unknown jacobian_mode: {self.jacobian_mode}")
+
+    def _block_sizes(self, theta_size):
+        # The free-block size is inferred from the flattened iterate: the
+        # metric covers the leading metric.size coordinates, the rest is free.
+        n_m = self.metric.size
+        if n_m > theta_size:
+            raise ValueError(
+                f"the metric covers {n_m} leading coordinates but x flattens "
+                f"to only {theta_size}; the free block is len(x) - metric.size "
+                "and must be nonnegative"
+            )
+        return n_m, theta_size - n_m
+
+    def _cold_state(self, lm_state):
+        # Drawn multi-start lanes must not reuse caches or hook state built at
+        # another (x, args); damping, ridge, and hyper stay inherited from the
+        # caller's initial state.
+        updates = {}
+        for flag in ("jacobian_valid", "metric_valid", "precond_valid"):
+            if getattr(lm_state, flag) is not None:
+                updates[flag] = jnp.zeros_like(getattr(lm_state, flag))
+        if lm_state.solver_cache is not None:
+            updates["solver_cache"] = jax.tree.map(
+                jnp.zeros_like, lm_state.solver_cache
+            )
+        return dataclasses.replace(lm_state, **updates) if updates else lm_state
+
     def _resolve_jacobian_mode(self, m, n):
         # "auto" vmaps the identity basis of the SMALL side: n forward-mode
         # columns when the system is tall or square (n <= m), m reverse-mode
@@ -165,6 +216,21 @@ class LevenbergMarquardtBase:
             ],
             axis=0,
         )
+
+    def _init_hook_state(self, theta, lm_state, args, p):
+        """The metric's and preconditioner's state at ``x0``, valid there, so
+        the first update reuses it. The flags stay absent when the hooks are
+        stateless."""
+        ctx = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
+        valid = jnp.asarray(True, dtype=jnp.bool_)
+        hooks = {}
+        if self._metric_prepares:
+            hooks["metric_state"] = self.metric.prepare(theta, ctx)
+            hooks["metric_valid"] = valid
+        if self._precond_prepares:
+            hooks["precond"] = self.preconditioner.prepare(theta, ctx)
+            hooks["precond_valid"] = valid
+        return hooks
 
     def _hook_state(self, theta, lm_state, args, p):
         """The metric's and preconditioner's prepared state for this step:

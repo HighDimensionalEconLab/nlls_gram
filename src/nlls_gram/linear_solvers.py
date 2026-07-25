@@ -179,10 +179,25 @@ class StepSolver(NamedTuple):
 
 
 class LinearSolver:
-    """Base class for the typed configs. ``materializes_jacobian`` drives the
-    dense ``J'`` assembly and its reject-step reuse."""
+    """Base class for the typed configs.
+
+    The class attributes declare which roles a config can fill, so an
+    unsupported combination is rejected at construction rather than silently
+    resolving to a different algorithm:
+
+    - ``materializes_jacobian`` drives the dense ``J'`` assembly and its
+      reject-step reuse;
+    - ``supports_forward`` / ``supports_ad``: the ``linear_solver`` and
+      ``ad_solver`` roles;
+    - ``supports_penalty``: whether the config can carry
+      :class:`~nlls_gram.RidgeLevenbergMarquardt`'s penalty rows. The dual
+      operator never sees them, so the Gram forms cannot.
+    """
 
     materializes_jacobian = True
+    supports_forward = True
+    supports_ad = True
+    supports_penalty = True
 
     def new_cache(self, m, n, n_m, dtype, penalized):
         """The reject-step cache pytree at ``init``, or ``None``."""
@@ -213,6 +228,17 @@ class Cholesky(LinearSolver):
     """
 
     form: str = "auto"
+
+    def __post_init__(self):
+        if self.form not in ("auto", "gram", "normal"):
+            raise ValueError(
+                f"Cholesky.form must be 'auto', 'gram', or 'normal'; got {self.form!r}"
+            )
+
+    @property
+    def supports_penalty(self):
+        # form="auto" resolves to normal under a penalized subproblem.
+        return self.form != "gram"
 
     def _resolved_form(self, m, n, penalized):
         # The ridge solver's penalty rows have no dual analogue -- the dual
@@ -292,7 +318,13 @@ class QR(LinearSolver):
     damping rows, and those rows keep the system full rank for any
     ``damping > 0``, so a rank-deficient Jacobian is handled rather than
     producing a non-finite step. No knobs.
+
+    Forward only: the implicit-AD system is undamped, so the damping rows that
+    make this path well posed vanish there. Use ``SVD()`` for a rank-deficient
+    tangent.
     """
+
+    supports_ad = False
 
     def new_cache(self, m, n, n_m, dtype, penalized):
         rows = min(m + n_m, n + 1) if penalized else min(m, n + 1)
@@ -489,10 +521,11 @@ class GramCG(_KrylovConfig):
     ``preconditioner`` acts on residual-space vectors -- an SPD approximation
     of ``(J~J~' + damping I)^{-1}`` -- which is the only difference from
     :class:`CG`'s contract, and the reason the two are separate configs rather
-    than one with a flag. Only the ridge solver has penalty rows, and they
-    have no dual analogue, so this config serves
-    :class:`~nlls_gram.LevenbergMarquardt` alone.
+    than one with a flag. The ridge penalty rows have no dual analogue, so
+    this config serves :class:`~nlls_gram.LevenbergMarquardt` alone.
     """
+
+    supports_penalty = False
 
     preconditioner: Preconditioner
     tol: float | None = None
@@ -542,6 +575,9 @@ class SVD(LinearSolver):
     rather than a NaN or a silent pseudo-solve. It assembles, so it is the
     dense fallback rather than the default.
     """
+
+    supports_forward = False
+    supports_penalty = False
 
     def prepare(self, sub):
         raise NotImplementedError("SVD is an ad_solver, not a forward solver")
