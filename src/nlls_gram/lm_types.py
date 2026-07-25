@@ -111,6 +111,16 @@ def _damping_floor(min_damping, dtype):
 def _cast_hyper(hyper, dtype):
     if hyper is None:
         return None
+    # NaN is the "resolve me against the problem dtype" sentinel for CG's
+    # tol=None: solve() builds the hyperparameters before it has seen a
+    # residual, and 1e-10 is unreachable in float32, so an unresolved default
+    # would burn the full CG budget every inner solve.
+    iterative_tol = jnp.asarray(hyper.iterative_tol, dtype=dtype)
+    iterative_tol = jnp.where(
+        jnp.isnan(iterative_tol),
+        jnp.asarray(1e-10 if jnp.finfo(dtype).bits > 32 else 1e-6, dtype=dtype),
+        iterative_tol,
+    )
     return LMHyperparams(
         jnp.asarray(hyper.damping_decrease, dtype=dtype),
         jnp.asarray(hyper.damping_increase, dtype=dtype),
@@ -119,7 +129,7 @@ def _cast_hyper(hyper, dtype):
         if hyper.max_damping is None
         else jnp.asarray(hyper.max_damping, dtype=dtype),
         jnp.asarray(hyper.geodesic_acceptance_ratio, dtype=dtype),
-        jnp.asarray(hyper.iterative_tol, dtype=dtype),
+        iterative_tol,
         jnp.asarray(hyper.iterative_atol, dtype=dtype),
         None
         if hyper.iterative_maxiter is None

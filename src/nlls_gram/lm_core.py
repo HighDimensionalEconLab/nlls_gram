@@ -154,9 +154,14 @@ class LevenbergMarquardtBase:
         """``LMHyperparams`` built from the constructor values."""
         iterative_tol = self.iterative_tol
         if iterative_tol is None:
-            # CG's tol=None: the _ad_cg_tol dtype-default convention.
-            resolved = jnp.result_type(float) if dtype is None else dtype
-            iterative_tol = 1e-10 if jnp.finfo(resolved).bits > 32 else 1e-6
+            # NaN marks "resolve against the problem dtype"; _cast_hyper does
+            # it once the residual dtype is known. Resolving here would bake in
+            # the JAX default float, which is wrong for a float32 problem under
+            # enabled x64.
+            if dtype is None:
+                iterative_tol = jnp.nan
+            else:
+                iterative_tol = 1e-10 if jnp.finfo(dtype).bits > 32 else 1e-6
         return LMHyperparams(
             jnp.asarray(self.damping_decrease, dtype=dtype),
             jnp.asarray(self.damping_increase, dtype=dtype),
@@ -354,10 +359,18 @@ class LevenbergMarquardtBase:
         if action.user_state is not None:
             user_state = action.user_state
         problem_changed = xargs_changed | state_changed
-        if self.cache_jacobian and (action.x is not None or action.args is not None):
-            lm_state = dataclasses.replace(
-                lm_state, jacobian_valid=lm_state.jacobian_valid & ~xargs_changed
-            )
+        if action.x is not None or action.args is not None:
+            # Everything prepared at the pre-action (x, args) is stale once
+            # either moves. The metric matters most: it DEFINES the subproblem,
+            # so reusing a factor built at the old iterate would silently solve
+            # a different problem in a different geometry.
+            stale = {}
+            for flag in ("jacobian_valid", "metric_valid", "precond_valid"):
+                carried = getattr(lm_state, flag)
+                if carried is not None:
+                    stale[flag] = carried & ~xargs_changed
+            if stale:
+                lm_state = dataclasses.replace(lm_state, **stale)
         touched = (
             action.x is not None
             or action.args is not None
@@ -437,6 +450,16 @@ class LevenbergMarquardtBase:
         tangents for ``result.x`` and ``result.aux``, with the failed lane's
         linear tangent program evaluated at differentiation-inert copies of the
         original ``(x0, args, p)``.
+
+        ONLY ``result.x``, ``result.aux``, and ``result.p`` carry tangents.
+        Everything else -- ``info`` (including ``info.loss``), ``lm_state``,
+        ``steps``, the histories, and the multi-start diagnostics -- is
+        differentiation-inert and gets EXACT ZERO, since damping, step norms,
+        and iteration counts are artifacts of the path rather than properties
+        of the root. Differentiating a loss therefore means recomputing it
+        from ``result.x``, not reading ``result.info.loss``::
+
+            jax.grad(lambda p: objective(solver.solve(x0, p=p).x, p))(p)
         """
         self._check_residual_args(args, p)
         if max_steps <= 0:
@@ -450,6 +473,7 @@ class LevenbergMarquardtBase:
         if not isinstance(xtol, jax.core.Tracer) and xtol < 0:
             raise ValueError("xtol must be nonnegative")
         self._validate_tolerances(atol, gtol, xtol)
+        callback = _hashable_hook(callback)
         lm_state = self._solve_lm_state(x0, args, p, lm_state)
         if lm_state.hyper is None:
             lm_state = dataclasses.replace(lm_state, hyper=self.hyperparams())

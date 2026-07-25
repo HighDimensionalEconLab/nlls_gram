@@ -46,10 +46,9 @@ class Metric:
     - ``factor_apply(v, ctx)``: ``F v``
     - ``factor_solve(v, ctx)``: ``F^{-1} v``
     - ``factor_solve_transpose(v, ctx)``: ``F^{-T} v``
-    - ``norm(v, ctx)``: ``||v||_W`` (vectors only; the base default is
-      ``||factor_apply(v)||_2`` and an override must match it to
-      floating-point accuracy, since the solver compares objective values
-      built from both forms)
+    - ``norm(v, ctx)``: ``||v||_W``, defaulted to ``||factor_apply(v)||_2``.
+      Provided for callers; the solvers measure in the whitened variable and
+      never call it.
 
     Every callback receives a :class:`~nlls_gram.SolverContext` carrying the
     solver's live state, so an exotic metric can key off the iterate;

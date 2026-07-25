@@ -448,11 +448,10 @@ def test_free_scale_changes_the_step_and_its_tangent():
             free_scale=free_scale,
         )
         solver = LevenbergMarquardt(residual, metric=metric, min_damping=1e-12)
-        run = lambda pv: (
-            solver.solve(  # noqa: B023
-                jnp.zeros(N), p=pv, max_steps=200, atol=1e-6
-            ).x
-        )
+
+        def run(pv, solver=solver):
+            return solver.solve(jnp.zeros(N), p=pv, max_steps=200, atol=1e-6).x
+
         solutions.append(np.asarray(run(p)))
         tangents.append(np.asarray(jax.jvp(run, (p,), (p_dot,))[1]))
     # A heavier free block is pulled toward zero relative to the metric block.

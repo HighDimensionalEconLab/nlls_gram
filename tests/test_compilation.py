@@ -18,14 +18,20 @@ import pytest
 from nlls_gram import (
     CG,
     QR,
+    BlockEigenPreconditioner,
     Cholesky,
     CholeskyMetric,
     DiagonalMetric,
     IdentityPreconditioner,
     LevenbergMarquardt,
+    MultiStart,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
     ridge_continuation,
+)
+from nlls_gram.multi_start import (
+    _multi_start_parallel_jit,
+    _multi_start_sequential_jit,
 )
 from nlls_gram.solve_loop import _solve_loop_jit
 
@@ -42,15 +48,22 @@ def make_p(scale=1.0):
     return {"b": scale * jnp.ones(M, jnp.float32)}
 
 
+JITTED = (_solve_loop_jit, _multi_start_sequential_jit, _multi_start_parallel_jit)
+
+
 @pytest.fixture(autouse=True)
 def fresh_cache():
-    _solve_loop_jit._clear_cache()
+    for jitted in JITTED:
+        jitted._clear_cache()
     yield
-    _solve_loop_jit._clear_cache()
+    for jitted in JITTED:
+        jitted._clear_cache()
 
 
 def compilations():
-    return _solve_loop_jit._cache_size()
+    # The multi-start drivers have their own caches, keyed on draw/accept and
+    # num_starts as well; counting only the plain loop would miss them.
+    return sum(jitted._cache_size() for jitted in JITTED)
 
 
 def test_equal_solvers_built_repeatedly_share_one_compilation():
@@ -192,3 +205,72 @@ def test_matrix_free_path_never_factorizes():
     assert "cholesky" not in jaxpr_text(
         CG(IdentityPreconditioner(), tol=1e-8, maxiter=16)
     )
+
+
+def draw_shifted(key, x, args):
+    return x + 0.1 * jax.random.normal(key, x.shape, x.dtype), args
+
+
+def test_multi_start_reuses_its_driver_compilation():
+    solver = LevenbergMarquardt(residual)
+    for scale in (1.0, 2.0, 3.0):
+        solver.solve(
+            jnp.zeros(N),
+            p=make_p(scale),
+            multi_start=MultiStart(
+                key=jax.random.key(0), num_starts=3, draw=draw_shifted
+            ),
+            **SOLVE,
+        )
+    # The sequential driver inlines the loop into its own jit, so there is
+    # one program total -- and reusing an equal MultiStart adds none.
+    assert compilations() == 1
+
+
+def test_a_fresh_residual_closure_per_call_recompiles():
+    # The commonest real-world trap, and one the package CANNOT fix: the
+    # residual is a jit static, so a lambda rebuilt per iteration is a new
+    # program every time. Pinned as a negative control so the guards above
+    # cannot pass by accident.
+    for scale in (1.0, 2.0, 3.0):
+        LevenbergMarquardt(lambda x, args, p: A @ x - p["b"]).solve(
+            jnp.zeros(N), p=make_p(scale), **SOLVE
+        )
+    assert compilations() == 3
+    # A module-level residual reused across calls compiles once.
+    for jitted in JITTED:
+        jitted._clear_cache()
+    for scale in (1.0, 2.0, 3.0):
+        LevenbergMarquardt(residual).solve(jnp.zeros(N), p=make_p(scale), **SOLVE)
+    assert compilations() == 1
+
+
+def test_save_steps_makes_max_steps_static():
+    # history_len is a jit static because the buffer shape depends on it --
+    # documented, and pinned here so the cost is not a surprise.
+    solver = LevenbergMarquardt(residual)
+    for max_steps in (5, 6, 7):
+        solver.solve(jnp.zeros(N), p=make_p(), max_steps=max_steps, atol=1e-6)
+    assert compilations() == 1
+    for jitted in JITTED:
+        jitted._clear_cache()
+    for max_steps in (5, 6, 7):
+        solver.solve(
+            jnp.zeros(N), p=make_p(), max_steps=max_steps, atol=1e-6, save_steps=True
+        )
+    assert compilations() == 3
+
+
+def test_a_stateful_preconditioner_reused_shares_one_compilation():
+    # BlockEigenPreconditioner holds a closure and an array, so it hashes by
+    # identity: reusing the instance must not recompile, and its per-step
+    # prepare() must not either.
+    preconditioner = BlockEigenPreconditioner(
+        lambda theta, ctx: [(jnp.eye(N, dtype=jnp.float32)[None], 0.0)],
+        jnp.arange(N),
+    )
+    for scale in (1.0, 2.0, 3.0):
+        LevenbergMarquardt(
+            residual, linear_solver=CG(preconditioner, tol=1e-8, maxiter=16)
+        ).solve(jnp.zeros(N), p=make_p(scale), **SOLVE)
+    assert compilations() == 1

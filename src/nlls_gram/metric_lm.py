@@ -167,6 +167,8 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             self.ad_solver_preconditioner = (
                 linear_solver.preconditioner if inherit else None
             )
+            if inherit:
+                self.ad_solver_penalty = getattr(linear_solver, "penalty", None)
         self.has_aux = has_aux
         # Only the dense paths materialize J', and the caches ride the same
         # reject-reuse lifecycle, so the flag is inert for the matrix-free forms.
@@ -620,9 +622,10 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             return solution
 
         if isinstance(config, GramCG):
-            # Dual: (B B') y = (dr/dp) p_dot, then u = -B' y. The right-hand
-            # side lies in range(B), so unpreconditioned CG from zero keeps the
-            # iterates selection-clean on rank-deficient problems.
+            # Dual: (B B') y = (dr/dp) p_dot, then u = -B' y. Selection is
+            # safe under any preconditioner here -- u = -B'y is invariant to
+            # the null(B') component of y -- unlike the normal form, where the
+            # preconditioner must preserve range(B').
             def dual_matvec(y):
                 return B(Bt(y))
 

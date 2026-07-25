@@ -219,12 +219,17 @@ class Cholesky(LinearSolver):
 
     ``form="gram"`` factors the ``m x m`` dual ``D = J~ J~'`` instead and
     takes the step ``u = -J~'(D + damping I)^{-1} r``. For ``damping > 0`` the
-    two produce the SAME step, by the push-through identity
-    ``B'(BB' + lam I)^{-1} = (B'B + lam I)^{-1}B'``; they differ only in which
-    dimension they factor in. ``form="auto"`` (the default) picks the smaller
-    at trace time -- gram when ``n > m``, normal otherwise -- so it is a cost
-    choice, not a semantics choice, and it keys on shape alone, never on
-    numerical rank.
+    two produce the same step in exact arithmetic, by the push-through
+    identity ``B'(BB' + lam I)^{-1} = (B'B + lam I)^{-1}B'``.
+
+    In FLOATING POINT they part company when ``m > n``: the dual then carries
+    ``m - n`` structural zero eigenvalues, so its condition number is
+    ``sigma_max^2 / damping`` however well conditioned ``J~`` is, and the gram
+    step loses digits as damping falls (measured ~1e-2 relative at
+    ``damping=1e-14`` where the normal form holds 1e-15). ``form="auto"`` (the
+    default) never picks gram there -- it takes gram only when ``n > m``, where
+    the normal system is the singular one -- so the default is safe and the
+    choice is a cost one. Forcing ``form="gram"`` on a tall problem is not.
     """
 
     form: str = "auto"
@@ -260,7 +265,7 @@ class Cholesky(LinearSolver):
         )
 
     def prepare(self, sub):
-        n_m, ridge, dtype = sub.n_m, sub.ridge, sub.dtype
+        n_m, ridge = sub.n_m, sub.ridge
         # B' = F_bar^{-T} J', shape (n, m). Every form below is built from it.
         grad = sub.whitened_transpose(sub.Jt @ sub.resid)
         if sub.penalized:
@@ -279,9 +284,8 @@ class Cholesky(LinearSolver):
 
         matrix = sub.cached(assemble)
         size = sub.m if gram else sub.n
-        factor = jsp_linalg.cho_factor(
-            matrix + sub.damping * jnp.eye(size, dtype=dtype)
-        )
+        shift = jnp.arange(size)
+        factor = jsp_linalg.cho_factor(matrix.at[shift, shift].add(sub.damping))
         if gram:
             # u = -B'(D + damping I)^{-1} c on residual-space right-hand sides.
             def dual_step(c):
