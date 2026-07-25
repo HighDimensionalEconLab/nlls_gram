@@ -491,47 +491,6 @@ frozen-projector AD rules make. Failed statuses return exact zero tangents
 and evaluate the masked tangent program at stop-gradient copies of the
 original inputs and the *initial* ridge.
 
-## Migration from the metric formulation
-
-```python
-# before (metric LM): selection via the algorithm's damping geometry,
-# epsilon-shifted so the metric stays invertible
-metric = repeated_shifted_dense_metric(K, repeats=3, zero_pad_size=d, epsilon=1e-7)
-solver = LevenbergMarquardt(residual_fn, metric=metric,
-                            linear_solve_dtype=jnp.float64,
-                            metric_solve_dtype=jnp.float64)
-result = solver.solve(theta_0, max_steps=400, atol=2e-8)
-
-# after (ridge LM): selection in the objective, no epsilon anywhere;
-# the metric takes the factor directly (gtol ~ 1e-3 * ridge * sqrt(q))
-metric = RepeatedFactorMetric(jnp.linalg.cholesky(K, upper=True), repeats=3)
-solver = RidgeLevenbergMarquardt(residual_fn, metric=metric,
-                                 ridge=1e-8)  # or None for the dtype default
-result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=2e-8)
-
-# optional homotopy if a fixed ridge converges slowly
-cb, us0 = ridge_continuation(ridge_floor=1e-8, decrease=0.1)
-result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=2e-8,
-                      callback=cb, user_state=us0)
-```
-
-Porting notes:
-
-- **`info.loss` includes the penalty.** Code that means equation error must
-  read `info.resid_loss`.
-- **Residual-only `atol` stopping must add a `gtol` or `xtol`** — the
-  conjunctive contract makes this loud, not silent; the whitened geometry
-  makes the `gtol` choice a one-line calibration
-  (`1e-3 * ridge * sqrt(q)`) instead of a guess.
-- **No dtype-promotion knobs**: the solve runs at the residual dtype
-  (`QR()` is the extreme-conditioning fix); the metric solver's
-  `linear_solve_dtype`/`metric_solve_dtype` have no ridge analog.
-- Forward `CG` users pass the preconditioner as a required config
-  field — `CG(IdentityPreconditioner())` at minimum — deliberately
-  stricter than the metric solver's optional preconditioner hooks.
-- Multi-start ranking uses the ridge objective at each lane's own final
-  ridge — comparable across lanes when they share a continuation schedule.
-
 ## API reference
 
 ::: nlls_gram.Metric

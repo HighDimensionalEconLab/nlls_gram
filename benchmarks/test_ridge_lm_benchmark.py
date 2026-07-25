@@ -19,7 +19,6 @@ from nlls_gram import (
     LevenbergMarquardt,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    repeated_shifted_dense_metric,
 )
 
 SIGMA = 1.0
@@ -86,8 +85,8 @@ def test_update_step(
     device = devices[0]
     K, residual, x0 = _problem(n, repeats, free_size, m_resid, device)
     if configuration == "metric":
-        metric = repeated_shifted_dense_metric(
-            K, repeats=repeats, zero_pad_size=free_size, epsilon=EPSILON
+        metric = RepeatedFactorMetric.from_gram(
+            K, repeats=repeats, epsilon=EPSILON, free_scale=EPSILON
         )
         solver = LevenbergMarquardt(residual, metric=metric)
     else:

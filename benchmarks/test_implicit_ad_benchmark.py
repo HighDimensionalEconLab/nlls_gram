@@ -5,10 +5,10 @@ import jax.numpy as jnp
 import pytest
 
 from nlls_gram import (
+    SVD,
     LevenbergMarquardt,
     LMStatus,
-    MetricFactory,
-    metric_from_diagonal,
+    Metric,
 )
 
 
@@ -40,21 +40,36 @@ def _direct_problem(*, has_aux):
     return solve, p, status
 
 
-def _metric_factory_problem():
+class PreparedDiagonalMetric(Metric):
+    """An iterate-dependent metric: the weights come from prepare(), so the
+    solver rebuilds them per accepted step and freezes them at the solution."""
+
+    size = 8
+
+    def prepare(self, theta, ctx):
+        return 1.0 + 0.1 * theta**2
+
+    def factor_apply(self, v, ctx):
+        return jnp.sqrt(ctx.metric_state) * v
+
+    def factor_solve(self, v, ctx):
+        return v / jnp.sqrt(ctx.metric_state)
+
+    def factor_solve_transpose(self, v, ctx):
+        return self.factor_solve(v, ctx)
+
+
+def _prepared_metric_problem():
     design = jnp.reshape(jnp.linspace(-0.8, 1.0, 32), (4, 8))
 
     def residual(x, _, p):
         return design @ x - p, {"weight": 1.0 + 0.1 * x**2}
 
-    factory = MetricFactory(
-        prepare=lambda x, args, p, aux: aux["weight"],
-        build=metric_from_diagonal,
-    )
     solver = LevenbergMarquardt(
         residual,
         has_aux=True,
-        metric_factory=factory,
-        ad_solver="svd",
+        metric=PreparedDiagonalMetric(),
+        ad_solver=SVD(),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )
@@ -102,8 +117,8 @@ def _make_problem(case):
         return _direct_problem(has_aux=False)
     if case == "direct_aux":
         return _direct_problem(has_aux=True)
-    if case == "metric_factory":
-        return _metric_factory_problem()
+    if case == "prepared_metric":
+        return _prepared_metric_problem()
     return _vmapped_problem()
 
 
@@ -128,7 +143,7 @@ def _make_transformed(case, transform):
     return transformed, p
 
 
-@pytest.mark.parametrize("case", ["direct", "direct_aux", "metric_factory", "vmapped"])
+@pytest.mark.parametrize("case", ["direct", "direct_aux", "prepared_metric", "vmapped"])
 @pytest.mark.parametrize("transform", ["jvp", "vjp"])
 def test_successful_implicit_ad(benchmark, case, transform):
     _, status_parameter, status = _make_problem(case)

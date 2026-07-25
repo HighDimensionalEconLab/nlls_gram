@@ -2,11 +2,8 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nlls_gram import (
-    matern_state_space,
-    repeated_shifted_dense_metric,
-    repeated_shifted_state_space_metric,
-)
+from nlls_gram import RepeatedFactorMetric
+from nlls_gram.experimental import StateSpaceMetric, matern_state_space
 
 SIGMA = 1.0
 ELL = 10.0
@@ -34,25 +31,20 @@ def _matern_gram(t, nu):
 
 @pytest.mark.parametrize("platform", ["cpu", "gpu"])
 @pytest.mark.parametrize(
-    ("n", "repeats", "zero_pad_size", "rhs_columns", "nu"),
+    ("n", "repeats", "rhs_columns", "nu"),
     [
-        (41, 3, 2, 123, 0.5),
-        (81, 7, 5, 567, 0.5),
-        (96, 5, 3, 480, 2.5),
-        (96, 9, 5, 865, 2.5),
-        (96, 201, 101, 1, 2.5),
+        (41, 3, 123, 0.5),
+        (81, 7, 567, 0.5),
+        (96, 5, 480, 2.5),
+        (96, 9, 865, 2.5),
+        (96, 201, 1, 2.5),
     ],
 )
-@pytest.mark.parametrize("callback", ["solve", "inv_sqrt", "inv_sqrt_transpose"])
-def test_repeated_shifted_dense_apply(
-    benchmark,
-    platform,
-    n,
-    repeats,
-    zero_pad_size,
-    rhs_columns,
-    nu,
-    callback,
+@pytest.mark.parametrize(
+    "callback", ["factor_apply", "factor_solve", "factor_solve_transpose"]
+)
+def test_repeated_factor_metric_apply(
+    benchmark, platform, n, repeats, rhs_columns, nu, callback
 ):
     devices = _devices(platform)
     if not devices:
@@ -60,18 +52,15 @@ def test_repeated_shifted_dense_apply(
     device = devices[0]
     t = jax.device_put(jnp.linspace(0.0, 40.0, n), device)
     K = _matern_gram(t, nu)
-    metric = repeated_shifted_dense_metric(
-        K,
-        repeats=repeats,
-        zero_pad_size=zero_pad_size,
-        epsilon=EPSILON,
+    metric = RepeatedFactorMetric.from_gram(
+        K, repeats=repeats, epsilon=EPSILON, free_scale=EPSILON
     )
-    total_size = repeats * n + zero_pad_size
+    total_size = repeats * n
     shape = (total_size,) if rhs_columns == 1 else (total_size, rhs_columns)
     x = jax.device_put(jax.random.normal(jax.random.key(0), shape), device)
-    apply = jax.jit(getattr(metric, callback))
+    apply = jax.jit(lambda v: getattr(metric, callback)(v, None))
     jax.block_until_ready(apply(x))
-    benchmark.group = f"repeated-shifted-dense-{callback}"
+    benchmark.group = f"repeated-factor-{callback}"
 
     def run():
         out = apply(x)
@@ -85,28 +74,27 @@ def test_repeated_shifted_dense_apply(
 @pytest.mark.parametrize("n", [1_000, 10_000, 100_000])
 @pytest.mark.parametrize("nu", [0.5, 1.5, 2.5])
 @pytest.mark.parametrize("parallel", [False, True])
-def test_repeated_shifted_state_space_apply(benchmark, platform, n, nu, parallel):
+def test_state_space_metric_apply(benchmark, platform, n, nu, parallel):
     devices = _devices(platform)
     if not devices:
         pytest.skip(f"JAX {platform!r} backend is not available")
     device = devices[0]
     t = jax.device_put(jnp.arange(n) * 1.0, device)
-    metric = repeated_shifted_state_space_metric(
+    metric = StateSpaceMetric(
         t,
         *matern_state_space(SIGMA, ELL, nu),
         repeats=3,
-        zero_pad_size=2,
         epsilon=EPSILON,
         parallel=parallel,
     )
-    x = jax.device_put(jnp.sin(jnp.linspace(0.0, 20.0, 3 * n + 2)), device)
+    x = jax.device_put(jnp.sin(jnp.linspace(0.0, 20.0, 3 * n)), device)
 
     @jax.jit
     def apply(value):
-        return metric.solve(value), metric.norm(value)
+        return metric.factor_solve(value, None), metric.norm(value, None)
 
     jax.block_until_ready(apply(x))
-    benchmark.group = "repeated-shifted-state-space"
+    benchmark.group = "state-space-metric"
 
     def run():
         out = apply(x)

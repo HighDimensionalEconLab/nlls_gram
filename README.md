@@ -7,32 +7,26 @@
 [![License: MIT](https://img.shields.io/github/license/HighDimensionalEconLab/nlls_gram)](https://github.com/HighDimensionalEconLab/nlls_gram/blob/main/LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-Levenberg-Marquardt nonlinear least-squares for JAX pytrees, aimed at
-solving systems of equations (i.e., interpolation). The core use case is
-underdetermined systems — more parameters than residuals — where something
-must select *which* interpolating solution is returned. The package ships
-two solvers with one shared `init`/`update`/`solve` protocol:
+Levenberg-Marquardt nonlinear least squares for JAX pytrees, aimed at solving
+systems of equations. The core use case is **underdetermined** systems — more
+parameters than residuals — where a zero-residual root is not unique and
+something must select *which* interpolant is returned. Two solvers differ in
+where that selection lives:
 
-- **`RidgeLevenbergMarquardt`** puts the selection in the **objective**: it
-  minimizes \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) for a user
-  positive-definite metric \(W\) on the metric block \(x_m\) of
-  \(x = [x_m; x_f]\) (the free block \(x_f\) stays unpenalized), with the
-  ridge weight \(\lambda\) annealed toward zero, so the limit is the
-  minimum-seminorm (e.g. minimum-RKHS-norm) interpolant by classical
-  nonlinear Tikhonov regularization ([Engl–Hanke–Neubauer 1996;
-  Kaltenbacher–Neubauer–Scherzer 2008](https://highdimensionaleconlab.github.io/nlls_gram/ridge_lm/)).
-  Every inner problem is a well-posed NLLS — plain Gauss-Newton alone would
-  converge to *some* interpolant without selecting the minimal-norm one
-  ([Campbell–Kunkel–Bobinyec 2012](https://highdimensionaleconlab.github.io/nlls_gram/ridge_lm/)).
-- **`LevenbergMarquardt`** is standard damped LM for general nonlinear least
-  squares — square, tall, or underdetermined — with dense, QR, CG, and
-  matrix-free LSMR linear solvers and a swappable implicit-AD rule.
+- **`RidgeLevenbergMarquardt`** puts it in the **objective**, minimizing
+  \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) for a positive-definite metric
+  \(W\) on the metric block of \(x = [x_m; x_f]\) (the free block stays
+  unpenalized). Annealing \(\lambda\) toward zero converges to the
+  minimum-seminorm — e.g. minimum-RKHS-norm — interpolant, by classical
+  nonlinear Tikhonov regularization. Every inner problem is a well-posed NLLS.
+- **`LevenbergMarquardt`** puts it in the **damping geometry**: standard
+  damped LM whose trust region is measured in \(W\), so the small-damping
+  Gauss-Newton limit is the minimum-\(W\)-norm correction.
 
-Both take a residual over `(x)`, `(x, args)`, or `(x, args, p)` (always in
-that order), flatten any pytree `x` with `jax.flatten_util.ravel_pytree`,
-expose per-step `update(...)` and an internally jitted `solve(...)` loop
-with callbacks and multi-start, and differentiate `solve(...).x` with
-respect to `p` through a custom implicit rule.
+Both take a residual over `(x)`, `(x, args)`, or `(x, args, p)`, flatten any
+pytree `x`, expose per-step `update(...)` and an internally jitted `solve(...)`
+loop with callbacks and multi-start, and differentiate `solve(...).x` with
+respect to `p` through a custom implicit rule — no unrolling.
 
 ## Install
 
@@ -40,207 +34,66 @@ respect to `p` through a custom implicit rule.
 uv add nlls-gram
 ```
 
-For GPU use, install the JAX accelerator build that matches your hardware, for
-example:
+For GPU use, install the JAX accelerator build that matches your hardware:
 
 ```bash
 uv add nlls-gram "jax[cuda13]"
 ```
 
-## Ridge Example: Minimum-RKHS-Norm Interpolation
-
-For kernel coefficient problems
-\(f_\alpha(x)=\sum_j \alpha_j K(x, x_j)\), the squared RKHS norm is
-\(\alpha^\top K \alpha\), so the metric is a `RepeatedFactorMetric`
-(`repeats` coefficient blocks sharing one upper-triangular factor \(F\)
-with \(W = F^\top F\), plus unpenalized structural scalars in the free
-block — no epsilon shift anywhere):
+## Minimum-RKHS-norm interpolation
 
 ```python
 import jax.numpy as jnp
+from nlls_gram import RidgeLevenbergMarquardt, RepeatedFactorMetric, ridge_continuation
 
-from nlls_gram import (
-    RepeatedFactorMetric,
-    RidgeLevenbergMarquardt,
-    ridge_continuation,
-)
+# W = blockdiag(K, K): the RKHS seminorm over two coefficient blocks. The
+# constructor takes the FACTOR; from_gram(K, ...) shifts and factors a K.
+metric = RepeatedFactorMetric(jnp.linalg.cholesky(K, upper=True), repeats=2)
 
-F = jnp.linalg.cholesky(K, upper=True)      # W = F'F per coefficient block
-metric = RepeatedFactorMetric(F, repeats=3)  # free block: len(x) - metric.size
-solver = RidgeLevenbergMarquardt(
-    residual_fn,                 # (x) | (x, args) | (x, args, p)
-    metric=metric,
-    ridge=1e-8,                  # fixed small ridge; None = dtype default
-)
-result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=1e-8)
+solver = RidgeLevenbergMarquardt(collocation_residual, metric=metric, ridge=1e-4)
 
-# optional homotopy (ridge annealed 1e-4 -> 1e-8 on stationarity):
-cb, us0 = ridge_continuation(ridge_floor=1e-8, decrease=0.1)
-result = solver.solve(theta_0, max_steps=400, gtol=1e-8, atol=1e-8,
-                      callback=cb, user_state=us0)
+# Anneal the ridge toward the interpolating limit on stationarity.
+callback, user_state = ridge_continuation(ridge_floor=1e-10)
+result = solver.solve(x0, callback=callback, user_state=user_state,
+                      gtol=1e-8, atol=1e-8)
 ```
 
-The solver runs entirely in the whitened variable
-\(y = \bar F x\) (\(\bar F = \mathrm{blockdiag}(F, I)\)): stock Euclidean
-LM on the augmented residual \([r;\sqrt{\lambda}\,y_m]\), where the
-penalty rows are constant. The trust-region damping and the selection
-weight are fully decoupled, the assembled whitened normal matrix
-\(\tilde J^\top \tilde J + \lambda E\) is cached across rejected steps
-and keeps a clean spectral floor at \(\lambda\) — so the default cholesky
-path stays accurate at deep ridge — and a damping-row QR path
-(`linear_solver=QR()`) covers the extreme tiny-ridge/tiny-damping regime.
-`IdentityMetric(size)` is plain ridge; `jnp.eye` never appears.
-`info.loss` is the ridge objective; `info.resid_loss` is the equation error.
-Stopping is conjunctive: `gtol` means "stationary at this ridge", `atol`
-additionally demands the equations solved (it never stops the solve alone).
-Steps are measured in the W-norm and gradients in the dual W⁻¹-norm, which
-makes calibration clean: `gtol ~ 1e-3 * ridge * sqrt(q(x*))` with
-\(q = \|x_m\|_W^2\) the solution's squared seminorm
-(`info.penalty_grad_norm` reports `sqrt(penalty_value)`).
-The [Ridge LM docs](https://highdimensionaleconlab.github.io/nlls_gram/ridge_lm/)
-derive the selection theorem, the whitened change of variables, the
-continuation schedule, and the solver table.
-
-## General Nonlinear Least Squares
+## General nonlinear least squares
 
 ```python
-import jax
-import jax.numpy as jnp
-
+import jax, jax.numpy as jnp
 from nlls_gram import LevenbergMarquardt
 
+def residual(x, args, p):
+    return args["design"] @ x - p["target"]
 
-def residual_fn(x, args):
-    ts, ys = args
-    return x["a"] * jnp.exp(x["b"] * ts) - ys
+solver = LevenbergMarquardt(residual)
+result = solver.solve(jnp.zeros(8), {"design": design}, p={"target": y},
+                      max_steps=200, atol=1e-8)
 
-
-ts = jnp.linspace(0.0, 2.0, 20)
-ys = 2.0 * jnp.exp(-1.0 * ts)
-x = {"a": 1.0, "b": 0.0}
-
-solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
-lm_state = solver.init(x, (ts, ys))
-
-
-@jax.jit
-def train_step(x, lm_state):
-    return solver.update(x, lm_state, (ts, ys))
-
-
-for _ in range(50):
-    x, lm_state, info = train_step(x, lm_state)
-
-print(x["a"], x["b"])  # approximately 2.0, -1.0
+# The solution is differentiable in p, at a cost independent of max_steps.
+sensitivity = jax.grad(
+    lambda p: jnp.sum(solver.solve(jnp.zeros(8), {"design": design}, p=p,
+                                   max_steps=200, atol=1e-8).x ** 2)
+)({"target": y})
 ```
 
-For a simple full solve loop:
+Pass `metric=` to weight the damping geometry.
 
-```python
-result = solver.solve(x, (ts, ys), max_steps=50, atol=1e-8)
-x = result.x
-```
+## Linear solvers
 
-`solve` stops on a residual-norm `atol`, gradient-norm `gtol`, or
-accepted-step-norm `xtol` (each `0.0` disables), always enforces `max_steps`,
-and takes a traceable callback for custom stopping, epoch-style data
-resampling, and per-step history recording; the docs have a cookbook.
+The same typed configs serve both solvers, forward and in the implicit-AD
+role: `Cholesky()` (the default, auto-selecting the smaller of the dual and
+normal systems), `QR()` (damping-row QR — stable at tiny damping and
+rank-safe), `CG(precond)` and `GramCG(precond)` (matrix-free in parameter and
+residual space), and `SVD()` for rank-deficient tangents. A knob that exists
+for only one method is a field on that method, so it cannot be passed with
+another.
 
-`solve(...).x` also supports custom implicit JVP/VJP with respect to `p`;
-the docs give the metric-minimum-norm formula and a minimal `jax.jvp` /
-`jax.vjp` example. The default `ad_solver="auto"` uses a direct solve for
-every square system, preserves the forward CG space for nonsquare CG systems,
-and uses SVD otherwise. Every method is independently swappable (an `lsmr` forward solve with
-`ad_solver="normal_cg"` is fully matrix-free end to end). The metric
-matters for underdetermined roots because it selects which tangent is the
-minimum-norm solution. The per-step `update(...)` interface does not define
-the implicit AD rule. By default, both `CONVERGED` and `MAX_STEPS` results are
-usable: fixed-step solves retain their implicit derivative while the status
-still reports `MAX_STEPS`. Pass `max_steps_is_success=False` for strict
-failure semantics. A failed solve keeps its primal result and diagnostics but
-contributes exactly zero through `result.x` and `result.aux`; `result.p`
-remains an identity pass-through. Its linear tangent program is evaluated
-safely at differentiation-inert copies of the caller's original
-`(x0, args, p)`, so those initial inputs must be JVP-safe for the residual,
-aux map, and any metric or preconditioner factory used by the selected AD
-method. This also keeps mixed successful/failed `vmap` lanes finite.
+## Docs
 
-### Advanced: metric damping
-
-`LevenbergMarquardt` optionally accepts a positive-definite parameter-space
-`metric` (or an iterate-aware `MetricFactory`) that redefines the damping
-geometry, so the small-damping Gauss-Newton limit selects
-minimum-*metric*-norm corrections — the algorithmic-bias alternative to the
-ridge objective, with `repeated_shifted_dense_metric` /
-`repeated_shifted_state_space_metric` covering the kernel geometry
-\(\operatorname{blockdiag}(K,\ldots,K,0_s)+\varepsilon I\). See the
-[metrics](https://highdimensionaleconlab.github.io/nlls_gram/metrics/) and
-[metric Gauss-Newton](https://highdimensionaleconlab.github.io/nlls_gram/gauss_newton/)
-docs pages; for new kernel problems prefer `RidgeLevenbergMarquardt`.
-
-## LevenbergMarquardt Solvers
-
-- `linear_solver="auto"` (the default): resolves at trace time to the
-  smaller dense factorization — `gram_cholesky` when `n > m`,
-  `normal_cholesky` otherwise. A shape rule, and safely so: the two forms
-  compute the same step.
-- `linear_solver="gram_cholesky"`: dense `m × m` residual-space Gram solve.
-- `linear_solver="normal_cholesky"`: dense `n × n` whitened normal solve;
-  its small-damping limit is the minimum-metric-norm least-squares step at
-  every shape and rank.
-- `linear_solver="qr"`: dense QR solve of the whitened-step problem (requires
-  a full-row-rank Jacobian).
-- `linear_solver="augmented_qr"`: direct augmented QR in parameter space;
-  robust to rank-deficient Jacobians when damping is positive and best suited
-  to small systems.
-- `linear_solver="gram_cg"`: matrix-free residual-space CG. A
-  `dual_preconditioner` is required (e.g. `sherman_morrison_preconditioner`,
-  or the randomized `nystrom_preconditioner` for neural-network duals; pass
-  `identity_preconditioner()` to run unpreconditioned CG explicitly);
-  on a nonsquare system `ad_solver="auto"` keeps `solve(...).x` matrix-free
-  under AD and requires `ad_solver_preconditioner` when the differentiated
-  solve is traced (an explicit `ad_solver="gram_cg"` validates it eagerly).
-  When the dual operator rotates as LM
-  drifts `x`, pass `preconditioner_factory=PreconditionerFactory(prepare,
-  apply)` instead — a θ-adaptive preconditioner rebuilt from the live iterate
-  each step — and `recycle=RecycleConfig(rank=k)` to carry a deflation basis
-  across steps, recycling each solve's Krylov subspace into the next.
-- `linear_solver="normal_cg"`: matrix-free CG on the whitened normal system,
-  iterating in parameter space — the matrix-free form for square-to-tall
-  problems. A `normal_preconditioner` is required; on rank-deficient
-  problems it must preserve `range(Bᵀ)` or the minimum-norm selection is
-  lost (`identity_preconditioner()` always qualifies — the docs give the
-  full requirement).
-- `linear_solver="lsmr"`: matrix-free LSMR on the whitened augmented system,
-  the iterative sibling of `augmented_qr`, using only J/Jᵀ products. It works
-  on the whitened Jacobian rather than a squared Gram/normal operator, so it
-  stays accurate at small damping where those solves hit their `eps·cond`
-  floor. An optional
-  `whitened_preconditioner=WhitenedPreconditioner(solve, solve_transpose)`
-  right-preconditions the operator to cluster its spectrum; every damped
-  posed subproblem stays exactly the identity-damped whitened one, so the
-  preconditioner changes the iteration path, never the converged step.
-
-All eight solve the same metric-damped linearized subproblem up to the
-accuracy of the chosen linear solver. The dense paths materialize the
-Jacobian from its small side (`jacobian_mode="auto"`; `"fwd"`/`"rev"`
-force one AD mode), so tall systems never build an `m × m` residual basis.
-
-## Docs and Alternatives
-
-Full docs: https://highdimensionaleconlab.github.io/nlls_gram/
-
-Working with an AI assistant? Point it at
-[`docs/tuning_guide.md`](https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/)
-if it doesn't pick it up automatically — solver selection, damping heuristics,
-inner-solve scheduling, and failure signatures, written to be read by humans
-and agents alike (also indexed via the site's `llms.txt`).
-
-For a broader JAX nonlinear solver library, see
-[Optimistix](https://github.com/patrick-kidger/optimistix). `nlls_gram` is more
-specialized: it focuses on underdetermined nonlinear least-squares, residual
-space Gram solves, and explicit parameter-space metrics.
+<https://highdimensionaleconlab.github.io/nlls_gram/>
 
 ## License
 
-MIT
+MIT.
