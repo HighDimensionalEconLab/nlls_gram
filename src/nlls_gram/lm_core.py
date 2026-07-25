@@ -14,10 +14,9 @@ import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram.lm_types import (
+    LMAction,
     LMHyperparams,
-    LMSolveAction,
     LMStatus,
-    SolverContext,
     _damping_floor,
 )
 from nlls_gram.multi_start import (
@@ -29,7 +28,6 @@ from nlls_gram.multi_start import (
     _multi_start_python_impl,
     _multi_start_sequential_jit,
 )
-from nlls_gram.preconditioners import Preconditioner
 from nlls_gram.solve_loop import _solve_loop_jit, _solve_python_impl
 from nlls_gram.utilities import (
     _hashable_hook,
@@ -44,7 +42,9 @@ class LevenbergMarquardtBase:
     # Value-based identity: the jitted solve loop marks the solver itself
     # static, so equal-config solvers built around the same residual share the
     # compiled loop across instances. Subclasses set _static_key/_static_hash
-    # in __init__ from their constructor arguments.
+    # in __init__ from their constructor arguments; metric/preconditioner
+    # instances key by pytree STRUCTURE (their arrays are threaded through
+    # the carried state, so equal-config fresh instances share one compile).
     def __eq__(self, other):
         if self is other:
             return True
@@ -54,6 +54,18 @@ class LevenbergMarquardtBase:
 
     def __hash__(self):
         return self._static_hash
+
+    # Whether a callback-replaced metric moves the objective (the ridge
+    # solver's penalty embeds it) or only the damping geometry.
+    _metric_defines_objective = False
+
+    def _check_registered_instance(self, instance, keyword):
+        if instance is not None and jax.tree_util.all_leaves([instance]):
+            raise TypeError(
+                f"{keyword} must be a registered pytree ({type(instance).__name__} "
+                "flattens as a leaf); register the class with "
+                "nlls_gram.register_pytree_dataclass"
+            )
 
     def _validate_configuration(self, linear_solver, ad_solver, penalized):
         """Reject a config in a role it cannot fill, at construction.
@@ -80,26 +92,13 @@ class LevenbergMarquardtBase:
         if self.jacobian_mode not in ("auto", "fwd", "rev"):
             raise ValueError(f"unknown jacobian_mode: {self.jacobian_mode}")
 
-    def _block_sizes(self, theta_size):
-        # The free-block size is inferred from the flattened iterate: the
-        # metric covers the leading metric.size coordinates, the rest is free.
-        n_m = self.metric.size
-        if n_m > theta_size:
-            raise ValueError(
-                f"the metric covers {n_m} leading coordinates but x flattens "
-                f"to only {theta_size}; the free block is len(x) - metric.size "
-                "and must be nonnegative"
-            )
-        return n_m, theta_size - n_m
-
     def _cold_state(self, lm_state):
-        # Drawn multi-start lanes must not reuse caches or hook state built at
-        # another (x, args); damping, ridge, and hyper stay inherited from the
-        # caller's initial state.
+        # Drawn multi-start lanes must not reuse caches built at another
+        # (x, args); damping, ridge, hyper, and the carried instances stay
+        # inherited from the caller's initial state.
         updates = {}
-        for flag in ("jacobian_valid", "metric_valid", "precond_valid"):
-            if getattr(lm_state, flag) is not None:
-                updates[flag] = jnp.zeros_like(getattr(lm_state, flag))
+        if lm_state.jacobian_valid is not None:
+            updates["jacobian_valid"] = jnp.zeros_like(lm_state.jacobian_valid)
         if lm_state.solver_cache is not None:
             updates["solver_cache"] = jax.tree.map(
                 jnp.zeros_like, lm_state.solver_cache
@@ -180,112 +179,62 @@ class LevenbergMarquardtBase:
     def _block_sizes(self, theta_size):
         # The free-block size is inferred from the flattened iterate: the
         # metric covers the leading metric.size coordinates, the rest is free.
-        n_f = theta_size - self.metric.size
+        n_f = theta_size - self.initial_metric.size
         if n_f < 0:
             raise ValueError(
-                f"the metric covers {self.metric.size} leading coordinates "
-                f"but x flattens to only {theta_size}; the free block is "
-                "len(x) - metric.size and must be nonnegative"
+                f"the metric covers {self.initial_metric.size} leading "
+                f"coordinates but x flattens to only {theta_size}; the free "
+                "block is len(x) - metric.size and must be nonnegative"
             )
-        return self.metric.size, n_f
+        return self.initial_metric.size, n_f
 
-    # The solver-internal extension F_bar = blockdiag(F, sqrt(free_scale) I):
-    # the metric's factor op on the metric block, a scalar on the free block.
-    # Applied to vectors or leading-axis-batched matrices; F_bar itself is
-    # never materialized, and the free block drops out entirely when it is
-    # empty or unscaled.
-    def _free_scale(self, v):
-        scale = self.metric.free_scale
-        return v if scale == 1.0 else v / jnp.sqrt(jnp.asarray(scale, v.dtype))
-
-    def _extended_solve(self, v, ctx):
-        n_m = self.metric.size
-        if n_m == 0:
-            return self._free_scale(v)
-        if v.shape[0] == n_m:
-            return self.metric.factor_solve(v, ctx)
-        return jnp.concatenate(
-            [self.metric.factor_solve(v[:n_m], ctx), self._free_scale(v[n_m:])], axis=0
+    def _resolved_state(self, lm_state):
+        # A hand-built pre-seeding LMState reads through the constructor
+        # instances; states from init/solve carry their own. The resolved
+        # view is ephemeral (ctx only) -- update passes the input fields
+        # through, so a user's own while_loop carry keeps its structure.
+        if lm_state.metric is not None:
+            return lm_state
+        return dataclasses.replace(
+            lm_state,
+            metric=self.initial_metric,
+            preconditioner=self.initial_preconditioner,
         )
 
-    def _extended_solve_transpose(self, v, ctx):
-        n_m = self.metric.size
+    # The solver-internal extension F_bar = blockdiag(F, sqrt(free_scale) I):
+    # the CARRIED metric's factor op on the metric block, a scalar on the
+    # free block. Applied to vectors or leading-axis-batched matrices; F_bar
+    # itself is never materialized. free_scale is a traced leaf, so the
+    # division is unconditional; the Euclidean default's static 1.0 folds
+    # away at compile time.
+    def _scaled_free(self, v, metric):
+        return v / jnp.sqrt(jnp.asarray(metric.free_scale, v.dtype))
+
+    def _extended_solve(self, v, ctx):
+        metric = ctx.lm_state.metric
+        n_m = metric.size
         if n_m == 0:
-            return self._free_scale(v)
+            return self._scaled_free(v, metric)
         if v.shape[0] == n_m:
-            return self.metric.factor_solve_transpose(v, ctx)
+            return metric.factor_solve(v, ctx)
         return jnp.concatenate(
-            [
-                self.metric.factor_solve_transpose(v[:n_m], ctx),
-                self._free_scale(v[n_m:]),
-            ],
+            [metric.factor_solve(v[:n_m], ctx), self._scaled_free(v[n_m:], metric)],
             axis=0,
         )
 
-    def _init_hook_state(self, theta, lm_state, args, p):
-        """The metric's and preconditioner's state at ``x0``, valid there, so
-        the first update reuses it. The flags stay absent when the hooks are
-        stateless."""
-        ctx = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
-        valid = jnp.asarray(True, dtype=jnp.bool_)
-        hooks = {}
-        if self._metric_prepares:
-            hooks["metric_state"] = self.metric.prepare(theta, ctx)
-            hooks["metric_valid"] = valid
-        if self._precond_prepares:
-            hooks["precond"] = self.preconditioner.prepare(theta, ctx)
-            hooks["precond_valid"] = valid
-        return hooks
-
-    def _hook_state(self, theta, lm_state, args, p):
-        """The metric's and preconditioner's prepared state for this step:
-        reused while still valid (a rejected step left ``x`` in place, or the
-        hook declined to rebuild), rebuilt from the live iterate otherwise."""
-        bare = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
-        metric_state = precond_state = None
-        if self._metric_prepares:
-            metric_state = jax.lax.cond(
-                lm_state.metric_valid | ~jnp.asarray(self.metric.rebuild(bare)),
-                lambda _: lm_state.metric_state,
-                lambda _: self.metric.prepare(theta, bare),
-                operand=None,
-            )
-        if self._precond_prepares:
-            precond_state = jax.lax.cond(
-                lm_state.precond_valid
-                | ~jnp.asarray(self.preconditioner.rebuild(bare)),
-                lambda _: lm_state.precond,
-                lambda _: self.preconditioner.prepare(theta, bare),
-                operand=None,
-            )
-        return metric_state, precond_state
-
-    def _carried_ctx(self, theta, lm_state, args, p):
-        return SolverContext(
-            x=theta,
-            lm_state=lm_state,
-            args=args,
-            p=p,
-            metric_state=lm_state.metric_state,
-            preconditioner_state=lm_state.precond,
-        )
-
-    def _frozen_ctx(self, theta, lm_state, args, p, preconditioner):
-        # Under implicit AD the hooks are FROZEN at the returned solution:
-        # prepare runs once there and the state-dependence is not
-        # differentiated, the same contract as a fixed metric closing over
-        # constants.
-        bare = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
-        metric_state = (
-            self.metric.prepare(theta, bare) if self._metric_prepares else None
-        )
-        precond_state = None
-        if preconditioner is not None and (
-            type(preconditioner).prepare is not Preconditioner.prepare
-        ):
-            precond_state = preconditioner.prepare(theta, bare)
-        return dataclasses.replace(
-            bare, metric_state=metric_state, preconditioner_state=precond_state
+    def _extended_solve_transpose(self, v, ctx):
+        metric = ctx.lm_state.metric
+        n_m = metric.size
+        if n_m == 0:
+            return self._scaled_free(v, metric)
+        if v.shape[0] == n_m:
+            return metric.factor_solve_transpose(v, ctx)
+        return jnp.concatenate(
+            [
+                metric.factor_solve_transpose(v[:n_m], ctx),
+                self._scaled_free(v[n_m:], metric),
+            ],
+            axis=0,
         )
 
     def _ad_linearization(self, x, args, p, p_dot):
@@ -308,10 +257,38 @@ class LevenbergMarquardtBase:
         default_tol = 1e-10 if jnp.finfo(dtype).bits > 32 else 1e-6
         return jnp.asarray(default_tol, dtype=dtype)
 
+    def _ad_preconditioner(self, lm_state):
+        # "carried": the forward instance at the solution, callback refreshes
+        # included; "explicit": the ad_solver's own baked instance.
+        if self._ad_preconditioner_source == "carried":
+            return lm_state.preconditioner
+        if self._ad_preconditioner_source == "explicit":
+            return self.ad_solver_preconditioner
+        return None
+
     def _action_or_default(self, action):
         if action is None:
-            return LMSolveAction()
+            return LMAction()
         return action
+
+    def _check_instance_structure(self, new, previous, name):
+        # Trace-time guard mirroring the hyper contract: a replaced instance
+        # must be the same registered type with matching static fields and
+        # leaf shapes/dtypes, or the while-loop carry breaks downstream with
+        # a raw mismatch error that never names the culprit.
+        def spec(tree):
+            leaves, treedef = jax.tree_util.tree_flatten(tree)
+            return treedef, [
+                (jnp.shape(leaf), jnp.result_type(leaf)) for leaf in leaves
+            ]
+
+        if spec(new) != spec(previous):
+            raise ValueError(
+                f"the callback action replaced lm_state.{name} with a "
+                "different type, structure, or leaf shape/dtype; rebuild the "
+                "same class with arrays matching the carried instance, and "
+                "preserve untouched fields with dataclasses.replace(ctx.lm_state, ...)"
+            )
 
     def _apply_action(self, action, x, lm_state, args, user_state):
         action = self._action_or_default(action)
@@ -321,6 +298,7 @@ class LevenbergMarquardtBase:
         # the field every step with unchanged values changes nothing.
         xargs_changed = jnp.asarray(False)
         state_changed = jnp.asarray(False)
+        metric_changed = jnp.asarray(False)
         if action.x is not None:
             xargs_changed = xargs_changed | _tree_changed(action.x, x)
             x = action.x
@@ -352,7 +330,20 @@ class LevenbergMarquardtBase:
                     "of the same dtype — a knob constructed as None cannot be "
                     "enabled mid-solve"
                 )
+            self._check_instance_structure(lm_state.metric, previous.metric, "metric")
+            self._check_instance_structure(
+                lm_state.preconditioner, previous.preconditioner, "preconditioner"
+            )
+            # A changed metric moves the ridge objective (suppressing this
+            # step's convergence test) but only re-whitens the metric
+            # solver's; both stale the whitening-dependent solver caches,
+            # neither the Jacobian cache -- J = dr/dx does not see the
+            # metric. Preconditioner changes are deliberately not compared:
+            # staleness only moves the CG iteration path.
+            metric_changed = _tree_changed(lm_state.metric, previous.metric)
             lm_state, state_changed = self._apply_action_state(lm_state, previous)
+            if self._metric_defines_objective:
+                state_changed = state_changed | metric_changed
         if action.args is not None:
             xargs_changed = xargs_changed | _tree_changed(action.args, args)
             args = action.args
@@ -360,23 +351,20 @@ class LevenbergMarquardtBase:
             user_state = action.user_state
         problem_changed = xargs_changed | state_changed
         if action.x is not None or action.args is not None:
-            # Everything prepared at the pre-action (x, args) is stale once
-            # either moves. The metric matters most: it DEFINES the subproblem,
-            # so reusing a factor built at the old iterate would silently solve
-            # a different problem in a different geometry.
-            stale = {}
-            for flag in ("jacobian_valid", "metric_valid", "precond_valid"):
-                carried = getattr(lm_state, flag)
-                if carried is not None:
-                    stale[flag] = carried & ~xargs_changed
-            if stale:
-                lm_state = dataclasses.replace(lm_state, **stale)
+            # The Jacobian cache describes the pre-action (x, args) and is
+            # stale once either moves.
+            if lm_state.jacobian_valid is not None:
+                lm_state = dataclasses.replace(
+                    lm_state, jacobian_valid=lm_state.jacobian_valid & ~xargs_changed
+                )
         touched = (
             action.x is not None
             or action.args is not None
             or action.lm_state is not None
         )
-        lm_state = self._invalidate_caches(lm_state, action, touched, problem_changed)
+        lm_state = self._invalidate_caches(
+            lm_state, action, touched, problem_changed | metric_changed
+        )
         return action, x, lm_state, args, user_state, problem_changed
 
     # Subclass hooks for the callback-action path. The defaults are inert.
@@ -386,13 +374,13 @@ class LevenbergMarquardtBase:
     def _apply_action_state(self, lm_state, previous):
         return lm_state, jnp.asarray(False)
 
-    def _invalidate_caches(self, lm_state, action, touched, problem_changed):
+    def _invalidate_caches(self, lm_state, action, touched, caches_stale):
         if touched and lm_state.solver_cache is not None:
             cache = lm_state.solver_cache
             lm_state = dataclasses.replace(
                 lm_state,
                 solver_cache=dataclasses.replace(
-                    cache, valid=cache.valid & ~problem_changed
+                    cache, valid=cache.valid & ~caches_stale
                 ),
             )
         return lm_state
@@ -428,8 +416,8 @@ class LevenbergMarquardtBase:
         ``LMStatus.CONVERGED``. How the three combine is the solver's own
         contract -- see each subclass.
 
-        ``callback`` receives an ``LMSolveContext`` after each step and may
-        return an ``LMSolveAction`` to stop or to override x/lm_state/args/
+        ``callback`` receives an ``LMContext`` after each step and may
+        return an ``LMAction`` to stop or to override x/lm_state/args/
         user_state; ``p`` is passed through but cannot be replaced. A callback
         that installs an invalid ``x`` or ``args`` must also stop with a failed
         status.
@@ -586,7 +574,10 @@ class LevenbergMarquardtBase:
         return self.init(x0, args, p=p) if lm_state is None else lm_state
 
     def _initial_ad_point(self, x, lm_state, args, p):
-        return (x, args, p)
+        # The pre-loop instances ride along: a failed lane's callback may
+        # have left invalid metric/preconditioner arrays behind, so the
+        # failed tangent program reads these instead.
+        return (x, args, p, lm_state.metric, lm_state.preconditioner)
 
     def _solve_impl(
         self,

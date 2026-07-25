@@ -191,7 +191,7 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 
 from nlls_gram import (
-    LMSolveAction,
+    LMAction,
     LMStatus,
     MultiStart,
     LevenbergMarquardt,
@@ -214,7 +214,7 @@ def epoch_callback(ctx):
         return jnp.asarray(False), jnp.asarray(LMStatus.RUNNING)
 
     stop, status = jax.lax.cond(ctx.step % 2 == 0, check, keep_running, None)
-    return LMSolveAction(stop=stop, status=status)
+    return LMAction(stop=stop, status=status)
 
 
 callback_solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)
@@ -482,10 +482,10 @@ import numpy as np
 
 from nlls_gram import (
     QR,
+    AnnealRidge,
     LevenbergMarquardt,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    ridge_continuation,
 )
 
 rng = np.random.default_rng(9)
@@ -533,7 +533,8 @@ x_metric = np.asarray(metric_result.x)
 # O(ridge) bias against the eps/ridge stationarity resolution -- pushing the
 # floor lower makes the answer WORSE, not better. gtol must sit well below
 # ridge times the target selection accuracy.
-callback, user_state0 = ridge_continuation(ridge_floor=1e-8, decrease=0.1)
+callback = AnnealRidge(ridge_floor=1e-8, decrease=0.1)
+user_state0 = callback.init_state()
 ridge_solver = RidgeLevenbergMarquardt(
     residual,
     metric=RepeatedFactorMetric(jnp.linalg.cholesky(K, upper=True), repeats=repeats),
@@ -599,14 +600,14 @@ family_a = spd_blocks(keys[0], 2, 3)
 family_free = spd_blocks(keys[1], 1, 2)
 permutation = jnp.asarray(np.random.default_rng(0).permutation(8))
 families = [(family_a, 1.0), (family_free, 0.0)]
-preconditioner = BlockEigenPreconditioner(lambda theta, ctx: families, permutation)
-state = preconditioner.prepare(jnp.zeros(8), None)
-for leaf in jax.tree.leaves(state["families"]):
-    assert leaf.dtype == jnp.float64, leaf.dtype
+preconditioner = BlockEigenPreconditioner(families, permutation)
+for leaf in jax.tree.leaves(preconditioner):
+    assert jnp.issubdtype(leaf.dtype, jnp.integer) or leaf.dtype == jnp.float64, (
+        leaf.dtype
+    )
 ridge = 3e-9
 ctx = SolverContext(
     lm_state=LMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(ridge)),
-    preconditioner_state=state,
 )
 v = jax.random.normal(keys[2], (8,))
 selection = jnp.eye(8)[permutation]
@@ -645,12 +646,13 @@ def residual(x, args, p):
 F_bar = jsp_linalg.block_diag(F, F, jnp.eye(N_F))
 J_whitened = jnp.linalg.solve(F_bar.T, A.T).T
 G = J_whitened.T @ J_whitened
-def exact_blocks(theta, ctx):
-    return [(G[:N_M, :N_M][None], 1.0), (G[N_M:, N_M:][None], 0.0)]
 
 
 def exact_preconditioner():
-    return BlockEigenPreconditioner(exact_blocks, jnp.arange(P_DIM))
+    return BlockEigenPreconditioner(
+        [(G[:N_M, :N_M][None], 1.0), (G[N_M:, N_M:][None], 0.0)],
+        jnp.arange(P_DIM),
+    )
 
 
 p_value = {"scale": jnp.asarray(1.0)}

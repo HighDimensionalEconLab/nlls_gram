@@ -9,7 +9,7 @@ Both drivers consume an informal solver protocol -- ``update``,
 import jax
 import jax.numpy as jnp
 
-from nlls_gram.lm_types import LMSolveContext, LMSolveResult, LMStatus
+from nlls_gram.lm_types import LMContext, LMSolveResult, LMStatus
 
 
 # save_steps bookkeeping shared by the jitted and Python solve loops: row `step` of
@@ -129,7 +129,7 @@ def _solve_loop_impl(
 
         action = None
         if callback is not None:
-            ctx = LMSolveContext(
+            ctx = LMContext(
                 step,
                 x,
                 x_old,
@@ -247,7 +247,7 @@ def _solve_python_impl(
             break
         action = None
         if callback is not None:
-            ctx = LMSolveContext(
+            ctx = LMContext(
                 jnp.asarray(steps, dtype=jnp.int32),
                 x,
                 x_old,

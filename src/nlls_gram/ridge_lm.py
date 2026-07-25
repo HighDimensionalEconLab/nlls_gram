@@ -5,7 +5,7 @@ RidgeLevenbergMarquardt minimizes the ridge objective
 and a positive-definite :class:`~nlls_gram.Metric` ``W`` on the metric block
 ``x_m`` (the free block ``x_f`` stays unpenalized), with the ridge weight
 ``lambda`` carried as traced state that a ``solve`` callback may anneal
-toward zero (:func:`ridge_continuation`). Selection of the minimum-seminorm
+toward zero (:class:`AnnealRidge`). Selection of the minimum-seminorm
 interpolant lives in the OBJECTIVE -- classical nonlinear Tikhonov
 regularization (Engl-Kunisch-Neubauer 1989; Engl-Hanke-Neubauer 1996 Ch. 10;
 the seminorm formulation goes back to Elden 1982) -- rather than in an
@@ -35,40 +35,39 @@ from nlls_gram.linear_solvers import (
     CholeskyCache,
     QRCache,
     Subproblem,
+    _config_static_key,
 )
 from nlls_gram.lm_core import LevenbergMarquardtBase
 from nlls_gram.lm_types import (
+    LMAction,
     LMInfo,
-    LMSolveAction,
     LMState,
     SolverContext,
     _cast_hyper,
     _damping_floor,
 )
-from nlls_gram.metrics import Metric
-from nlls_gram.preconditioners import Preconditioner
 from nlls_gram.utilities import (
     _static_key_component,
+    _where_tree,
     _zero_tangent_leaf,
     canonicalize_residual,
 )
 
 __all__ = [
+    "AnnealRidge",
     "CholeskyCache",
-    "RidgeContinuation",
     "QRCache",
     "RidgeLevenbergMarquardt",
-    "ridge_continuation",
 ]
 
 
-def ridge_continuation(
-    *, decrease=0.1, ridge_floor, grad_rtol=1e-2, stall_rtol=0.0, dtype=None
-):
-    """Build ``(callback, user_state0)`` implementing ridge continuation.
+@dataclass(frozen=True)
+class AnnealRidge:
+    """Ridge-continuation ``solve`` callback: multiply ``lm_state.ridge`` by
+    ``decrease`` whenever the current level has yielded what it can, never
+    below ``ridge_floor``.
 
-    The callback multiplies ``lm_state.ridge`` by ``decrease`` whenever the
-    current level has yielded what it can, never below ``ridge_floor``:
+    A level has yielded what it can when it is
 
     - **stationary**: ``info.grad_norm`` fell below ``grad_rtol`` relative to
       its reference value at the current ridge level (the level's first
@@ -80,65 +79,73 @@ def ridge_continuation(
       demand approaches ``grad_rtol ** levels`` times the initial gradient,
       and the anneal can freeze below the problem's noise floor while steps
       keep being accepted with negligible progress. Enable with
-      ``stall_rtol ~ 0.99`` when that happens (advancing on stagnation is
-      still more conservative than the cited iteratively regularized
-      Gauss-Newton method, which anneals every step). Off by default
-      because it cannot distinguish a converged level from an accepted
-      micro-step under temporarily high damping early in a hard solve --
-      where a false advance collapses the schedule prematurely; widening
-      ``decrease`` (e.g. ``0.01``) is the alternative fix for a frozen
-      anneal, since larger jumps keep the per-level references generous.
+      ``stall_rtol ~ 0.99`` when that happens. Off by default because it
+      cannot distinguish a converged level from an accepted micro-step under
+      temporarily high damping early in a hard solve -- where a false
+      advance collapses the schedule prematurely; widening ``decrease``
+      (e.g. ``0.01``) is the alternative fix for a frozen anneal, since
+      larger jumps keep the per-level references generous.
 
     ``ridge_floor`` is REQUIRED and strictly positive (``ridge = 0`` is out
-    of the solver's contract). The callback returns an
-    :class:`~nlls_gram.LMSolveAction` replacing ``lm_state`` AND
-    ``user_state`` (the per-level reference and previous gradient live in
-    ``user_state`` as fixed-shape scalars, since a ``lax.while_loop`` carry
-    cannot grow from ``None`` mid-loop -- hence the factory shape)::
+    of the solver's contract). Usage::
 
-        cb, us0 = ridge_continuation(ridge_floor=1e-10)
-        result = solver.solve(x0, callback=cb, user_state=us0,
+        anneal = AnnealRidge(ridge_floor=1e-10)
+        result = solver.solve(x0, callback=anneal,
+                              user_state=anneal.init_state(),
                               gtol=1e-8, atol=1e-8)
 
     The solved-out continuation path converges to the minimum-seminorm
     solution by nonlinear Tikhonov theory (Engl-Kunisch-Neubauer 1989;
-    Engl-Hanke-Neubauer 1996), while annealing per accepted stationarity event
-    rather than per fully solved level is the iteratively regularized
+    Engl-Hanke-Neubauer 1996), while annealing per accepted stationarity
+    event rather than per fully solved level is the iteratively regularized
     Gauss-Newton method (Bakushinskii 1992; Blaschke-Neubauer-Scherzer 1997;
-    Kaltenbacher-Neubauer-Scherzer 2008), whose theory wants exactly this kind
-    of monotone, boundedly geometric schedule. Pair the schedule with the
-    conjunctive stopping rule: choose ``atol`` BETWEEN the ridge-floor
+    Kaltenbacher-Neubauer-Scherzer 2008), whose theory wants exactly this
+    kind of monotone, boundedly geometric schedule. Pair the schedule with
+    the conjunctive stopping rule: choose ``atol`` BETWEEN the ridge-floor
     residual and the last intermediate level's residual (they differ by
     roughly ``1 / decrease``), so the solve can only stop at the floor even
     when ``gtol`` must sit above a variant-dependent stationarity noise
     floor -- intermediate levels are stationary too, and ``atol`` is what
-    rules them out. ``dtype`` types the ``user_state0`` scalars (default:
-    the JAX
-    default float; pass the problem dtype explicitly for a float32 program
-    under enabled x64).
-    """
+    rules them out.
 
-    schedule = RidgeContinuation(
-        decrease=decrease,
-        ridge_floor=ridge_floor,
-        grad_rtol=grad_rtol,
-        stall_rtol=stall_rtol,
-    )
-    infinity = jnp.asarray(
-        jnp.inf, dtype=jnp.result_type(float) if dtype is None else dtype
-    )
-    return schedule, {"reference": infinity, "previous": infinity}
+    HOW IT WORKS, for composing the schedule into a callback of your own
+    (data re-draws, damping resets, a preconditioner refresh): the per-level
+    reference and previous gradient ride in ``user_state`` as two
+    fixed-shape scalars (``init_state`` builds them; a ``lax.while_loop``
+    carry cannot grow from ``None`` mid-loop), with ``+inf`` marking "no
+    observation at this level yet" -- the first step after a decrease sets
+    the reference and can never read as stalled. Both trackers reset to
+    ``+inf`` exactly when the level advances; at the floor the ridge stops
+    changing, so the solver stops suppressing convergence and ``gtol``/
+    ``atol`` can fire. All comparisons run at the ridge dtype and the
+    returned trackers are cast back to the ``user_state`` dtype. A wrapping
+    callback calls the instance, inspects ``action.lm_state.ridge <
+    ctx.lm_state.ridge`` for a level advance, and returns a
+    ``dataclasses.replace`` of the action -- e.g. gating an expensive
+    preconditioner rebuild on the advance with ``jax.lax.cond`` so the
+    eigendecomposition is paid only when it fires (a ``jnp.where`` merge
+    would pay it every step)::
 
+        def driver_callback(ctx):
+            action = anneal(ctx)
+            advanced = action.lm_state.ridge < ctx.lm_state.ridge
+            precond = jax.lax.cond(
+                advanced,
+                lambda: BlockEigenPreconditioner(families(ctx.x), PERM),
+                lambda: ctx.lm_state.preconditioner,
+            )
+            return dataclasses.replace(
+                action,
+                lm_state=dataclasses.replace(
+                    action.lm_state, preconditioner=precond
+                ),
+            )
 
-@dataclass(frozen=True)
-class RidgeContinuation:
-    """The callback :func:`ridge_continuation` builds; see it for the schedule.
-
-    A frozen dataclass rather than a closure because ``solve`` marks the
-    callback a jit STATIC argument: a fresh closure would key a fresh
-    compilation of the whole solve loop on every construction. Two equal
-    schedules compare equal and share one compiled loop. ``ridge_floor`` must
-    be a concrete float for that sharing -- a traced value is unhashable and
+    A frozen dataclass with scalar fields rather than a closure because
+    ``solve`` marks the callback a jit STATIC argument: equal schedules
+    compare equal and share one compiled loop, while a fresh closure per
+    construction would key a fresh compilation. ``ridge_floor`` must be a
+    concrete float for that sharing -- a traced value is unhashable and
     falls back to identity.
     """
 
@@ -161,6 +168,15 @@ class RidgeContinuation:
             raise ValueError("grad_rtol must be positive")
         if not 0 <= self.stall_rtol < 1:
             raise ValueError("stall_rtol must lie in [0, 1)")
+
+    def init_state(self, dtype=None):
+        """The initial ``user_state``: both trackers at ``+inf``. ``dtype``
+        defaults to the JAX default float; pass the problem dtype explicitly
+        for a float32 program under enabled x64."""
+        infinity = jnp.asarray(
+            jnp.inf, dtype=jnp.result_type(float) if dtype is None else dtype
+        )
+        return {"reference": infinity, "previous": infinity}
 
     def __call__(self, ctx):
         ridge = ctx.lm_state.ridge
@@ -198,7 +214,7 @@ class RidgeContinuation:
         advanced = new_ridge < ridge
         fresh_level = jnp.asarray(jnp.inf, dtype)
         state_dtype = jnp.asarray(ctx.user_state["reference"]).dtype
-        return LMSolveAction(
+        return LMAction(
             lm_state=dataclasses.replace(ctx.lm_state, ridge=new_ridge),
             user_state={
                 "reference": jnp.where(advanced, fresh_level, reference).astype(
@@ -241,7 +257,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
     package's alternative is metric-damped
     :class:`~nlls_gram.LevenbergMarquardt`; this solver instead makes every
     inner problem a well-posed NLLS. Annealing ``ridge`` per stationarity
-    event (:func:`ridge_continuation`) is the iteratively regularized
+    event (:class:`AnnealRidge`) is the iteratively regularized
     Gauss-Newton method (Bakushinskii 1992; Kaltenbacher-Neubauer-Scherzer
     2008). For kernel metrics each inner step is a kernel ridge regression
     of the relinearized equations (Chen-Hosseini-Owhadi-Stuart 2021).
@@ -369,8 +385,8 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
     callback-produced value).
 
     The init/update/solve protocol, callback contract
-    (:class:`~nlls_gram.LMSolveContext` ->
-    :class:`~nlls_gram.LMSolveAction`), ``multi_start``, ``save_steps``, and
+    (:class:`~nlls_gram.LMContext` ->
+    :class:`~nlls_gram.LMAction`), ``multi_start``, ``save_steps``, and
     :class:`~nlls_gram.LMSolveResult` are shared with
     :class:`~nlls_gram.LevenbergMarquardt`; code written against that solver
     ports by changing the constructor (its damping metric -> this metric)
@@ -379,6 +395,10 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
     ridge objective at each lane's own final ridge -- comparable across lanes
     when they share a continuation schedule.
     """
+
+    # The metric defines the ridge objective, so a callback-replaced metric
+    # is a problem change (convergence suppressed for that step).
+    _metric_defines_objective = True
 
     def __init__(
         self,
@@ -407,7 +427,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         ):
             raise ValueError(
                 "ridge must be strictly positive (ridge = 0 is unsupported: "
-                "use ridge_continuation with a positive ridge_floor to "
+                "use AnnealRidge with a positive ridge_floor to "
                 "approach the ridgeless limit)"
             )
         if init_damping <= 0 or damping_decrease <= 0 or damping_increase <= 0:
@@ -420,7 +440,8 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             raise ValueError("max_damping must be at least init_damping")
         self.residual_fn = canonical_residual
         self.residual_arity = residual_arity
-        self.metric = metric
+        self.initial_metric = metric
+        self._check_registered_instance(metric, "metric")
         self.ridge = ridge
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
@@ -440,47 +461,75 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             # approximation of (J~'J~ + ridge E + damping I)^{-1}, posed on
             # the whitened variable. IdentityPreconditioner() opts out
             # explicitly.
-            self.normal_cg_preconditioner = linear_solver.preconditioner
+            if linear_solver.preconditioner is None:
+                raise ValueError(
+                    "the forward linear_solver requires a preconditioner; "
+                    "IdentityPreconditioner() is the explicit opt-out "
+                    "(preconditioner=None is legal only in the ad_solver role)"
+                )
+            self._check_registered_instance(
+                linear_solver.preconditioner, "linear_solver.preconditioner"
+            )
+            self.initial_preconditioner = linear_solver.preconditioner
             # tol=None resolves per residual dtype in hyperparams(), the
             # _ad_cg_tol convention.
             self.iterative_tol = linear_solver.tol
             self.iterative_atol = linear_solver.atol
             self.iterative_maxiter = linear_solver.maxiter
         else:
-            self.normal_cg_preconditioner = None
+            self.initial_preconditioner = None
             self.iterative_tol = 0.0
             self.iterative_atol = 0.0
             self.iterative_maxiter = 8
         if isinstance(ad_solver, CG):
-            if ad_solver.preconditioner.requires_positive_damping:
-                raise ValueError(
-                    "this preconditioner divides by the live damping and "
-                    "cannot serve in ad_solver (the AD system is undamped)"
-                )
             self.ad_solver_tol = ad_solver.tol
             self.ad_solver_atol = ad_solver.atol
             self.ad_solver_maxiter = ad_solver.maxiter
-            self.ad_solver_preconditioner = ad_solver.preconditioner
+            if ad_solver.preconditioner is None:
+                # preconditioner=None in the AD role inherits the CARRIED
+                # forward instance at the solution (callback refreshes
+                # included) while pinning the AD tolerance and budget.
+                self.ad_solver_preconditioner = None
+                if self.initial_preconditioner is None:
+                    self._ad_preconditioner_source = "none"
+                elif self.initial_preconditioner.requires_positive_damping:
+                    raise ValueError(
+                        "ad_solver preconditioner=None inherits the forward "
+                        "preconditioner, but this one divides by the live "
+                        "damping and cannot serve the undamped AD system"
+                    )
+                else:
+                    self._ad_preconditioner_source = "carried"
+            else:
+                if ad_solver.preconditioner.requires_positive_damping:
+                    raise ValueError(
+                        "this preconditioner divides by the live damping and "
+                        "cannot serve in ad_solver (the AD system is undamped)"
+                    )
+                self._check_registered_instance(
+                    ad_solver.preconditioner, "ad_solver.preconditioner"
+                )
+                self.ad_solver_preconditioner = ad_solver.preconditioner
+                self._ad_preconditioner_source = "explicit"
         else:
             self.ad_solver_tol = None
             self.ad_solver_atol = 0.0
             self.ad_solver_maxiter = None
+            self.ad_solver_preconditioner = None
             # ad_solver=None matches the forward family, and a CG forward
-            # also hands its preconditioner to the undamped implicit solve:
-            # the AD operator IS the forward operator at zero damping, the
-            # typed apply is damping-analytic there, and unpreconditioned
+            # also hands its CARRIED preconditioner to the undamped implicit
+            # solve: the AD operator IS the forward operator at zero damping,
+            # the typed apply is damping-analytic there, and unpreconditioned
             # implicit CG degrades exactly like the forward as the ridge
             # shrinks. The AD tolerance and budget stay at the AD defaults
             # (run to tolerance); damping-dividing hooks fall back to
             # unpreconditioned.
-            if (
+            inherit = (
                 ad_solver is None
                 and isinstance(linear_solver, CG)
                 and not linear_solver.preconditioner.requires_positive_damping
-            ):
-                self.ad_solver_preconditioner = linear_solver.preconditioner
-            else:
-                self.ad_solver_preconditioner = None
+            )
+            self._ad_preconditioner_source = "carried" if inherit else "none"
         self.has_aux = has_aux
         # Only the dense paths materialize J' (and the cholesky/qr caches ride
         # on the same reject-reuse lifecycle), so the flag is inert for the
@@ -488,35 +537,27 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         self.cache_jacobian = cache_jacobian and not isinstance(linear_solver, CG)
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
-        # The forward preconditioner is the one whose prepared state is carried
-        # (the AD role runs once, at the solution). Whether a hook is stateful
-        # is a static property of its class, so the slots and their lax.cond
-        # compile away entirely for the stateless default.
-        self.preconditioner = self.normal_cg_preconditioner
-        self._metric_prepares = type(metric).prepare is not Metric.prepare
-        self._precond_prepares = self.preconditioner is not None and (
-            type(self.preconditioner).prepare is not Preconditioner.prepare
-        )
         # Value-based identity: the jitted solve loop marks the solver itself
         # static, so equal-config solvers built around the same residual and
-        # metric share the compiled loop across instances. Keyed on the
-        # constructor arguments -- every derived attribute is a function of
-        # them. Metrics hash by identity, so a rebuilt equal-config metric
-        # keys a fresh compilation.
+        # metric-STRUCTURE share the compiled loop across instances. The
+        # metric and forward preconditioner key by pytree structure (their
+        # arrays are threaded through the carried state); an explicit AD
+        # instance keys by identity (its arrays are baked into the tangent
+        # program).
         self._static_key = tuple(
             _static_key_component(value)
             for value in (
                 residual_fn,
-                metric,
+                jax.tree_util.tree_structure(metric),
                 ridge,
                 init_damping,
                 damping_decrease,
                 damping_increase,
                 min_damping,
                 max_damping,
-                linear_solver,
+                _config_static_key(linear_solver, baked=False),
                 jacobian_mode,
-                ad_solver,
+                _config_static_key(ad_solver, baked=True),
                 has_aux,
                 self.cache_jacobian,
                 geodesic_acceleration,
@@ -547,9 +588,11 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         min_damping = _damping_floor(self.min_damping, dtype)
         damping = jnp.maximum(jnp.asarray(self.init_damping, dtype=dtype), min_damping)
         ridge = self._resolve_ridge(dtype)
-        hooks = self._init_hook_state(theta, LMState(damping, ridge), args, p)
+        instances = dict(
+            metric=self.initial_metric, preconditioner=self.initial_preconditioner
+        )
         if not self.cache_jacobian:
-            return LMState(damping, ridge, **hooks)
+            return LMState(damping, ridge, **instances)
         p_dim = theta.size
         m = residual.size
         return LMState(
@@ -560,7 +603,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             jacobian_valid=jnp.asarray(False, dtype=jnp.bool_),
             aux=jax.tree.map(jnp.zeros_like, aux),
             solver_cache=self.linear_solver.new_cache(m, p_dim, n_m, dtype, True),
-            **hooks,
+            **instances,
         )
 
     def _initial_info(self, x, lm_state, args, p):
@@ -572,9 +615,10 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         theta, _ = ravel_pytree(x)
         ridge = jnp.asarray(lm_state.ridge, dtype=residual.dtype)
         n_m = self._block_sizes(theta.shape[0])[0]
-        ctx = self._carried_ctx(theta, lm_state, args, p)
+        resolved = self._resolved_state(lm_state)
+        ctx = SolverContext(x=theta, lm_state=resolved, args=args, p=p)
         y_m = jnp.asarray(
-            self.metric.factor_apply(theta[:n_m], ctx), dtype=residual.dtype
+            resolved.metric.factor_apply(theta[:n_m], ctx), dtype=residual.dtype
         )
         penalty_value = jnp.sum(y_m**2)
         loss = resid_loss + ridge * penalty_value
@@ -671,16 +715,11 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         # including the reported norms -- is the whitened one. y_m doubles as
         # the pre-step penalty value ||y_m||^2.
         n_m, n_f = self._block_sizes(theta.shape[0])
-        metric_state, precond_state = self._hook_state(theta, lm_state, args, p)
-        ctx = SolverContext(
-            x=theta,
-            lm_state=lm_state,
-            args=args,
-            p=p,
-            metric_state=metric_state,
-            preconditioner_state=precond_state,
+        resolved_state = self._resolved_state(lm_state)
+        ctx = SolverContext(x=theta, lm_state=resolved_state, args=args, p=p)
+        y_m = jnp.asarray(
+            resolved_state.metric.factor_apply(theta[:n_m], ctx), dtype=resid.dtype
         )
-        y_m = jnp.asarray(self.metric.factor_apply(theta[:n_m], ctx), dtype=resid.dtype)
         penalty_value_old = jnp.sum(y_m**2)
         penalty_gradient = jnp.concatenate([y_m, jnp.zeros(n_f, dtype=resid.dtype)])
 
@@ -812,18 +851,13 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         loss = jnp.where(improved, loss_candidate, loss_old)
         resid_loss = jnp.where(improved, resid_loss_candidate, resid_loss_old)
         penalty_value = jnp.where(improved, penalty_candidate, penalty_value_old)
-        # Thread the caches and prepared hook state built at this step's
-        # pre-step (x, ridge): valid = ~improved marks them reusable exactly
-        # when the step was rejected (x did not move). ridge passes through
-        # unchanged -- only init() and callbacks set it. The input hyper (not
-        # the fallback) passes through so the loop carry structure is stable.
-        hooks = {}
-        if self._metric_prepares:
-            hooks["metric_state"] = metric_state
-            hooks["metric_valid"] = ~improved
-        if self._precond_prepares:
-            hooks["precond"] = precond_state
-            hooks["precond_valid"] = ~improved
+        # Thread the caches built at this step's pre-step (x, ridge):
+        # valid = ~improved marks them reusable exactly when the step was
+        # rejected (x did not move). ridge and the carried instances pass
+        # through unchanged -- only init() and callbacks set them. The input
+        # hyper (not the fallback) passes through so the loop carry structure
+        # is stable.
+        instances = dict(metric=lm_state.metric, preconditioner=lm_state.preconditioner)
         if self.cache_jacobian:
             new_lm_state = LMState(
                 new_damping,
@@ -834,10 +868,12 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
                 aux,
                 lm_state.hyper,
                 solver_cache=step_solver.make_cache(~improved),
-                **hooks,
+                **instances,
             )
         else:
-            new_lm_state = LMState(new_damping, ridge, hyper=lm_state.hyper, **hooks)
+            new_lm_state = LMState(
+                new_damping, ridge, hyper=lm_state.hyper, **instances
+            )
         return (
             unravel(theta_new),
             new_lm_state,
@@ -901,17 +937,20 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         # Recast a hand-replaced ridge to the carried scalar dtype: a
         # weak-typed replace(state, ridge=1e-4) would change the jit input
         # aval and retrace the loop.
-        return dataclasses.replace(
-            lm_state,
-            ridge=jnp.asarray(
-                lm_state.ridge, dtype=jnp.asarray(lm_state.damping).dtype
-            ),
+        return self._resolved_state(
+            dataclasses.replace(
+                lm_state,
+                ridge=jnp.asarray(
+                    lm_state.ridge, dtype=jnp.asarray(lm_state.damping).dtype
+                ),
+            )
         )
 
     def _initial_ad_point(self, x, lm_state, args, p):
-        # The pre-loop ridge rides along: a failed lane's callback may have
-        # left an invalid ridge behind, so the failed tangent uses this one.
-        return (x, args, p, lm_state.ridge)
+        # The pre-loop ridge and instances ride along: a failed lane's
+        # callback may have left an invalid ridge or metric behind, so the
+        # failed tangent uses these.
+        return (x, args, p, lm_state.metric, lm_state.preconditioner, lm_state.ridge)
 
     def _check_action_state(self, lm_state):
         if lm_state.ridge is None:
@@ -963,10 +1002,11 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             residual = self._residual_and_aux(result.x, result.args, p)[0]
             theta, _ = ravel_pytree(result.x)
             n_m = self._block_sizes(theta.shape[0])[0]
-            ctx = self._carried_ctx(theta, result.lm_state, result.args, p)
+            resolved = self._resolved_state(result.lm_state)
+            ctx = SolverContext(x=theta, lm_state=resolved, args=result.args, p=p)
             ridge = jnp.asarray(result.lm_state.ridge, dtype=residual.dtype)
             y_m = jnp.asarray(
-                self.metric.factor_apply(theta[:n_m], ctx), dtype=residual.dtype
+                resolved.metric.factor_apply(theta[:n_m], ctx), dtype=residual.dtype
             )
             loss = jnp.sum(residual**2) + ridge * jnp.sum(y_m**2)
         return jnp.where(
@@ -982,16 +1022,24 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
     def _ad_x_tangent(self, x, args, p, p_dot, result, ad_success, initial_ad_point):
         if p is None:
             return jax.tree.map(_zero_tangent_leaf, x)
-        # A successful tangent uses the winner's own final ridge; a failed one
-        # the pre-loop initial ridge. Both are stop-gradient'd -- lambda is
-        # inert conditioning data, and the returned state rides along as
-        # equally inert SolverContext data for the factor callbacks.
+        # A successful tangent uses the winner's own final ridge and carried
+        # instances; a failed one the pre-loop initial ones (a callback may
+        # have left invalid values behind). All are stop-gradient'd -- inert
+        # conditioning data for the factor callbacks.
         final_ridge = jax.lax.stop_gradient(result.lm_state.ridge)
-        initial_ridge = jax.lax.stop_gradient(initial_ad_point[3])
+        initial_ridge = jax.lax.stop_gradient(initial_ad_point[5])
         ridge = jnp.where(
             ad_success, final_ridge, jnp.asarray(initial_ridge, final_ridge.dtype)
         )
         lm_state = jax.lax.stop_gradient(result.lm_state)
+        initial_instances = jax.lax.stop_gradient(initial_ad_point[3:5])
+        lm_state = dataclasses.replace(
+            lm_state,
+            metric=_where_tree(ad_success, lm_state.metric, initial_instances[0]),
+            preconditioner=_where_tree(
+                ad_success, lm_state.preconditioner, initial_instances[1]
+            ),
+        )
         if self._resolved_ad_solver() == "cholesky":
             return self._ad_tangent_cholesky(x, args, p, p_dot, ridge, lm_state)
         return self._ad_tangent_normal_cg(x, args, p, p_dot, ridge, lm_state)
@@ -1005,7 +1053,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             x, args, p, p_dot
         )
         n_m = self._block_sizes(theta.shape[0])[0]
-        ctx = self._frozen_ctx(theta, lm_state, args, p, self.ad_solver_preconditioner)
+        ctx = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
         Jt = self._assemble_jt(theta_jvp, theta, residual)
         ridge_typed = jnp.asarray(ridge, dtype=residual.dtype)
         Jt_sub = jnp.asarray(
@@ -1025,7 +1073,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             x, args, p, p_dot
         )
         n_m, n_f = self._block_sizes(theta.shape[0])
-        ctx = self._frozen_ctx(theta, lm_state, args, p, self.ad_solver_preconditioner)
+        ctx = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
         theta_transpose = jax.linear_transpose(theta_jvp, theta)
 
         def JT(cotangent):
@@ -1052,7 +1100,8 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
 
         cg_tol = self._ad_cg_tol(residual.dtype)
         cg_atol = jnp.asarray(self.ad_solver_atol, dtype=residual.dtype)
-        if self.ad_solver_preconditioner is None:
+        ad_preconditioner = self._ad_preconditioner(lm_state)
+        if ad_preconditioner is None:
             apply_M = None
         else:
             # The AD system is undamped, so the preconditioner sees zero
@@ -1061,7 +1110,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             zero_damping = jnp.zeros((), dtype=residual.dtype)
 
             def apply_M(v):
-                return self.ad_solver_preconditioner.apply(v, zero_damping, ctx)
+                return ad_preconditioner.apply(v, zero_damping, ctx)
 
         def solve(matvec, rhs_value):
             solution, _ = jsp_sparse_linalg.cg(

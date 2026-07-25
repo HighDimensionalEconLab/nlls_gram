@@ -1,3 +1,6 @@
+import dataclasses
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
 import pytest
@@ -8,31 +11,37 @@ from nlls_gram import (
     GramCG,
     IdentityPreconditioner,
     LevenbergMarquardt,
-    LMSolveAction,
+    LMAction,
     LMStatus,
     Metric,
     MultiStart,
+    register_pytree_dataclass,
 )
 
 
-class AuxWeightedMetric(Metric):
-    """An iterate-dependent metric: the diagonal weights ride on prepare's
-    traced state, rebuilt from the live iterate and frozen at the solution
-    under implicit AD."""
+@dataclass(frozen=True, eq=False)
+class WeightedMetric(Metric):
+    """A metric whose diagonal weight is a carried leaf: a callback rebuilds
+    it from the live iterate, and the carried instance is frozen at the
+    solution under implicit AD."""
 
-    size = 1
-
-    def prepare(self, theta, ctx):
-        return 1.0 + jnp.sqrt(jnp.abs(theta))
+    weight: jax.Array
+    size: int = 1
+    free_scale: float = 1.0
 
     def factor_apply(self, v, ctx):
-        return jnp.sqrt(ctx.metric_state) * v
+        return jnp.sqrt(self.weight) * v
 
     def factor_solve(self, v, ctx):
-        return v / jnp.sqrt(ctx.metric_state)
+        return v / jnp.sqrt(self.weight)
 
     def factor_solve_transpose(self, v, ctx):
         return self.factor_solve(v, ctx)
+
+
+register_pytree_dataclass(
+    WeightedMetric, data_fields=("weight", "free_scale"), meta_fields=("size",)
+)
 
 
 def test_failed_lane_uses_initial_point_under_vmap_jvp_and_vjp():
@@ -85,26 +94,33 @@ def test_failed_lane_uses_initial_point_under_vmap_jvp_and_vjp():
     assert jnp.allclose(cotangent, jnp.asarray([1.0, 0.0]), atol=1e-6)
 
 
-def test_invalid_failed_result_uses_initial_point_for_a_prepared_metric():
+def test_invalid_failed_result_uses_initial_instances_for_a_carried_metric():
     def residual(x, _, p):
         root = jnp.sqrt(x)
         return root - p, {"weight": 1.0 + root}
 
+    x0 = jnp.ones(1)
     solver = LevenbergMarquardt(
         residual,
         has_aux=True,
-        metric=AuxWeightedMetric(),
+        metric=WeightedMetric(1.0 + jnp.sqrt(jnp.abs(x0))),
         ad_solver=SVD(),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )
-    x0 = jnp.ones(1)
 
-    def invalidate(_):
-        return LMSolveAction(
+    def invalidate(ctx):
+        # Poison BOTH the iterate and the carried metric: the failed-lane
+        # tangent program must read the pre-loop instances, or the NaN
+        # weight reaches the whitening and the zero-tangent contract breaks.
+        return LMAction(
             stop=True,
             status=LMStatus.NONFINITE,
             x=-jnp.ones(1),
+            lm_state=dataclasses.replace(
+                ctx.lm_state,
+                metric=WeightedMetric(jnp.full((1,), jnp.nan)),
+            ),
         )
 
     def failed_outputs(p):

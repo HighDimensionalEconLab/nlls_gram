@@ -12,7 +12,7 @@ selection of the returned root lives:
 - ``RidgeLevenbergMarquardt`` puts it in the OBJECTIVE, minimizing
   ``||r(x)||^2 + ridge * ||x_m||_W^2`` for a positive-definite ``Metric`` W on
   the metric block, with the ridge weight carried as traced state a callback
-  can anneal (``ridge_continuation``). Classical nonlinear Tikhonov
+  can anneal (``AnnealRidge``). Classical nonlinear Tikhonov
   regularization; the minimum-seminorm interpolant is what it converges to.
 - ``LevenbergMarquardt`` puts it in the DAMPING GEOMETRY, minimizing
   ``||r(x)||^2`` with the same ``Metric`` weighting the trust region, so the
@@ -36,10 +36,10 @@ from nlls_gram.linear_solvers import (
     QRCache,
 )
 from nlls_gram.lm_types import (
+    LMAction,
+    LMContext,
     LMHyperparams,
     LMInfo,
-    LMSolveAction,
-    LMSolveContext,
     LMSolveResult,
     LMState,
     LMStatus,
@@ -62,18 +62,15 @@ from nlls_gram.preconditioners import (
     Preconditioner,
     ShermanMorrisonPreconditioner,
     WoodburyPreconditioner,
-    block_eigen_state,
 )
-from nlls_gram.ridge_lm import (
-    RidgeContinuation,
-    RidgeLevenbergMarquardt,
-    ridge_continuation,
-)
+from nlls_gram.ridge_lm import AnnealRidge, RidgeLevenbergMarquardt
+from nlls_gram.utilities import register_pytree_dataclass
 
 __all__ = [
     "CG",
     "QR",
     "SVD",
+    "AnnealRidge",
     "BlockEigenPreconditioner",
     "Cholesky",
     "CholeskyCache",
@@ -83,10 +80,10 @@ __all__ = [
     "GramCG",
     "IdentityMetric",
     "IdentityPreconditioner",
+    "LMAction",
+    "LMContext",
     "LMHyperparams",
     "LMInfo",
-    "LMSolveAction",
-    "LMSolveContext",
     "LMSolveResult",
     "LMState",
     "LMStatus",
@@ -99,11 +96,9 @@ __all__ = [
     "Preconditioner",
     "QRCache",
     "RepeatedFactorMetric",
-    "RidgeContinuation",
     "RidgeLevenbergMarquardt",
     "ShermanMorrisonPreconditioner",
     "SolverContext",
     "WoodburyPreconditioner",
-    "block_eigen_state",
-    "ridge_continuation",
+    "register_pytree_dataclass",
 ]

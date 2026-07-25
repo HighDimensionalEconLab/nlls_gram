@@ -10,16 +10,18 @@ must stay exact -- a preconditioner only changes the CG iteration path, so
 approximations and staleness are safe.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Any
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 
+from nlls_gram.utilities import register_pytree_dataclass
+
 
 class Preconditioner:
-    """SPD preconditioner for ``RidgeLevenbergMarquardt``'s CG paths.
+    """SPD preconditioner for the solvers' CG paths.
 
     ``apply(v, damping, ctx)`` returns an SPD approximation of the damped
     operator's inverse -- ``(J~'J~ + ridge E + damping I)^{-1}`` in parameter
@@ -27,12 +29,23 @@ class Preconditioner:
     residual space under :class:`~nlls_gram.GramCG`. In the forward role it
     sits in CG's ``M`` slot with the live damping; in the ``ad_solver`` role
     the implicit system is undamped and ``damping`` is zero. ``ctx`` is the
-    same :class:`~nlls_gram.SolverContext` the metric factor ops receive, so a
-    preconditioner can key off the solver state.
+    same :class:`~nlls_gram.SolverContext` the metric factor ops receive.
 
-    Implement a custom one as a small dataclass (``eq=False`` identity hashing
-    when it holds arrays -- construct once at setup scope and reuse, since the
-    instance enters the solver's compile-cache key)::
+    Preconditioner instances are JAX PYTREES: array fields are traced
+    leaves, the type plus its static fields are structure. Every concrete
+    class must be registered with
+    :func:`~nlls_gram.register_pytree_dataclass` -- the solvers reject
+    unregistered instances. The instance rides inside the solver state
+    (``lm_state.preconditioner``), so a ``solve`` callback refreshes it by
+    calling the CONSTRUCTOR again with fresh arrays -- same type, same leaf
+    shapes and dtypes, pure traced ops, no recompilation. Never
+    ``dataclasses.replace`` a preconditioner: ``replace`` re-runs
+    ``__init__``, re-paying any eigendecomposition or sketch, and
+    construction-time-only inputs are not stored to re-supply. A stale
+    instance only changes the CG iteration path, never the converged step,
+    so refreshing rarely (or never) is always safe.
+
+    Implement a custom one as a small registered frozen dataclass::
 
         @dataclass(frozen=True, eq=False)
         class JacobiPreconditioner(Preconditioner):
@@ -41,39 +54,14 @@ class Preconditioner:
             def apply(self, v, damping, ctx):
                 return v / (self.diagonal + damping)
 
+        register_pytree_dataclass(JacobiPreconditioner, data_fields=("diagonal",))
+
     Subclasses whose ``apply`` divides by the live damping must set
     ``requires_positive_damping = True``; the constructor rejects them for
     the AD role, where damping is zero.
     """
 
     requires_positive_damping = False
-
-    def prepare(self, theta, ctx):
-        """Build this preconditioner's numeric state from the current iterate.
-
-        The default is ``None`` -- a stateless preconditioner, whose state
-        slot compiles away. Override to hold traced arrays that must track the
-        iterate: the returned pytree rides on ``lm_state.precond`` and comes
-        back as ``ctx.preconditioner_state`` in :meth:`apply`. It is rebuilt on
-        accepted steps and reused across rejected ones (where ``x`` did not
-        move), runs inside the jitted loop as traced ops, and is frozen at the
-        solution under implicit AD. Its pytree structure must not change
-        between rebuilds.
-
-        Expensive setup that does NOT depend on the iterate belongs in
-        ``__init__``, where it is paid once.
-        """
-        return None
-
-    def rebuild(self, ctx):
-        """Traced predicate gating a rebuild on an accepted step.
-
-        The default rebuilds every accepted step. Return ``False`` to keep the
-        carried state -- staleness only changes the CG iteration path, never
-        the converged step, so declining is always safe and often much
-        cheaper (e.g. rebuild only when ridge continuation advances a level).
-        """
-        return True
 
     def apply(self, v, damping, ctx):
         raise NotImplementedError
@@ -85,17 +73,21 @@ class IdentityPreconditioner(Preconditioner):
 
     Nobody should run Krylov methods without thinking about preconditioning,
     so opting out is an explicit, greppable decision rather than a silent
-    default. Stateless and value-equal: two instances compare equal, so
-    equal ``CG`` configs share one compiled solve loop.
+    default. Stateless: every instance compares equal, so equal ``CG``
+    configs share one compiled solve loop.
     """
 
     def apply(self, v, damping, ctx):
         return v
 
 
+register_pytree_dataclass(IdentityPreconditioner, data_fields=())
+
+
 @dataclass(frozen=True, eq=False)
 class BlockEigenPreconditioner(Preconditioner):
-    """Block-diagonal eigenbasis preconditioner that owns its state.
+    """Block-diagonal eigenbasis preconditioner over grouped whitened
+    coordinates.
 
     The workhorse for structured whitened normal operators
     ``J~'J~ + ridge E + damping I`` built from repeated interacting blocks
@@ -108,38 +100,72 @@ class BlockEigenPreconditioner(Preconditioner):
 
     per block -- analytic in both the live ``damping`` (traced; it changes per
     LM step) and the live ``ridge`` (read from ``ctx.lm_state.ridge``, so
-    ridge continuation composes with no rebuild).
+    ridge continuation composes with no refresh).
 
-    ``blocks_fn(theta, ctx)`` returns the family list that
-    :func:`block_eigen_state` packs: ``(blocks, ridge_weight)`` pairs whose
+    ``families`` is a sequence of ``(blocks, ridge_weight)`` pairs:
     ``blocks`` has shape ``(groups, size, size)`` -- the stacked diagonal
     blocks of ``J~'J~`` restricted to that family's coordinate groups, in
     permuted order. Families in the metric block set ``ridge_weight = 1``
-    (their diagonal carries the ``ridge`` spectral floor); free-block families
-    set ``0`` (damping-only, so the zero-damping AD role applies their plain
-    inverse -- positive definite whenever the free block is identified).
-    ``permutation`` reorders the flattened whitened vector into family-major
-    order; ``jnp.arange(n)`` serves when the natural layout already is.
+    (their diagonal carries the ``ridge`` spectral floor); free-block
+    families set ``0`` (damping-only, so the zero-damping AD role applies
+    their plain inverse -- positive definite whenever the free block is
+    identified). Blocks are symmetrized and eigendecomposed HERE, once;
+    positive semidefiniteness is assumed, not validated (entries may be
+    traced). ``permutation`` is the 1-D integer array reordering the
+    flattened whitened parameter vector into family-major order
+    (``v_permuted = v[permutation]``); families are consumed in sequence and
+    must cover it exactly. ``jnp.arange(n)`` serves when the natural layout
+    already is family-major.
 
-    The eigendecomposition runs in :meth:`prepare` from the live iterate, so
-    it is rebuilt on accepted steps and reused across rejected ones. Override
-    ``rebuild`` to decline -- a stale state only changes the CG iteration
-    path, never the converged step, so refreshing only when ridge continuation
-    advances a level is a pure saving::
-
-        class OnLevelChange(BlockEigenPreconditioner):
-            def rebuild(self, ctx):
-                return ctx.lm_state.ridge < self.last_ridge
+    The constructor is fully traceable, so a ``solve`` callback refreshes
+    the preconditioner from the live iterate by constructing a new instance
+    -- gate the rebuild with ``jax.lax.cond`` (e.g. on a ridge-continuation
+    level advance) so the eigendecomposition is paid only when it fires; a
+    ``jnp.where`` merge would pay it every step.
     """
 
-    blocks_fn: Any
+    families: InitVar[Any]
     permutation: jax.Array
+    eigenvectors: tuple = field(init=False)
+    eigenvalues: tuple = field(init=False)
+    ridge_weights: tuple = field(init=False)
+    inverse_permutation: jax.Array = field(init=False)
 
-    def prepare(self, theta, ctx):
-        return block_eigen_state(self.blocks_fn(theta, ctx), self.permutation)
+    def __post_init__(self, families):
+        permutation = jnp.asarray(self.permutation)
+        if permutation.ndim != 1 or not jnp.issubdtype(permutation.dtype, jnp.integer):
+            raise ValueError("permutation must be a 1-D integer array")
+        eigenvectors, eigenvalues, ridge_weights = [], [], []
+        covered = 0
+        for blocks, ridge_weight in families:
+            blocks = jnp.asarray(blocks)
+            if blocks.ndim != 3 or blocks.shape[1] != blocks.shape[2]:
+                raise ValueError(
+                    "each family's blocks must have shape (groups, size, size); "
+                    f"got {blocks.shape}"
+                )
+            symmetrized = 0.5 * (blocks + jnp.swapaxes(blocks, 1, 2))
+            values, vectors = jnp.linalg.eigh(symmetrized)
+            # eigh of a numerically PSD block can return tiny negative
+            # eigenvalues; clamped at zero the apply shift stays positive for
+            # any positive ridge/damping (and the zero-damping AD role stays
+            # SPD whenever the family itself is).
+            eigenvalues.append(jnp.maximum(values, 0.0))
+            eigenvectors.append(vectors)
+            ridge_weights.append(jnp.asarray(ridge_weight, dtype=blocks.dtype))
+            covered += blocks.shape[0] * blocks.shape[1]
+        if covered != permutation.shape[0]:
+            raise ValueError(
+                f"families cover {covered} coordinates but the permutation "
+                f"has {permutation.shape[0]}"
+            )
+        object.__setattr__(self, "permutation", permutation)
+        object.__setattr__(self, "eigenvectors", tuple(eigenvectors))
+        object.__setattr__(self, "eigenvalues", tuple(eigenvalues))
+        object.__setattr__(self, "ridge_weights", tuple(ridge_weights))
+        object.__setattr__(self, "inverse_permutation", jnp.argsort(permutation))
 
     def apply(self, v, damping, ctx):
-        state = ctx.preconditioner_state
         # LevenbergMarquardt carries no ridge, so its metric-block families
         # shift by the damping alone.
         carried = ctx.lm_state.ridge
@@ -148,88 +174,33 @@ class BlockEigenPreconditioner(Preconditioner):
             if carried is None
             else jnp.asarray(carried, dtype=v.dtype)
         )
-        permuted = v[state["permutation"]]
+        permuted = v[self.permutation]
         pieces = []
         offset = 0
-        for family in state["families"]:
-            V = family["eigenvectors"]
-            eigenvalues = family["eigenvalues"]
+        for V, values, ridge_weight in zip(
+            self.eigenvectors, self.eigenvalues, self.ridge_weights, strict=True
+        ):
             groups, size = V.shape[0], V.shape[1]
             segment = permuted[offset : offset + groups * size]
             offset += groups * size
-            shift = family["ridge_weight"] * ridge + damping
+            shift = ridge_weight * ridge + damping
             coefficients = jnp.einsum("gab,ga->gb", V, segment.reshape(groups, size))
-            solved = coefficients / (eigenvalues + shift)
-            pieces.append(jnp.einsum("gab,gb->ga", V, solved).reshape(-1))
-        if offset != permuted.shape[0]:
-            raise ValueError(
-                f"block_eigen_state families cover {offset} coordinates but "
-                f"the parameter vector has {permuted.shape[0]}"
+            pieces.append(
+                jnp.einsum("gab,gb->ga", V, coefficients / (values + shift)).reshape(-1)
             )
-        return jnp.concatenate(pieces)[state["inverse_permutation"]].astype(v.dtype)
+        return jnp.concatenate(pieces)[self.inverse_permutation].astype(v.dtype)
 
 
-def block_eigen_state(families, permutation):
-    """Pack stacked SPD diagonal blocks into a
-    :class:`BlockEigenPreconditioner` state pytree.
-
-    ``families`` is a sequence of ``(blocks, ridge_weight)`` pairs:
-    ``blocks`` has shape ``(groups, size, size)`` -- the stacked diagonal
-    blocks of the whitened normal operator ``J~'J~`` restricted to that
-    family's coordinate groups, in permuted order -- and ``ridge_weight`` is
-    ``1.0`` for metric-block families (the apply shift includes the live
-    ridge) or ``0.0`` for free-block families (damping-only). Blocks are
-    symmetrized and eigendecomposed here, once; positive semidefiniteness is
-    assumed, not validated (entries may be traced).
-
-    ``permutation`` is the 1-D integer array reordering the flattened
-    whitened parameter vector into family-major order
-    (``v_permuted = v[permutation]``); families are consumed in sequence
-    and must cover it exactly. The identity ``jnp.arange(p)`` serves when
-    the natural layout is already family-major.
-
-    Fully traceable, so an adaptive rebuild can run inside a jitted solve
-    callback; the state's pytree structure (family count and shapes) is
-    static and must not change across rebuilds.
-    """
-
-    permutation = jnp.asarray(permutation)
-    if permutation.ndim != 1 or not jnp.issubdtype(permutation.dtype, jnp.integer):
-        raise ValueError("permutation must be a 1-D integer array")
-    packed = []
-    covered = 0
-    for blocks, ridge_weight in families:
-        blocks = jnp.asarray(blocks)
-        if blocks.ndim != 3 or blocks.shape[1] != blocks.shape[2]:
-            raise ValueError(
-                "each family's blocks must have shape (groups, size, size); "
-                f"got {blocks.shape}"
-            )
-        symmetrized = 0.5 * (blocks + jnp.swapaxes(blocks, 1, 2))
-        eigenvalues, eigenvectors = jnp.linalg.eigh(symmetrized)
-        # eigh of a numerically PSD block can return tiny negative
-        # eigenvalues; clamped at zero the apply shift stays positive for
-        # any positive ridge/damping (and the zero-damping AD role stays
-        # SPD whenever the family itself is).
-        eigenvalues = jnp.maximum(eigenvalues, 0.0)
-        packed.append(
-            {
-                "eigenvectors": eigenvectors,
-                "eigenvalues": eigenvalues,
-                "ridge_weight": jnp.asarray(ridge_weight, dtype=blocks.dtype),
-            }
-        )
-        covered += blocks.shape[0] * blocks.shape[1]
-    if covered != permutation.shape[0]:
-        raise ValueError(
-            f"families cover {covered} coordinates but the permutation has "
-            f"{permutation.shape[0]}"
-        )
-    return {
-        "permutation": permutation,
-        "inverse_permutation": jnp.argsort(permutation),
-        "families": tuple(packed),
-    }
+register_pytree_dataclass(
+    BlockEigenPreconditioner,
+    data_fields=(
+        "permutation",
+        "eigenvectors",
+        "eigenvalues",
+        "ridge_weights",
+        "inverse_permutation",
+    ),
+)
 
 
 @dataclass(frozen=True, eq=False)
@@ -244,22 +215,39 @@ class ShermanMorrisonPreconditioner(Preconditioner):
     ``(c^2/m) u u'`` into ``J M^{-1} J'``. The live ``damping`` is ignored --
     spectral closeness to the damped operator is all a preconditioner needs --
     which also makes it valid in the zero-damping ``ad_solver`` role.
+
+    ``solve`` applies ``A^{-1}`` and is called on every ``apply``, so it is a
+    STATIC field: a fixed hashable callable whose identity enters the
+    instance's pytree structure, with anything it closes over entering the
+    compiled program as constants. This class is a setup-scope object for a
+    fixed dual operator, not a callback-refresh target.
     """
 
-    solve: object
+    solve: Any
     u: jax.Array
-    weight: float
-    _solve_u: jax.Array = field(init=False)
-    _denominator: jax.Array = field(init=False)
+    weight: Any
+    solve_u: jax.Array = field(init=False)
+    denominator: jax.Array = field(init=False)
 
     def __post_init__(self):
-        solve_u = self.solve(self.u)
-        object.__setattr__(self, "_solve_u", solve_u)
-        object.__setattr__(self, "_denominator", 1.0 / self.weight + self.u @ solve_u)
+        u = jnp.asarray(self.u)
+        weight = jnp.asarray(self.weight, dtype=jnp.result_type(u, 1.0))
+        solve_u = self.solve(u)
+        object.__setattr__(self, "u", u)
+        object.__setattr__(self, "weight", weight)
+        object.__setattr__(self, "solve_u", solve_u)
+        object.__setattr__(self, "denominator", 1.0 / weight + u @ solve_u)
 
     def apply(self, v, damping, ctx):
         y = self.solve(v)
-        return y - self._solve_u * ((self.u @ y) / self._denominator)
+        return y - self.solve_u * ((self.u @ y) / self.denominator)
+
+
+register_pytree_dataclass(
+    ShermanMorrisonPreconditioner,
+    data_fields=("u", "weight", "solve_u", "denominator"),
+    meta_fields=("solve",),
+)
 
 
 @dataclass(frozen=True, eq=False)
@@ -271,14 +259,15 @@ class WoodburyPreconditioner(Preconditioner):
     capacitance ``C = diag(1/weights) + U' A^{-1} U``; ``A^{-1}U`` (one matrix
     solve) and the Cholesky factor of the k x k capacitance are precomputed.
     ``weights`` must be positive -- not validated, since inputs may be traced.
-    Like Sherman-Morrison it ignores ``damping`` and so serves the AD role too.
+    Like Sherman-Morrison it ignores ``damping`` and so serves the AD role
+    too, and its ``solve`` is the same STATIC always-called field.
     """
 
-    solve: object
+    solve: Any
     U: jax.Array
     weights: jax.Array
-    _solve_U: jax.Array = field(init=False)
-    _factor: tuple = field(init=False)
+    solve_U: jax.Array = field(init=False)
+    capacitance_factor: jax.Array = field(init=False)
 
     def __post_init__(self):
         U, weights = jnp.asarray(self.U), jnp.asarray(self.weights)
@@ -287,13 +276,25 @@ class WoodburyPreconditioner(Preconditioner):
         object.__setattr__(self, "U", U)
         object.__setattr__(self, "weights", weights)
         solve_U = self.solve(U)
-        object.__setattr__(self, "_solve_U", solve_U)
+        object.__setattr__(self, "solve_U", solve_U)
         capacitance = jnp.diag(1.0 / weights) + U.T @ solve_U
-        object.__setattr__(self, "_factor", jsp_linalg.cho_factor(capacitance))
+        object.__setattr__(
+            self, "capacitance_factor", jsp_linalg.cho_factor(capacitance)[0]
+        )
 
     def apply(self, v, damping, ctx):
         y = self.solve(v)
-        return y - self._solve_U @ jsp_linalg.cho_solve(self._factor, self.U.T @ y)
+        correction = jsp_linalg.cho_solve(
+            (self.capacitance_factor, False), self.U.T @ y
+        )
+        return y - self.solve_U @ correction
+
+
+register_pytree_dataclass(
+    WoodburyPreconditioner,
+    data_fields=("U", "weights", "solve_U", "capacitance_factor"),
+    meta_fields=("solve",),
+)
 
 
 @dataclass(frozen=True, eq=False)
@@ -338,6 +339,11 @@ class PaddedPreconditioner(Preconditioner):
         )
 
 
+register_pytree_dataclass(
+    PaddedPreconditioner, data_fields=("base",), meta_fields=("n_real",)
+)
+
+
 @dataclass(frozen=True, eq=False)
 class NystromPreconditioner(Preconditioner):
     """Randomized Nystrom preconditioner (Frangella-Tropp-Udell) for a PSD
@@ -360,32 +366,34 @@ class NystromPreconditioner(Preconditioner):
     where the dual operator is the ``m x m`` empirical NTK Gram ``J J'`` --
     fast spectral decay plus the LM damping shift is exactly the FTU regime.
     ``matvec`` must apply a symmetric PSD operator to ``(n, k)`` matrices; an
-    indefinite one silently produces NaN through the Cholesky square root. The
-    build costs ``rank`` operator applications plus an ``O(n rank^2)``
-    QR/SVD, paid once at construction, so for a nonlinear problem it
-    approximates the dual at the linearization point it was built from
-    (staleness is safe). Each apply is two ``(n, rank)`` matvecs.
+    indefinite one silently produces NaN through the Cholesky square root. It
+    is consumed at construction -- the build costs ``rank`` operator
+    applications plus an ``O(n rank^2)`` QR/SVD, and only the sketch is
+    stored, so for a nonlinear problem the instance approximates the dual at
+    the linearization point it was built from (staleness is safe; a callback
+    refreshes by constructing a new instance from a fresh ``matvec``). Each
+    apply is two ``(n, rank)`` matvecs.
 
     ``key`` is an explicit PRNG key; the same key reproduces the same
     preconditioner. ``dtype=None`` uses the JAX default float -- pass the
     operator dtype explicitly for a float32 problem under enabled x64.
     """
 
-    matvec: object
+    matvec: InitVar[Any]
     n: int
     rank: int
-    key: jax.Array
-    dtype: object = None
-    _basis: jax.Array = field(init=False)
-    _eigenvalues: jax.Array = field(init=False)
+    key: InitVar[Any]
+    dtype: InitVar[Any] = None
+    basis: jax.Array = field(init=False)
+    eigenvalues: jax.Array = field(init=False)
 
-    def __post_init__(self):
+    def __post_init__(self, matvec, key, dtype):
         if not 0 < self.rank <= self.n:
             raise ValueError("rank must be a positive int <= n")
-        dtype = jnp.result_type(float) if self.dtype is None else self.dtype
+        dtype = jnp.result_type(float) if dtype is None else dtype
         shape = (self.n, self.rank)
-        Omega = jnp.linalg.qr(jax.random.normal(self.key, shape, dtype))[0]
-        Y = self.matvec(Omega)
+        Omega = jnp.linalg.qr(jax.random.normal(key, shape, dtype))[0]
+        Y = matvec(Omega)
         # The floor keeps the shift usable for a (near-)zero operator, where
         # eps * ||Y||_F alone would leave the core singular; tiny/eps stays
         # clear of the subnormal range through the downstream products.
@@ -396,12 +404,19 @@ class NystromPreconditioner(Preconditioner):
         L = jnp.linalg.cholesky(0.5 * (core + core.T))
         B = jsp_linalg.solve_triangular(L, Y_nu.T, lower=True).T
         U, sigma, _ = jnp.linalg.svd(B, full_matrices=False)
-        object.__setattr__(self, "_basis", U)
-        object.__setattr__(self, "_eigenvalues", jnp.maximum(sigma**2 - nu, 0.0))
+        object.__setattr__(self, "basis", U)
+        object.__setattr__(self, "eigenvalues", jnp.maximum(sigma**2 - nu, 0.0))
 
     def apply(self, v, damping, ctx):
         # Regrouped so the apply is two (n, rank) matvecs instead of three.
-        U, lam = self._basis, self._eigenvalues
+        U, lam = self.basis, self.eigenvalues
         rho = lam[-1]
         Utv = U.T @ v
         return U @ (Utv / (lam + damping) - Utv / (rho + damping)) + v / (rho + damping)
+
+
+register_pytree_dataclass(
+    NystromPreconditioner,
+    data_fields=("basis", "eigenvalues"),
+    meta_fields=("n", "rank"),
+)

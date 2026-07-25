@@ -18,6 +18,7 @@ import pytest
 from nlls_gram import (
     CG,
     QR,
+    AnnealRidge,
     BlockEigenPreconditioner,
     Cholesky,
     CholeskyMetric,
@@ -27,7 +28,6 @@ from nlls_gram import (
     MultiStart,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    ridge_continuation,
 )
 from nlls_gram.multi_start import (
     _multi_start_parallel_jit,
@@ -98,24 +98,47 @@ def test_shape_change_compiles_one_extra_program_and_reuses_both():
     assert compilations() == 2
 
 
-# Metrics hold arrays, so they hash by identity and the documented contract is
-# build-once-at-setup-scope. What must not happen is a recompilation when the
-# same metric is reused and only the solver around it is rebuilt.
+# Metric instances key compilation by pytree STRUCTURE (type + static
+# fields); their arrays are threaded through the carried state. A fresh
+# equal-config metric per solve must therefore share one compiled loop --
+# and, the other half of the guarantee, its VALUES must actually be used.
 METRICS = {
-    "cholesky": lambda: CholeskyMetric(jnp.eye(N, dtype=jnp.float32)),
-    "diagonal": lambda: DiagonalMetric(jnp.ones(N, jnp.float32)),
-    "repeated": lambda: RepeatedFactorMetric(jnp.eye(N, dtype=jnp.float32)),
+    "cholesky": lambda scale=1.0: CholeskyMetric(scale * jnp.eye(N, dtype=jnp.float32)),
+    "diagonal": lambda scale=1.0: DiagonalMetric(scale * jnp.ones(N, jnp.float32)),
+    "repeated": lambda scale=1.0: RepeatedFactorMetric(
+        scale * jnp.eye(N, dtype=jnp.float32)
+    ),
 }
 
 
 @pytest.mark.parametrize("name", list(METRICS))
-def test_reused_metric_survives_solver_rebuilds(name):
-    metric = METRICS[name]()
+def test_fresh_equal_config_metric_compiles_once(name):
     for scale in (1.0, 2.0, 3.0):
-        LevenbergMarquardt(residual, metric=metric).solve(
+        LevenbergMarquardt(residual, metric=METRICS[name]()).solve(
             jnp.zeros(N), p=make_p(scale), **SOLVE
         )
     assert compilations() == 1
+
+
+def test_shared_compile_uses_each_metrics_own_values():
+    # Two same-treedef, different-valued metrics share one compiled loop; a
+    # leftover static read would silently reuse the first metric's factor
+    # for the second solver. The damping geometry selects the returned root
+    # of this underdetermined system, so different weights must move x.
+    def solve_with(scale):
+        return LevenbergMarquardt(
+            residual,
+            metric=DiagonalMetric(
+                jnp.asarray([100.0, 1.0, 1.0, 1.0, 100.0], jnp.float32) ** scale
+            ),
+        ).solve(jnp.zeros(N), p=make_p(), max_steps=60, atol=1e-6)
+
+    heavy_ends = solve_with(1.0)
+    heavy_middle = solve_with(-1.0)
+    assert compilations() == 1
+    assert not np.allclose(
+        np.asarray(heavy_ends.x), np.asarray(heavy_middle.x), atol=1e-4
+    )
 
 
 def test_stateless_preconditioner_is_value_equal():
@@ -135,12 +158,12 @@ def ridge_solver():
 
 
 def run_continuation(solver, ridge_floor, scale=1.0):
-    callback, user_state = ridge_continuation(ridge_floor=ridge_floor)
+    callback = AnnealRidge(ridge_floor=ridge_floor)
     return solver.solve(
         jnp.zeros(N),
         p=make_p(scale),
         callback=callback,
-        user_state=user_state,
+        user_state=callback.init_state(),
         max_steps=20,
         gtol=1e-6,
     )
@@ -261,16 +284,51 @@ def test_save_steps_makes_max_steps_static():
     assert compilations() == 3
 
 
-def test_a_stateful_preconditioner_reused_shares_one_compilation():
-    # BlockEigenPreconditioner holds a closure and an array, so it hashes by
-    # identity: reusing the instance must not recompile, and its per-step
-    # prepare() must not either.
-    preconditioner = BlockEigenPreconditioner(
-        lambda theta, ctx: [(jnp.eye(N, dtype=jnp.float32)[None], 0.0)],
-        jnp.arange(N),
-    )
+def test_fresh_equal_config_preconditioner_compiles_once():
+    # BlockEigenPreconditioner keys by structure too: a fresh equal-config
+    # instance per solve (same family count, shapes, permutation length)
+    # shares the compiled loop; its eigendecomposition arrays ride in the
+    # carried state.
     for scale in (1.0, 2.0, 3.0):
+        preconditioner = BlockEigenPreconditioner(
+            [(scale * jnp.eye(N, dtype=jnp.float32)[None], 0.0)], jnp.arange(N)
+        )
         LevenbergMarquardt(
             residual, linear_solver=CG(preconditioner, tol=1e-8, maxiter=16)
         ).solve(jnp.zeros(N), p=make_p(scale), **SOLVE)
     assert compilations() == 1
+
+
+def test_callback_instance_swap_does_not_recompile():
+    # A callback that rebuilds the carried metric/preconditioner inside the
+    # loop constructs same-structure instances: no recompilation across
+    # solves, and none from the swap itself.
+    import dataclasses as dc
+
+    from nlls_gram import LMAction
+
+    metric0 = DiagonalMetric(jnp.ones(N, jnp.float32))
+
+    def swap(ctx):
+        fresh = jax.lax.cond(
+            ctx.step == 2,
+            lambda: DiagonalMetric(2.0 * jnp.ones(N, jnp.float32)),
+            lambda: ctx.lm_state.metric,
+        )
+        return LMAction(lm_state=dc.replace(ctx.lm_state, metric=fresh))
+
+    for scale in (1.0, 2.0):
+        LevenbergMarquardt(residual, metric=metric0).solve(
+            jnp.zeros(N), p=make_p(scale), callback=swap, **SOLVE
+        )
+    assert compilations() == 1
+
+
+def test_a_different_instance_structure_is_a_different_program():
+    LevenbergMarquardt(residual, metric=DiagonalMetric(jnp.ones(N, jnp.float32))).solve(
+        jnp.zeros(N), p=make_p(), **SOLVE
+    )
+    LevenbergMarquardt(
+        residual, metric=RepeatedFactorMetric(jnp.eye(N, dtype=jnp.float32))
+    ).solve(jnp.zeros(N), p=make_p(), **SOLVE)
+    assert compilations() == 2

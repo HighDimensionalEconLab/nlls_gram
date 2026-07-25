@@ -7,14 +7,15 @@ import pytest
 
 from nlls_gram import (
     CG,
+    AnnealRidge,
     IdentityMetric,
     IdentityPreconditioner,
-    LMSolveAction,
+    LMAction,
     LMStatus,
     MultiStart,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    ridge_continuation,
+    register_pytree_dataclass,
 )
 
 CG_CONFIG = CG(IdentityPreconditioner(), maxiter=40)
@@ -59,7 +60,8 @@ def test_ridge_continuation_beats_any_single_moderate_ridge():
     fixed_result = fixed.solve(jnp.zeros(P_DIM), max_steps=300, gtol=1e-5)
     fixed_error = np.linalg.norm(np.asarray(fixed_result.x) - x_dagger)
 
-    callback, user_state0 = ridge_continuation(ridge_floor=1e-6, decrease=0.1)
+    callback = AnnealRidge(ridge_floor=1e-6, decrease=0.1)
+    user_state0 = callback.init_state()
     solver = RidgeLevenbergMarquardt(linear_residual, metric=make_metric(), ridge=1e-2)
     result = solver.solve(
         jnp.zeros(P_DIM),
@@ -82,7 +84,7 @@ def test_callback_ridge_change_suppresses_convergence():
     # hand-rolled callback assigning a weak-typed Python float must not
     # change the while_loop carry aval (the solver recasts it).
     def always_shrink(ctx):
-        return LMSolveAction(
+        return LMAction(
             lm_state=dataclasses.replace(ctx.lm_state, ridge=ctx.lm_state.ridge * 0.5)
         )
 
@@ -97,7 +99,7 @@ def test_callback_ridge_change_suppresses_convergence():
     assert int(plain.status) == int(LMStatus.CONVERGED)
 
     def clumsy(ctx):
-        return LMSolveAction(lm_state=dataclasses.replace(ctx.lm_state, ridge=5e-3))
+        return LMAction(lm_state=dataclasses.replace(ctx.lm_state, ridge=5e-3))
 
     result = solver.solve(jnp.zeros(P_DIM), max_steps=50, gtol=1e-4, callback=clumsy)
     assert result.lm_state.ridge.dtype == jnp.float32
@@ -191,7 +193,8 @@ def test_has_aux():
 
 
 def test_jit_false_parity():
-    callback, user_state0 = ridge_continuation(ridge_floor=1e-5, decrease=0.1)
+    callback = AnnealRidge(ridge_floor=1e-5, decrease=0.1)
+    user_state0 = callback.init_state()
     results = {}
     for jit in (True, False):
         solver = RidgeLevenbergMarquardt(
@@ -266,6 +269,9 @@ def test_equal_settings_solvers_share_the_compiled_solve_loop():
         linear_solver=CG(IdentityPreconditioner(), maxiter=40),
     )
     assert a == rebuilt_config
+    # Metrics key by pytree STRUCTURE: a rebuilt equal-config metric (fresh
+    # arrays, same statics) shares the compile, and its values flow through
+    # the carried state rather than being baked in.
     rebuilt_metric = RidgeLevenbergMarquardt(
         residual,
         metric=make_metric(),
@@ -273,7 +279,16 @@ def test_equal_settings_solvers_share_the_compiled_solve_loop():
         cache_jacobian=False,
         linear_solver=CG_CONFIG,
     )
-    assert a != rebuilt_metric
+    assert a == rebuilt_metric
+    assert hash(a) == hash(rebuilt_metric)
+    different_structure = RidgeLevenbergMarquardt(
+        residual,
+        metric=IdentityMetric(P_DIM),
+        ridge=1e-3,
+        cache_jacobian=False,
+        linear_solver=CG_CONFIG,
+    )
+    assert a != different_structure
 
 
 def test_traced_changes_do_not_retrace_the_loop():
@@ -306,7 +321,8 @@ def test_traced_changes_do_not_retrace_the_loop():
     # The continuation callback (a NEW problem: callback identity keys the
     # compile) traces once, then repeat solves with the same callback reuse
     # the compiled loop.
-    callback, us0 = ridge_continuation(ridge_floor=1e-6, decrease=0.1)
+    callback = AnnealRidge(ridge_floor=1e-6, decrease=0.1)
+    us0 = callback.init_state()
     solver.solve(x0, max_steps=60, gtol=1e-4, callback=callback, user_state=us0)
     with_callback = traces["count"]
     solver.solve(x0, max_steps=60, gtol=1e-4, callback=callback, user_state=us0)
@@ -327,6 +343,10 @@ def test_rejected_step_skips_assembly():
             if v.ndim == 2:
                 jax.debug.callback(lambda: counters.append(1), ordered=True)
             return v
+
+    register_pytree_dataclass(
+        CountingMetric, data_fields=("free_scale",), meta_fields=("size",)
+    )
 
     def residual(theta):
         # Nonlinear scalar tail engineered so the near-Newton step from a

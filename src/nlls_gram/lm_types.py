@@ -15,10 +15,10 @@ import jax
 import jax.numpy as jnp
 
 __all__ = [
+    "LMAction",
+    "LMContext",
     "LMHyperparams",
     "LMInfo",
-    "LMSolveAction",
-    "LMSolveContext",
     "LMSolveResult",
     "LMState",
     "LMStatus",
@@ -31,29 +31,24 @@ __all__ = [
 class SolverContext:
     """What the solver knows at a metric, preconditioner, or linear-solver
     call site -- the inner algebra's context, as opposed to
-    :class:`LMSolveContext`, which a per-step user callback receives.
+    :class:`LMContext`, which a per-step user callback receives.
 
     Fields are ``None`` where the call site has nothing to offer:
 
     - ``x``: the current FLATTENED iterate (the whole parameter vector, not
       just the metric block).
-    - ``lm_state``: the live :class:`LMState` (damping, ridge, caches). In the
-      implicit-AD rule this is the returned state under ``stop_gradient`` --
-      inert conditioning data, like the ridge.
+    - ``lm_state``: the live :class:`LMState` (damping, ridge, caches, and
+      the carried metric/preconditioner instances). In the implicit-AD rule
+      this is the returned state under ``stop_gradient`` -- inert
+      conditioning data, like the ridge.
     - ``args`` / ``p``: the residual's auxiliary data and differentiation
       parameters as passed to ``solve``/``update``.
-    - ``metric_state`` / ``preconditioner_state``: the output of the metric's
-      and preconditioner's own ``prepare``, rebuilt from the live iterate on
-      accepted steps and reused across rejected ones. ``None`` for the
-      stateless default.
     """
 
     x: Any = None
     lm_state: Any = None
     args: Any = None
     p: Any = None
-    metric_state: Any = None
-    preconditioner_state: Any = None
 
 
 class LMStatus(enum.IntEnum):
@@ -62,7 +57,7 @@ class LMStatus(enum.IntEnum):
     Members are real ints (``IntEnum``): they work as dict keys, compare
     against status arrays, and ``LMStatus(int(result.status)).name`` recovers
     the label for logging. Callbacks may return bare members (or any weak
-    integer value) as ``LMSolveAction.status`` -- the solver canonicalizes to
+    integer value) as ``LMAction.status`` -- the solver canonicalizes to
     int32 at the boundary, so no explicit dtype casts are needed.
     """
 
@@ -147,13 +142,17 @@ class LMState:
     callback that rebuilds the state must PRESERVE the fields it does not mean
     to change -- use ``dataclasses.replace(ctx.lm_state, ...)``.
 
+    The callback-owned fields are ``damping``, ``ridge``, ``metric``,
+    ``preconditioner``, and the ``hyper`` group (replaceable as a unit);
+    everything else is solver-owned bookkeeping.
+
     Attributes:
         damping: ``()`` current LM damping.
         ridge: ``()`` ridge weight, strictly positive, for
             ``RidgeLevenbergMarquardt``; ``None`` for the metric solver.
             Replacing it is the supported way to anneal mid-solve (see
-            ``RidgeContinuation``); the solver treats a ridge change as a
-            problem change, suppressing that step's convergence test and
+            ``AnnealRidge``); the solver treats a ridge change as a problem
+            change, suppressing that step's convergence test and
             invalidating the ridge-keyed caches.
         resid: cached residual at the current ``x`` (``cache_jacobian`` dense
             paths only).
@@ -165,10 +164,16 @@ class LMState:
             ``None`` (``init``'s default) falls back to the constructor values.
         solver_cache: the linear solver's own reject-step cache, whose pytree
             structure is fixed by the static ``linear_solver`` config.
-        metric_state: the metric's ``prepare`` output at the current ``x``.
-        metric_valid: ``()`` bool, ``jacobian_valid`` reuse semantics.
-        precond: the preconditioner's ``prepare`` output at the current ``x``.
-        precond_valid: ``()`` bool, ``jacobian_valid`` reuse semantics.
+        metric: the carried :class:`~nlls_gram.Metric` instance every factor
+            op reads. A callback replaces it by constructing a new instance
+            of the same type with matching leaf shapes and dtypes; the ridge
+            solver treats a changed metric as a problem change (the metric
+            defines its objective), the metric solver only invalidates the
+            whitening-dependent solver caches.
+        preconditioner: the carried :class:`~nlls_gram.Preconditioner`
+            instance the Krylov configs read; ``None`` outside them. A
+            callback refresh is never treated as a problem change --
+            staleness only moves the CG iteration path.
     """
 
     damping: jax.Array
@@ -179,10 +184,8 @@ class LMState:
     aux: Any = None
     hyper: LMHyperparams | None = None
     solver_cache: Any = None
-    metric_state: Any = None
-    metric_valid: jax.Array | None = None
-    precond: Any = None
-    precond_valid: jax.Array | None = None
+    metric: Any = None
+    preconditioner: Any = None
 
 
 @jax.tree_util.register_dataclass
@@ -256,7 +259,7 @@ class LMInfo:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
-class LMSolveAction:
+class LMAction:
     """Optional callback action for ``solve``.
 
     A field left as ``None`` is unchanged. ``status`` is used only when
@@ -275,7 +278,7 @@ class LMSolveAction:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
-class LMSolveContext:
+class LMContext:
     """Information passed to a ``solve`` callback after each LM update."""
 
     step: jax.Array

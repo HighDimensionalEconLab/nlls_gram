@@ -9,6 +9,7 @@ from nlls_gram import (
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
     SolverContext,
+    register_pytree_dataclass,
 )
 
 REPEATS = 3
@@ -118,6 +119,8 @@ def test_solver_passes_live_context_to_the_factor_ops():
 
         factor_solve = factor_apply
         factor_solve_transpose = factor_apply
+
+    register_pytree_dataclass(Probe, data_fields=("free_scale",), meta_fields=("size",))
 
     A = jnp.asarray(np.random.default_rng(0).normal(size=(2, 4)), jnp.float32)
 

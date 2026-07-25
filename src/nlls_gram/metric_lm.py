@@ -15,6 +15,7 @@ Euclidean damping is fine.
 """
 
 import dataclasses
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -28,6 +29,7 @@ from nlls_gram.linear_solvers import (
     Cholesky,
     GramCG,
     Subproblem,
+    _config_static_key,
 )
 from nlls_gram.lm_core import LevenbergMarquardtBase
 from nlls_gram.lm_types import (
@@ -38,22 +40,30 @@ from nlls_gram.lm_types import (
     _damping_floor,
 )
 from nlls_gram.metrics import Metric
-from nlls_gram.preconditioners import Preconditioner
 from nlls_gram.utilities import (
     _static_key_component,
+    _where_tree,
     _zero_tangent_leaf,
     canonicalize_residual,
+    register_pytree_dataclass,
 )
 
 __all__ = ["LevenbergMarquardt"]
 
 
+@dataclass(frozen=True, eq=False)
 class _EuclideanMetric(Metric):
     """The default metric: ``F = I`` over however many coordinates ``x``
-    flattens to, resolved at trace time rather than at construction."""
+    flattens to. ``size = 0`` puts everything in the free block, and the
+    static unit ``free_scale`` folds the free-block scaling away."""
 
-    size = 0  # the free block absorbs everything, so F_bar is the identity
-    free_scale = 1.0
+    size: int = 0
+    free_scale: float = 1.0
+
+
+register_pytree_dataclass(
+    _EuclideanMetric, data_fields=(), meta_fields=("size", "free_scale")
+)
 
 
 class LevenbergMarquardt(LevenbergMarquardtBase):
@@ -118,7 +128,8 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             raise ValueError("max_damping must be at least init_damping")
         self.residual_fn = canonical_residual
         self.residual_arity = residual_arity
-        self.metric = _EuclideanMetric() if metric is None else metric
+        self.initial_metric = _EuclideanMetric() if metric is None else metric
+        self._check_registered_instance(self.initial_metric, "metric")
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
@@ -130,43 +141,71 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         self._validate_configuration(linear_solver, ad_solver, penalized=False)
         krylov = isinstance(linear_solver, (CG, GramCG))
         if krylov:
-            self.preconditioner = linear_solver.preconditioner
+            if linear_solver.preconditioner is None:
+                raise ValueError(
+                    "the forward linear_solver requires a preconditioner; "
+                    "IdentityPreconditioner() is the explicit opt-out "
+                    "(preconditioner=None is legal only in the ad_solver role)"
+                )
+            self._check_registered_instance(
+                linear_solver.preconditioner, "linear_solver.preconditioner"
+            )
+            self.initial_preconditioner = linear_solver.preconditioner
             self.iterative_tol = linear_solver.tol
             self.iterative_atol = linear_solver.atol
             self.iterative_maxiter = linear_solver.maxiter
         else:
-            self.preconditioner = None
+            self.initial_preconditioner = None
             self.iterative_tol = 0.0
             self.iterative_atol = 0.0
             self.iterative_maxiter = 8
         if isinstance(ad_solver, (CG, GramCG)):
-            if ad_solver.preconditioner.requires_positive_damping:
-                raise ValueError(
-                    "this preconditioner divides by the live damping and cannot "
-                    "serve in ad_solver (the AD system is undamped)"
-                )
             self.ad_solver_tol = ad_solver.tol
             self.ad_solver_atol = ad_solver.atol
             self.ad_solver_maxiter = ad_solver.maxiter
-            self.ad_solver_preconditioner = ad_solver.preconditioner
             self.ad_solver_penalty = getattr(ad_solver, "penalty", None)
+            if ad_solver.preconditioner is None:
+                # preconditioner=None in the AD role inherits the CARRIED
+                # forward instance at the solution (callback refreshes
+                # included) while pinning the AD tolerance and budget.
+                self.ad_solver_preconditioner = None
+                if self.initial_preconditioner is None:
+                    self._ad_preconditioner_source = "none"
+                elif self.initial_preconditioner.requires_positive_damping:
+                    raise ValueError(
+                        "ad_solver preconditioner=None inherits the forward "
+                        "preconditioner, but this one divides by the live "
+                        "damping and cannot serve the undamped AD system"
+                    )
+                else:
+                    self._ad_preconditioner_source = "carried"
+            else:
+                if ad_solver.preconditioner.requires_positive_damping:
+                    raise ValueError(
+                        "this preconditioner divides by the live damping and "
+                        "cannot serve in ad_solver (the AD system is undamped)"
+                    )
+                self._check_registered_instance(
+                    ad_solver.preconditioner, "ad_solver.preconditioner"
+                )
+                self.ad_solver_preconditioner = ad_solver.preconditioner
+                self._ad_preconditioner_source = "explicit"
         else:
             self.ad_solver_tol = None
             self.ad_solver_atol = 0.0
             self.ad_solver_maxiter = None
             self.ad_solver_penalty = None
-            # ad_solver=None under a matrix-free forward hands that
-            # preconditioner to the undamped implicit solve: the AD operator IS
-            # the forward operator at zero damping. Damping-dividing hooks fall
-            # back to unpreconditioned.
+            self.ad_solver_preconditioner = None
+            # ad_solver=None under a matrix-free forward hands the CARRIED
+            # forward preconditioner to the undamped implicit solve: the AD
+            # operator IS the forward operator at zero damping.
+            # Damping-dividing hooks fall back to unpreconditioned.
             inherit = (
                 ad_solver is None
                 and krylov
                 and not linear_solver.preconditioner.requires_positive_damping
             )
-            self.ad_solver_preconditioner = (
-                linear_solver.preconditioner if inherit else None
-            )
+            self._ad_preconditioner_source = "carried" if inherit else "none"
             if inherit:
                 self.ad_solver_penalty = getattr(linear_solver, "penalty", None)
         self.has_aux = has_aux
@@ -175,23 +214,23 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         self.cache_jacobian = cache_jacobian and linear_solver.materializes_jacobian
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
-        self._metric_prepares = type(self.metric).prepare is not Metric.prepare
-        self._precond_prepares = self.preconditioner is not None and (
-            type(self.preconditioner).prepare is not Preconditioner.prepare
-        )
+        # Metric and forward-preconditioner instances key by pytree structure:
+        # their arrays are threaded through the carried state, so equal-config
+        # fresh instances share one compiled loop. An explicit AD instance is
+        # baked into the tangent program as constants, so it keys by identity.
         self._static_key = tuple(
             _static_key_component(value)
             for value in (
                 residual_fn,
-                metric,
+                jax.tree_util.tree_structure(self.initial_metric),
                 init_damping,
                 damping_decrease,
                 damping_increase,
                 min_damping,
                 max_damping,
-                linear_solver,
+                _config_static_key(linear_solver, baked=False),
                 jacobian_mode,
-                ad_solver,
+                _config_static_key(ad_solver, baked=True),
                 has_aux,
                 self.cache_jacobian,
                 geodesic_acceleration,
@@ -214,9 +253,11 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         dtype = residual.dtype
         min_damping = _damping_floor(self.min_damping, dtype)
         damping = jnp.maximum(jnp.asarray(self.init_damping, dtype=dtype), min_damping)
-        hooks = self._init_hook_state(theta, LMState(damping), args, p)
+        instances = dict(
+            metric=self.initial_metric, preconditioner=self.initial_preconditioner
+        )
         if not self.cache_jacobian:
-            return LMState(damping, **hooks)
+            return LMState(damping, **instances)
         return LMState(
             damping,
             resid=jnp.zeros(residual.shape, dtype=dtype),
@@ -226,17 +267,23 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             solver_cache=self.linear_solver.new_cache(
                 residual.size, theta.size, n_m, dtype, False
             ),
-            **hooks,
+            **instances,
         )
 
     def _solve_lm_state(self, x0, args, p, lm_state):
         if lm_state is not None:
-            return lm_state
-        if self.cache_jacobian or self._metric_prepares or self._precond_prepares:
+            # A hand-built pre-seeding state enters the loop with the
+            # constructor instances; the carry needs them present.
+            return self._resolved_state(lm_state)
+        if self.cache_jacobian:
             return self.init(x0, args, p=p)
         # Nothing needs sizing from a residual evaluation, so skip it: the
         # loop recasts the damping dtype itself.
-        return LMState(jnp.asarray(self.init_damping))
+        return LMState(
+            jnp.asarray(self.init_damping),
+            metric=self.initial_metric,
+            preconditioner=self.initial_preconditioner,
+        )
 
     def _initial_info(self, x, lm_state, args, p):
         # grad_norm is a +inf sentinel (computing it would cost a Jacobian
@@ -315,14 +362,8 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         )
 
         n_m, n_f = self._block_sizes(theta.shape[0])
-        metric_state, precond_state = self._hook_state(theta, lm_state, args, p)
         ctx = SolverContext(
-            x=theta,
-            lm_state=lm_state,
-            args=args,
-            p=p,
-            metric_state=metric_state,
-            preconditioner_state=precond_state,
+            x=theta, lm_state=self._resolved_state(lm_state), args=args, p=p
         )
         zero = jnp.zeros((), dtype=resid.dtype)
         step_solver = self.linear_solver.prepare(
@@ -418,13 +459,9 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         new_damping = jnp.maximum(new_damping, min_damping)
         loss = jnp.where(improved, loss_candidate, loss_old)
 
-        hooks = {}
-        if self._metric_prepares:
-            hooks["metric_state"] = metric_state
-            hooks["metric_valid"] = ~improved
-        if self._precond_prepares:
-            hooks["precond"] = precond_state
-            hooks["precond_valid"] = ~improved
+        # The input state's instances pass through verbatim -- None stays
+        # None, so a user's own loop around update keeps its carry structure.
+        instances = dict(metric=lm_state.metric, preconditioner=lm_state.preconditioner)
         if self.cache_jacobian:
             new_lm_state = LMState(
                 new_damping,
@@ -434,10 +471,10 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
                 aux=aux,
                 hyper=lm_state.hyper,
                 solver_cache=step_solver.make_cache(~improved),
-                **hooks,
+                **instances,
             )
         else:
-            new_lm_state = LMState(new_damping, hyper=lm_state.hyper, **hooks)
+            new_lm_state = LMState(new_damping, hyper=lm_state.hyper, **instances)
         return (
             unravel(theta_new),
             new_lm_state,
@@ -519,12 +556,23 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
     def _ad_x_tangent(self, x, args, p, p_dot, result, ad_success, initial_ad_point):
         if p is None:
             return jax.tree.map(_zero_tangent_leaf, x)
+        # The carried instances are frozen conditioning data at the solution;
+        # a failed lane reads the differentiation-inert pre-loop instances
+        # instead (a callback may have left invalid arrays behind).
         lm_state = jax.lax.stop_gradient(result.lm_state)
+        initial_instances = jax.lax.stop_gradient(initial_ad_point[3:5])
+        lm_state = dataclasses.replace(
+            lm_state,
+            metric=_where_tree(ad_success, lm_state.metric, initial_instances[0]),
+            preconditioner=_where_tree(
+                ad_success, lm_state.preconditioner, initial_instances[1]
+            ),
+        )
         theta, unravel, residual, theta_jvp, residual_p_dot = self._ad_linearization(
             x, args, p, p_dot
         )
         resolved = self._resolved_ad_solver(residual.shape[0], theta.shape[0])
-        ctx = self._frozen_ctx(theta, lm_state, args, p, self.ad_solver_preconditioner)
+        ctx = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
         n_m, n_f = self._block_sizes(theta.shape[0])
         dtype = residual.dtype
 
@@ -604,11 +652,12 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             return whiten_transpose(JT(w))
 
         apply_M = None
-        if self.ad_solver_preconditioner is not None:
+        ad_preconditioner = self._ad_preconditioner(ctx.lm_state)
+        if ad_preconditioner is not None:
             # The AD system is undamped, so the preconditioner sees zero
             # damping (requires_positive_damping hooks were rejected).
             def apply_M(v):
-                return self.ad_solver_preconditioner.apply(v, zero_damping, ctx)
+                return ad_preconditioner.apply(v, zero_damping, ctx)
 
         def cg(matvec, rhs, preconditioner=apply_M):
             solution, _ = jsp_sparse_linalg.cg(

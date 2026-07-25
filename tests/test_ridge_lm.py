@@ -20,6 +20,7 @@ from nlls_gram import (
     QRCache,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
+    register_pytree_dataclass,
 )
 
 # Analytic linear-Gaussian testbed: r(theta) = A theta - b with m < p, the
@@ -454,6 +455,8 @@ def test_normal_cg_preconditioner_changes_nothing():
         def apply(self, v, damping, ctx):
             seen.append(ctx is not None and ctx.lm_state is not None)
             return v / (self.scale + damping)
+
+    register_pytree_dataclass(JacobiPreconditioner, data_fields=("scale",))
 
     scale = jnp.asarray(RNG.uniform(0.5, 2.0, size=P_DIM), dtype=jnp.float32)
     preconditioned = build(

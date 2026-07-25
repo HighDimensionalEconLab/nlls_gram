@@ -32,6 +32,7 @@ import jax.scipy.linalg as jsp_linalg
 import jax.scipy.sparse.linalg as jsp_sparse_linalg
 
 from nlls_gram.preconditioners import Preconditioner
+from nlls_gram.utilities import _IdentityKey
 
 __all__ = [
     "CG",
@@ -42,6 +43,33 @@ __all__ = [
     "StepSolver",
     "Subproblem",
 ]
+
+
+def _config_static_key(config, *, baked):
+    # Compile-key component for a solver config. The Krylov configs hold a
+    # preconditioner instance whose place in the key depends on how its
+    # arrays reach the compiled program: threaded through the carried state
+    # (forward role) -> key by pytree structure, so equal-config fresh
+    # instances share a compile; baked in as closure constants (explicit
+    # ad_solver role) -> key by identity, so different values never share
+    # one. Everything else is a value-hashable dataclass and keys as itself.
+    if config is None or not isinstance(config, (CG, GramCG)):
+        return config
+    precond = config.preconditioner
+    if precond is None:
+        precond_key = None
+    elif baked:
+        precond_key = _IdentityKey(precond)
+    else:
+        precond_key = jax.tree_util.tree_structure(precond)
+    return (
+        type(config),
+        precond_key,
+        config.tol,
+        config.atol,
+        config.maxiter,
+        getattr(config, "penalty", None),
+    )
 
 
 @jax.tree_util.register_dataclass
@@ -443,20 +471,24 @@ class CG(_KrylovConfig):
     ``requires_positive_damping`` are rejected for that role) and ``penalty``
     optionally adding a small ridge that stabilizes a rank-deficient tangent.
 
-    ``preconditioner`` is REQUIRED -- nobody should run Krylov methods without
-    a preconditioning decision, so :class:`~nlls_gram.IdentityPreconditioner`
-    is the explicit opt-out and a custom one is a small subclass implementing
-    ``apply(v, damping, ctx)``. On rank-deficient problems it must map
-    ``range(B')`` into itself or the minimum-norm selection is silently lost;
-    the identity, polynomials in the operator, and exact shifted inverses are
-    safe, and on full-column-rank problems the condition is vacuous.
+    ``preconditioner`` is REQUIRED in the forward role -- nobody should run
+    Krylov methods without a preconditioning decision, so
+    :class:`~nlls_gram.IdentityPreconditioner` is the explicit opt-out and a
+    custom one is a small registered dataclass implementing
+    ``apply(v, damping, ctx)``. In the ``ad_solver`` role,
+    ``preconditioner=None`` inherits the CARRIED forward instance at the
+    solution while pinning the AD tolerance and budget. On rank-deficient
+    problems the preconditioner must map ``range(B')`` into itself or the
+    minimum-norm selection is silently lost; the identity, polynomials in the
+    operator, and exact shifted inverses are safe, and on full-column-rank
+    problems the condition is vacuous.
 
     ``tol=None`` resolves to a dtype default (``1e-10`` in float64, ``1e-6``
     in float32); ``maxiter`` must be set when both tolerances are explicitly
     zero, since an uncapped zero-tolerance CG loop has no stopping rule.
     """
 
-    preconditioner: Preconditioner
+    preconditioner: Preconditioner | None
     tol: float | None = None
     atol: float = 0.0
     maxiter: int | None = None
@@ -491,8 +523,15 @@ class CG(_KrylovConfig):
                 normal = normal + pullback
             return normal + damping * u
 
+        # The CARRIED instance, so a callback refresh reaches the very next
+        # inner solve; the config's own field only seeds the initial state.
+        precond = ctx.lm_state.preconditioner
+
         def apply_M(v):
-            return self.preconditioner.apply(v, damping, ctx)
+            return precond.apply(v, damping, ctx)
+
+        if precond is None:
+            apply_M = None
 
         def solve_N(_, c):
             return self._cg(N_matvec, c, sub, apply_M)
@@ -531,7 +570,7 @@ class GramCG(_KrylovConfig):
 
     supports_penalty = False
 
-    preconditioner: Preconditioner
+    preconditioner: Preconditioner | None
     tol: float | None = None
     atol: float = 0.0
     maxiter: int | None = None
@@ -544,8 +583,15 @@ class GramCG(_KrylovConfig):
                 damping * y
             )
 
+        # The CARRIED instance, so a callback refresh reaches the very next
+        # inner solve; the config's own field only seeds the initial state.
+        precond = ctx.lm_state.preconditioner
+
         def apply_M(v):
-            return self.preconditioner.apply(v, damping, ctx)
+            return precond.apply(v, damping, ctx)
+
+        if precond is None:
+            apply_M = None
 
         def solve_dual(_, c):
             return self._cg(dual_matvec, c, sub, apply_M)
