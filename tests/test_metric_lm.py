@@ -16,6 +16,7 @@ import pytest
 
 from nlls_gram import (
     CG,
+    LU,
     QR,
     SVD,
     Cholesky,
@@ -419,6 +420,7 @@ def test_solver_identity_is_value_based():
     "kwargs,message",
     [
         (dict(linear_solver=SVD()), "linear_solver"),
+        (dict(linear_solver=LU()), "linear_solver"),
         (dict(ad_solver=QR()), "ad_solver"),
     ],
 )
@@ -426,6 +428,56 @@ def test_a_config_in_a_role_it_cannot_fill_is_rejected(kwargs, message):
     # Without this the combination silently resolves to a DIFFERENT algorithm.
     with pytest.raises(ValueError, match=message):
         LevenbergMarquardt(linear_residual, **kwargs)
+
+
+def test_auto_ad_solver_is_lu_when_square_and_svd_otherwise():
+    # Square has a unique tangent, so the plain factorization applies at
+    # cond(B); the normal/dual forms would square it for nothing. Rectangular
+    # needs the minimum-metric-norm selection, and its undamped operator is
+    # singular exactly where padded residuals make the small side deficient,
+    # so the rank-safe rule is the default rather than an opt-in.
+    solver = LevenbergMarquardt(linear_residual)
+    assert isinstance(solver._resolved_ad_solver(8, 8), LU)
+    assert isinstance(solver._resolved_ad_solver(4, 8), SVD)
+    assert isinstance(solver._resolved_ad_solver(8, 4), SVD)
+
+
+def test_lu_ad_solver_requires_a_square_system():
+    solver = LevenbergMarquardt(linear_residual, ad_solver=LU())
+    assert isinstance(solver._resolved_ad_solver(8, 8), LU)
+    for m, n in ((4, 8), (8, 4)):
+        with pytest.raises(ValueError, match="square"):
+            solver._resolved_ad_solver(m, n)
+
+
+def test_square_implicit_tangent_uses_the_unwhitened_direct_solve():
+    # The square rule solves J theta_dot = -dr/dp directly: the tangent is
+    # unique, so the metric selects nothing and the whitening round-trip the
+    # rectangular rules need is skipped. A non-identity metric must therefore
+    # leave the square tangent unchanged.
+    A_sq = jnp.asarray(RNG.normal(size=(N, N)), jnp.float32)
+    p0 = jnp.asarray(RNG.normal(size=N), jnp.float32)
+    direction = jnp.asarray(RNG.normal(size=N), jnp.float32)
+
+    def tangent(metric):
+        solver = LevenbergMarquardt(
+            lambda x, args, p: A_sq @ x - p,
+            metric=metric,
+            cache_jacobian=False,
+            geodesic_acceleration=False,
+        )
+
+        def run(p_value):
+            return solver.solve(jnp.zeros(N), p=p_value, max_steps=200, atol=1e-6).x
+
+        return jax.jvp(run, (p0,), (direction,))[1]
+
+    np.testing.assert_allclose(
+        np.asarray(tangent(None)),
+        np.asarray(tangent(CholeskyMetric(L_W))),
+        rtol=1e-4,
+        atol=1e-5,
+    )
 
 
 def test_free_scale_changes_the_step_and_its_tangent():

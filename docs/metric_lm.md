@@ -70,11 +70,21 @@ otherwise:
 
 | `ad_solver` | needs | notes |
 |---|---|---|
-| `None` | — | matches the forward family, falling back to `Cholesky()` |
-| `Cholesky()` | full rank in the small side | factors whichever of \(BB^\top\), \(B^\top B\) is smaller |
+| `None` | — | matches the forward family, else `LU()` if \(m = n\) and `SVD()` if not |
+| `LU()` | \(m = n\) | solves \(B\) itself at \(\text{cond}(B)\); rejects a rectangular system |
+| `Cholesky()` | full rank in the small side | factors whichever of \(BB^\top\), \(B^\top B\) is smaller, at \(\text{cond}(B)^2\) |
 | `SVD()` | nothing | spectral filter; the rule for padded zero residuals |
 | `CG(precond)` | \(n \le m\) | `penalty=` regularizes it for \(n > m\), at an \(O(\text{penalty})\) bias |
 | `GramCG(precond)` | \(m \le n\) | |
+
+A **square** \(B\) is the case where the tangent is a plain nonsingular solve:
+it is unique, so no norm is being minimized and the metric selects nothing.
+That is what makes `LU()` valid there and why it is the default — and why the
+square rule skips the whitening round-trip the rectangular rules require. It
+also means one factorization serves both directions, forward mode solving with
+\(B\) and reverse mode with \(B^\top\). `Cholesky()` computes the same map on
+a square system but at \(\text{cond}(B)^2\), which costs roughly half the
+significant digits of the tangent for nothing.
 
 The **padded zero residual** pattern — appending identically-zero rows so
 compiled shapes stay stable across problem instances — makes the undamped dual

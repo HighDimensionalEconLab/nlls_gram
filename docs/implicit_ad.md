@@ -26,16 +26,23 @@ Reverse mode comes from JAX transposing that linear tangent program, so `grad`,
 
 ## Choosing an `ad_solver`
 
-`None`, the default, matches the forward family. Override it when the shape
-or the rank says otherwise — see
+`None`, the default, matches the forward family where that operator is
+invertible and otherwise picks by shape: `LU()` for a square system, `SVD()`
+for a rectangular one. Both err like \(\text{cond}(B)\varepsilon\); the normal
+and dual factorizations err like \(\text{cond}(B)^2\varepsilon\), so the
+default is also the accurate choice. Override it when you know more than the
+shape does — see
 [Metric LM](metric_lm.md#rank-deficiency-and-implicit-ad) for the table of
 which rule is valid where. The short version:
 
+- `LU()` for a square system; it is already the default, and it raises rather
+  than guessing if the system turns out rectangular;
 - `SVD()` whenever the undamped system is singular by construction — padded
-  zero residuals are the common case;
+  zero residuals are the common case, and again the default;
 - `GramCG(precond)` for \(m \le n\) and `CG(precond)` for \(n \le m\) when the
   forward solve is matrix-free and you want the tangent to stay so;
-- `Cholesky()` otherwise.
+- `Cholesky()` to trade tangent accuracy for speed on a rectangular system
+  whose small side is known to have full rank.
 
 A Krylov rule used outside its valid shape raises rather than returning a
 quietly wrong tangent.

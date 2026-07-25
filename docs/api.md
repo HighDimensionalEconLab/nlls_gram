@@ -12,6 +12,7 @@
 ::: nlls_gram.QR
 ::: nlls_gram.CG
 ::: nlls_gram.GramCG
+::: nlls_gram.LU
 ::: nlls_gram.SVD
 
 ## Metrics

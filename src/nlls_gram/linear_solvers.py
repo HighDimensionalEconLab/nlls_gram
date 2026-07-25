@@ -615,6 +615,34 @@ class GramCG(_KrylovConfig):
 
 
 @dataclass(frozen=True)
+class LU(LinearSolver):
+    """Direct nonsymmetric solve of a SQUARE system, ``ad_solver`` role only.
+
+    When the whitened Jacobian is square the implicit-AD system ``B u = -dr/dp``
+    has a unique solution, so there is no norm being minimized and the metric
+    does not select among answers. That makes the plain factorization of ``B``
+    available, and it is strictly better than routing through a normal or dual
+    operator: ``cond(B'B) = cond(B)^2``, so Cholesky loses half the significant
+    digits of the tangent for nothing. One factorization also serves both
+    directions -- forward mode solves with ``B``, reverse mode with ``B'``.
+
+    This is why ``ad_solver=None`` resolves here for a square dense problem.
+    It requires squareness and says so: a rectangular system needs a selection
+    rule (minimum-metric-norm) that a plain solve cannot express, so
+    :class:`SVD` or the Cholesky forms own that case.
+
+    The forward subproblem is damped and therefore symmetric positive definite
+    at every shape, so this config has no forward role.
+    """
+
+    supports_forward = False
+    supports_penalty = False
+
+    def prepare(self, sub):
+        raise NotImplementedError("LU is an ad_solver, not a forward solver")
+
+
+@dataclass(frozen=True)
 class SVD(LinearSolver):
     """Spectral-filter pseudoinverse, for the ``ad_solver`` role only.
 

@@ -715,3 +715,56 @@ assert "f32" not in solve_jaxpr
         text=True,
     )
     assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_float64_square_implicit_tangent_tracks_cond_not_cond_squared():
+    # The square AD rule factors J directly, so the tangent errs like
+    # cond(J) * eps. Routing the same system through Cholesky on J'J errs
+    # like cond(J)^2 * eps -- at cond = 1e8 in float64 that is a tangent with
+    # no correct digits, reported as a converged solve.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+import numpy as np
+
+from nlls_gram import Cholesky, LevenbergMarquardt
+
+n = 12
+rng = np.random.default_rng(0)
+u, _ = np.linalg.qr(rng.standard_normal((n, n)))
+v, _ = np.linalg.qr(rng.standard_normal((n, n)))
+A_np = u @ np.diag(np.logspace(0, -8, n)) @ v.T
+A = jnp.asarray(A_np)
+p0 = jnp.asarray(rng.standard_normal(n))
+direction = jnp.asarray(rng.standard_normal(n))
+expected = np.linalg.solve(A_np, np.asarray(direction))
+
+
+def tangent_error(ad_solver):
+    solver = LevenbergMarquardt(
+        lambda x, args, p: A @ x - p,
+        ad_solver=ad_solver,
+        cache_jacobian=False,
+        geodesic_acceleration=False,
+    )
+
+    def run(p_value):
+        return solver.solve(jnp.zeros(n), p=p_value, max_steps=200, atol=1e-13).x
+
+    got = jax.jvp(run, (p0,), (direction,))[1]
+    return float(jnp.linalg.norm(got - expected) / jnp.linalg.norm(expected))
+
+
+auto = tangent_error(None)
+normal = tangent_error(Cholesky())
+assert auto < 1e-7, auto
+assert auto < normal / 1000.0, (auto, normal)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout

@@ -28,6 +28,7 @@ https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/
 
 from nlls_gram.linear_solvers import (
     CG,
+    LU,
     QR,
     SVD,
     Cholesky,
@@ -68,6 +69,7 @@ from nlls_gram.utilities import register_pytree_dataclass
 
 __all__ = [
     "CG",
+    "LU",
     "QR",
     "SVD",
     "AnnealRidge",

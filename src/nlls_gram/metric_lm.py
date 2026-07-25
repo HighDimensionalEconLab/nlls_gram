@@ -25,6 +25,7 @@ from jax.flatten_util import ravel_pytree
 
 from nlls_gram.linear_solvers import (
     CG,
+    LU,
     SVD,
     Cholesky,
     GramCG,
@@ -520,7 +521,24 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
                 n <= m or self.linear_solver.penalty is not None
             ):
                 return self.linear_solver
-            return Cholesky()
+            # Square: the tangent is a unique plain solve, so factor B itself
+            # rather than squaring its condition number through B'B.
+            if m == n:
+                return LU()
+            # Rectangular: the undamped system is singular whenever the small
+            # side is rank deficient, which padded zero residuals produce by
+            # construction, and the assembled Cholesky rules have no answer
+            # there. SVD selects the minimum-metric-norm tangent at cond(B)
+            # rather than cond(B)^2, so it is the safe default; Cholesky() is
+            # the opt-in when the small side is known to have full rank.
+            return SVD()
+        if isinstance(resolved, LU) and m != n:
+            raise ValueError(
+                f"ad_solver=LU() needs a square system, but the residual is {m} "
+                f"and x flattens to {n}: a rectangular tangent is selected by a "
+                "minimum-metric-norm rule that a plain solve cannot express. "
+                "Use SVD(), or Cholesky() when the small side has full rank"
+            )
         if isinstance(resolved, GramCG) and m > n:
             raise ValueError(
                 f"ad_solver=GramCG() needs m <= n, but the residual is {m} and "
@@ -556,6 +574,13 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             x, args, p, p_dot
         )
         resolved = self._resolved_ad_solver(residual.shape[0], theta.shape[0])
+        if isinstance(resolved, LU):
+            # Square: J theta_dot = -dr/dp p_dot has a unique solution, so the
+            # metric selects nothing and the whitening round-trip below is
+            # avoidable work -- solve the unwhitened system directly. This is
+            # the same uniqueness that makes the plain factorization valid.
+            Jt = self._assemble_jt(theta_jvp, theta, residual)
+            return unravel(self._ad_tangent_lu(Jt, residual_p_dot))
         ctx = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
         n_m, n_f = self._block_sizes(theta.shape[0])
         dtype = residual.dtype
@@ -607,6 +632,13 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             return -Bt @ jsp_linalg.cho_solve(factor, residual_p_dot)
         factor = jsp_linalg.cho_factor(Bt @ Bt.T)
         return -jsp_linalg.cho_solve(factor, Bt @ residual_p_dot)
+
+    def _ad_tangent_lu(self, Bt, residual_p_dot):
+        # Square B: u = -B^{-1} (dr/dp) p_dot, factored directly. The normal
+        # form (B'B)^{-1}B' is algebraically the same map here but numerically
+        # worse, at cond(B)^2. Reverse mode transposes this solve, which is the
+        # same factorization applied to B'.
+        return -jnp.linalg.solve(Bt.T, residual_p_dot)
 
     def _ad_tangent_svd(self, Bt, residual_p_dot):
         # Spectral filter: u = -B^+ (dr/dp) p_dot, the minimum-metric-norm

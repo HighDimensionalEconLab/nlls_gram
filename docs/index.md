@@ -84,6 +84,7 @@ method, so it cannot be passed with another.
 | `QR()` | damping-row QR of \([\tilde J;\sqrt\lambda I]\) | \(n\) | tiny damping or ridge; rank-safe |
 | `CG(precond)` | matrix-free normal | \(n\) | \(n \lesssim m\), no dense \(J\) |
 | `GramCG(precond)` | matrix-free dual | \(m\) | \(m \ll n\), no dense \(J\) |
+| `LU()` | dense solve of \(B\) | \(n\) | `ad_solver` only: square tangents |
 | `SVD()` | pseudoinverse | — | `ad_solver` only: rank-deficient tangents |
 
 For \(\lambda > 0\) the gram and normal forms compute the *same* step (the
@@ -91,8 +92,10 @@ push-through identity), so the choice is about cost, not semantics. A
 `preconditioner` is required for the Krylov configs —
 `IdentityPreconditioner()` is the explicit opt-out.
 
-`ad_solver=None` (the default) matches the forward family, falling back to
-`Cholesky()` where the forward config's undamped operator would be singular.
+`ad_solver=None` (the default) matches the forward family where its undamped
+operator is invertible, and otherwise picks by shape: `LU()` when \(m = n\),
+`SVD()` when not. Both track \(\text{cond}(B)\); routing either through a
+normal or dual factorization would square it.
 
 ## Where to go next
 
