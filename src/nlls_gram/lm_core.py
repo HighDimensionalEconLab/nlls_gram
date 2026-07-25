@@ -11,6 +11,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram.lm_types import (
@@ -60,12 +61,27 @@ class LevenbergMarquardtBase:
     _metric_defines_objective = False
 
     def _check_registered_instance(self, instance, keyword):
-        if instance is not None and jax.tree_util.all_leaves([instance]):
+        if instance is None:
+            return
+        if jax.tree_util.all_leaves([instance]):
             raise TypeError(
                 f"{keyword} must be a registered pytree ({type(instance).__name__} "
                 "flattens as a leaf); register the class with "
                 "nlls_gram.register_pytree_dataclass"
             )
+        # A nested unregistered object (e.g. PaddedPreconditioner over an
+        # unregistered base) flattens as an opaque leaf and would fail deep
+        # inside jit instead of here.
+        for leaf in jax.tree_util.tree_leaves(instance):
+            if not isinstance(
+                leaf, (jax.Array, np.ndarray, np.generic, int, float, complex, bool)
+            ):
+                raise TypeError(
+                    f"{keyword} contains a non-array leaf of type "
+                    f"{type(leaf).__name__}; register nested "
+                    "metric/preconditioner classes with "
+                    "nlls_gram.register_pytree_dataclass"
+                )
 
     def _validate_configuration(self, linear_solver, ad_solver, penalized):
         """Reject a config in a role it cannot fill, at construction.
