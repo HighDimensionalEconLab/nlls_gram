@@ -434,9 +434,12 @@ result = solver.solve(x0, {"preconditioner": build_state(x0)},
 
 The AD-role CG reads the state from `result.args` at zero damping — a
 callback-rebuilt state is exactly the near-solution build the tangent solve
-wants; pass `ad_solver=CG(...)` EXPLICITLY when the tangent matters
-(`ad_solver=None` matches the CG family but runs the tangent solve
-unpreconditioned). One measured calibration note: with a family layout
+wants. `ad_solver=None` inherits the forward CG's preconditioner for the
+undamped tangent solve (applied at zero damping; hooks marked
+`requires_positive_damping` fall back to unpreconditioned) while keeping
+the AD-default tolerance and unbounded iteration budget — pass
+`ad_solver=CG(...)` explicitly to pin `tol`/`maxiter` instead. One
+measured calibration note: with a family layout
 whose blocks carry the same ridge floor as the operator, the CG iteration
 count SATURATES as the ridge anneals down (it does not grow like
 \(1/\sqrt{\lambda}\)) — budget `maxiter` for the saturated count, since a
@@ -466,7 +469,12 @@ are deliberately ignored — and **no damping** in the AD matrix.
 the same operator (positive definite does not mean well conditioned —
 unpreconditioned CG degrades as \(\lambda\) shrinks). `ad_solver=None`
 (the default) matches the forward path: `Cholesky()` for the dense
-forwards, `CG` for a `CG` forward.
+forwards, and a `CG` forward keeps both its family and its
+preconditioner — the typed apply is damping-analytic, so the forward hook
+serves the undamped system at zero damping exactly
+(`requires_positive_damping` hooks fall back to unpreconditioned); the AD
+tolerance and iteration budget stay at the AD defaults unless an explicit
+`ad_solver=CG(...)` pins them.
 
 The contract, stated plainly: exact differentiation carries two extra terms
 (\(\sum_i r_i \nabla^2 r_i\) in the matrix, \((\partial J^\top/\partial p)r\)

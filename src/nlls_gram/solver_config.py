@@ -16,7 +16,10 @@ compiled solve loop; construct them inline freely.
   required in both roles; ``identity_preconditioner()`` opts out.
 
 ``ad_solver=None`` (the default) matches the forward path's family:
-``Cholesky`` for the dense forwards, ``CG`` under a ``CG`` forward.
+``Cholesky`` for the dense forwards, ``CG`` under a ``CG`` forward -- with
+the forward's preconditioner inherited into the undamped solve (applied at
+zero damping; ``requires_positive_damping`` hooks fall back to
+unpreconditioned) and the AD-default tolerance and budget.
 ``LevenbergMarquardt`` (the metric solver) keeps its string-named solver menu
 for now; these types are the configuration surface the solvers are converging
 on.

@@ -494,7 +494,12 @@ class RidgeLevenbergMarquardt:
     ``preconditioner`` hook (PD does not mean well-conditioned --
     unpreconditioned CG degrades as ``ridge`` shrinks). ``ad_solver=None``
     (the default) matches the forward path: ``Cholesky()`` for the dense
-    forwards, ``CG()`` for a matrix-free ``CG`` forward. Failed statuses
+    forwards, and a ``CG`` forward keeps its family AND its preconditioner
+    -- the typed apply is damping-analytic, so the forward hook serves the
+    undamped system at zero damping exactly (hooks marked
+    ``requires_positive_damping`` fall back to unpreconditioned), while the
+    AD tolerance and iteration budget stay at the AD defaults; pass
+    ``ad_solver=CG(...)`` to pin those. Failed statuses
     return exact zero tangents for ``result.x``/``result.aux`` and evaluate
     the masked tangent program at stop-gradient copies of the caller's
     original inputs and the INITIAL ridge (never a possibly-invalid
@@ -641,7 +646,22 @@ class RidgeLevenbergMarquardt:
             self.ad_solver_tol = None
             self.ad_solver_atol = 0.0
             self.ad_solver_maxiter = None
-            self.ad_solver_preconditioner = None
+            # ad_solver=None matches the forward family, and a CG forward
+            # also hands its preconditioner to the undamped implicit solve:
+            # the AD operator IS the forward operator at zero damping, the
+            # typed apply is damping-analytic there, and unpreconditioned
+            # implicit CG degrades exactly like the forward as the ridge
+            # shrinks. The AD tolerance and budget stay at the AD defaults
+            # (run to tolerance); damping-dividing hooks fall back to
+            # unpreconditioned.
+            if (
+                ad_solver is None
+                and isinstance(linear_solver, CG)
+                and not linear_solver.preconditioner.requires_positive_damping
+            ):
+                self.ad_solver_preconditioner = linear_solver.preconditioner
+            else:
+                self.ad_solver_preconditioner = None
         self.has_aux = has_aux
         # Only the dense paths materialize J' (and the cholesky/qr caches ride
         # on the same reject-reuse lifecycle), so the flag is inert for the

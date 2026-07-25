@@ -169,9 +169,8 @@ def test_cg_solve_matches_cholesky_with_callback_rebuild():
 
 
 def test_ad_role_zero_damping_matches_cholesky_tangent():
-    # ad_solver is the EXPLICIT CG config: ad_solver=None resolves to the CG
-    # family but with no preconditioner, which would leave the typed apply
-    # untested in its zero-damping role.
+    # The EXPLICIT ad_solver config pins the AD CG's tol/maxiter (the
+    # ad_solver=None inheritance path is covered separately below).
     metric, residual, G = build_problem()
     p = {"scale": jnp.asarray(1.0)}
     p_dot = {"scale": jnp.asarray(1.0)}
@@ -200,6 +199,41 @@ def test_ad_role_zero_damping_matches_cholesky_tangent():
         )
     )
     np.testing.assert_allclose(cg_tangent, reference, rtol=1e-3, atol=1e-4)
+
+
+def test_ad_solver_none_inherits_forward_cg_preconditioner():
+    # ad_solver=None under a CG forward hands the forward preconditioner to
+    # the undamped implicit solve (the typed apply is damping-analytic at
+    # zero damping), keeping the AD-default tolerance and budget.
+    metric, residual, G = build_problem()
+    p = {"scale": jnp.asarray(1.0)}
+    p_dot = {"scale": jnp.asarray(1.0)}
+    x0 = jnp.zeros(P_DIM)
+    args = {"data": jnp.asarray(1.0), "preconditioner": exact_state(G)}
+    solve_options = dict(max_steps=60, gtol=1e-5, xtol=1e-7)
+
+    inheriting = RidgeLevenbergMarquardt(
+        residual,
+        metric=metric,
+        ridge=RIDGE,
+        linear_solver=CG(BlockEigenPreconditioner(), tol=1e-7, maxiter=200),
+    )
+    assert inheriting.ad_solver_preconditioner == BlockEigenPreconditioner()
+    assert inheriting.ad_solver_tol is None
+    assert inheriting.ad_solver_maxiter is None
+
+    def solved_x(solver):
+        def run(p_value):
+            return solver.solve(x0, args, p=p_value, **solve_options).x
+
+        return jax.jvp(run, (p,), (p_dot,))[1]
+
+    reference = solved_x(
+        RidgeLevenbergMarquardt(
+            residual, metric=metric, ridge=RIDGE, linear_solver=Cholesky()
+        )
+    )
+    np.testing.assert_allclose(solved_x(inheriting), reference, rtol=1e-3, atol=1e-4)
 
 
 def test_state_dataclass_survives_jit_boundary():
