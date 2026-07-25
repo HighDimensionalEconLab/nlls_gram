@@ -58,13 +58,13 @@ from nlls_gram.lm_types import (
     LMSolveResult,
     LMState,
     LMStatus,
+    SolverContext,
 )
 from nlls_gram.lsmr import LSMRState, lsmr
 from nlls_gram.metrics import (
     GramMetric,
     IdentityMetric,
     Metric,
-    MetricContext,
     RepeatedFactorMetric,
     metric_from_cholesky,
     metric_from_diagonal,
@@ -113,7 +113,7 @@ __all__ = [
     "GramMetric",
     "IdentityMetric",
     "Metric",
-    "MetricContext",
+    "SolverContext",
     "MetricFactory",
     "MultiStart",
     "IdentityPreconditioner",

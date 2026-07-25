@@ -1763,13 +1763,11 @@ from nlls_gram import (
     CG,
     BlockEigenPreconditioner,
     Cholesky,
-    LMSolveAction,
     LMStatus,
-    MetricContext,
+    SolverContext,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
     LMState,
-    block_eigen_state,
 )
 
 # apply == dense inverse of the shifted block-diagonal approximation, at
@@ -1785,15 +1783,16 @@ def spd_blocks(key, groups, size):
 family_a = spd_blocks(keys[0], 2, 3)
 family_free = spd_blocks(keys[1], 1, 2)
 permutation = jnp.asarray(np.random.default_rng(0).permutation(8))
-state = block_eigen_state([(family_a, 1.0), (family_free, 0.0)], permutation)
+families = [(family_a, 1.0), (family_free, 0.0)]
+preconditioner = BlockEigenPreconditioner(lambda theta, ctx: families, permutation)
+state = preconditioner.prepare(jnp.zeros(8), None)
 for leaf in jax.tree.leaves(state["families"]):
     assert leaf.dtype == jnp.float64, leaf.dtype
 ridge = 3e-9
-ctx = MetricContext(
+ctx = SolverContext(
     lm_state=LMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(ridge)),
-    args={"preconditioner": state},
+    preconditioner_state=state,
 )
-preconditioner = BlockEigenPreconditioner()
 v = jax.random.normal(keys[2], (8,))
 selection = jnp.eye(8)[permutation]
 dense_permuted = jsp_linalg.block_diag(family_a[0], family_a[1], family_free[0])
@@ -1831,14 +1830,18 @@ def residual(x, args, p):
 F_bar = jsp_linalg.block_diag(F, F, jnp.eye(N_F))
 J_whitened = jnp.linalg.solve(F_bar.T, A.T).T
 G = J_whitened.T @ J_whitened
-exact_state = block_eigen_state(
-    [(G[:N_M, :N_M][None], 1.0), (G[N_M:, N_M:][None], 0.0)],
-    jnp.arange(P_DIM),
-)
+def exact_blocks(theta, ctx):
+    return [(G[:N_M, :N_M][None], 1.0), (G[N_M:, N_M:][None], 0.0)]
+
+
+def exact_preconditioner():
+    return BlockEigenPreconditioner(exact_blocks, jnp.arange(P_DIM))
+
+
 p_value = {"scale": jnp.asarray(1.0)}
 p_dot = {"scale": jnp.asarray(1.0)}
 x0 = jnp.zeros(P_DIM)
-args = {"data": jnp.asarray(1.0), "preconditioner": exact_state}
+args = {"data": jnp.asarray(1.0)}
 solve_options = dict(max_steps=80, gtol=1e-10, xtol=1e-14)
 
 reference_solver = RidgeLevenbergMarquardt(
@@ -1848,30 +1851,14 @@ reference = reference_solver.solve(x0, args, p=p_value, **solve_options)
 assert int(reference.status) == int(LMStatus.CONVERGED)
 
 
-def rebuild_callback(ctx):
-    fresh = block_eigen_state(
-        [(1.25 * G[:N_M, :N_M][None], 1.0), (1.25 * G[N_M:, N_M:][None], 0.0)],
-        jnp.arange(P_DIM),
-    )
-    swap = ctx.step == 2
-    new_state = jax.tree_util.tree_map(
-        lambda old, new: jnp.where(swap, new, old),
-        ctx.args["preconditioner"],
-        fresh,
-    )
-    return LMSolveAction(args={**ctx.args, "preconditioner": new_state})
-
-
 cg_solver = RidgeLevenbergMarquardt(
     residual,
     metric=metric,
     ridge=RIDGE,
-    linear_solver=CG(BlockEigenPreconditioner(), tol=1e-12, maxiter=400),
-    ad_solver=CG(BlockEigenPreconditioner(), tol=1e-12, maxiter=400),
+    linear_solver=CG(exact_preconditioner(), tol=1e-12, maxiter=400),
+    ad_solver=CG(exact_preconditioner(), tol=1e-12, maxiter=400),
 )
-result = cg_solver.solve(
-    x0, args, p=p_value, callback=rebuild_callback, **solve_options
-)
+result = cg_solver.solve(x0, args, p=p_value, **solve_options)
 assert int(result.status) == int(LMStatus.CONVERGED)
 # Matched to the tangent comparison below. The two solves stop on the same
 # gtol, and a ridge-scaled stopping rule leaves x-slack ~ gtol / ridge

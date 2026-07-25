@@ -3,7 +3,7 @@
 :class:`Preconditioner` (with :class:`IdentityPreconditioner`) is the typed
 hook of :class:`~nlls_gram.RidgeLevenbergMarquardt`'s ``CG`` config: an SPD
 approximation of the damped whitened normal inverse, receiving the live
-solver state through a :class:`~nlls_gram.MetricContext`.
+solver state through a :class:`~nlls_gram.SolverContext`.
 
 The remaining helpers serve ``LevenbergMarquardt``'s string-named solver
 menu: a ``dual_preconditioner(v, damping)`` callback supplies an
@@ -14,6 +14,7 @@ changes the subproblem being solved, so approximations are safe.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -28,7 +29,7 @@ class Preconditioner:
     vectors. In the forward role (``linear_solver=CG(...)``) it sits in CG's
     ``M`` slot with the live damping; in the AD role (``ad_solver=CG(...)``)
     the implicit-AD system is undamped and ``damping`` is zero. ``ctx`` is
-    the same :class:`~nlls_gram.MetricContext` the metric factor ops receive
+    the same :class:`~nlls_gram.SolverContext` the metric factor ops receive
     (the flat iterate, the live ``LMState``, ``args``, ``p``), so a
     preconditioner can key off the solver state. A preconditioner changes
     the CG iteration path, never the subproblem being solved, so
@@ -52,6 +53,33 @@ class Preconditioner:
 
     requires_positive_damping = False
 
+    def prepare(self, theta, ctx):
+        """Build this preconditioner's numeric state from the current iterate.
+
+        The default is ``None`` -- a stateless preconditioner, whose state
+        slot compiles away. Override to hold traced arrays that must track the
+        iterate: the returned pytree rides on ``lm_state.precond`` and comes
+        back as ``ctx.preconditioner_state`` in :meth:`apply`. It is rebuilt on
+        accepted steps and reused across rejected ones (where ``x`` did not
+        move), runs inside the jitted loop as traced ops, and is frozen at the
+        solution under implicit AD. Its pytree structure must not change
+        between rebuilds.
+
+        Expensive setup that does NOT depend on the iterate belongs in
+        ``__init__``, where it is paid once.
+        """
+        return None
+
+    def rebuild(self, ctx):
+        """Traced predicate gating a rebuild on an accepted step.
+
+        The default rebuilds every accepted step. Return ``False`` to keep the
+        carried state -- staleness only changes the CG iteration path, never
+        the converged step, so declining is always safe and often much
+        cheaper (e.g. rebuild only when ridge continuation advances a level).
+        """
+        return True
+
     def apply(self, v, damping, ctx):
         raise NotImplementedError
 
@@ -70,54 +98,53 @@ class IdentityPreconditioner(Preconditioner):
         return v
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class BlockEigenPreconditioner(Preconditioner):
-    """Block-diagonal eigenbasis preconditioner whose state rides in ``args``.
+    """Block-diagonal eigenbasis preconditioner that owns its state.
 
     The workhorse for structured whitened normal operators
     ``J~'J~ + ridge E + damping I`` built from repeated interacting blocks
     (multiple "agents" coupled through shared equations): approximate the
     operator by a block-diagonal matrix over a chosen grouping of the
-    whitened coordinates, eigendecompose each block ONCE at build time, and
-    apply the exact inverse of the shifted approximation
+    whitened coordinates, eigendecompose each block, and apply the exact
+    inverse of the shifted approximation
 
         v  ->  V ((V' v) / (Lambda + ridge_weight * ridge + damping)) V'
 
-    per block -- analytic in both the live ``damping`` (traced; it changes
-    per LM step) and the live ``ridge`` (read from ``ctx.lm_state.ridge``,
-    so ridge continuation composes with no rebuild). Families whose
-    coordinates lie in the metric block set ``ridge_weight = 1`` (their
-    diagonal carries the ``ridge`` spectral floor); free-block families set
-    ``0`` (damping-only, and the zero-damping AD role then applies their
-    plain inverse -- positive definite whenever the free block is
-    identified).
+    per block -- analytic in both the live ``damping`` (traced; it changes per
+    LM step) and the live ``ridge`` (read from ``ctx.lm_state.ridge``, so
+    ridge continuation composes with no rebuild).
 
-    The instance itself is STATELESS and hashes by value on ``args_key``
-    alone, so equal ``CG`` configs share one compiled solve loop and a
-    rebuilt state never retraces. The numeric state -- a pytree built by
-    :func:`block_eigen_state` -- lives at ``ctx.args[args_key]``: pass it as
-    ``solve(x0, {args_key: state, ...})``, and rebuild it adaptively from a
-    solve callback returning ``LMSolveAction(args=...)`` (rebuild when
-    ridge continuation advances a level: the level change already suppresses
-    that step's convergence test, so the swap is free; identical returned
-    values suppress nothing). A stale or approximate state only changes the
-    CG iteration path, never the converged step.
+    ``blocks_fn(theta, ctx)`` returns the family list that
+    :func:`block_eigen_state` packs: ``(blocks, ridge_weight)`` pairs whose
+    ``blocks`` has shape ``(groups, size, size)`` -- the stacked diagonal
+    blocks of ``J~'J~`` restricted to that family's coordinate groups, in
+    permuted order. Families in the metric block set ``ridge_weight = 1``
+    (their diagonal carries the ``ridge`` spectral floor); free-block families
+    set ``0`` (damping-only, so the zero-damping AD role applies their plain
+    inverse -- positive definite whenever the free block is identified).
+    ``permutation`` reorders the flattened whitened vector into family-major
+    order; ``jnp.arange(n)`` serves when the natural layout already is.
+
+    The eigendecomposition runs in :meth:`prepare` from the live iterate, so
+    it is rebuilt on accepted steps and reused across rejected ones. Override
+    ``rebuild`` to decline -- a stale state only changes the CG iteration
+    path, never the converged step, so refreshing only when ridge continuation
+    advances a level is a pure saving::
+
+        class OnLevelChange(BlockEigenPreconditioner):
+            def rebuild(self, ctx):
+                return ctx.lm_state.ridge < self.last_ridge
     """
 
-    args_key: str = "preconditioner"
+    blocks_fn: Any
+    permutation: jax.Array
+
+    def prepare(self, theta, ctx):
+        return block_eigen_state(self.blocks_fn(theta, ctx), self.permutation)
 
     def apply(self, v, damping, ctx):
-        if ctx.args is None or self.args_key not in ctx.args:
-            raise ValueError(
-                "BlockEigenPreconditioner reads its state from "
-                f"ctx.args[{self.args_key!r}]; pass the block_eigen_state(...) "
-                "pytree under that key in the residual args"
-            )
-        state = ctx.args[self.args_key]
-        if ctx.lm_state is None:
-            raise ValueError(
-                "BlockEigenPreconditioner needs ctx.lm_state for the live ridge weight"
-            )
+        state = ctx.preconditioner_state
         ridge = jnp.asarray(ctx.lm_state.ridge, dtype=v.dtype)
         permuted = v[state["permutation"]]
         pieces = []

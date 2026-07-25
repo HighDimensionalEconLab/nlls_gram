@@ -6,15 +6,15 @@ import pytest
 
 from nlls_gram import (
     IdentityMetric,
-    MetricContext,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
+    SolverContext,
 )
 
 REPEATS = 3
 BLOCK = 5
 N_M = REPEATS * BLOCK
-CTX = MetricContext()
+CTX = SolverContext()
 
 
 def make_factor(key, size):
@@ -108,7 +108,7 @@ def test_constructor_and_input_validation():
 
 
 def test_solver_passes_live_context_to_the_factor_ops():
-    # Every factor op receives a MetricContext carrying the flat iterate and
+    # Every factor op receives a SolverContext carrying the flat iterate and
     # the live LMState (recorded at trace time -- the fields are
     # tracers, their presence and shapes are static).
     seen = []

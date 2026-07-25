@@ -22,7 +22,38 @@ __all__ = [
     "LMSolveResult",
     "LMState",
     "LMStatus",
+    "SolverContext",
 ]
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class SolverContext:
+    """What the solver knows at a metric, preconditioner, or linear-solver
+    call site -- the inner algebra's context, as opposed to
+    :class:`LMSolveContext`, which a per-step user callback receives.
+
+    Fields are ``None`` where the call site has nothing to offer:
+
+    - ``x``: the current FLATTENED iterate (the whole parameter vector, not
+      just the metric block).
+    - ``lm_state``: the live :class:`LMState` (damping, ridge, caches). In the
+      implicit-AD rule this is the returned state under ``stop_gradient`` --
+      inert conditioning data, like the ridge.
+    - ``args`` / ``p``: the residual's auxiliary data and differentiation
+      parameters as passed to ``solve``/``update``.
+    - ``metric_state`` / ``preconditioner_state``: the output of the metric's
+      and preconditioner's own ``prepare``, rebuilt from the live iterate on
+      accepted steps and reused across rejected ones. ``None`` for the
+      stateless default.
+    """
+
+    x: Any = None
+    lm_state: Any = None
+    args: Any = None
+    p: Any = None
+    metric_state: Any = None
+    preconditioner_state: Any = None
 
 
 class LMStatus(enum.IntEnum):

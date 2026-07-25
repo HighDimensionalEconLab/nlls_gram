@@ -269,7 +269,7 @@ float64; only go below that with a measured `gtol`.
 
 A `Metric` supplies the factor through four ops, each taking a metric-block
 vector — or a matrix whose *leading* axis is `size` (columns batched) — and
-a `MetricContext` carrying everything the solver knows at the call site
+a `SolverContext` carrying everything the solver knows at the call site
 (the flat iterate `x`, the live `LMState`, `args`, `p`; the shipped
 metrics ignore it, a custom metric may key off it):
 
@@ -372,7 +372,7 @@ genuinely needs float64 selection should run the solve in float64.
 The `CG` config requires a typed `Preconditioner` in both roles: a subclass
 implementing `apply(v, damping, ctx)`, an SPD approximation of
 \((\tilde J^\top \tilde J + \lambda E + \mu I)^{-1}\) applied with the live
-damping (zero in the AD role), receiving the same `MetricContext` as the
+damping (zero in the AD role), receiving the same `SolverContext` as the
 metric ops. `IdentityPreconditioner()` is the explicit opt-out; a custom
 one is a small dataclass:
 
@@ -536,7 +536,7 @@ Porting notes:
 
 ::: nlls_gram.Metric
 
-::: nlls_gram.MetricContext
+::: nlls_gram.SolverContext
 
 ::: nlls_gram.IdentityMetric
 

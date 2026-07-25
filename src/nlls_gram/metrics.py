@@ -5,7 +5,7 @@
 factor callbacks for an invertible factor ``F`` with ``W = F'F`` --
 :class:`IdentityMetric` is the plain-ridge case and
 :class:`RepeatedFactorMetric` the kernel workhorse (``repeats`` copies of one
-block factor). Every callback receives a :class:`MetricContext` carrying the
+block factor). Every callback receives a :class:`SolverContext` carrying the
 solver's live state, so exotic metrics can key off the iterate.
 
 :class:`GramMetric` (with :func:`metric_from_cholesky`,
@@ -16,37 +16,12 @@ solver -- an unrelated contract kept under its own name.
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 
 from nlls_gram import quasiseparable
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class MetricContext:
-    """Everything the solver knows at a factor-callback call site.
-
-    Passed as the second positional argument of every :class:`Metric` op.
-    The shipped metrics ignore it; a custom metric may key its factor off any
-    field. Fields are ``None`` where the call site has nothing to offer:
-
-    - ``x``: the current FLATTENED iterate (the full parameter vector, not
-      just the metric block).
-    - ``lm_state``: the live :class:`~nlls_gram.LMState` (damping,
-      ridge, caches). In the implicit-AD rule this is the returned state
-      under ``stop_gradient`` -- inert conditioning data, like the ridge.
-    - ``args`` / ``p``: the residual's auxiliary data and differentiation
-      parameters as passed to ``solve``/``update``.
-    """
-
-    x: Any = None
-    lm_state: Any = None
-    args: Any = None
-    p: Any = None
 
 
 class Metric:
@@ -65,7 +40,7 @@ class Metric:
 
     Subclasses implement the ops on metric-block vectors (or matrices whose
     LEADING axis is ``size``; columns are batched), each also receiving a
-    :class:`MetricContext` with the solver's live state:
+    :class:`SolverContext` with the solver's live state:
 
     - ``factor_apply(v, ctx)``: ``F v``
     - ``factor_solve(v, ctx)``: ``F^{-1} v``
@@ -90,6 +65,29 @@ class Metric:
     """
 
     size: int
+
+    def prepare(self, theta, ctx):
+        """Build this metric's numeric state from the current iterate.
+
+        The default is ``None`` -- a fixed metric, whose state slot compiles
+        away. Override for an iterate-dependent metric (a kernel Gram factor
+        over state points that live in ``x``, say): the returned pytree rides
+        on ``lm_state.metric_state`` and comes back as ``ctx.metric_state`` in
+        the factor ops. It is rebuilt on accepted steps and reused across
+        rejected ones, and is FROZEN at the solution under implicit AD -- the
+        state-dependence is not differentiated, the same contract as a fixed
+        metric closing over constants. Its pytree structure must not change
+        between rebuilds.
+
+        Unlike a preconditioner, the metric defines the subproblem, so the
+        factor it yields must be exact for the state it was built from.
+        """
+        return None
+
+    def rebuild(self, ctx):
+        """Traced predicate gating a rebuild on an accepted step. The default
+        rebuilds every accepted step."""
+        return True
 
     def factor_apply(self, v, ctx):
         """``F v`` for a metric-block vector or leading-axis-batched matrix."""

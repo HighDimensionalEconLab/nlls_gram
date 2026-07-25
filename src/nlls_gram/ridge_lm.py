@@ -40,10 +40,12 @@ from nlls_gram.lm_types import (
     LMInfo,
     LMSolveAction,
     LMState,
+    SolverContext,
     _cast_hyper,
     _damping_floor,
 )
-from nlls_gram.metrics import MetricContext
+from nlls_gram.metrics import Metric
+from nlls_gram.preconditioners import Preconditioner
 from nlls_gram.utilities import (
     _static_key_component,
     _zero_tangent_leaf,
@@ -273,7 +275,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
       :class:`~nlls_gram.Preconditioner`
       (:class:`~nlls_gram.IdentityPreconditioner` opts out): its
       ``apply(v, damping, ctx)`` -- an SPD approximation of the damped
-      inverse, handed the same :class:`~nlls_gram.MetricContext` as the
+      inverse, handed the same :class:`~nlls_gram.SolverContext` as the
       metric ops -- sits in CG's ``M`` slot with the live damping. The
       operator carries the ``ridge`` spectral floor on the metric block, so
       the preconditioner only has to capture ``J~'J~``'s structure.
@@ -453,6 +455,15 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         self.cache_jacobian = cache_jacobian and not isinstance(linear_solver, CG)
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
+        # The forward preconditioner is the one whose prepared state is carried
+        # (the AD role runs once, at the solution). Whether a hook is stateful
+        # is a static property of its class, so the slots and their lax.cond
+        # compile away entirely for the stateless default.
+        self.preconditioner = self.normal_cg_preconditioner
+        self._metric_prepares = type(metric).prepare is not Metric.prepare
+        self._precond_prepares = self.preconditioner is not None and (
+            type(self.preconditioner).prepare is not Preconditioner.prepare
+        )
         # Value-based identity: the jitted solve loop marks the solver itself
         # static, so equal-config solvers built around the same residual and
         # metric share the compiled loop across instances. Keyed on the
@@ -553,22 +564,81 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         min_damping = _damping_floor(self.min_damping, dtype)
         damping = jnp.maximum(jnp.asarray(self.init_damping, dtype=dtype), min_damping)
         ridge = self._resolve_ridge(dtype)
+        # Hook state is built at x0 and VALID there, so the first update
+        # reuses it; the flags stay None when the hooks are stateless.
+        hooks = {}
+        ctx = SolverContext(x=theta, args=args, p=p)
+        valid = jnp.asarray(True, dtype=jnp.bool_)
+        if self._metric_prepares:
+            hooks["metric_state"] = self.metric.prepare(theta, ctx)
+            hooks["metric_valid"] = valid
+        if self._precond_prepares:
+            hooks["precond"] = self.preconditioner.prepare(theta, ctx)
+            hooks["precond_valid"] = valid
         if not self.cache_jacobian:
-            return LMState(damping, ridge)
+            return LMState(damping, ridge, **hooks)
         p_dim = theta.size
         m = residual.size
-        invalid = jnp.asarray(False, dtype=jnp.bool_)
-        common = dict(
-            resid=jnp.zeros(residual.shape, dtype=dtype),
-            Jt=jnp.zeros((p_dim, m), dtype=dtype),
-            jacobian_valid=invalid,
-            aux=jax.tree.map(jnp.zeros_like, aux),
-        )
         return LMState(
             damping,
             ridge,
-            **common,
+            resid=jnp.zeros(residual.shape, dtype=dtype),
+            Jt=jnp.zeros((p_dim, m), dtype=dtype),
+            jacobian_valid=jnp.asarray(False, dtype=jnp.bool_),
+            aux=jax.tree.map(jnp.zeros_like, aux),
             solver_cache=self.linear_solver.new_cache(m, p_dim, n_m, dtype),
+            **hooks,
+        )
+
+    def _hook_state(self, theta, lm_state, args, p):
+        """The metric's and preconditioner's prepared state for this step:
+        reused while still valid (a rejected step left ``x`` in place, or the
+        hook declined to rebuild), rebuilt from the live iterate otherwise."""
+        bare = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
+        metric_state = precond_state = None
+        if self._metric_prepares:
+            metric_state = jax.lax.cond(
+                lm_state.metric_valid | ~jnp.asarray(self.metric.rebuild(bare)),
+                lambda _: lm_state.metric_state,
+                lambda _: self.metric.prepare(theta, bare),
+                operand=None,
+            )
+        if self._precond_prepares:
+            precond_state = jax.lax.cond(
+                lm_state.precond_valid
+                | ~jnp.asarray(self.preconditioner.rebuild(bare)),
+                lambda _: lm_state.precond,
+                lambda _: self.preconditioner.prepare(theta, bare),
+                operand=None,
+            )
+        return metric_state, precond_state
+
+    def _carried_ctx(self, theta, lm_state, args, p):
+        return SolverContext(
+            x=theta,
+            lm_state=lm_state,
+            args=args,
+            p=p,
+            metric_state=lm_state.metric_state,
+            preconditioner_state=lm_state.precond,
+        )
+
+    def _frozen_ctx(self, theta, lm_state, args, p, preconditioner):
+        # Under implicit AD the hooks are FROZEN at the returned solution:
+        # prepare runs once there and the state-dependence is not
+        # differentiated, the same contract as a fixed metric closing over
+        # constants.
+        bare = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
+        metric_state = (
+            self.metric.prepare(theta, bare) if self._metric_prepares else None
+        )
+        precond_state = None
+        if preconditioner is not None and (
+            type(preconditioner).prepare is not Preconditioner.prepare
+        ):
+            precond_state = preconditioner.prepare(theta, bare)
+        return dataclasses.replace(
+            bare, metric_state=metric_state, preconditioner_state=precond_state
         )
 
     def _initial_info(self, x, lm_state, args, p):
@@ -580,7 +650,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         theta, _ = ravel_pytree(x)
         ridge = jnp.asarray(lm_state.ridge, dtype=residual.dtype)
         n_m = self._block_sizes(theta.shape[0])[0]
-        ctx = MetricContext(x=theta, lm_state=lm_state, args=args, p=p)
+        ctx = self._carried_ctx(theta, lm_state, args, p)
         y_m = jnp.asarray(
             self.metric.factor_apply(theta[:n_m], ctx), dtype=residual.dtype
         )
@@ -679,7 +749,15 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         # including the reported norms -- is the whitened one. y_m doubles as
         # the pre-step penalty value ||y_m||^2.
         n_m, n_f = self._block_sizes(theta.shape[0])
-        ctx = MetricContext(x=theta, lm_state=lm_state, args=args, p=p)
+        metric_state, precond_state = self._hook_state(theta, lm_state, args, p)
+        ctx = SolverContext(
+            x=theta,
+            lm_state=lm_state,
+            args=args,
+            p=p,
+            metric_state=metric_state,
+            preconditioner_state=precond_state,
+        )
         y_m = jnp.asarray(self.metric.factor_apply(theta[:n_m], ctx), dtype=resid.dtype)
         penalty_value_old = jnp.sum(y_m**2)
         penalty_gradient = jnp.concatenate([y_m, jnp.zeros(n_f, dtype=resid.dtype)])
@@ -812,11 +890,18 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         loss = jnp.where(improved, loss_candidate, loss_old)
         resid_loss = jnp.where(improved, resid_loss_candidate, resid_loss_old)
         penalty_value = jnp.where(improved, penalty_candidate, penalty_value_old)
-        # Thread the caches built at this step's pre-step (x, ridge):
-        # valid = ~improved marks them reusable exactly when the step was
-        # rejected (x did not move). ridge passes through unchanged -- only
-        # init() and callbacks set it. The input hyper (not the fallback)
-        # passes through so the loop carry structure is stable.
+        # Thread the caches and prepared hook state built at this step's
+        # pre-step (x, ridge): valid = ~improved marks them reusable exactly
+        # when the step was rejected (x did not move). ridge passes through
+        # unchanged -- only init() and callbacks set it. The input hyper (not
+        # the fallback) passes through so the loop carry structure is stable.
+        hooks = {}
+        if self._metric_prepares:
+            hooks["metric_state"] = metric_state
+            hooks["metric_valid"] = ~improved
+        if self._precond_prepares:
+            hooks["precond"] = precond_state
+            hooks["precond_valid"] = ~improved
         if self.cache_jacobian:
             new_lm_state = LMState(
                 new_damping,
@@ -827,9 +912,10 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
                 aux,
                 lm_state.hyper,
                 solver_cache=step_solver.make_cache(~improved),
+                **hooks,
             )
         else:
-            new_lm_state = LMState(new_damping, ridge, hyper=lm_state.hyper)
+            new_lm_state = LMState(new_damping, ridge, hyper=lm_state.hyper, **hooks)
         return (
             unravel(theta_new),
             new_lm_state,
@@ -957,6 +1043,9 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             updates["solver_cache"] = jax.tree.map(
                 jnp.zeros_like, lm_state.solver_cache
             )
+        for flag in ("metric_valid", "precond_valid"):
+            if getattr(lm_state, flag) is not None:
+                updates[flag] = jnp.zeros_like(getattr(lm_state, flag))
         if not updates:
             return lm_state
         return dataclasses.replace(lm_state, **updates)
@@ -973,9 +1062,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             residual = self._residual_and_aux(result.x, result.args, p)[0]
             theta, _ = ravel_pytree(result.x)
             n_m = self._block_sizes(theta.shape[0])[0]
-            ctx = MetricContext(
-                x=theta, lm_state=result.lm_state, args=result.args, p=p
-            )
+            ctx = self._carried_ctx(theta, result.lm_state, result.args, p)
             ridge = jnp.asarray(result.lm_state.ridge, dtype=residual.dtype)
             y_m = jnp.asarray(
                 self.metric.factor_apply(theta[:n_m], ctx), dtype=residual.dtype
@@ -997,7 +1084,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         # A successful tangent uses the winner's own final ridge; a failed one
         # the pre-loop initial ridge. Both are stop-gradient'd -- lambda is
         # inert conditioning data, and the returned state rides along as
-        # equally inert MetricContext data for the factor callbacks.
+        # equally inert SolverContext data for the factor callbacks.
         final_ridge = jax.lax.stop_gradient(result.lm_state.ridge)
         initial_ridge = jax.lax.stop_gradient(initial_ad_point[3])
         ridge = jnp.where(
@@ -1031,7 +1118,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             x, args, p, p_dot
         )
         n_m = self._block_sizes(theta.shape[0])[0]
-        ctx = MetricContext(x=theta, lm_state=lm_state, args=args, p=p)
+        ctx = self._frozen_ctx(theta, lm_state, args, p, self.ad_solver_preconditioner)
         Jt = self._assemble_jt(theta_jvp, theta, residual)
         ridge_typed = jnp.asarray(ridge, dtype=residual.dtype)
         Jt_sub = jnp.asarray(
@@ -1051,7 +1138,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             x, args, p, p_dot
         )
         n_m, n_f = self._block_sizes(theta.shape[0])
-        ctx = MetricContext(x=theta, lm_state=lm_state, args=args, p=p)
+        ctx = self._frozen_ctx(theta, lm_state, args, p, self.ad_solver_preconditioner)
         theta_transpose = jax.linear_transpose(theta_jvp, theta)
 
         def JT(cotangent):

@@ -431,7 +431,7 @@ def test_rejected_step_reuses_residual_and_jacobian():
 def test_normal_cg_preconditioner_changes_nothing():
     # M changes the CG iteration path, never the solved subproblem: a
     # Jacobi-style SPD Preconditioner subclass must reproduce the identity-M
-    # step -- and it receives the live MetricContext.
+    # step -- and it receives the live SolverContext.
     seen = []
 
     @dataclasses.dataclass(frozen=True, eq=False)
