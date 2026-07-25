@@ -70,6 +70,139 @@ class IdentityPreconditioner(Preconditioner):
         return v
 
 
+@dataclass(frozen=True)
+class BlockEigenPreconditioner(Preconditioner):
+    """Block-diagonal eigenbasis preconditioner whose state rides in ``args``.
+
+    The workhorse for structured whitened normal operators
+    ``J~'J~ + ridge E + damping I`` built from repeated interacting blocks
+    (multiple "agents" coupled through shared equations): approximate the
+    operator by a block-diagonal matrix over a chosen grouping of the
+    whitened coordinates, eigendecompose each block ONCE at build time, and
+    apply the exact inverse of the shifted approximation
+
+        v  ->  V ((V' v) / (Lambda + ridge_weight * ridge + damping)) V'
+
+    per block -- analytic in both the live ``damping`` (traced; it changes
+    per LM step) and the live ``ridge`` (read from ``ctx.lm_state.ridge``,
+    so ridge continuation composes with no rebuild). Families whose
+    coordinates lie in the metric block set ``ridge_weight = 1`` (their
+    diagonal carries the ``ridge`` spectral floor); free-block families set
+    ``0`` (damping-only, and the zero-damping AD role then applies their
+    plain inverse -- positive definite whenever the free block is
+    identified).
+
+    The instance itself is STATELESS and hashes by value on ``args_key``
+    alone, so equal ``CG`` configs share one compiled solve loop and a
+    rebuilt state never retraces. The numeric state -- a pytree built by
+    :func:`block_eigen_state` -- lives at ``ctx.args[args_key]``: pass it as
+    ``solve(x0, {args_key: state, ...})``, and rebuild it adaptively from a
+    solve callback returning ``LMSolveAction(args=...)`` (rebuild when
+    ridge continuation advances a level: the level change already suppresses
+    that step's convergence test, so the swap is free; identical returned
+    values suppress nothing). A stale or approximate state only changes the
+    CG iteration path, never the converged step.
+    """
+
+    args_key: str = "preconditioner"
+
+    def apply(self, v, damping, ctx):
+        if ctx.args is None or self.args_key not in ctx.args:
+            raise ValueError(
+                "BlockEigenPreconditioner reads its state from "
+                f"ctx.args[{self.args_key!r}]; pass the block_eigen_state(...) "
+                "pytree under that key in the residual args"
+            )
+        state = ctx.args[self.args_key]
+        if ctx.lm_state is None:
+            raise ValueError(
+                "BlockEigenPreconditioner needs ctx.lm_state for the live ridge weight"
+            )
+        ridge = jnp.asarray(ctx.lm_state.ridge, dtype=v.dtype)
+        permuted = v[state["permutation"]]
+        pieces = []
+        offset = 0
+        for family in state["families"]:
+            V = family["eigenvectors"]
+            eigenvalues = family["eigenvalues"]
+            groups, size = V.shape[0], V.shape[1]
+            segment = permuted[offset : offset + groups * size]
+            offset += groups * size
+            shift = family["ridge_weight"] * ridge + damping
+            coefficients = jnp.einsum("gab,ga->gb", V, segment.reshape(groups, size))
+            solved = coefficients / (eigenvalues + shift)
+            pieces.append(jnp.einsum("gab,gb->ga", V, solved).reshape(-1))
+        if offset != permuted.shape[0]:
+            raise ValueError(
+                f"block_eigen_state families cover {offset} coordinates but "
+                f"the parameter vector has {permuted.shape[0]}"
+            )
+        return jnp.concatenate(pieces)[state["inverse_permutation"]].astype(v.dtype)
+
+
+def block_eigen_state(families, permutation):
+    """Pack stacked SPD diagonal blocks into a
+    :class:`BlockEigenPreconditioner` state pytree.
+
+    ``families`` is a sequence of ``(blocks, ridge_weight)`` pairs:
+    ``blocks`` has shape ``(groups, size, size)`` -- the stacked diagonal
+    blocks of the whitened normal operator ``J~'J~`` restricted to that
+    family's coordinate groups, in permuted order -- and ``ridge_weight`` is
+    ``1.0`` for metric-block families (the apply shift includes the live
+    ridge) or ``0.0`` for free-block families (damping-only). Blocks are
+    symmetrized and eigendecomposed here, once; positive semidefiniteness is
+    assumed, not validated (entries may be traced).
+
+    ``permutation`` is the 1-D integer array reordering the flattened
+    whitened parameter vector into family-major order
+    (``v_permuted = v[permutation]``); families are consumed in sequence
+    and must cover it exactly. The identity ``jnp.arange(p)`` serves when
+    the natural layout is already family-major.
+
+    Fully traceable, so an adaptive rebuild can run inside a jitted solve
+    callback; the state's pytree structure (family count and shapes) is
+    static and must not change across rebuilds.
+    """
+
+    permutation = jnp.asarray(permutation)
+    if permutation.ndim != 1 or not jnp.issubdtype(permutation.dtype, jnp.integer):
+        raise ValueError("permutation must be a 1-D integer array")
+    packed = []
+    covered = 0
+    for blocks, ridge_weight in families:
+        blocks = jnp.asarray(blocks)
+        if blocks.ndim != 3 or blocks.shape[1] != blocks.shape[2]:
+            raise ValueError(
+                "each family's blocks must have shape (groups, size, size); "
+                f"got {blocks.shape}"
+            )
+        symmetrized = 0.5 * (blocks + jnp.swapaxes(blocks, 1, 2))
+        eigenvalues, eigenvectors = jnp.linalg.eigh(symmetrized)
+        # eigh of a numerically PSD block can return tiny negative
+        # eigenvalues; clamped at zero the apply shift stays positive for
+        # any positive ridge/damping (and the zero-damping AD role stays
+        # SPD whenever the family itself is).
+        eigenvalues = jnp.maximum(eigenvalues, 0.0)
+        packed.append(
+            {
+                "eigenvectors": eigenvectors,
+                "eigenvalues": eigenvalues,
+                "ridge_weight": jnp.asarray(ridge_weight, dtype=blocks.dtype),
+            }
+        )
+        covered += blocks.shape[0] * blocks.shape[1]
+    if covered != permutation.shape[0]:
+        raise ValueError(
+            f"families cover {covered} coordinates but the permutation has "
+            f"{permutation.shape[0]}"
+        )
+    return {
+        "permutation": permutation,
+        "inverse_permutation": jnp.argsort(permutation),
+        "families": tuple(packed),
+    }
+
+
 def identity_preconditioner():
     """The identity map as an explicit "no preconditioner" choice for the
     ``LevenbergMarquardt`` hooks.

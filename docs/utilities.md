@@ -5,7 +5,11 @@ repeated shifted kernel geometry used by kernel least-squares models. For any
 other geometry, construct a [`GramMetric`](metrics.md) directly. Iterative solver
 preconditioners remain separate: they can approximate an operator without
 changing the nonlinear least-squares problem, whereas a metric defines the
-problem itself.
+problem itself. Everything on this page serves the classic
+`LevenbergMarquardt` hooks; the ridge solver's typed `Preconditioner`
+subclasses (`IdentityPreconditioner`, the adaptive
+`BlockEigenPreconditioner` + `block_eigen_state`) are documented on the
+[Ridge LM page](ridge_lm.md#preconditioners).
 
 | Helper | Builds | Storage |
 | --- | --- | --- |

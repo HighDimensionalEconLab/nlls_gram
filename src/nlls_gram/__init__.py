@@ -72,8 +72,10 @@ from nlls_gram.metrics import (
     repeated_shifted_state_space_metric,
 )
 from nlls_gram.preconditioners import (
+    BlockEigenPreconditioner,
     IdentityPreconditioner,
     Preconditioner,
+    block_eigen_state,
     identity_preconditioner,
     identity_right_preconditioner,
     nystrom_preconditioner,
@@ -105,6 +107,7 @@ from nlls_gram.solver_config import (
 )
 
 __all__ = [
+    "BlockEigenPreconditioner",
     "Cholesky",
     "CholeskyCache",
     "LevenbergMarquardt",
@@ -134,6 +137,7 @@ __all__ = [
     "RecycleConfig",
     "RecycleState",
     "HarvestState",
+    "block_eigen_state",
     "build_coarse_operator",
     "deflated_pcg",
     "identity_preconditioner",

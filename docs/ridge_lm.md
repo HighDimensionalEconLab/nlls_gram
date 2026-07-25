@@ -388,6 +388,64 @@ class JacobiPreconditioner(Preconditioner):
 A preconditioner changes the CG iteration path, never the subproblem —
 approximations are safe (unlike the metric factor, which must be exact).
 
+For repeated interacting blocks (multiple "agents" coupled through shared
+equations), `BlockEigenPreconditioner` is the shipped workhorse: a
+block-diagonal approximation over a chosen grouping of the whitened
+coordinates, eigendecomposed once per build and applied with the
+damping-analytic shift \(\Lambda + \texttt{ridge\_weight}\cdot\lambda +
+\mu\) (metric-block families carry the live ridge, free-block families are
+damping-only). The instance is stateless and value-hashable; its numeric
+state — built by `block_eigen_state` from stacked SPD diagonal blocks and a
+family-major permutation — rides in the residual `args` under a fixed key
+and is read through `ctx.args` at apply time.
+
+**Adaptive rebuilds through the solve callback.** Because the state lives
+in `args`, a callback can rebuild it from the live iterate with no solver
+support: staleness detection is a traced value comparison, so returning
+identical values suppresses nothing, and a real swap suppresses only that
+step's convergence check. The natural policy pairs rebuilds with
+`ridge_continuation` — rebuild exactly when the anneal advances a level,
+which already suppresses that step:
+
+```python
+continuation, user_state0 = ridge_continuation(ridge_floor=1e-11)
+
+def callback(ctx):
+    action = continuation(ctx)
+    advanced = action.lm_state.ridge < ctx.lm_state.ridge
+    fresh = build_state(ctx.x)          # model-side analytic assembly
+    state = jax.tree_util.tree_map(
+        lambda old, new: jnp.where(advanced, new, old),
+        ctx.args["preconditioner"], fresh,
+    )
+    return LMSolveAction(
+        lm_state=action.lm_state, user_state=action.user_state,
+        args={**ctx.args, "preconditioner": state},
+    )
+
+solver = RidgeLevenbergMarquardt(
+    residual_fn, metric=metric,
+    linear_solver=CG(BlockEigenPreconditioner(), tol=1e-10, maxiter=2500),
+)
+result = solver.solve(x0, {"preconditioner": build_state(x0)},
+                      callback=callback, user_state=user_state0,
+                      max_steps=120, gtol=1e-11)
+```
+
+The AD-role CG reads the state from `result.args` at zero damping — a
+callback-rebuilt state is exactly the near-solution build the tangent solve
+wants; pass `ad_solver=CG(...)` EXPLICITLY when the tangent matters
+(`ad_solver=None` matches the CG family but runs the tangent solve
+unpreconditioned). One measured calibration note: with a family layout
+whose blocks carry the same ridge floor as the operator, the CG iteration
+count SATURATES as the ridge anneals down (it does not grow like
+\(1/\sqrt{\lambda}\)) — budget `maxiter` for the saturated count, since a
+truncated inner solve stalls the endgame. Two scope cautions for
+args-carried state: `save_steps=True` records a full copy of `args` per
+step (the whole eigenbasis, every step), and a parallel `multi_start`
+vmaps the callback so a `where`-gated rebuild evaluates BOTH branches in
+every lane — keep both out of preconditioned-CG production runs.
+
 ## Implicit differentiation
 
 `solve(...).x` has a custom implicit rule with respect to `p`: Gauss–Newton
@@ -479,6 +537,10 @@ Porting notes:
 ::: nlls_gram.Preconditioner
 
 ::: nlls_gram.IdentityPreconditioner
+
+::: nlls_gram.BlockEigenPreconditioner
+
+::: nlls_gram.block_eigen_state
 
 ## References
 

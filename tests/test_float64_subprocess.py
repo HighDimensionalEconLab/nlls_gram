@@ -1747,3 +1747,162 @@ np.testing.assert_allclose(x_ridge, x_metric, atol=1e-6)
         text=True,
     )
     assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_float64_block_eigen_preconditioner_default_precision():
+    script = r"""
+import dataclasses
+
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+import jax.scipy.linalg as jsp_linalg
+import numpy as np
+
+from nlls_gram import (
+    CG,
+    BlockEigenPreconditioner,
+    Cholesky,
+    LMSolveAction,
+    LMStatus,
+    MetricContext,
+    RepeatedFactorMetric,
+    RidgeLevenbergMarquardt,
+    RidgeLMState,
+    block_eigen_state,
+)
+
+# apply == dense inverse of the shifted block-diagonal approximation, at
+# float64 accuracy, for both a positive and a zero damping (the AD role).
+keys = jax.random.split(jax.random.key(0), 3)
+
+
+def spd_blocks(key, groups, size):
+    root = jax.random.normal(key, (groups, size, size))
+    return jnp.einsum("gik,gjk->gij", root, root) + 0.5 * jnp.eye(size)
+
+
+family_a = spd_blocks(keys[0], 2, 3)
+family_free = spd_blocks(keys[1], 1, 2)
+permutation = jnp.asarray(np.random.default_rng(0).permutation(8))
+state = block_eigen_state([(family_a, 1.0), (family_free, 0.0)], permutation)
+for leaf in jax.tree.leaves(state["families"]):
+    assert leaf.dtype == jnp.float64, leaf.dtype
+ridge = 3e-9
+ctx = MetricContext(
+    lm_state=RidgeLMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(ridge)),
+    args={"preconditioner": state},
+)
+preconditioner = BlockEigenPreconditioner()
+v = jax.random.normal(keys[2], (8,))
+selection = jnp.eye(8)[permutation]
+dense_permuted = jsp_linalg.block_diag(family_a[0], family_a[1], family_free[0])
+ridge_mask = jnp.concatenate([jnp.ones(6), jnp.zeros(2)])
+for damping in (0.0, 0.37):
+    shifted = dense_permuted + jnp.diag(ridge_mask * ridge + damping)
+    expected = jnp.linalg.solve(selection.T @ shifted @ selection, v)
+    got = preconditioner.apply(v, jnp.asarray(damping), ctx)
+    assert got.dtype == jnp.float64
+    np.testing.assert_allclose(got, expected, rtol=1e-11, atol=1e-13)
+
+# End-to-end at the production precision: CG with the block-eigen state
+# (including a mid-solve callback rebuild) matches the Cholesky solution,
+# and the tangent through the zero-damping AD-role CG matches too.
+REPEATS = 2
+BLOCK = 4
+N_M = REPEATS * BLOCK
+N_F = 2
+P_DIM = N_M + N_F
+M_RESID = 14
+RIDGE = 1e-8
+
+root = jax.random.normal(jax.random.key(2), (BLOCK, BLOCK + 2))
+K = root @ root.T + 0.5 * jnp.eye(BLOCK)
+F = jnp.linalg.cholesky(K, upper=True)
+metric = RepeatedFactorMetric(F, repeats=REPEATS)
+A = jax.random.normal(jax.random.key(3), (M_RESID, P_DIM)) / jnp.sqrt(P_DIM)
+target = jax.random.normal(jax.random.key(4), (M_RESID,))
+
+
+def residual(x, args, p):
+    return A @ x - p["scale"] * target
+
+
+F_bar = jsp_linalg.block_diag(F, F, jnp.eye(N_F))
+J_whitened = jnp.linalg.solve(F_bar.T, A.T).T
+G = J_whitened.T @ J_whitened
+exact_state = block_eigen_state(
+    [(G[:N_M, :N_M][None], 1.0), (G[N_M:, N_M:][None], 0.0)],
+    jnp.arange(P_DIM),
+)
+p_value = {"scale": jnp.asarray(1.0)}
+p_dot = {"scale": jnp.asarray(1.0)}
+x0 = jnp.zeros(P_DIM)
+args = {"data": jnp.asarray(1.0), "preconditioner": exact_state}
+solve_options = dict(max_steps=80, gtol=1e-10, xtol=1e-14)
+
+reference_solver = RidgeLevenbergMarquardt(
+    residual, metric=metric, ridge=RIDGE, linear_solver=Cholesky()
+)
+reference = reference_solver.solve(x0, args, p=p_value, **solve_options)
+assert int(reference.status) == int(LMStatus.CONVERGED)
+
+
+def rebuild_callback(ctx):
+    fresh = block_eigen_state(
+        [(1.25 * G[:N_M, :N_M][None], 1.0), (1.25 * G[N_M:, N_M:][None], 0.0)],
+        jnp.arange(P_DIM),
+    )
+    swap = ctx.step == 2
+    new_state = jax.tree_util.tree_map(
+        lambda old, new: jnp.where(swap, new, old),
+        ctx.args["preconditioner"],
+        fresh,
+    )
+    return LMSolveAction(args={**ctx.args, "preconditioner": new_state})
+
+
+cg_solver = RidgeLevenbergMarquardt(
+    residual,
+    metric=metric,
+    ridge=RIDGE,
+    linear_solver=CG(BlockEigenPreconditioner(), tol=1e-12, maxiter=400),
+    ad_solver=CG(BlockEigenPreconditioner(), tol=1e-12, maxiter=400),
+)
+result = cg_solver.solve(
+    x0, args, p=p_value, callback=rebuild_callback, **solve_options
+)
+assert int(result.status) == int(LMStatus.CONVERGED)
+np.testing.assert_allclose(np.asarray(result.x), np.asarray(reference.x),
+                           rtol=1e-9, atol=1e-11)
+
+
+def tangent(solver):
+    def run(p_in):
+        return solver.solve(x0, args, p=p_in, **solve_options).x
+
+    return jax.jvp(run, (p_value,), (p_dot,))[1]
+
+
+np.testing.assert_allclose(
+    np.asarray(tangent(cg_solver)),
+    np.asarray(tangent(reference_solver)),
+    rtol=1e-7,
+    atol=1e-9,
+)
+
+# The whole CG solve traces float64-only.
+solve_jaxpr = str(
+    jax.make_jaxpr(
+        lambda p_in: cg_solver.solve(x0, args, p=p_in, **solve_options).x
+    )(p_value)
+)
+assert "f32" not in solve_jaxpr
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
