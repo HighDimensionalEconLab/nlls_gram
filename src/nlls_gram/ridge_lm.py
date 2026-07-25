@@ -20,6 +20,7 @@ uses corrected semi-normal equations (Bjorck 1987; Bjorck 1996 Sec. 6.6.5).
 """
 
 import dataclasses
+from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +54,7 @@ from nlls_gram.utilities import (
 
 __all__ = [
     "CholeskyCache",
+    "RidgeContinuation",
     "QRCache",
     "RidgeLevenbergMarquardt",
     "ridge_continuation",
@@ -115,67 +117,97 @@ def ridge_continuation(
     under enabled x64).
     """
 
-    if not 0 < decrease < 1:
-        raise ValueError("decrease must lie strictly between 0 and 1")
-    concrete_floor = not isinstance(ridge_floor, (jax.Array, jax.core.Tracer))
-    if concrete_floor and float(ridge_floor) <= 0:
-        raise ValueError(
-            "ridge_floor must be strictly positive (ridge = 0 is "
-            "unsupported by RidgeLevenbergMarquardt)"
-        )
-    if grad_rtol <= 0:
-        raise ValueError("grad_rtol must be positive")
-    if not 0 <= stall_rtol < 1:
-        raise ValueError("stall_rtol must lie in [0, 1)")
-    if dtype is None:
-        dtype = jnp.result_type(float)
-    infinity = jnp.asarray(jnp.inf, dtype=dtype)
-    user_state0 = {"reference": infinity, "previous": infinity}
+    schedule = RidgeContinuation(
+        decrease=decrease,
+        ridge_floor=ridge_floor,
+        grad_rtol=grad_rtol,
+        stall_rtol=stall_rtol,
+    )
+    infinity = jnp.asarray(
+        jnp.inf, dtype=jnp.result_type(float) if dtype is None else dtype
+    )
+    return schedule, {"reference": infinity, "previous": infinity}
 
-    def callback(ctx):
+
+@dataclass(frozen=True)
+class RidgeContinuation:
+    """The callback :func:`ridge_continuation` builds; see it for the schedule.
+
+    A frozen dataclass rather than a closure because ``solve`` marks the
+    callback a jit STATIC argument: a fresh closure would key a fresh
+    compilation of the whole solve loop on every construction. Two equal
+    schedules compare equal and share one compiled loop. ``ridge_floor`` must
+    be a concrete float for that sharing -- a traced value is unhashable and
+    falls back to identity.
+    """
+
+    ridge_floor: float
+    decrease: float = 0.1
+    grad_rtol: float = 1e-2
+    stall_rtol: float = 0.0
+
+    def __post_init__(self):
+        if not 0 < self.decrease < 1:
+            raise ValueError("decrease must lie strictly between 0 and 1")
+        if not isinstance(self.ridge_floor, (jax.Array, jax.core.Tracer)) and (
+            float(self.ridge_floor) <= 0
+        ):
+            raise ValueError(
+                "ridge_floor must be strictly positive (ridge = 0 is "
+                "unsupported by RidgeLevenbergMarquardt)"
+            )
+        if self.grad_rtol <= 0:
+            raise ValueError("grad_rtol must be positive")
+        if not 0 <= self.stall_rtol < 1:
+            raise ValueError("stall_rtol must lie in [0, 1)")
+
+    def __call__(self, ctx):
         ridge = ctx.lm_state.ridge
-        grad_norm = jnp.asarray(ctx.info.grad_norm, dtype=ridge.dtype)
-        reference = jnp.asarray(ctx.user_state["reference"], dtype=ridge.dtype)
-        previous = jnp.asarray(ctx.user_state["previous"], dtype=ridge.dtype)
-        # +inf marks "no observation at this level yet": the first step after
-        # a ridge decrease (or the initial step) sets the reference and can
-        # never read as stalled.
+        dtype = ridge.dtype
+        grad_norm = jnp.asarray(ctx.info.grad_norm, dtype=dtype)
+        reference = jnp.asarray(ctx.user_state["reference"], dtype=dtype)
+        previous = jnp.asarray(ctx.user_state["previous"], dtype=dtype)
+        # +inf marks "no observation at this level yet": the first step after a
+        # ridge decrease (or the initial step) sets the reference and can never
+        # read as stalled.
         reference = jnp.where(jnp.isfinite(reference), reference, grad_norm)
-        floor = jnp.asarray(ridge_floor, dtype=ridge.dtype)
-        stationary = grad_norm <= jnp.asarray(grad_rtol, ridge.dtype) * reference
-        if stall_rtol > 0:
+        stationary = grad_norm <= jnp.asarray(self.grad_rtol, dtype) * reference
+        if self.stall_rtol > 0:
             # ACCEPTED steps only: a rejected step leaves x (and so the
-            # gradient) unchanged -- that is the trust region adapting, not
-            # the level converging -- while an accepted step that improved
-            # the gradient by less than the stall factor means the level has
+            # gradient) unchanged -- that is the trust region adapting, not the
+            # level converging -- while an accepted step that improved the
+            # gradient by less than the stall factor means the level has
             # yielded what it can.
             stalled = ctx.info.accepted & (
-                grad_norm >= jnp.asarray(stall_rtol, ridge.dtype) * previous
+                grad_norm >= jnp.asarray(self.stall_rtol, dtype) * previous
             )
         else:
             stalled = jnp.asarray(False)
         new_ridge = jnp.where(
             stationary | stalled,
-            jnp.maximum(ridge * jnp.asarray(decrease, ridge.dtype), floor),
+            jnp.maximum(
+                ridge * jnp.asarray(self.decrease, dtype),
+                jnp.asarray(self.ridge_floor, dtype),
+            ),
             ridge,
         )
         # Reset the trackers when the level actually changes; at the floor the
         # ridge is unchanged, so convergence is not suppressed and gtol/atol
         # can fire.
         advanced = new_ridge < ridge
-        fresh_level = jnp.asarray(jnp.inf, ridge.dtype)
-        new_reference = jnp.where(advanced, fresh_level, reference)
-        new_previous = jnp.where(advanced, fresh_level, grad_norm)
+        fresh_level = jnp.asarray(jnp.inf, dtype)
         state_dtype = jnp.asarray(ctx.user_state["reference"]).dtype
         return LMSolveAction(
             lm_state=dataclasses.replace(ctx.lm_state, ridge=new_ridge),
             user_state={
-                "reference": new_reference.astype(state_dtype),
-                "previous": new_previous.astype(state_dtype),
+                "reference": jnp.where(advanced, fresh_level, reference).astype(
+                    state_dtype
+                ),
+                "previous": jnp.where(advanced, fresh_level, grad_norm).astype(
+                    state_dtype
+                ),
             },
         )
-
-    return callback, user_state0
 
 
 class RidgeLevenbergMarquardt(LevenbergMarquardtBase):

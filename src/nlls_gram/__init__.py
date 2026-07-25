@@ -64,7 +64,11 @@ from nlls_gram.preconditioners import (
     WoodburyPreconditioner,
     block_eigen_state,
 )
-from nlls_gram.ridge_lm import RidgeLevenbergMarquardt, ridge_continuation
+from nlls_gram.ridge_lm import (
+    RidgeContinuation,
+    RidgeLevenbergMarquardt,
+    ridge_continuation,
+)
 
 __all__ = [
     "CG",
@@ -95,6 +99,7 @@ __all__ = [
     "Preconditioner",
     "QRCache",
     "RepeatedFactorMetric",
+    "RidgeContinuation",
     "RidgeLevenbergMarquardt",
     "ShermanMorrisonPreconditioner",
     "SolverContext",
