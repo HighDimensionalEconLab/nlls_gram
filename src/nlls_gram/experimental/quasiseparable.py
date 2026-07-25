@@ -50,7 +50,7 @@ def matern_state_space(sigma, ell, nu):
     ``Pinf = diag(1, f^2)``; nu=2.5 has ``h = [sigma, 0, 0]`` and the CAR(3)
     ``Pinf``/transition transcribed from tinygp v0.3.1.
 
-    Nugget-free Matern-3/2 and 5/2 Grams on fine grids are extremely
+    Unshifted Matern-3/2 and 5/2 Grams on fine grids are extremely
     ill-conditioned. Pass a positive ``epsilon`` to
     ``StateSpaceMetric``; the shift is folded into its
     structured factorization exactly.
