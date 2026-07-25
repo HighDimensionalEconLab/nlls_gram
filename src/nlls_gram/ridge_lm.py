@@ -565,6 +565,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             )
         )
         self._static_hash = hash(self._static_key)
+        self._sealed = True
 
     def _resolve_ridge(self, dtype):
         if self.ridge is None:

@@ -119,7 +119,7 @@ def test_invalid_failed_result_uses_initial_instances_for_a_carried_metric():
             x=-jnp.ones(1),
             lm_state=dataclasses.replace(
                 ctx.lm_state,
-                metric=WeightedMetric(jnp.full((1,), jnp.nan)),
+                metric=WeightedMetric(jnp.full((1,), jnp.nan, dtype=ctx.x.dtype)),
             ),
         )
 

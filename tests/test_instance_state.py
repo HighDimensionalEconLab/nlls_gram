@@ -140,6 +140,32 @@ def test_wrong_structure_swap_raises_naming_the_field():
         solver.solve(x0, max_steps=5, callback=swap_in_loop)
 
 
+def test_solvers_are_frozen_after_construction():
+    # The configuration keys the compiled loop, so mutating a constructed
+    # solver would silently reuse a stale compilation.
+    solver = LevenbergMarquardt(linear_residual)
+    with pytest.raises(AttributeError, match="frozen after construction"):
+        solver.geodesic_acceleration = False
+    with pytest.raises(AttributeError, match="frozen after construction"):
+        solver.residual_fn = linear_residual
+
+
+def test_weak_type_instance_swap_raises():
+    # A weak/strong scalar swap passes the carry's physical shape/dtype
+    # checks but retraces the loop body under different promotion rules, so
+    # the structure guard must reject it.
+    solver = RidgeLevenbergMarquardt(linear_residual, metric=make_metric(), ridge=1e-3)
+    x0 = jnp.zeros(P_DIM)
+    state = solver.init(x0)
+    leaves, treedef = jax.tree_util.tree_flatten(state.metric)
+    doctored = jax.tree_util.tree_unflatten(
+        treedef, [1.0 if jnp.ndim(leaf) == 0 else leaf for leaf in leaves]
+    )
+    action = LMAction(lm_state=dataclasses.replace(state, metric=doctored))
+    with pytest.raises(ValueError, match="lm_state.metric"):
+        solver._apply_action(action, x0, state, None, None)
+
+
 def test_untouched_metric_costs_no_comparison_ops():
     # A callback that anneals the ridge via dataclasses.replace hands the
     # metric subtree back as the same tracers: the identity short-circuit

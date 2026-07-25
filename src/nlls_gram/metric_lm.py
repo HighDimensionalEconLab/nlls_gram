@@ -238,6 +238,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             )
         )
         self._static_hash = hash(self._static_key)
+        self._sealed = True
 
     def init(self, x0, args=None, *, p=None):
         """Build the initial :class:`~nlls_gram.LMState` at ``x0``.

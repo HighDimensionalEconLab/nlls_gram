@@ -56,6 +56,18 @@ class LevenbergMarquardtBase:
     def __hash__(self):
         return self._static_hash
 
+    # Sealed at the end of each subclass __init__: the configuration keys
+    # the compiled solve loop, so mutate-by-assignment would keep the stale
+    # key and silently reuse another configuration's compilation.
+    def __setattr__(self, name, value):
+        if getattr(self, "_sealed", False):
+            raise AttributeError(
+                f"{type(self).__name__} is frozen after construction: its "
+                "configuration keys the compiled solve loop. Build a new "
+                "solver instead of assigning attributes"
+            )
+        object.__setattr__(self, name, value)
+
     # Whether a callback-replaced metric moves the objective (the ridge
     # solver's penalty embeds it) or only the damping geometry.
     _metric_defines_objective = False
@@ -290,20 +302,27 @@ class LevenbergMarquardtBase:
     def _check_instance_structure(self, new, previous, name):
         # Trace-time guard mirroring the hyper contract: a replaced instance
         # must be the same registered type with matching static fields and
-        # leaf shapes/dtypes, or the while-loop carry breaks downstream with
-        # a raw mismatch error that never names the culprit.
+        # leaf avals -- weak type included, since a weak/strong scalar swap
+        # passes the while-loop carry's physical checks but retraces the body
+        # under different promotion rules.
         def spec(tree):
             leaves, treedef = jax.tree_util.tree_flatten(tree)
             return treedef, [
-                (jnp.shape(leaf), jnp.result_type(leaf)) for leaf in leaves
+                (
+                    jnp.shape(leaf),
+                    jnp.result_type(leaf),
+                    getattr(jax.typeof(jnp.asarray(leaf)), "weak_type", False),
+                )
+                for leaf in leaves
             ]
 
         if spec(new) != spec(previous):
             raise ValueError(
                 f"the callback action replaced lm_state.{name} with a "
-                "different type, structure, or leaf shape/dtype; rebuild the "
-                "same class with arrays matching the carried instance, and "
-                "preserve untouched fields with dataclasses.replace(ctx.lm_state, ...)"
+                "different type, structure, or leaf shape/dtype/weak-type; "
+                "rebuild the same class with arrays matching the carried "
+                "instance, and preserve untouched fields with "
+                "dataclasses.replace(ctx.lm_state, ...)"
             )
 
     def _apply_action(self, action, x, lm_state, args, user_state):
