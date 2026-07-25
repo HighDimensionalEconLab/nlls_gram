@@ -52,7 +52,7 @@ def matern_state_space(sigma, ell, nu):
 
     Nugget-free Matern-3/2 and 5/2 Grams on fine grids are extremely
     ill-conditioned. Pass a positive ``epsilon`` to
-    ``repeated_shifted_state_space_metric``; the shift is folded into its
+    ``StateSpaceMetric``; the shift is folded into its
     structured factorization exactly.
     """
 

@@ -1,7 +1,7 @@
 """Per-update step cost: ridge LM (cholesky/qr/cg) vs metric LM at the
 kernel-driver problem sizes (p = repeats * n + free parameters, m residuals).
 The residual is a fixed random affine map so the benchmark isolates the
-solver's linear algebra, matching test_repeated_shifted_metric_benchmark's
+solver's linear algebra, matching test_metric_benchmark.py's
 kernel geometry.
 """
 
