@@ -768,3 +768,155 @@ assert auto < normal / 1000.0, (auto, normal)
         text=True,
     )
     assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_float32_problem_under_x64_never_promotes_solvers_ad_or_preconditioners():
+    # The dangerous direction: with x64 ENABLED, Python scalars default to f64
+    # and can silently promote a float32 problem's whole compute. Every config
+    # must keep its arithmetic in f32, with f64 appearing only where a
+    # call-boundary scalar is explicitly converted.
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+import numpy as np
+
+from nlls_gram import (
+    CG,
+    LU,
+    QR,
+    SVD,
+    Cholesky,
+    CholeskyMetric,
+    DiagonalMetric,
+    GramCG,
+    IdentityPreconditioner,
+    LevenbergMarquardt,
+    NystromPreconditioner,
+    ShermanMorrisonPreconditioner,
+    WoodburyPreconditioner,
+)
+
+rng = np.random.default_rng(3)
+m, n = 4, 7
+A = jnp.asarray(rng.normal(size=(m, n)), jnp.float32)
+b = jnp.asarray(rng.normal(size=m), jnp.float32)
+x0 = jnp.zeros(n, jnp.float32)
+A_sq = jnp.asarray(rng.normal(size=(n, n)) + n * np.eye(n), jnp.float32)
+p_sq = jnp.asarray(rng.normal(size=n), jnp.float32)
+x0_sq = jnp.zeros(n, jnp.float32)
+dual = jnp.asarray(A) @ jnp.asarray(A).T + 0.5 * jnp.eye(m, dtype=jnp.float32)
+
+
+def fat(x, args, p):
+    return A @ x - p
+
+
+def square(x, args, p):
+    return A_sq @ x - p
+
+
+def dual_solve(v):
+    return jnp.linalg.solve(dual, v)
+
+
+def dual_matvec(X):
+    return dual @ X
+
+
+def promotions(text):
+    bad = []
+    for line in text.splitlines():
+        s = line.strip()
+        if " = " in s and ":f64[" in s.split(" = ")[0]:
+            if "convert_element_type" not in s:
+                bad.append(s[:100])
+    return bad
+
+
+def check(label, solver, residual, start, p_value, cotangent_size):
+    def run(p):
+        return solver.solve(start, None, p=p, max_steps=6, atol=1e-5).x
+
+    traces = {
+        "primal": jax.make_jaxpr(run)(p_value),
+        "jvp": jax.make_jaxpr(
+            lambda p: jax.jvp(run, (p,), (jnp.ones_like(p),))[1]
+        )(p_value),
+        "vjp": jax.make_jaxpr(
+            lambda p: jax.vjp(run, p)[1](jnp.ones(cotangent_size, jnp.float32))[0]
+        )(p_value),
+    }
+    for mode, jaxpr in traces.items():
+        bad = promotions(str(jaxpr))
+        assert not bad, f"{label} [{mode}] promoted to f64:\n" + "\n".join(bad[:4])
+    assert run(p_value).dtype == jnp.float32, label
+
+
+precond = IdentityPreconditioner()
+for label, kwargs in [
+    ("cholesky", dict(linear_solver=Cholesky())),
+    ("cholesky_gram", dict(linear_solver=Cholesky(form="gram"))),
+    ("cholesky_normal", dict(linear_solver=Cholesky(form="normal"))),
+    ("qr", dict(linear_solver=QR())),
+    ("cg", dict(linear_solver=CG(precond, maxiter=8), ad_solver=SVD())),
+    ("gram_cg", dict(linear_solver=GramCG(precond, maxiter=8))),
+    ("ad_auto_svd", dict()),
+    ("ad_svd", dict(ad_solver=SVD())),
+    ("ad_cholesky", dict(ad_solver=Cholesky())),
+    ("ad_gram_cg", dict(ad_solver=GramCG(precond, maxiter=8))),
+    ("metric_diagonal", dict(metric=DiagonalMetric(jnp.ones(n, jnp.float32) * 2))),
+    ("metric_cholesky", dict(metric=CholeskyMetric(jnp.eye(n, dtype=jnp.float32)))),
+    (
+        "precond_sherman_morrison",
+        dict(
+            linear_solver=GramCG(
+                ShermanMorrisonPreconditioner(
+                    dual_solve,
+                    jnp.asarray(rng.normal(size=m), jnp.float32),
+                    jnp.asarray(0.3, jnp.float32),
+                ),
+                maxiter=8,
+            ),
+            ad_solver=SVD(),
+        ),
+    ),
+    (
+        "precond_woodbury",
+        dict(
+            linear_solver=GramCG(
+                WoodburyPreconditioner(
+                    dual_solve,
+                    jnp.asarray(rng.normal(size=(m, 2)), jnp.float32),
+                    jnp.asarray([0.4, 0.7], jnp.float32),
+                ),
+                maxiter=8,
+            ),
+            ad_solver=SVD(),
+        ),
+    ),
+    (
+        "precond_nystrom",
+        dict(
+            linear_solver=GramCG(
+                NystromPreconditioner(
+                    dual_matvec, n=m, rank=2, key=jax.random.key(0), dtype=jnp.float32
+                ),
+                maxiter=8,
+            ),
+            ad_solver=SVD(),
+        ),
+    ),
+]:
+    check(label, LevenbergMarquardt(fat, **kwargs), fat, x0, b, n)
+
+for label, ad in [("square_auto_lu", None), ("square_lu", LU()), ("square_svd", SVD())]:
+    check(label, LevenbergMarquardt(square, ad_solver=ad), square, x0_sq, p_sq, n)
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout
