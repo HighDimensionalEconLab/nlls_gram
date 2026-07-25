@@ -99,7 +99,6 @@ def test_converges_to_the_minimum_metric_norm_root(name):
         linear_residual,
         metric=metric,
         linear_solver=FORWARD_SOLVERS[name],
-        min_damping=1e-12,
     )
     result = solver.solve(jnp.zeros(N), max_steps=200, atol=1e-6)
     assert int(result.status) == int(LMStatus.CONVERGED)
@@ -133,7 +132,7 @@ def test_diagonal_and_dense_metrics_agree_on_the_same_geometry():
     dense = CholeskyMetric(jnp.diag(jnp.sqrt(weights)))
     x0 = jnp.zeros(N)
     results = [
-        LevenbergMarquardt(linear_residual, metric=metric, min_damping=1e-12).solve(
+        LevenbergMarquardt(linear_residual, metric=metric).solve(
             x0, max_steps=200, atol=1e-6
         )
         for metric in (DiagonalMetric(weights), dense)
@@ -162,7 +161,7 @@ def test_repeated_factor_metric_matches_its_dense_block_diagonal():
     repeated = RepeatedFactorMetric(
         jnp.asarray(np.linalg.cholesky(K).T, jnp.float32), repeats=repeats
     )
-    solver = LevenbergMarquardt(linear_residual, metric=repeated, min_damping=1e-12)
+    solver = LevenbergMarquardt(linear_residual, metric=repeated)
     result = solver.solve(jnp.zeros(N), max_steps=200, atol=1e-6)
     np.testing.assert_allclose(
         np.asarray(result.x), min_norm_solution(dense), rtol=3e-3, atol=3e-4
@@ -170,7 +169,7 @@ def test_repeated_factor_metric_matches_its_dense_block_diagonal():
 
 
 def test_default_metric_is_euclidean():
-    plain = LevenbergMarquardt(linear_residual, min_damping=1e-12).solve(
+    plain = LevenbergMarquardt(linear_residual).solve(
         jnp.zeros(N), max_steps=200, atol=1e-6
     )
     np.testing.assert_allclose(
@@ -242,12 +241,12 @@ def test_rejected_step_leaves_x_and_marks_the_cache_reusable():
 
 
 def test_solve_and_manual_update_loop_agree():
-    solver = LevenbergMarquardt(linear_residual, min_damping=1e-12)
+    solver = LevenbergMarquardt(linear_residual)
     x = jnp.zeros(N)
     state = solver.init(x)
     for _ in range(40):
         x, state, _ = solver.update(x, state)
-    looped = LevenbergMarquardt(linear_residual, min_damping=1e-12).solve(
+    looped = LevenbergMarquardt(linear_residual).solve(
         jnp.zeros(N), max_steps=40, atol=0.0, gtol=0.0, xtol=0.0
     )
     np.testing.assert_allclose(
@@ -264,9 +263,7 @@ def test_pytree_x_and_args_round_trip():
     x0 = {"head": jnp.zeros(N), "tail": jnp.zeros(2)}
     args = {"target": B}
     p = {"anchor": jnp.asarray([0.25, -0.5], jnp.float32)}
-    result = LevenbergMarquardt(residual, min_damping=1e-12).solve(
-        x0, args, p=p, max_steps=200, atol=1e-6
-    )
+    result = LevenbergMarquardt(residual).solve(x0, args, p=p, max_steps=200, atol=1e-6)
     assert int(result.status) == int(LMStatus.CONVERGED)
     np.testing.assert_allclose(
         np.asarray(result.x["tail"]), np.asarray(p["anchor"]), rtol=1e-4, atol=1e-5
@@ -293,7 +290,6 @@ def test_implicit_jvp_matches_the_analytic_min_norm_map(name):
         lambda x, args, p: A @ x - p["b"],
         metric=metric,
         ad_solver=AD_SOLVERS[name],
-        min_damping=1e-12,
     )
     p = {"b": B}
     p_dot = {"b": jnp.asarray(RNG.normal(size=M), jnp.float32)}
@@ -312,7 +308,6 @@ def test_implicit_vjp_is_the_transpose_of_the_jvp(name):
         lambda x, args, p: A @ x - p["b"],
         metric=CholeskyMetric(L_W),
         ad_solver=AD_SOLVERS[name],
-        min_damping=1e-12,
     )
     p = {"b": B}
     p_dot = {"b": jnp.asarray(RNG.normal(size=M), jnp.float32)}
@@ -342,7 +337,7 @@ def test_gram_cg_ad_rejects_the_overdetermined_shape():
 
 
 def test_nonlinear_residual_solves_and_differentiates():
-    solver = LevenbergMarquardt(nonlinear_residual, min_damping=1e-12)
+    solver = LevenbergMarquardt(nonlinear_residual)
     p = {"scale": jnp.asarray(1.0)}
     result = solver.solve(jnp.zeros(N), p=p, max_steps=300, atol=1e-5)
     assert int(result.status) == int(LMStatus.CONVERGED)
@@ -371,12 +366,12 @@ def test_padded_zero_residual_matches_the_unpadded_solve():
         return jnp.concatenate([A @ x - p["b"], jnp.zeros(pad)])
 
     p = {"b": B}
-    unpadded = LevenbergMarquardt(
-        lambda x, args, p: A @ x - p["b"], min_damping=1e-12
-    ).solve(jnp.zeros(N), p=p, max_steps=200, atol=1e-6)
-    padded_result = LevenbergMarquardt(
-        padded, ad_solver=SVD(), min_damping=1e-12
-    ).solve(jnp.zeros(N), p=p, max_steps=200, atol=1e-6)
+    unpadded = LevenbergMarquardt(lambda x, args, p: A @ x - p["b"]).solve(
+        jnp.zeros(N), p=p, max_steps=200, atol=1e-6
+    )
+    padded_result = LevenbergMarquardt(padded, ad_solver=SVD()).solve(
+        jnp.zeros(N), p=p, max_steps=200, atol=1e-6
+    )
     # Two independently converged float32 solves, so the agreement is a
     # measured property rather than a tolerance bound.
     np.testing.assert_allclose(
@@ -385,7 +380,7 @@ def test_padded_zero_residual_matches_the_unpadded_solve():
     # The point of SVD() here is the TANGENT: padding makes the undamped dual
     # singular, and the spectral filter recovers the unpadded tangent anyway.
     p_dot = {"b": jnp.asarray(RNG.normal(size=M), jnp.float32)}
-    padded_solver = LevenbergMarquardt(padded, ad_solver=SVD(), min_damping=1e-12)
+    padded_solver = LevenbergMarquardt(padded, ad_solver=SVD())
     tangent = jax.jvp(
         lambda pv: padded_solver.solve(jnp.zeros(N), p=pv, max_steps=200, atol=1e-6).x,
         (p,),
@@ -399,7 +394,7 @@ def test_has_aux_reports_pre_step_aux_and_a_final_value():
     def residual(x):
         return linear_residual(x), {"norm": jnp.sum(x**2)}
 
-    solver = LevenbergMarquardt(residual, has_aux=True, min_damping=1e-12)
+    solver = LevenbergMarquardt(residual, has_aux=True)
     x0 = jnp.ones(N)
     _, _, info = solver.update(x0, solver.init(x0))
     np.testing.assert_allclose(float(info.aux["norm"]), float(N), rtol=1e-6)
@@ -447,7 +442,7 @@ def test_free_scale_changes_the_step_and_its_tangent():
             jnp.linalg.cholesky(jnp.asarray(W_NP[:4, :4], jnp.float32), upper=True),
             free_scale=free_scale,
         )
-        solver = LevenbergMarquardt(residual, metric=metric, min_damping=1e-12)
+        solver = LevenbergMarquardt(residual, metric=metric)
 
         def run(pv, solver=solver):
             return solver.solve(jnp.zeros(N), p=pv, max_steps=200, atol=1e-6).x

@@ -285,7 +285,7 @@ for parallel in (False, True):
     )
 
 
-def test_float64_default_min_damping_uses_float64_normal_floor():
+def test_float64_damping_floor_is_the_float64_normal_floor():
     script = r"""
 import jax
 jax.config.update("jax_enable_x64", True)

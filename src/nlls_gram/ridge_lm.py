@@ -409,8 +409,6 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         init_damping=1e-3,
         damping_decrease=0.5,
         damping_increase=4.0,
-        min_damping=None,
-        max_damping=None,
         linear_solver=Cholesky(),  # noqa: B008 -- frozen, immutable default
         jacobian_mode="auto",
         ad_solver=None,
@@ -434,10 +432,6 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             raise ValueError(
                 "init_damping, damping_decrease, and damping_increase must be positive"
             )
-        if min_damping is not None and not 0 < min_damping <= init_damping:
-            raise ValueError("min_damping must be positive and at most init_damping")
-        if max_damping is not None and max_damping < init_damping:
-            raise ValueError("max_damping must be at least init_damping")
         self.residual_fn = canonical_residual
         self.residual_arity = residual_arity
         self.initial_metric = metric
@@ -446,8 +440,6 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
-        self.min_damping = min_damping
-        self.max_damping = max_damping
         self.linear_solver = linear_solver
         self.jacobian_mode = jacobian_mode
         self.ad_solver = ad_solver
@@ -553,8 +545,6 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
                 init_damping,
                 damping_decrease,
                 damping_increase,
-                min_damping,
-                max_damping,
                 _config_static_key(linear_solver, baked=False),
                 jacobian_mode,
                 _config_static_key(ad_solver, baked=True),
@@ -586,8 +576,9 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         theta, _ = ravel_pytree(x0)
         n_m, _ = self._block_sizes(theta.size)
         dtype = residual.dtype
-        min_damping = _damping_floor(self.min_damping, dtype)
-        damping = jnp.maximum(jnp.asarray(self.init_damping, dtype=dtype), min_damping)
+        damping = jnp.maximum(
+            jnp.asarray(self.init_damping, dtype=dtype), _damping_floor(dtype)
+        )
         ridge = self._resolve_ridge(dtype)
         instances = dict(
             metric=self.initial_metric, preconditioner=self.initial_preconditioner
@@ -697,9 +688,9 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         )
         damping_decrease = jnp.asarray(hyper.damping_decrease, dtype=resid.dtype)
         damping_increase = jnp.asarray(hyper.damping_increase, dtype=resid.dtype)
-        min_damping = _damping_floor(hyper.min_damping, resid.dtype)
+        damping_floor = _damping_floor(resid.dtype)
         damping = jnp.maximum(
-            jnp.asarray(lm_state.damping, dtype=resid.dtype), min_damping
+            jnp.asarray(lm_state.damping, dtype=resid.dtype), damping_floor
         )
         if lm_state.ridge is None:
             # A None ridge is a legal LMState (the metric solver leaves it
@@ -840,15 +831,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         improved = jnp.isfinite(loss_candidate) & (loss_candidate < loss_old)
         theta_new = jnp.where(improved, theta + step, theta)
         damping_factor = jnp.where(improved, damping_decrease, damping_increase)
-        new_damping = damping * damping_factor
-        if hyper.max_damping is not None:
-            new_damping = jnp.minimum(
-                new_damping,
-                jnp.maximum(
-                    jnp.asarray(hyper.max_damping, dtype=resid.dtype), min_damping
-                ),
-            )
-        new_damping = jnp.maximum(new_damping, min_damping)
+        new_damping = jnp.maximum(damping * damping_factor, damping_floor)
         loss = jnp.where(improved, loss_candidate, loss_old)
         resid_loss = jnp.where(improved, resid_loss_candidate, resid_loss_old)
         penalty_value = jnp.where(improved, penalty_candidate, penalty_value_old)

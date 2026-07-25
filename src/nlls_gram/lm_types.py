@@ -77,30 +77,30 @@ class LMHyperparams:
     the inner CG budget as the loss falls -- via
     ``dataclasses.replace(ctx.lm_state, hyper=dataclasses.replace(
     ctx.lm_state.hyper, iterative_maxiter=...))``. A field constructed as
-    ``None`` (uncapped ``max_damping``, backend-default ``iterative_maxiter``)
-    is compiled out and stays ``None``. Static configuration -- the linear
-    solver, the metric, ``geodesic_acceleration``, ``cache_jacobian``,
-    ``has_aux`` -- shapes the compiled program and lives on the solver.
+    ``None`` (backend-default ``iterative_maxiter``) is compiled out and stays
+    ``None``. Static configuration -- the linear solver, the metric,
+    ``geodesic_acceleration``, ``cache_jacobian``, ``has_aux`` -- shapes the
+    compiled program and lives on the solver.
     """
 
     damping_decrease: jax.Array
     damping_increase: jax.Array
-    min_damping: jax.Array
-    max_damping: jax.Array | None
     geodesic_acceptance_ratio: jax.Array
     iterative_tol: jax.Array
     iterative_atol: jax.Array
     iterative_maxiter: jax.Array | None
 
 
-def _damping_floor(min_damping, dtype):
+def _damping_floor(dtype):
+    # Smallest positive normal. Damping is updated multiplicatively, so a value
+    # in a backend's flush-to-zero range is absorbing: `0 * damping_increase`
+    # stays 0 and the solver could never re-damp after a rejected step. Far
+    # below the scale at which damping still perturbs the Gram diagonal, so it
+    # is an anti-underflow backstop, not regularization -- use the ridge solver
+    # for that. To hold a larger floor, clamp `damping` in a solve callback.
     if dtype is None:
-        seed = 0.0 if min_damping is None else min_damping
-        dtype = jnp.asarray(seed).dtype
-    dtype_floor = jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
-    if min_damping is None:
-        return dtype_floor
-    return jnp.maximum(jnp.asarray(min_damping, dtype=dtype), dtype_floor)
+        dtype = jnp.asarray(0.0).dtype
+    return jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
 
 
 def _cast_hyper(hyper, dtype):
@@ -119,10 +119,6 @@ def _cast_hyper(hyper, dtype):
     return LMHyperparams(
         jnp.asarray(hyper.damping_decrease, dtype=dtype),
         jnp.asarray(hyper.damping_increase, dtype=dtype),
-        _damping_floor(hyper.min_damping, dtype),
-        None
-        if hyper.max_damping is None
-        else jnp.asarray(hyper.max_damping, dtype=dtype),
         jnp.asarray(hyper.geodesic_acceptance_ratio, dtype=dtype),
         iterative_tol,
         jnp.asarray(hyper.iterative_atol, dtype=dtype),

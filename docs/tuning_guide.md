@@ -39,12 +39,15 @@ recompilation.
 `init_damping=1e-3` with `damping_decrease=0.5` / `damping_increase=4.0` is
 the standard schedule. Reach for the others only on evidence:
 
-- `min_damping` — lower it (e.g. `1e-12`) when the minimum-norm limit is the
-  point and the default floor is truncating the endgame;
-- `max_damping` — cap it when a bad region sends damping to infinity and the
-  solver stalls instead of failing;
 - `geodesic_acceptance_ratio` — lower it when the second-order correction is
   being accepted on steps where it overshoots.
+
+Damping is bounded only by an anti-underflow floor at
+`jnp.finfo(residual.dtype).tiny`; there is no upper cap. Letting damping fall
+freely is the point — the endgame wants it to vanish so the step approaches
+Gauss–Newton and the minimum-norm limit. Clamp it in a callback on the rare
+problem that needs a bound (see [Callbacks](callbacks.md)), and use
+`RidgeLevenbergMarquardt` when what you actually want is regularization.
 
 ## The ridge schedule
 

@@ -42,12 +42,25 @@ step, reported even when the step is rejected). Before the first update the
 loop's `LMInfo` uses sentinels `grad_norm=inf` and `step_norm=0`, so `gtol`
 and `xtol` cannot fire at step zero.
 
-Repeated rejections multiply the damping by `damping_increase` without bound,
-which can overflow in float32. The constructor's `max_damping` clamps the
-damping from above; leave it `None` for uncapped classic behavior. Accepted
-steps cannot underflow damping to zero: `min_damping=None` uses
-`jnp.finfo(residual.dtype).tiny`, while an explicit value selects a larger
-absolute floor.
+Damping is floored at `jnp.finfo(residual.dtype).tiny`, the smallest positive
+normal. This is an anti-underflow backstop, not regularization: the update is
+multiplicative, so a damping in a backend's flush-to-zero range would be
+absorbing — `0 * damping_increase` stays `0` and the solver could never
+re-damp after a rejected step. The floor sits far below the scale at which
+damping still perturbs the Gram diagonal, so it never alters a solve that was
+going to make progress. To hold a larger floor, or to cap damping from above,
+clamp it in a callback:
+
+```python
+damping = jnp.clip(ctx.lm_state.damping, 1e-12, 1e6)
+return LMAction(lm_state=dataclasses.replace(ctx.lm_state, damping=damping))
+```
+
+Left unclamped, repeated rejections multiply damping by `damping_increase`
+without bound and it can overflow to `inf` in float32. That is not a failure
+mode worth guarding: the step goes to zero, every trial is rejected, `x` stays
+at the last accepted iterate, and the solve ends at `MAX_STEPS` with the best
+point it found. For genuine regularization, use `RidgeLevenbergMarquardt`.
 
 Status codes are integer constants:
 
@@ -85,9 +98,9 @@ to second-guess a callback's explicit replacement.
 ### Resettable Hyperparameters
 
 `solve()` populates `lm_state.hyper` with an `LMHyperparams` of traced
-per-step values: `damping_decrease`, `damping_increase`, `min_damping`,
-`max_damping`, `geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`,
-and `iterative_maxiter`. Because they ride in the lm_state, a callback can reset
+per-step values: `damping_decrease`, `damping_increase`,
+`geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`, and
+`iterative_maxiter`. Because they ride in the lm_state, a callback can reset
 any of them mid-solve — exactly like a damping reset:
 
 ```python
@@ -97,8 +110,8 @@ new_hyper = dataclasses.replace(
 return LMAction(lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper))
 ```
 
-Two contracts: knobs constructed as `None` (uncapped `max_damping`,
-backend-default `iterative_maxiter`) are compiled out and stay `None` — a
+Two contracts: knobs constructed as `None` (backend-default
+`iterative_maxiter`) are compiled out and stay `None` — a
 callback cannot turn them on; and replacement values must be arrays of the same dtype (use
 `jnp.asarray`/`jnp.where`), since they live in the jitted loop carry. Static
 configuration — `linear_solver`, `geodesic_acceleration`, `cache_jacobian`,

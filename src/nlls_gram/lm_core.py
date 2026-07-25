@@ -18,7 +18,6 @@ from nlls_gram.lm_types import (
     LMAction,
     LMHyperparams,
     LMStatus,
-    _damping_floor,
 )
 from nlls_gram.multi_start import (
     MultiStart,
@@ -192,10 +191,6 @@ class LevenbergMarquardtBase:
         return LMHyperparams(
             jnp.asarray(self.damping_decrease, dtype=dtype),
             jnp.asarray(self.damping_increase, dtype=dtype),
-            _damping_floor(self.min_damping, dtype),
-            None
-            if self.max_damping is None
-            else jnp.asarray(self.max_damping, dtype=dtype),
             jnp.asarray(self.geodesic_acceptance_ratio, dtype=dtype),
             jnp.asarray(iterative_tol, dtype=dtype),
             jnp.asarray(self.iterative_atol, dtype=dtype),
