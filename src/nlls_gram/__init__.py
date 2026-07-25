@@ -44,8 +44,12 @@ https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/
 """
 
 from nlls_gram.gram_lm import (
-    DrawNNXModule,
     LevenbergMarquardt,
+    MetricFactory,
+    PreconditionerFactory,
+    WhitenedPreconditioner,
+)
+from nlls_gram.lm_types import (
     LMHyperparams,
     LMInfo,
     LMSolveAction,
@@ -53,11 +57,6 @@ from nlls_gram.gram_lm import (
     LMSolveResult,
     LMState,
     LMStatus,
-    MetricFactory,
-    MultiStart,
-    MultiStartInfo,
-    PreconditionerFactory,
-    WhitenedPreconditioner,
 )
 from nlls_gram.lsmr import LSMRState, lsmr
 from nlls_gram.metrics import (
@@ -71,6 +70,7 @@ from nlls_gram.metrics import (
     repeated_shifted_dense_metric,
     repeated_shifted_state_space_metric,
 )
+from nlls_gram.multi_start import DrawNNXModule, MultiStart, MultiStartInfo
 from nlls_gram.preconditioners import (
     BlockEigenPreconditioner,
     IdentityPreconditioner,
@@ -96,8 +96,6 @@ from nlls_gram.ridge_lm import (
     CholeskyCache,
     QRCache,
     RidgeLevenbergMarquardt,
-    RidgeLMInfo,
-    RidgeLMState,
     ridge_continuation,
 )
 from nlls_gram.solver_config import (
@@ -146,8 +144,6 @@ __all__ = [
     "LSMRState",
     "ridge_continuation",
     "RidgeLevenbergMarquardt",
-    "RidgeLMInfo",
-    "RidgeLMState",
     "matern_state_space",
     "metric_from_cholesky",
     "metric_from_diagonal",

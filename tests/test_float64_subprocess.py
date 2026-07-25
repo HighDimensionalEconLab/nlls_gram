@@ -1768,7 +1768,7 @@ from nlls_gram import (
     MetricContext,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    RidgeLMState,
+    LMState,
     block_eigen_state,
 )
 
@@ -1790,7 +1790,7 @@ for leaf in jax.tree.leaves(state["families"]):
     assert leaf.dtype == jnp.float64, leaf.dtype
 ridge = 3e-9
 ctx = MetricContext(
-    lm_state=RidgeLMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(ridge)),
+    lm_state=LMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(ridge)),
     args={"preconditioner": state},
 )
 preconditioner = BlockEigenPreconditioner()

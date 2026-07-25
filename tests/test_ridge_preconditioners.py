@@ -15,11 +15,11 @@ from nlls_gram import (
     BlockEigenPreconditioner,
     Cholesky,
     LMSolveAction,
+    LMState,
     LMStatus,
     MetricContext,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    RidgeLMState,
     block_eigen_state,
 )
 
@@ -53,7 +53,7 @@ def test_apply_matches_dense_inverse(damping):
     state, dense_permuted, ridge_mask, permutation = packed_state(jax.random.key(0))
     ridge = 0.05
     ctx = MetricContext(
-        lm_state=RidgeLMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(ridge)),
+        lm_state=LMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(ridge)),
         args={"preconditioner": state},
     )
     preconditioner = BlockEigenPreconditioner()
@@ -80,7 +80,7 @@ def test_value_hashing_and_config_equality():
 def test_missing_state_and_bad_builder_inputs():
     preconditioner = BlockEigenPreconditioner()
     ctx = MetricContext(
-        lm_state=RidgeLMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(1e-3)),
+        lm_state=LMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(1e-3)),
         args={"other": 1.0},
     )
     with pytest.raises(ValueError, match="ctx.args"):
@@ -253,7 +253,7 @@ def test_state_dataclass_survives_jit_boundary():
     def apply(v, damping, ridge, state):
         traces.append(None)
         ctx = MetricContext(
-            lm_state=RidgeLMState(damping=damping, ridge=ridge),
+            lm_state=LMState(damping=damping, ridge=ridge),
             args={"preconditioner": state},
         )
         return preconditioner.apply(v, damping, ctx)

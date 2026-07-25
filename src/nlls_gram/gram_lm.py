@@ -1,6 +1,4 @@
 import dataclasses
-from dataclasses import dataclass
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -9,8 +7,30 @@ import jax.scipy.sparse.linalg as jsp_sparse_linalg
 import numpy as np
 from jax.flatten_util import ravel_pytree
 
+from nlls_gram.lm_types import (
+    LMHyperparams,
+    LMInfo,
+    LMSolveAction,
+    LMSolveContext,
+    LMSolveResult,
+    LMState,
+    LMStatus,
+    _cast_hyper,
+    _damping_floor,
+)
 from nlls_gram.lsmr import lsmr_solve
 from nlls_gram.metrics import GramMetric, _metric_with_compute_dtype
+from nlls_gram.multi_start import (
+    DrawNNXModule,
+    MultiStart,
+    MultiStartInfo,
+    _accept_converged,
+    _accept_converged_or_max_steps,
+    _check_drawn_types,
+    _multi_start_parallel_jit,
+    _multi_start_python_impl,
+    _multi_start_sequential_jit,
+)
 from nlls_gram.preconditioners import WhitenedPreconditioner
 from nlls_gram.recycled_cg import (
     RecycleConfig,
@@ -18,27 +38,10 @@ from nlls_gram.recycled_cg import (
     build_coarse_operator,
     deflated_pcg,
 )
-from nlls_gram.utility import (
-    DrawNNXModule,
-    LMHyperparams,
-    LMSolveAction,
-    LMSolveContext,
-    LMSolveResult,
-    LMStatus,
-    MultiStart,
-    MultiStartInfo,
-    _accept_converged,
-    _accept_converged_or_max_steps,
-    _cast_hyper,
-    _check_drawn_types,
-    _damping_floor,
+from nlls_gram.solve_loop import _solve_loop_jit, _solve_python_impl
+from nlls_gram.utilities import (
     _hashable_hook,
     _mask_tangent_tree,
-    _multi_start_parallel_jit,
-    _multi_start_python_impl,
-    _multi_start_sequential_jit,
-    _solve_loop_jit,
-    _solve_python_impl,
     _static_key_component,
     _tree_changed,
     _where_tree,
@@ -73,100 +76,6 @@ __all__ = [
 # Hyperparameters are static Python scalars; data-dependent control flow is
 # traced (jnp.where), so a rejected step returns the unchanged x rather than
 # branching. Dtypes flow from the residual; damping scalars are cast to match.
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class LMState:
-    """Carried LM solver state threaded through ``init``/``update``/``solve``.
-
-    Only ``damping`` is always live; the remaining fields are populated by the
-    features that need them and stay ``None`` on the default path (compiled away
-    at no cost). A ``solve`` callback that rebuilds ``lm_state`` must PRESERVE the
-    fields it does not mean to change -- in particular the ``recycle`` basis and
-    the ``precond``/``precond_valid`` and ``metric_state``/``metric_valid``
-    factory state, which carry across steps.
-
-    Attributes:
-        damping: ``()`` current LM damping ``lambda``.
-        resid: cached residual at the current ``x`` (``cache_jacobian=True`` only,
-            else ``None``).
-        Jt: cached transpose-Jacobian ``J'`` output at the current ``x``
-            (``cache_jacobian=True`` only).
-        jacobian_valid: ``()`` bool -- the cached ``resid``/``Jt`` are still
-            current because the last step was rejected so ``x`` did not move
-            (``cache_jacobian=True`` only).
-        aux: residual aux pytree at the current ``x`` (``has_aux=True``).
-        hyper: per-step :class:`LMHyperparams`, populated by ``solve``; ``None``
-            (``init``'s default) falls back to the constructor values with
-            identical compiled code and no extra per-call buffers in manual
-            ``update`` loops.
-        recycle: :class:`~nlls_gram.RecycleState` carrying the deflation basis and
-            warm starts across steps (``recycle`` set only).
-        precond: ``preconditioner_factory`` prepared state (the ``prepare``-built
-            pytree) at the current ``x``; ``None`` on the default path.
-        precond_valid: ``()`` bool -- the carried ``precond`` is still current
-            because ``x`` has not moved since it was built (so it is reused, not
-            rebuilt); ``None`` on the default path.
-        metric_state: ``metric_factory`` prepared state (the ``prepare``-built
-            pytree) at the current ``x``; ``None`` on the default path.
-        metric_valid: ``()`` bool -- the carried ``metric_state`` is still
-            current because ``x`` has not moved since it was built (so it is
-            reused, not rebuilt); ``None`` on the default path.
-    """
-
-    damping: jax.Array
-    resid: jax.Array | None = None
-    Jt: jax.Array | None = None
-    jacobian_valid: jax.Array | None = None
-    aux: Any = None
-    hyper: LMHyperparams | None = None
-    recycle: RecycleState | None = None
-    precond: Any = None
-    precond_valid: jax.Array | None = None
-    metric_state: Any = None
-    metric_valid: jax.Array | None = None
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class LMInfo:
-    """Per-step diagnostics returned by ``update`` (and for each ``solve`` step).
-
-    The loss/damping fields report the accept/reject outcome of the step, while
-    ``grad_norm``/``step_norm``/``aux`` are evaluated at the PRE-step ``x`` (the
-    iterate the step was computed from), so they describe the point entering the
-    step, not the one it produced.
-
-    Attributes:
-        loss: ``min(loss_old, loss_candidate)`` sum of squared residuals (at the
-            retained iterate).
-        loss_old: sum of squared residuals at the pre-step ``x``.
-        loss_candidate: sum of squared residuals at the trial point.
-        accepted: ``()`` bool, whether the trial step was accepted.
-        damping: ``()`` post-update damping ``lambda``.
-        damping_factor: ``()`` multiplicative damping update applied this step.
-        used_geodesic: ``()`` bool, whether the geodesic-acceleration correction
-            entered the accepted step.
-        acceleration_ratio: ``()`` geodesic acceleration-to-velocity norm ratio.
-        grad_norm: ``()`` ``||J' r||`` at the pre-step ``x``.
-        step_norm: ``()`` ``||candidate step||``, reported even when the step is
-            rejected.
-        aux: residual aux output at the pre-step ``x`` (``has_aux=True``, else
-            ``None``).
-    """
-
-    loss: jax.Array
-    loss_old: jax.Array
-    loss_candidate: jax.Array
-    accepted: jax.Array
-    damping: jax.Array
-    damping_factor: jax.Array
-    used_geodesic: jax.Array
-    acceleration_ratio: jax.Array
-    grad_norm: jax.Array
-    step_norm: jax.Array
-    aux: Any = None
 
 
 class PreconditionerFactory:
@@ -1060,10 +969,10 @@ class LevenbergMarquardt:
         theta, _ = ravel_pytree(x0)
         return LMState(
             damping,
-            jnp.zeros(residual.shape, dtype=residual.dtype),
-            jnp.zeros((theta.size, residual.size), dtype=residual.dtype),
-            jnp.asarray(False, dtype=jnp.bool_),
-            jax.tree.map(jnp.zeros_like, aux),
+            resid=jnp.zeros(residual.shape, dtype=residual.dtype),
+            Jt=jnp.zeros((theta.size, residual.size), dtype=residual.dtype),
+            jacobian_valid=jnp.asarray(False, dtype=jnp.bool_),
+            aux=jax.tree.map(jnp.zeros_like, aux),
             recycle=recycle,
             precond=precond,
             precond_valid=precond_valid,
@@ -1200,17 +1109,17 @@ class LevenbergMarquardt:
         zero = jnp.zeros((), dtype=residual.dtype)
         one = jnp.ones((), dtype=residual.dtype)
         return LMInfo(
-            loss,
-            loss,
-            loss,
-            jnp.asarray(False, dtype=jnp.bool_),
-            jnp.asarray(lm_state.damping, dtype=residual.dtype),
-            one,
-            jnp.asarray(False, dtype=jnp.bool_),
-            zero,
-            jnp.asarray(jnp.inf, dtype=residual.dtype),
-            zero,
-            aux,
+            loss=loss,
+            loss_old=loss,
+            loss_candidate=loss,
+            accepted=jnp.asarray(False, dtype=jnp.bool_),
+            damping=jnp.asarray(lm_state.damping, dtype=residual.dtype),
+            damping_factor=one,
+            used_geodesic=jnp.asarray(False, dtype=jnp.bool_),
+            acceleration_ratio=zero,
+            grad_norm=jnp.asarray(jnp.inf, dtype=residual.dtype),
+            step_norm=zero,
+            aux=aux,
         )
 
     def update(self, x, lm_state, args=None, p=None):
@@ -1816,16 +1725,16 @@ class LevenbergMarquardt:
         if self.cache_jacobian:
             new_lm_state = LMState(
                 new_damping,
-                resid,
-                Jt,
-                ~improved,
-                aux,
-                lm_state.hyper,
-                new_recycle,
-                new_precond,
-                new_precond_valid,
-                new_metric_state,
-                new_metric_valid,
+                resid=resid,
+                Jt=Jt,
+                jacobian_valid=~improved,
+                aux=aux,
+                hyper=lm_state.hyper,
+                recycle=new_recycle,
+                precond=new_precond,
+                precond_valid=new_precond_valid,
+                metric_state=new_metric_state,
+                metric_valid=new_metric_valid,
             )
         else:
             new_lm_state = LMState(
@@ -1841,17 +1750,17 @@ class LevenbergMarquardt:
             unravel(theta_new),
             new_lm_state,
             LMInfo(
-                loss,
-                loss_old,
-                loss_candidate,
-                improved,
-                new_damping,
-                damping_factor,
-                used_geodesic,
-                acceleration_ratio,
-                jnp.linalg.norm(grad),
-                jnp.linalg.norm(step),
-                aux,
+                loss=loss,
+                loss_old=loss_old,
+                loss_candidate=loss_candidate,
+                accepted=improved,
+                damping=new_damping,
+                damping_factor=damping_factor,
+                used_geodesic=used_geodesic,
+                acceleration_ratio=acceleration_ratio,
+                grad_norm=jnp.linalg.norm(grad),
+                step_norm=jnp.linalg.norm(step),
+                aux=aux,
             ),
         )
 

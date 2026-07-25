@@ -109,7 +109,7 @@ def test_constructor_and_input_validation():
 
 def test_solver_passes_live_context_to_the_factor_ops():
     # Every factor op receives a MetricContext carrying the flat iterate and
-    # the live RidgeLMState (recorded at trace time -- the fields are
+    # the live LMState (recorded at trace time -- the fields are
     # tracers, their presence and shapes are static).
     seen = []
 

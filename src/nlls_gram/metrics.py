@@ -36,7 +36,7 @@ class MetricContext:
 
     - ``x``: the current FLATTENED iterate (the full parameter vector, not
       just the metric block).
-    - ``lm_state``: the live :class:`~nlls_gram.RidgeLMState` (damping,
+    - ``lm_state``: the live :class:`~nlls_gram.LMState` (damping,
       ridge, caches). In the implicit-AD rule this is the returned state
       under ``stop_gradient`` -- inert conditioning data, like the ridge.
     - ``args`` / ``p``: the residual's auxiliary data and differentiation

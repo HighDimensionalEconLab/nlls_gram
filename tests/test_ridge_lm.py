@@ -13,11 +13,11 @@ from nlls_gram import (
     CholeskyCache,
     IdentityMetric,
     IdentityPreconditioner,
+    LMState,
     Preconditioner,
     QRCache,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    RidgeLMState,
 )
 
 # Analytic linear-Gaussian testbed: r(theta) = A theta - b with m < p, the
@@ -299,12 +299,12 @@ def test_constructor_and_state_validation():
     bare = RidgeLevenbergMarquardt(
         linear_residual, metric=make_metric(), ridge=1e-3, cache_jacobian=False
     )
-    bad = RidgeLMState(jnp.asarray(1e-3), None)
+    bad = LMState(jnp.asarray(1e-3), None)
     with pytest.raises(ValueError, match="ridge"):
         bare.update(jnp.zeros(P_DIM), bad)
     with pytest.raises(ValueError, match="ridge"):
         bare.solve(jnp.zeros(P_DIM), lm_state=bad, gtol=1e-5)
-    zero_ridge = RidgeLMState(jnp.asarray(1e-3), jnp.asarray(0.0))
+    zero_ridge = LMState(jnp.asarray(1e-3), jnp.asarray(0.0))
     with pytest.raises(ValueError, match="strictly positive"):
         bare.solve(jnp.zeros(P_DIM), lm_state=zero_ridge, gtol=1e-5)
 

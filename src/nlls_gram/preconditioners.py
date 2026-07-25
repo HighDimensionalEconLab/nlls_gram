@@ -29,7 +29,7 @@ class Preconditioner:
     ``M`` slot with the live damping; in the AD role (``ad_solver=CG(...)``)
     the implicit-AD system is undamped and ``damping`` is zero. ``ctx`` is
     the same :class:`~nlls_gram.MetricContext` the metric factor ops receive
-    (the flat iterate, the live ``RidgeLMState``, ``args``, ``p``), so a
+    (the flat iterate, the live ``LMState``, ``args``, ``p``), so a
     preconditioner can key off the solver state. A preconditioner changes
     the CG iteration path, never the subproblem being solved, so
     approximations are safe.

@@ -270,7 +270,7 @@ float64; only go below that with a measured `gtol`.
 A `Metric` supplies the factor through four ops, each taking a metric-block
 vector — or a matrix whose *leading* axis is `size` (columns batched) — and
 a `MetricContext` carrying everything the solver knows at the call site
-(the flat iterate `x`, the live `RidgeLMState`, `args`, `p`; the shipped
+(the flat iterate `x`, the live `LMState`, `args`, `p`; the shipped
 metrics ignore it, a custom metric may key off it):
 
 - `factor_apply(v, ctx)` — \(F v\)

@@ -21,37 +21,26 @@ uses corrected semi-normal equations (Bjorck 1987; Bjorck 1996 Sec. 6.6.5).
 
 import dataclasses
 from dataclasses import dataclass
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 import jax.scipy.sparse.linalg as jsp_sparse_linalg
-import numpy as np
 from jax.flatten_util import ravel_pytree
 
+from nlls_gram.lm_core import LevenbergMarquardtBase
+from nlls_gram.lm_types import (
+    LMHyperparams,
+    LMInfo,
+    LMSolveAction,
+    LMState,
+    _cast_hyper,
+    _damping_floor,
+)
 from nlls_gram.metrics import Metric, MetricContext
 from nlls_gram.solver_config import CG, QR, Cholesky
-from nlls_gram.utility import (
-    LMHyperparams,
-    LMSolveAction,
-    LMStatus,
-    MultiStart,
-    _accept_converged,
-    _accept_converged_or_max_steps,
-    _cast_hyper,
-    _check_drawn_types,
-    _damping_floor,
-    _hashable_hook,
-    _mask_tangent_tree,
-    _multi_start_parallel_jit,
-    _multi_start_python_impl,
-    _multi_start_sequential_jit,
-    _solve_loop_jit,
-    _solve_python_impl,
+from nlls_gram.utilities import (
     _static_key_component,
-    _tree_changed,
-    _where_tree,
     _zero_tangent_leaf,
     canonicalize_residual,
 )
@@ -60,8 +49,6 @@ __all__ = [
     "CholeskyCache",
     "QRCache",
     "RidgeLevenbergMarquardt",
-    "RidgeLMInfo",
-    "RidgeLMState",
     "ridge_continuation",
 ]
 
@@ -100,133 +87,6 @@ class QRCache:
     R: jax.Array
     valid: jax.Array
     ridge: jax.Array
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class RidgeLMState:
-    """Carried solver state threaded through ``init``/``update``/``solve``.
-
-    ``damping`` and ``ridge`` are always live; the remaining fields are
-    populated by the configuration that needs them and stay ``None`` on the
-    other paths (compiled away at no cost). A ``solve`` callback that rebuilds
-    ``lm_state`` must PRESERVE the fields it does not mean to change -- use
-    ``dataclasses.replace(ctx.lm_state, ...)``. Replacing ``ridge`` is the
-    supported way to anneal the ridge weight mid-solve (see
-    :func:`ridge_continuation`); the solver treats a ridge change as a problem
-    change, suppressing that step's convergence test and invalidating the
-    ridge-keyed caches.
-
-    Attributes:
-        damping: ``()`` current LM damping ``mu`` (the Euclidean trust-region
-            parameter, decoupled from ``ridge``).
-        ridge: ``()`` current ridge weight ``lambda``, strictly positive by
-            contract. Set by ``init`` (constructor value or the dtype default)
-            and replaced only by callbacks.
-        resid: cached TRUE residual at the current ``x``
-            (``cache_jacobian=True`` dense paths only, else ``None``).
-        Jt: cached transpose-Jacobian ``J'`` of the TRUE residual at the
-            current ``x`` (``cache_jacobian=True`` dense paths only).
-        jacobian_valid: ``()`` bool -- the cached ``resid``/``Jt`` are still
-            current because the last step was rejected so ``x`` did not move.
-        aux: residual aux pytree at the current ``x`` (``has_aux=True``).
-        hyper: per-step :class:`~nlls_gram.LMHyperparams`, populated by
-            ``solve``; ``None`` (``init``'s default) falls back to the
-            constructor values.
-        solver_cache: the configured forward solver's own reject-step cache
-            -- a :class:`CholeskyCache` or :class:`QRCache` whose pytree
-            structure is fixed by the static ``linear_solver`` config, or
-            ``None`` when the path carries no cache (``CG``,
-            ``cache_jacobian=False``).
-        metric_state: reserved for the future ``metric_factory`` (adaptive
-            metrics): traced data a factory's ``prepare``/``build`` pair
-            would turn into a :class:`~nlls_gram.Metric` per step. Always
-            ``None`` today.
-        metric_valid: reserved alongside ``metric_state`` with the
-            ``jacobian_valid`` reject-reuse semantics; a state change is a
-            problem change (convergence suppressed, ridge-keyed caches
-            invalidated). Always ``None`` today.
-    """
-
-    damping: jax.Array
-    ridge: jax.Array
-    resid: jax.Array | None = None
-    Jt: jax.Array | None = None
-    jacobian_valid: jax.Array | None = None
-    aux: Any = None
-    hyper: LMHyperparams | None = None
-    solver_cache: Any = None
-    metric_state: Any = None
-    metric_valid: jax.Array | None = None
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class RidgeLMInfo:
-    """Per-step diagnostics returned by ``update`` (and for each ``solve`` step).
-
-    ``loss`` is the RIDGE OBJECTIVE ``||r||^2 + ridge * ||x_m||_W^2``
-    actually being minimized -- it includes the penalty term. Code that means
-    equation error must read ``resid_loss`` (``||r||^2`` alone). The
-    loss/damping fields report the accept/reject outcome of the step, while
-    ``grad_norm``/``step_norm``/``aux`` are evaluated at the PRE-step ``x``.
-
-    The solver runs in the whitened variable ``y = F_bar x``, so
-    ``grad_norm``, ``step_norm``, and ``penalty_grad_norm`` are Euclidean in
-    ``y`` -- equivalently, steps are measured in the W-norm and gradients in
-    the dual W^{-1}-norm. Objective values
-    (``loss``/``resid_loss``/``penalty_value``) are unaffected by the change
-    of variables: whitening is a pure linear bijection of the same objective.
-
-    Attributes:
-        loss: ``min(loss_old, loss_candidate)`` ridge objective at the
-            retained iterate.
-        loss_old: ridge objective at the pre-step ``x``.
-        loss_candidate: ridge objective at the trial point.
-        resid_loss: ``||r||^2`` at the retained iterate.
-        penalty_value: ``||x_m||_W^2 = ||y_m||^2`` at the retained iterate.
-        ridge: ``()`` the ridge weight ``lambda`` used this step.
-        accepted: ``()`` bool, whether the trial step was accepted.
-        damping: ``()`` post-update damping ``mu``.
-        damping_factor: ``()`` multiplicative damping update applied this step.
-        used_geodesic: ``()`` bool, whether the geodesic-acceleration
-            correction entered the accepted step.
-        acceleration_ratio: ``()`` geodesic acceleration-to-velocity whitened
-            norm ratio.
-        grad_norm: ``()`` ``||F_bar^{-T} J'r + ridge [y_m; 0]||`` at the
-            pre-step ``x`` -- the whitened ridge stationarity residual (the
-            dual W^{-1}-norm of the half-gradient), NOT ``||J'r||``.
-        penalty_grad_norm: ``()`` ``||[y_m; 0]|| = sqrt(penalty_value)`` at
-            the pre-step ``x`` -- the whitened penalty-gradient scale,
-            reported so ``gtol`` can be CALIBRATED instead of guessed: at a
-            ridge minimizer the gradient is the cancellation of the residual
-            pullback against ``ridge * [y_m; 0]``, so demanding ``grad_norm
-            < c * ridge * penalty_grad_norm`` resolves the null-space
-            (selection) coordinates to ~``c`` relative accuracy. The recipe
-            is ``gtol ~ 1e-3 * ridge * sqrt(q(x*))`` with ``q`` the
-            solution's squared seminorm, usually known to an order of
-            magnitude before any pilot run.
-        step_norm: ``()`` whitened ``||delta_y||`` of the candidate step --
-            the W-norm of the x-space step -- reported even when the step is
-            rejected (``xtol`` therefore bounds the whitened step).
-        aux: residual aux output at the pre-step ``x`` (``has_aux=True``).
-    """
-
-    loss: jax.Array
-    loss_old: jax.Array
-    loss_candidate: jax.Array
-    resid_loss: jax.Array
-    penalty_value: jax.Array
-    ridge: jax.Array
-    accepted: jax.Array
-    damping: jax.Array
-    damping_factor: jax.Array
-    used_geodesic: jax.Array
-    acceleration_ratio: jax.Array
-    grad_norm: jax.Array
-    penalty_grad_norm: jax.Array
-    step_norm: jax.Array
-    aux: Any = None
 
 
 def ridge_continuation(
@@ -348,7 +208,7 @@ def ridge_continuation(
     return callback, user_state0
 
 
-class RidgeLevenbergMarquardt:
+class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
     """Levenberg-Marquardt for the ridge objective
     ``F(x) = ||r(x, args, p)||^2 + ridge * q(x)`` with
     ``q(x) = ||x_m||_W^2`` over a JAX pytree ``x``, built for underdetermined
@@ -697,16 +557,6 @@ class RidgeLevenbergMarquardt:
         )
         self._static_hash = hash(self._static_key)
 
-    def __eq__(self, other):
-        if self is other:
-            return True
-        if type(other) is not type(self):
-            return NotImplemented
-        return self._static_key == other._static_key
-
-    def __hash__(self):
-        return self._static_hash
-
     def hyperparams(self, dtype=None):
         """``LMHyperparams`` built from the constructor values."""
         iterative_tol = self.iterative_tol
@@ -768,7 +618,7 @@ class RidgeLevenbergMarquardt:
         return jnp.asarray(self.ridge, dtype=dtype)
 
     def init(self, x0, args=None, *, p=None):
-        """Build the initial :class:`RidgeLMState` at ``x0``.
+        """Build the initial :class:`LMState` at ``x0``.
 
         One residual evaluation types ``damping`` and resolves
         ``ridge=None`` to the dtype default, and sizes the Jacobian/normal/QR
@@ -785,7 +635,7 @@ class RidgeLevenbergMarquardt:
         damping = jnp.maximum(jnp.asarray(self.init_damping, dtype=dtype), min_damping)
         ridge = self._resolve_ridge(dtype)
         if not self.cache_jacobian:
-            return RidgeLMState(damping, ridge)
+            return LMState(damping, ridge)
         p_dim = theta.size
         m = residual.size
         invalid = jnp.asarray(False, dtype=jnp.bool_)
@@ -808,47 +658,7 @@ class RidgeLevenbergMarquardt:
                 valid=invalid,
                 ridge=jnp.zeros((), dtype=dtype),
             )
-        return RidgeLMState(damping, ridge, **common, solver_cache=cache)
-
-    def _resolve_jacobian_mode(self, m, n):
-        # Static (shape-driven) choice of dense Jacobian assembly on the TRUE
-        # residual: "auto" takes n forward-mode columns when the system is
-        # tall or square (n <= m) and m reverse-mode rows only when strictly
-        # fat, so the identity basis being vmapped is always the small side.
-        # The penalty rows are affine and never assembled through AD.
-        if self.jacobian_mode != "auto":
-            return self.jacobian_mode
-        return "fwd" if n <= m else "rev"
-
-    def _assemble_jt(self, jvp_fn, theta, resid):
-        if self._resolve_jacobian_mode(resid.shape[0], theta.shape[0]) == "fwd":
-            parameter_basis = jnp.eye(theta.shape[0], dtype=theta.dtype)
-            return jax.vmap(jvp_fn)(parameter_basis)
-        transpose_fn = jax.linear_transpose(jvp_fn, theta)
-        residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
-        return jax.vmap(lambda cotangent: transpose_fn(cotangent)[0])(residual_basis).T
-
-    def _dense_resid_jt_aux(self, residual_flat, theta):
-        if self.has_aux:
-            resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
-        else:
-            resid, jvp_fn = jax.linearize(residual_flat, theta)
-            aux = None
-        return resid, self._assemble_jt(jvp_fn, theta, resid), aux
-
-    def _residual_and_aux(self, x, args, p):
-        if self.has_aux:
-            value, aux = self.residual_fn(x, args, p)
-            for leaf in jax.tree.leaves(aux):
-                if not isinstance(
-                    leaf, (jax.Array, np.ndarray, np.generic, bool, int, float, complex)
-                ):
-                    raise TypeError(
-                        "has_aux=True: aux leaves must be JAX numeric types "
-                        f"(arrays or scalars); got {type(leaf).__name__}"
-                    )
-            return jnp.ravel(value), aux
-        return jnp.ravel(self.residual_fn(x, args, p)), None
+        return LMState(damping, ridge, **common, solver_cache=cache)
 
     def _initial_info(self, x, lm_state, args, p):
         # grad_norm and penalty_grad_norm are +inf sentinels (computing them
@@ -857,10 +667,6 @@ class RidgeLevenbergMarquardt:
         residual, aux = self._residual_and_aux(x, args, p)
         resid_loss = jnp.sum(residual**2)
         theta, _ = ravel_pytree(x)
-        if lm_state.ridge is None:
-            raise ValueError(
-                "the lm_state has no ridge; create it with init(x, args, p=p)"
-            )
         ridge = jnp.asarray(lm_state.ridge, dtype=residual.dtype)
         n_m = self._block_sizes(theta.shape[0])[0]
         ctx = MetricContext(x=theta, lm_state=lm_state, args=args, p=p)
@@ -871,22 +677,23 @@ class RidgeLevenbergMarquardt:
         loss = resid_loss + ridge * penalty_value
         zero = jnp.zeros((), dtype=residual.dtype)
         one = jnp.ones((), dtype=residual.dtype)
-        return RidgeLMInfo(
-            loss,
-            loss,
-            loss,
-            resid_loss,
-            penalty_value,
-            ridge,
-            jnp.asarray(False, dtype=jnp.bool_),
-            jnp.asarray(lm_state.damping, dtype=residual.dtype),
-            one,
-            jnp.asarray(False, dtype=jnp.bool_),
-            zero,
-            jnp.asarray(jnp.inf, dtype=residual.dtype),
-            jnp.asarray(jnp.inf, dtype=residual.dtype),
-            zero,
-            aux,
+        infinity = jnp.asarray(jnp.inf, dtype=residual.dtype)
+        return LMInfo(
+            loss=loss,
+            loss_old=loss,
+            loss_candidate=loss,
+            accepted=jnp.asarray(False, dtype=jnp.bool_),
+            damping=jnp.asarray(lm_state.damping, dtype=residual.dtype),
+            damping_factor=one,
+            used_geodesic=jnp.asarray(False, dtype=jnp.bool_),
+            acceleration_ratio=zero,
+            grad_norm=infinity,
+            step_norm=zero,
+            ridge=ridge,
+            resid_loss=resid_loss,
+            penalty_value=penalty_value,
+            penalty_grad_norm=infinity,
+            aux=aux,
         )
 
     def update(self, x, lm_state, args=None, p=None):
@@ -1329,7 +1136,7 @@ class RidgeLevenbergMarquardt:
                 new_cache = CholeskyCache(normal_matrix, ~improved, ridge)
             else:
                 new_cache = QRCache(qr_R, ~improved, ridge)
-            new_lm_state = RidgeLMState(
+            new_lm_state = LMState(
                 new_damping,
                 ridge,
                 resid,
@@ -1340,481 +1147,98 @@ class RidgeLevenbergMarquardt:
                 solver_cache=new_cache,
             )
         else:
-            new_lm_state = RidgeLMState(new_damping, ridge, hyper=lm_state.hyper)
+            new_lm_state = LMState(new_damping, ridge, hyper=lm_state.hyper)
         return (
             unravel(theta_new),
             new_lm_state,
-            RidgeLMInfo(
-                loss,
-                loss_old,
-                loss_candidate,
-                resid_loss,
-                penalty_value,
-                ridge,
-                improved,
-                new_damping,
-                damping_factor,
-                used_geodesic,
-                acceleration_ratio,
-                jnp.linalg.norm(grad),
-                jnp.linalg.norm(penalty_gradient),
-                jnp.linalg.norm(step_sub),
-                aux,
+            LMInfo(
+                loss=loss,
+                loss_old=loss_old,
+                loss_candidate=loss_candidate,
+                accepted=improved,
+                damping=new_damping,
+                damping_factor=damping_factor,
+                used_geodesic=used_geodesic,
+                acceleration_ratio=acceleration_ratio,
+                grad_norm=jnp.linalg.norm(grad),
+                step_norm=jnp.linalg.norm(step_sub),
+                ridge=ridge,
+                resid_loss=resid_loss,
+                penalty_value=penalty_value,
+                penalty_grad_norm=jnp.linalg.norm(penalty_gradient),
+                aux=aux,
             ),
         )
 
-    def solve(
-        self,
-        x0,
-        args=None,
-        *,
-        p=None,
-        lm_state=None,
-        max_steps=256,
-        max_steps_is_success=True,
-        atol=0.0,
-        gtol=0.0,
-        xtol=0.0,
-        callback=None,
-        user_state=None,
-        save_steps=False,
-        multi_start=None,
-        jit=True,
-    ):
-        """Run repeated LM updates until a stopping rule fires.
-
-        Parameters are the same as ``update`` plus loop controls, matching
-        :meth:`LevenbergMarquardt.solve
-        <nlls_gram.LevenbergMarquardt.solve>` (callbacks, ``save_steps``,
-        ``multi_start``, ``max_steps_is_success``, ``jit``) with two
-        differences. First, the tolerance semantics are conjunctive:
-        ``gtol`` bounds the whitened ridge stationarity ``info.grad_norm =
-        ||J~'r + ridge [y_m; 0]||`` (the dual W^{-1}-norm of the
-        half-gradient) and ``xtol`` the accepted whitened step norm
-        ``info.step_norm = ||delta_y||`` (the W-norm of the step) -- either
-        fires "done with the current fixed-ridge problem". The calibration
-        recipe reads ``gtol ~ 1e-3 * ridge * sqrt(q(x*))`` since
-        ``penalty_grad_norm = sqrt(penalty_value)``. Meanwhile
-        ``atol > 0`` ADDITIONALLY requires ``sqrt(resid_loss) <= atol``
-        (the model equations actually solved, the ridgeless-endgame check)
-        and never stops the solve alone; ``atol > 0`` therefore requires a
-        positive ``gtol`` or ``xtol`` (validated loudly). Second,
-        ``lm_state=None`` always builds the state with :meth:`init`
-        (resolving ``ridge=None`` needs the residual dtype); a
-        caller-supplied ``lm_state`` must carry a positive ``ridge``.
-
-        For ridge continuation pass the pair returned by
-        :func:`ridge_continuation` as ``callback``/``user_state``. A callback
-        ridge change is a problem change: that step's convergence test is
-        suppressed and the ridge-keyed caches invalidate.
-        """
-        self._check_residual_args(args, p)
-        if not isinstance(max_steps_is_success, bool):
-            raise TypeError("max_steps_is_success must be a bool")
-        if max_steps <= 0:
-            raise ValueError("max_steps must be positive")
-        # Tolerances are traced data inside the loop, so vmapped/traced values
-        # skip the concrete-only validation.
-        atol_concrete = not isinstance(atol, jax.core.Tracer)
-        gtol_concrete = not isinstance(gtol, jax.core.Tracer)
-        xtol_concrete = not isinstance(xtol, jax.core.Tracer)
-        if atol_concrete and atol < 0:
-            raise ValueError("atol must be nonnegative")
-        if gtol_concrete and gtol < 0:
-            raise ValueError("gtol must be nonnegative")
-        if xtol_concrete and xtol < 0:
-            raise ValueError("xtol must be nonnegative")
+    def _validate_tolerances(self, atol, gtol, xtol):
+        # atol is a CONJUNCTIVE filter on the true residual, never a stopping
+        # rule alone: a residual-only test would stop at any interpolating
+        # iterate, before the seminorm is minimized.
+        concrete = [not isinstance(t, jax.core.Tracer) for t in (atol, gtol, xtol)]
         if (
-            atol_concrete
+            concrete[0]
             and atol > 0
-            and (gtol_concrete and gtol == 0)
-            and (xtol_concrete and xtol == 0)
+            and (concrete[1] and gtol == 0)
+            and (concrete[2] and xtol == 0)
         ):
             raise ValueError(
                 "atol > 0 requires a positive gtol or xtol: atol is a "
                 "conjunctive filter on the TRUE residual, never a stopping "
-                "rule by itself -- a residual-only test would stop at any "
-                "interpolating iterate before the seminorm is minimized. "
-                "Calibrate gtol from a pilot run as roughly 1e-3 * ridge * "
-                "info.penalty_grad_norm (the relative-stationarity recipe)"
+                "rule by itself. Calibrate gtol from a pilot run as roughly "
+                "1e-3 * ridge * info.penalty_grad_norm"
             )
+
+    def _solve_lm_state(self, x0, args, p, lm_state):
         if lm_state is None:
             # Unconditional init (no minimal-state fast path): resolving
             # ridge=None needs the residual dtype, and the dense caches need
             # their shapes.
-            lm_state = self.init(x0, args, p=p)
-        else:
-            if lm_state.ridge is None:
-                raise ValueError(
-                    "the caller-supplied lm_state has no ridge; create it "
-                    "with init(x, args, p=p) or set a positive ridge"
-                )
-            if (
-                not isinstance(lm_state.ridge, jax.core.Tracer)
-                and jnp.ndim(lm_state.ridge) == 0
-                and float(lm_state.ridge) <= 0.0
-            ):
-                raise ValueError(
-                    "the caller-supplied lm_state.ridge must be strictly "
-                    "positive (ridge = 0 is unsupported)"
-                )
-            # Recast a hand-replaced ridge to the carried scalar dtype: a
-            # weak-typed `dataclasses.replace(state, ridge=1e-4)` would
-            # otherwise change the jit input aval and retrace the loop.
-            lm_state = dataclasses.replace(
-                lm_state,
-                ridge=jnp.asarray(
-                    lm_state.ridge, dtype=jnp.asarray(lm_state.damping).dtype
-                ),
+            return self.init(x0, args, p=p)
+        if lm_state.ridge is None:
+            raise ValueError(
+                "the caller-supplied lm_state has no ridge; create it with "
+                "init(x, args, p=p) or set a positive ridge"
             )
-        if lm_state.hyper is None:
-            lm_state = dataclasses.replace(lm_state, hyper=self.hyperparams())
-        history_len = max_steps + 1 if save_steps else None
-
-        if multi_start is not None:
-            if not isinstance(multi_start, MultiStart):
-                raise TypeError("multi_start must be a MultiStart or None")
-            num_starts = multi_start.num_starts
-            draw = _hashable_hook(multi_start.draw if num_starts > 1 else None)
-            default_accept = (
-                _accept_converged_or_max_steps
-                if max_steps_is_success
-                else _accept_converged
-            )
-            accept = _hashable_hook(
-                default_accept if multi_start.accept is None else multi_start.accept
-            )
-            parallel = multi_start.parallel and num_starts > 1
-            if draw is not None and jit:
-                drawn = jax.eval_shape(draw, multi_start.key, x0, args)
-                _check_drawn_types(x0, args, drawn)
-
-            @jax.custom_jvp
-            def solve_multi_start_with_ad_p(
-                x,
-                lm_state,
-                args,
-                p,
-                user_state,
-                key,
-                max_steps,
-                atol,
-                gtol,
-                xtol,
-            ):
-                return self._multi_start_impl(
-                    x,
-                    lm_state,
-                    args,
-                    p,
-                    user_state,
-                    key,
-                    history_len,
-                    max_steps,
-                    atol,
-                    gtol,
-                    xtol,
-                    callback,
-                    jit,
-                    num_starts,
-                    draw,
-                    accept,
-                    parallel,
-                )
-
-            @solve_multi_start_with_ad_p.defjvp
-            def solve_multi_start_with_ad_p_jvp(primals, tangents):
-                p_dot = tangents[3]
-                result = solve_multi_start_with_ad_p(*primals)
-                initial_ad_point = (
-                    primals[0],
-                    primals[2],
-                    primals[3],
-                    primals[1].ridge,
-                )
-                return result, self._ad_result_tangent(
-                    result, p_dot, initial_ad_point, max_steps_is_success
-                )
-
-            return solve_multi_start_with_ad_p(
-                x0,
-                lm_state,
-                args,
-                p,
-                user_state,
-                multi_start.key,
-                max_steps,
-                atol,
-                gtol,
-                xtol,
-            )
-
-        @jax.custom_jvp
-        def solve_with_ad_p(
-            x,
-            lm_state,
-            args,
-            p,
-            user_state,
-            max_steps,
-            atol,
-            gtol,
-            xtol,
+        if (
+            not isinstance(lm_state.ridge, jax.core.Tracer)
+            and jnp.ndim(lm_state.ridge) == 0
+            and float(lm_state.ridge) <= 0.0
         ):
-            return self._solve_impl(
-                x,
-                lm_state,
-                args,
-                p,
-                user_state,
-                history_len,
-                max_steps,
-                atol,
-                gtol,
-                xtol,
-                callback,
-                jit,
-            )
-
-        @solve_with_ad_p.defjvp
-        def solve_with_ad_p_jvp(primals, tangents):
-            p_dot = tangents[3]
-            result = solve_with_ad_p(*primals)
-            initial_ad_point = (primals[0], primals[2], primals[3], primals[1].ridge)
-            return result, self._ad_result_tangent(
-                result, p_dot, initial_ad_point, max_steps_is_success
-            )
-
-        return solve_with_ad_p(
-            x0,
-            lm_state,
-            args,
-            p,
-            user_state,
-            max_steps,
-            atol,
-            gtol,
-            xtol,
-        )
-
-    def _solve_impl(
-        self,
-        x,
-        lm_state,
-        args,
-        p,
-        user_state,
-        history_len,
-        max_steps,
-        atol,
-        gtol,
-        xtol,
-        callback,
-        jit,
-    ):
-        if jit:
-            return _solve_loop_jit(
-                self,
-                x,
-                lm_state,
-                args,
-                p,
-                user_state,
-                history_len,
-                max_steps,
-                atol,
-                gtol,
-                xtol,
-                callback,
-            )
-        return _solve_python_impl(
-            self,
-            x,
-            lm_state,
-            args,
-            p,
-            user_state,
-            history_len,
-            max_steps,
-            atol,
-            gtol,
-            xtol,
-            callback,
-        )
-
-    def _multi_start_impl(
-        self,
-        x,
-        lm_state,
-        args,
-        p,
-        user_state,
-        key,
-        history_len,
-        max_steps,
-        atol,
-        gtol,
-        xtol,
-        callback,
-        jit,
-        num_starts,
-        draw,
-        accept,
-        parallel,
-    ):
-        if not jit:
-            return _multi_start_python_impl(
-                self,
-                x,
-                lm_state,
-                args,
-                p,
-                user_state,
-                key,
-                history_len,
-                max_steps,
-                atol,
-                gtol,
-                xtol,
-                callback,
-                num_starts,
-                draw,
-                accept,
-                parallel,
-            )
-        if parallel:
-            return _multi_start_parallel_jit(
-                self,
-                x,
-                lm_state,
-                args,
-                p,
-                user_state,
-                key,
-                history_len,
-                max_steps,
-                atol,
-                gtol,
-                xtol,
-                callback,
-                draw,
-                accept,
-                num_starts,
-            )
-        return _multi_start_sequential_jit(
-            self,
-            x,
-            lm_state,
-            args,
-            p,
-            user_state,
-            key,
-            jnp.asarray(num_starts, dtype=jnp.int32),
-            history_len,
-            max_steps,
-            atol,
-            gtol,
-            xtol,
-            callback,
-            draw,
-            accept,
-        )
-
-    def _action_or_default(self, action):
-        if action is None:
-            return LMSolveAction()
-        return action
-
-    def _apply_action(self, action, x, lm_state, args, user_state):
-        action = self._action_or_default(action)
-        # The step's diagnostics and every cache describe the pre-action
-        # problem, so they are stale iff the action actually changed the
-        # values -- a traced comparison, so a jit-style callback that returns
-        # the field every step with unchanged values changes nothing. A ridge
-        # change leaves the Jacobian cache VALID (J does not depend on ridge)
-        # but invalidates the ridge-keyed normal/QR caches and suppresses the
-        # convergence check (the diagnostics were computed at the old ridge).
-        xargs_changed = jnp.asarray(False)
-        ridge_changed = jnp.asarray(False)
-        if action.x is not None:
-            xargs_changed = xargs_changed | _tree_changed(action.x, x)
-            x = action.x
-        if action.lm_state is not None:
-            previous_hyper = lm_state.hyper
-            # Captured BEFORE replacing: ridge lives inside action.lm_state,
-            # not as a top-level action field.
-            previous_ridge = lm_state.ridge
-            lm_state = action.lm_state
-            if lm_state.ridge is None:
-                raise ValueError(
-                    "the callback action returned an lm_state without ridge; "
-                    "use dataclasses.replace(ctx.lm_state, ...) to preserve it"
-                )
-            if self.cache_jacobian and lm_state.jacobian_valid is None:
-                raise ValueError(
-                    "cache_jacobian=True but the callback action returned an "
-                    "lm_state without the Jacobian cache; use "
-                    "dataclasses.replace(ctx.lm_state, ...) to preserve the "
-                    "cache fields"
-                )
-            if previous_hyper is not None and (
-                lm_state.hyper is None
-                or jax.tree_util.tree_structure(previous_hyper)
-                != jax.tree_util.tree_structure(lm_state.hyper)
-                or [leaf.dtype for leaf in jax.tree_util.tree_leaves(previous_hyper)]
-                != [leaf.dtype for leaf in jax.tree_util.tree_leaves(lm_state.hyper)]
-            ):
-                raise ValueError(
-                    "the callback action changed the structure or dtypes of "
-                    "lm_state.hyper; reset values with "
-                    "dataclasses.replace(ctx.lm_state.hyper, ...) using arrays "
-                    "of the same dtype — a knob constructed as None cannot be "
-                    "enabled mid-solve"
-                )
-            # Recast a callback-provided ridge to the carried scalar's dtype:
-            # a weak-typed Python float in the action must not change the
-            # while_loop carry aval.
-            new_ridge = jnp.asarray(lm_state.ridge, dtype=previous_ridge.dtype)
-            ridge_changed = ridge_changed | ~jnp.array_equal(
-                new_ridge, previous_ridge, equal_nan=True
-            )
-            lm_state = dataclasses.replace(lm_state, ridge=new_ridge)
-        if action.args is not None:
-            xargs_changed = xargs_changed | _tree_changed(action.args, args)
-            args = action.args
-        if action.user_state is not None:
-            user_state = action.user_state
-        problem_changed = xargs_changed | ridge_changed
-        if self.cache_jacobian and (action.x is not None or action.args is not None):
-            lm_state = dataclasses.replace(
-                lm_state, jacobian_valid=lm_state.jacobian_valid & ~xargs_changed
-            )
-        touched = (
-            action.x is not None
-            or action.args is not None
-            or action.lm_state is not None
-        )
-        if touched and lm_state.solver_cache is not None:
-            cache = lm_state.solver_cache
-            lm_state = dataclasses.replace(
-                lm_state,
-                solver_cache=dataclasses.replace(
-                    cache, valid=cache.valid & ~problem_changed
-                ),
-            )
-        return action, x, lm_state, args, user_state, problem_changed
-
-    def _check_residual_args(self, args, p):
-        if args is not None and self.residual_arity < 2:
             raise ValueError(
-                "args was passed but residual_fn takes only (x); "
-                "use residual_fn(x, args)"
+                "the caller-supplied lm_state.ridge must be strictly positive "
+                "(ridge = 0 is unsupported)"
             )
-        if p is not None and self.residual_arity < 3:
+        # Recast a hand-replaced ridge to the carried scalar dtype: a
+        # weak-typed replace(state, ridge=1e-4) would change the jit input
+        # aval and retrace the loop.
+        return dataclasses.replace(
+            lm_state,
+            ridge=jnp.asarray(
+                lm_state.ridge, dtype=jnp.asarray(lm_state.damping).dtype
+            ),
+        )
+
+    def _initial_ad_point(self, x, lm_state, args, p):
+        # The pre-loop ridge rides along: a failed lane's callback may have
+        # left an invalid ridge behind, so the failed tangent uses this one.
+        return (x, args, p, lm_state.ridge)
+
+    def _check_action_state(self, lm_state):
+        if lm_state.ridge is None:
             raise ValueError(
-                "p was passed but residual_fn takes no p argument; "
-                "use residual_fn(x, args, p)"
+                "the callback action returned an lm_state without ridge; "
+                "use dataclasses.replace(ctx.lm_state, ...) to preserve it"
             )
+
+    def _apply_action_state(self, lm_state, previous):
+        # A ridge change leaves the Jacobian cache VALID (J does not depend on
+        # ridge) but invalidates the ridge-keyed normal/QR caches and
+        # suppresses the convergence check, whose diagnostics were computed at
+        # the old ridge. The recast keeps a weak-typed callback float from
+        # changing the while_loop carry aval.
+        new_ridge = jnp.asarray(lm_state.ridge, dtype=previous.ridge.dtype)
+        changed = ~jnp.array_equal(new_ridge, previous.ridge, equal_nan=True)
+        return dataclasses.replace(lm_state, ridge=new_ridge), changed
 
     def _converged(self, info, atol, gtol, xtol):
         # gtol/xtol mean "done with the current fixed-ridge problem"; atol is
@@ -1879,54 +1303,25 @@ class RidgeLevenbergMarquardt:
             jnp.isfinite(loss), loss, jnp.asarray(jnp.inf, dtype=loss.dtype)
         )
 
-    def _ad_result_tangent(self, result, p_dot, initial_ad_point, max_steps_is_success):
-        # A successful tangent relinearizes at the returned solution with the
-        # winner's own final ridge (stop-gradient: lambda is inert
-        # conditioning data). A failed tangent uses the differentiation-inert
-        # original initial point and the pre-loop INITIAL ridge -- a failed
-        # lane's callback may have left an invalid ridge behind. Everything
-        # except x, p, and aux is bookkeeping with zero tangents.
-        initial_x, initial_args, initial_p, initial_ridge = jax.tree.map(
-            jax.lax.stop_gradient, initial_ad_point
-        )
-        ad_success = result.status == LMStatus.CONVERGED
-        if max_steps_is_success:
-            ad_success = ad_success | (result.status == LMStatus.MAX_STEPS)
-        ad_x = _where_tree(ad_success, result.x, initial_x)
-        ad_args = _where_tree(ad_success, result.args, initial_args)
-        ad_p = _where_tree(ad_success, result.p, initial_p)
-        ad_p_dot = _mask_tangent_tree(ad_success, p_dot)
-        final_ridge = jax.lax.stop_gradient(result.lm_state.ridge)
-        ad_ridge = jnp.where(
-            ad_success, final_ridge, jnp.asarray(initial_ridge, final_ridge.dtype)
-        )
-        # The returned state rides along as inert MetricContext data for the
-        # factor callbacks, like the frozen ridge.
-        ad_lm_state = jax.lax.stop_gradient(result.lm_state)
-        x_dot = self._ad_x_tangent_from_p(
-            ad_x, ad_args, ad_p, ad_p_dot, ad_ridge, ad_lm_state
-        )
-        zero_result = jax.tree.map(_zero_tangent_leaf, result)
-        x_dot = _where_tree(ad_success, x_dot, zero_result.x)
-        aux_dot = zero_result.aux
-        if self.has_aux and ad_p is not None:
-            # aux depends on p directly and through the solution x*(p).
-            def aux_at_solution(x_value, p_value):
-                return self.residual_fn(x_value, ad_args, p_value)[1]
-
-            aux_dot = jax.jvp(aux_at_solution, (ad_x, ad_p), (x_dot, ad_p_dot))[1]
-            aux_dot = _where_tree(ad_success, aux_dot, zero_result.aux)
-        return dataclasses.replace(zero_result, x=x_dot, p=p_dot, aux=aux_dot)
-
     def _resolved_ad_solver(self):
         if self.ad_solver is None:
             # Matrix-free forward -> matrix-free AD.
             return "normal_cg" if self._resolved_solver() == "normal_cg" else "cholesky"
         return "cholesky" if isinstance(self.ad_solver, Cholesky) else "normal_cg"
 
-    def _ad_x_tangent_from_p(self, x, args, p, p_dot, ridge, lm_state):
+    def _ad_x_tangent(self, x, args, p, p_dot, result, ad_success, initial_ad_point):
         if p is None:
             return jax.tree.map(_zero_tangent_leaf, x)
+        # A successful tangent uses the winner's own final ridge; a failed one
+        # the pre-loop initial ridge. Both are stop-gradient'd -- lambda is
+        # inert conditioning data, and the returned state rides along as
+        # equally inert MetricContext data for the factor callbacks.
+        final_ridge = jax.lax.stop_gradient(result.lm_state.ridge)
+        initial_ridge = jax.lax.stop_gradient(initial_ad_point[3])
+        ridge = jnp.where(
+            ad_success, final_ridge, jnp.asarray(initial_ridge, final_ridge.dtype)
+        )
+        lm_state = jax.lax.stop_gradient(result.lm_state)
         if self._resolved_ad_solver() == "cholesky":
             return self._ad_tangent_cholesky(x, args, p, p_dot, ridge, lm_state)
         return self._ad_tangent_normal_cg(x, args, p, p_dot, ridge, lm_state)
@@ -2035,9 +1430,3 @@ class RidgeLevenbergMarquardt:
         )
         theta_dot = jnp.asarray(self._extended_solve(y_dot, ctx), residual.dtype)
         return unravel(theta_dot)
-
-    def _ad_cg_tol(self, dtype):
-        if self.ad_solver_tol is not None:
-            return jnp.asarray(self.ad_solver_tol, dtype=dtype)
-        default_tol = 1e-10 if jnp.finfo(dtype).bits > 32 else 1e-6
-        return jnp.asarray(default_tol, dtype=dtype)
