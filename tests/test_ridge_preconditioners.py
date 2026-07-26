@@ -145,24 +145,54 @@ def test_cg_solve_matches_cholesky():
 
 
 def test_callback_refresh_reaches_the_next_inner_solve():
-    # A callback-constructed instance replaces the carried one and drives the
-    # very next CG solve: with a starved inner budget, a scrambled
-    # preconditioner cannot reach gtol within the step cap, while refreshing
-    # to the exact one at step 1 converges almost as fast as exact-from-start
-    # -- and the swap is not a problem change, so convergence fires normally.
+    # The contract: an instance a callback puts in the carried state is what
+    # the NEXT inner solve uses. Asserted on the step itself -- swapping the
+    # exact preconditioner into a scrambled solver's state must produce the
+    # step a solver BUILT with the exact one takes from the same state -- and
+    # that holds bit-for-bit on both x86 and ARM.
+    #
+    # It used to be asserted through "the refreshed solve reaches gtol", which
+    # measured something else. The residual here is linear, so with a starved
+    # maxiter=3 budget the endgame stalls at the float32 loss floor: once no
+    # trial strictly improves the loss, every step is rejected and damping
+    # ratchets to ~3e4. Whether gtol=1e-5 lands above or below that floor is
+    # platform arithmetic -- ARM reached 4.5e-6 and x86 stopped at 6.0e-5 --
+    # so the old assertion passed on the author's machine and failed in CI
+    # while the mechanism it was meant to check was working identically on
+    # both.
     metric, residual, G = build_problem()
     p = {"scale": jnp.asarray(1.0)}
     x0 = jnp.zeros(P_DIM)
 
-    def build(callback=None):
-        solver = RidgeLevenbergMarquardt(
+    def solver_with(preconditioner):
+        return RidgeLevenbergMarquardt(
             residual,
             metric=metric,
             ridge=RIDGE,
-            linear_solver=CG(scrambled_preconditioner(), tol=0.0, maxiter=3),
+            linear_solver=CG(preconditioner, tol=0.0, maxiter=3),
         )
-        return solver.solve(x0, p=p, max_steps=60, gtol=1e-5, callback=callback)
 
+    scrambled = solver_with(scrambled_preconditioner())
+    exact = solver_with(exact_preconditioner(G))
+
+    stale_state = scrambled.init(x0, p=p)
+    swapped_state = dataclasses.replace(
+        stale_state, preconditioner=exact_preconditioner(G)
+    )
+    x_stale = scrambled.update(x0, stale_state, p=p)[0]
+    x_exact = exact.update(x0, exact.init(x0, p=p), p=p)[0]
+    x_swapped = scrambled.update(x0, swapped_state, p=p)[0]
+
+    # The carried instance drives the solve...
+    np.testing.assert_allclose(
+        np.asarray(x_swapped), np.asarray(x_exact), rtol=1e-6, atol=1e-7
+    )
+    # ...and the scrambled one it replaced gives a materially different step,
+    # so the check above is not vacuous.
+    assert float(jnp.linalg.norm(x_swapped - x_stale)) > 1.0
+
+    # End to end through a callback: the refreshed instance is the one carried
+    # out of the solve, and a starved scrambled run does not converge.
     def refresh(ctx):
         fresh = jax.lax.cond(
             ctx.step == 1,
@@ -173,17 +203,17 @@ def test_callback_refresh_reaches_the_next_inner_solve():
             lm_state=dataclasses.replace(ctx.lm_state, preconditioner=fresh)
         )
 
-    stale = build()
-    refreshed = build(refresh)
+    refreshed = scrambled.solve(x0, p=p, max_steps=60, gtol=1e-5, callback=refresh)
+    stale = scrambled.solve(x0, p=p, max_steps=60, gtol=1e-5)
     assert int(stale.status) == int(LMStatus.MAX_STEPS)
-    assert int(refreshed.status) == int(LMStatus.CONVERGED)
-    assert int(refreshed.steps) <= 12
-    # The carried instance in the result is the refreshed one.
     np.testing.assert_allclose(
         refreshed.lm_state.preconditioner.eigenvalues[0],
         exact_preconditioner(G).eigenvalues[0],
         rtol=1e-6,
     )
+    # The refresh has to help, even where the float32 floor stops it short of
+    # gtol: a strictly better stationarity than the run that never refreshed.
+    assert float(refreshed.info.grad_norm) < float(stale.info.grad_norm)
 
 
 @pytest.mark.parametrize("ad_mode", ["explicit", "inherit", "inherit_knobs"])
