@@ -5,8 +5,9 @@ import jax.numpy as jnp
 import pytest
 
 from nlls_gram import (
+    SVD,
     LevenbergMarquardt,
-    LMSolveAction,
+    LMAction,
     LMStatus,
     MultiStart,
 )
@@ -320,7 +321,7 @@ def test_sequential_draw_receives_previous_initial_values():
         return jnp.array([theta[0] - args, theta[0] - args - 10.0])
 
     def mutating_callback(ctx):
-        return LMSolveAction(x=ctx.x + 100.0, args=ctx.args + 1.0)
+        return LMAction(x=ctx.x + 100.0, args=ctx.args + 1.0)
 
     solver = LevenbergMarquardt(residual, init_damping=1.0)
     x0 = jnp.array([2.0])
@@ -621,8 +622,6 @@ def test_multi_start_validation_errors():
 
     solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     x0 = jnp.zeros(2)
-    with pytest.raises(TypeError, match="MultiStart"):
-        solver.solve(x0, p=jnp.asarray(3.0), multi_start=42)
 
     def bad_draw(key, x, args):
         return x[:1], args
@@ -696,9 +695,9 @@ def test_mv2020_style_draw_resamples_args(parallel):
             return {"data": data, "key": carry_key}
 
         new_args = jax.lax.cond(ctx.step == 1, fresh, lambda _: ctx.args, None)
-        return LMSolveAction(args=new_args)
+        return LMAction(args=new_args)
 
-    solver = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver="svd")
+    solver = LevenbergMarquardt(residual, init_damping=1e-2, ad_solver=SVD())
     args0 = {"data": jnp.array([1.0, -2.0, 0.5]), "key": jax.random.key(22)}
     x0 = jnp.array([jnp.nan, jnp.nan, jnp.nan])  # forces one retry
     p = jnp.asarray(2.0)

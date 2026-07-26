@@ -1,95 +1,91 @@
-"""Metric types for the package's two solvers.
+"""The positive-definite metric both solvers take, given through factor
+callbacks.
 
-:class:`Metric` is the positive-definite metric ``W`` on the metric block of
-:class:`~nlls_gram.RidgeLevenbergMarquardt`'s parameter vector, given through
-factor callbacks for an invertible factor ``F`` with ``W = F'F`` --
-:class:`IdentityMetric` is the plain-ridge case and
-:class:`RepeatedFactorMetric` the kernel workhorse (``repeats`` copies of one
-block factor). Every callback receives a :class:`MetricContext` carrying the
-solver's live state, so exotic metrics can key off the iterate.
-
-:class:`GramMetric` (with :func:`metric_from_cholesky`,
-:func:`metric_from_diagonal`, and the ``repeated_shifted_*`` constructors) is
-the damping metric of the classic :class:`~nlls_gram.LevenbergMarquardt`
-solver -- an unrelated contract kept under its own name.
+One contract serves two roles. For
+:class:`~nlls_gram.RidgeLevenbergMarquardt` the metric ``W`` weights the
+OBJECTIVE's penalty, ``ridge * ||x_m||_W^2``; for
+:class:`~nlls_gram.LevenbergMarquardt` it is the damping geometry, so the
+small-damping Gauss-Newton limit selects minimum-``W``-norm corrections.
+Either way the solver runs in the whitened variable and never materializes
+``W`` or its factor.
 """
 
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
 
 import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 
-from nlls_gram import quasiseparable
+from nlls_gram.lm_types import SolverContext
+from nlls_gram.utilities import mm, register_pytree_dataclass
 
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class MetricContext:
-    """Everything the solver knows at a factor-callback call site.
-
-    Passed as the second positional argument of every :class:`Metric` op.
-    The shipped metrics ignore it; a custom metric may key its factor off any
-    field. Fields are ``None`` where the call site has nothing to offer:
-
-    - ``x``: the current FLATTENED iterate (the full parameter vector, not
-      just the metric block).
-    - ``lm_state``: the live :class:`~nlls_gram.RidgeLMState` (damping,
-      ridge, caches). In the implicit-AD rule this is the returned state
-      under ``stop_gradient`` -- inert conditioning data, like the ridge.
-    - ``args`` / ``p``: the residual's auxiliary data and differentiation
-      parameters as passed to ``solve``/``update``.
-    """
-
-    x: Any = None
-    lm_state: Any = None
-    args: Any = None
-    p: Any = None
+__all__ = [
+    "CholeskyMetric",
+    "DiagonalMetric",
+    "IdentityMetric",
+    "Metric",
+    "RepeatedFactorMetric",
+    "SolverContext",
+]
 
 
 class Metric:
-    """Positive-definite metric ``W`` on the metric block, via factor callbacks.
+    """Positive-definite metric ``W``, via factor callbacks.
 
-    :class:`~nlls_gram.RidgeLevenbergMarquardt` minimizes
-    ``||r(x)||^2 + ridge * ||x_m||_W^2`` where ``x = [x_m; x_f]`` splits into
-    the metric block ``x_m`` (the leading ``size`` coordinates, covered by
-    ``W``) and the free block ``x_f`` (unpenalized). The metric is supplied
-    through callbacks for an invertible factor ``F`` with ``W = F'F``, the
-    whitened variable being ``x_hat_m = F x_m`` and
+    ``x = [x_m; x_f]`` splits into the metric block ``x_m`` -- the leading
+    ``size`` coordinates, covered by ``W`` -- and a free block ``x_f``. The
+    metric is supplied through callbacks for an invertible factor ``F`` with
+    ``W = F'F``, the whitened variable being ``F x_m`` and
     ``||v||_W = ||F v||_2``. ``F`` should be upper triangular; the canonical
-    example is the upper Cholesky factor,
-    ``F = jnp.linalg.cholesky(K, upper=True)``. The solver runs entirely in
-    the whitened variable and never materializes ``W`` or ``F``.
+    example is ``F = jnp.linalg.cholesky(K, upper=True)``. The solver extends
+    it to ``F_bar = blockdiag(F, sqrt(free_scale) I)`` over the whole vector
+    and never materializes either.
 
     Subclasses implement the ops on metric-block vectors (or matrices whose
-    LEADING axis is ``size``; columns are batched), each also receiving a
-    :class:`MetricContext` with the solver's live state:
+    LEADING axis is ``size``; columns are batched):
 
     - ``factor_apply(v, ctx)``: ``F v``
     - ``factor_solve(v, ctx)``: ``F^{-1} v``
     - ``factor_solve_transpose(v, ctx)``: ``F^{-T} v``
-    - ``norm(v, ctx)``: ``||v||_W`` (vectors only; the base default is
-      ``||factor_apply(v)||_2``, and an override must match it to
-      floating-point accuracy -- the solver compares objective values built
-      from both forms)
+    - ``norm(v, ctx)``: ``||v||_W``, defaulted to ``||factor_apply(v)||_2``.
+      Provided for callers; the solvers measure in the whitened variable and
+      never call it.
 
-    Contracts: the factor must be EXACT -- the solver hardcodes the identity
+    Every op receives a :class:`~nlls_gram.SolverContext` carrying the
+    solver's live state, so an exotic metric can key off the iterate through
+    ``ctx.x`` and ``ctx.lm_state``.
+
+    Metric instances are JAX PYTREES: array fields are traced leaves, the
+    type plus its static fields are structure. Every concrete class must be
+    registered with
+    :func:`~nlls_gram.register_pytree_dataclass` -- the solvers reject
+    unregistered instances. The instance rides inside the solver state
+    (``lm_state.metric``), so a ``solve`` callback replaces the metric by
+    constructing a new instance of the same type (same static fields, same
+    leaf shapes and dtypes) -- pure traced ops, no recompilation. Equal-config
+    instances with fresh arrays share one compiled solve loop.
+    ``dataclasses.replace`` works too: metric constructors only validate and
+    derive shapes, so re-running them under trace is cheap.
+
+    ``free_scale`` weights the free block in the whitened variable: ``1.0``
+    (the default) leaves it Euclidean. The ridge solver never penalizes the
+    free block whatever the scale -- ``free_scale`` only changes its
+    trust-region geometry -- while for the metric solver it IS that block's
+    damping weight. It is a traced leaf, canonicalized by each constructor to
+    the factor's float dtype, so changing it never recompiles.
+
+    Contracts: the factor must be EXACT. The solver hardcodes the identity
     penalty block in the whitened variable, so an approximate factor silently
     changes the objective (unlike a CG preconditioner, which may be sloppy).
     The ridge weight never enters the factorization, so ridge continuation
-    composes unchanged. How a subclass fulfills the ops (prefactorized
-    storage, factorize-in-``__init__``, fully matrix-free) is its
-    constructor's business; the solver only sees the ops.
-
-    Metrics hash and compare by identity (``eq=False`` frozen dataclasses --
-    array fields make value-hashing impossible): construct one at setup scope
-    and reuse it, since rebuilding an equal-config metric per call would key
-    a fresh solver compilation.
+    composes unchanged. How a subclass fulfills the ops -- prefactorized
+    storage, factorize-in-``__init__``, fully matrix-free -- is its
+    constructor's business, and the constructor must be traceable when the
+    metric is rebuilt inside a jitted callback.
     """
 
     size: int
+    free_scale: float = 1.0
 
     def factor_apply(self, v, ctx):
         """``F v`` for a metric-block vector or leading-axis-batched matrix."""
@@ -105,14 +101,20 @@ class Metric:
 
     def norm(self, v, ctx):
         """``||v||_W = ||F v||_2`` for a metric-block vector."""
-        if v.ndim != 1:
-            raise ValueError("Metric.norm requires a vector")
         return jnp.linalg.norm(self.factor_apply(v, ctx))
 
 
-def _validate_metric_input(v, size):
-    if v.ndim not in (1, 2):
-        raise ValueError("metric factor callbacks require a vector or matrix")
+def _canonical_free_scale(free_scale, dtype):
+    # F_bar = blockdiag(F, sqrt(free_scale) I), so a non-positive scale makes
+    # the whitening noninvertible or complex. Traced values skip the sign
+    # check; the strong-typed cast keeps rebuilt instances aval-identical to
+    # the originals inside lax.cond/while_loop.
+    if not isinstance(free_scale, (jax.Array, jax.core.Tracer)) and free_scale <= 0:
+        raise ValueError("free_scale must be positive")
+    return jnp.asarray(free_scale, dtype=dtype)
+
+
+def _check_leading_size(v, size):
     if v.shape[0] != size:
         raise ValueError(
             f"metric factor input leading size must be {size}, got {v.shape[0]}"
@@ -121,63 +123,155 @@ def _validate_metric_input(v, size):
 
 @dataclass(frozen=True, eq=False)
 class IdentityMetric(Metric):
-    """The identity metric ``W = I`` on ``size`` coordinates -- plain ridge.
+    """The identity metric ``W = I`` on ``size`` coordinates -- plain ridge for
+    the ridge solver, Euclidean damping for the metric solver.
 
     ``F = I``: every factor op is the identity and ``norm`` is the Euclidean
-    norm, so ``RidgeLevenbergMarquardt`` reduces to the classical
-    ``||r||^2 + ridge * ||x_m||^2`` objective with no special-casing.
+    norm, with no special-casing anywhere downstream.
     """
 
     size: int
+    free_scale: float = 1.0
 
     def __post_init__(self):
-        if (
-            isinstance(self.size, bool)
-            or not isinstance(self.size, int)
-            or self.size <= 0
-        ):
-            raise ValueError("size must be a positive Python int")
+        if self.size < 0:
+            raise ValueError("size must be nonnegative")
+        object.__setattr__(
+            self,
+            "free_scale",
+            _canonical_free_scale(self.free_scale, jnp.result_type(float)),
+        )
 
     def factor_apply(self, v, ctx):
-        _validate_metric_input(v, self.size)
+        _check_leading_size(v, self.size)
         return v
 
     def factor_solve(self, v, ctx):
-        _validate_metric_input(v, self.size)
+        _check_leading_size(v, self.size)
         return v
 
     def factor_solve_transpose(self, v, ctx):
-        _validate_metric_input(v, self.size)
+        _check_leading_size(v, self.size)
         return v
 
     def norm(self, v, ctx):
-        if v.ndim != 1:
-            raise ValueError("Metric.norm requires a vector")
-        _validate_metric_input(v, self.size)
+        _check_leading_size(v, self.size)
         return jnp.linalg.norm(v)
+
+
+register_pytree_dataclass(
+    IdentityMetric, data_fields=("free_scale",), meta_fields=("size",)
+)
+
+
+@dataclass(frozen=True, eq=False)
+class CholeskyMetric(Metric):
+    """Dense metric ``W = L L'`` from its lower-triangular Cholesky factor.
+
+    ``L`` is the factor as ``jnp.linalg.cholesky`` returns it, so the upper
+    factor this class works with is ``F = L'``. Triangularity and positive
+    definiteness are assumed, not validated -- the entries may be traced, and
+    a singular factor propagates NaN loudly through the triangular solves.
+    """
+
+    L: jax.Array
+    free_scale: float = 1.0
+    size: int = field(init=False)
+
+    def __post_init__(self):
+        L = jnp.asarray(self.L)
+        if L.ndim != 2 or L.shape[0] != L.shape[1] or L.shape[0] == 0:
+            raise ValueError("L must be a nonempty square matrix")
+        object.__setattr__(self, "L", L)
+        object.__setattr__(self, "size", L.shape[0])
+        object.__setattr__(
+            self,
+            "free_scale",
+            _canonical_free_scale(self.free_scale, jnp.result_type(L, 1.0)),
+        )
+
+    def factor_apply(self, v, ctx):
+        _check_leading_size(v, self.size)
+        return mm(self.L.T, v)
+
+    def factor_solve(self, v, ctx):
+        _check_leading_size(v, self.size)
+        return jsp_linalg.solve_triangular(self.L.T, v, lower=False)
+
+    def factor_solve_transpose(self, v, ctx):
+        _check_leading_size(v, self.size)
+        return jsp_linalg.solve_triangular(self.L, v, lower=True)
+
+
+register_pytree_dataclass(
+    CholeskyMetric, data_fields=("L", "free_scale"), meta_fields=("size",)
+)
+
+
+@dataclass(frozen=True, eq=False)
+class DiagonalMetric(Metric):
+    """The diagonal metric ``W = diag(weights)``; ``F = diag(sqrt(weights))``.
+
+    ``weights`` must be a positive 1-D array. Positivity is not validated
+    because the values may be traced. Every op is elementwise.
+    """
+
+    weights: jax.Array
+    free_scale: float = 1.0
+    size: int = field(init=False)
+
+    def __post_init__(self):
+        weights = jnp.asarray(self.weights)
+        if weights.ndim != 1:
+            raise ValueError("weights must be 1-D")
+        object.__setattr__(self, "weights", weights)
+        object.__setattr__(self, "size", weights.shape[0])
+        object.__setattr__(
+            self,
+            "free_scale",
+            _canonical_free_scale(self.free_scale, jnp.result_type(weights, 1.0)),
+        )
+
+    def _scaled(self, v, factor):
+        _check_leading_size(v, self.size)
+        return v * factor.reshape(factor.shape + (1,) * (v.ndim - 1))
+
+    def factor_apply(self, v, ctx):
+        return self._scaled(v, jnp.sqrt(self.weights))
+
+    def factor_solve(self, v, ctx):
+        return self._scaled(v, 1.0 / jnp.sqrt(self.weights))
+
+    def factor_solve_transpose(self, v, ctx):
+        return self.factor_solve(v, ctx)
+
+
+register_pytree_dataclass(
+    DiagonalMetric, data_fields=("weights", "free_scale"), meta_fields=("size",)
+)
 
 
 @dataclass(frozen=True, eq=False)
 class RepeatedFactorMetric(Metric):
-    """``repeats`` copies of one block factor on the metric block.
+    """``repeats`` copies of one block factor: ``W = blockdiag(F'F, ...)``.
 
-    The metric is ``W = blockdiag(F'F, ..., F'F)`` for an upper-triangular
-    invertible block factor ``F`` -- e.g.
-    ``F = jnp.linalg.cholesky(K, upper=True)`` for a positive-definite Gram
-    matrix ``K``, giving the repeated kernel seminorm
-    ``sum_j alpha_j' K alpha_j`` on ``repeats`` coefficient blocks. The
-    constructor takes the FACTOR, not ``K`` (callers typically already hold
-    it); triangularity and positive-definiteness are assumed, not validated
-    (the entries may be traced -- a singular factor propagates NaN loudly
-    through the triangular solves).
+    ``F`` is an upper-triangular invertible block factor -- e.g.
+    ``jnp.linalg.cholesky(K, upper=True)`` for a positive-definite Gram matrix
+    ``K``, giving the repeated kernel seminorm ``sum_j alpha_j' K alpha_j``
+    over ``repeats`` coefficient blocks. The constructor takes the FACTOR, not
+    ``K`` (callers typically already hold it); a positive-SEMIdefinite ``K``
+    needs a shift first: ``jnp.linalg.cholesky(K + epsilon * I, upper=True)``.
+    Triangularity and positive definiteness are assumed, not validated.
 
     All repeated blocks (and all batched columns) share a single triangular
-    product or solve: the ops reshape the metric block into the columns of
-    one ``(block, repeats * cols)`` matrix. ``size = repeats * F.shape[0]``.
+    product or solve: the ops reshape the metric block into the columns of one
+    ``(block, repeats * cols)`` matrix, so no repeated factor or full block
+    diagonal is ever formed. ``size = repeats * F.shape[0]``.
     """
 
     F: jax.Array
     repeats: int = field(default=1, kw_only=True)
+    free_scale: float = field(default=1.0, kw_only=True)
     size: int = field(init=False)
 
     def __post_init__(self):
@@ -187,17 +281,16 @@ class RepeatedFactorMetric(Metric):
         dtype = jnp.result_type(F, 1.0)
         if not jnp.issubdtype(dtype, jnp.floating):
             raise TypeError("F must have a real floating-point dtype")
-        if (
-            isinstance(self.repeats, bool)
-            or not isinstance(self.repeats, int)
-            or self.repeats < 1
-        ):
+        if self.repeats < 1:
             raise ValueError("repeats must be a positive integer")
         object.__setattr__(self, "F", F.astype(dtype))
         object.__setattr__(self, "size", self.repeats * F.shape[0])
+        object.__setattr__(
+            self, "free_scale", _canonical_free_scale(self.free_scale, dtype)
+        )
 
     def _map_blocks(self, block_op, v):
-        _validate_metric_input(v, self.size)
+        _check_leading_size(v, self.size)
         block_size = self.F.shape[0]
         trailing_shape = v.shape[1:]
         packed = jnp.moveaxis(
@@ -210,7 +303,7 @@ class RepeatedFactorMetric(Metric):
         ).reshape((self.size,) + trailing_shape)
 
     def factor_apply(self, v, ctx):
-        return self._map_blocks(lambda m: self.F @ m, v)
+        return self._map_blocks(lambda m: mm(self.F, m), v)
 
     def factor_solve(self, v, ctx):
         return self._map_blocks(
@@ -223,340 +316,8 @@ class RepeatedFactorMetric(Metric):
         )
 
 
-@dataclass(frozen=True)
-class GramMetric:
-    """Positive-definite parameter-space metric ``M`` given through callbacks,
-    for the classic :class:`~nlls_gram.LevenbergMarquardt` solver.
-
-    All callbacks act on the flattened parameter vector. With ``P = M^{-1}``
-    and ``S`` satisfying ``S S' = M^{-1}``:
-
-    - ``solve(x)``: ``M^{-1} x``
-    - ``norm(x)``: ``sqrt(x' M x)``
-    - ``inv_sqrt(x)``: ``S x``
-    - ``inv_sqrt_transpose(x)``: ``S' x``
-
-    Fields left as ``None`` default to the identity metric. Which fields are
-    required depends on the solver configuration; see ``LevenbergMarquardt``.
-    """
-
-    solve: Callable | None = None
-    norm: Callable | None = None
-    inv_sqrt: Callable | None = None
-    inv_sqrt_transpose: Callable | None = None
-
-
-def metric_from_cholesky(L):
-    """Build a dense ``GramMetric`` from a lower-triangular Cholesky factor.
-
-    ``L`` is the factor of the metric matrix ``M = L @ L.T``, as returned by
-    ``jnp.linalg.cholesky``.
-    """
-
-    L = jnp.asarray(L)
-    if L.ndim != 2 or L.shape[0] != L.shape[1]:
-        raise ValueError("L must be a square matrix")
-
-    def solve(x):
-        y = jsp_linalg.solve_triangular(L, x, lower=True)
-        return jsp_linalg.solve_triangular(L.T, y, lower=False)
-
-    def norm(x):
-        return jnp.linalg.norm(L.T @ x)
-
-    def inv_sqrt(x):
-        return jsp_linalg.solve_triangular(L.T, x, lower=False)
-
-    def inv_sqrt_transpose(x):
-        return jsp_linalg.solve_triangular(L, x, lower=True)
-
-    return GramMetric(
-        solve=solve,
-        norm=norm,
-        inv_sqrt=inv_sqrt,
-        inv_sqrt_transpose=inv_sqrt_transpose,
-    )
-
-
-def metric_from_diagonal(weights):
-    """Build a ``GramMetric`` for the diagonal metric ``M = diag(weights)``.
-
-    ``weights`` must be a one-dimensional array of positive values. Positivity
-    is not validated because the values may be traced. Every callback is
-    elementwise.
-    """
-
-    weights = jnp.asarray(weights)
-    if weights.ndim != 1:
-        raise ValueError("weights must be 1-D")
-    sqrt_weights = jnp.sqrt(weights)
-
-    def expand(v, x):
-        return v.reshape(v.shape + (1,) * (x.ndim - 1))
-
-    def solve(x):
-        return x / expand(weights, x)
-
-    def norm(x):
-        return jnp.sqrt(x @ (weights * x))
-
-    def inv_sqrt(x):
-        return x / expand(sqrt_weights, x)
-
-    return GramMetric(
-        solve=solve,
-        norm=norm,
-        inv_sqrt=inv_sqrt,
-        inv_sqrt_transpose=inv_sqrt,
-    )
-
-
-def _validate_repeated_shifted_layout(repeats, zero_pad_size):
-    if not isinstance(repeats, int) or isinstance(repeats, bool) or repeats < 1:
-        raise ValueError("repeats must be a positive integer")
-    if (
-        not isinstance(zero_pad_size, int)
-        or isinstance(zero_pad_size, bool)
-        or zero_pad_size < 0
-    ):
-        raise ValueError("zero_pad_size must be a nonnegative integer")
-
-
-def _repeated_shifted_metric(block_metric, block_size, repeats, zero_pad_size, epsilon):
-    repeated_size = repeats * block_size
-    total_size = repeated_size + zero_pad_size
-    sqrt_epsilon = jnp.sqrt(epsilon)
-
-    def check_input(x, *, norm=False):
-        expected_ndim = (1,) if norm else (1, 2)
-        if x.ndim not in expected_ndim:
-            kind = "a vector" if norm else "a vector or matrix"
-            raise ValueError(f"metric callback requires {kind}")
-        if x.shape[0] != total_size:
-            raise ValueError(
-                f"metric leading size must be {total_size}, got {x.shape[0]}"
-            )
-
-    def packed_head(x):
-        trailing_shape = x.shape[1:]
-        return jnp.moveaxis(
-            x[:repeated_size].reshape((repeats, block_size) + trailing_shape),
-            0,
-            1,
-        ).reshape(block_size, -1)
-
-    def unpack_head(x, trailing_shape):
-        return jnp.moveaxis(
-            x.reshape((block_size, repeats) + trailing_shape), 0, 1
-        ).reshape((repeated_size,) + trailing_shape)
-
-    def apply(block_callback, tail_scale):
-        def callback(x):
-            check_input(x)
-            trailing_shape = x.shape[1:]
-            head = unpack_head(block_callback(packed_head(x)), trailing_shape)
-            tail = x[repeated_size:] / tail_scale
-            return jnp.concatenate([head, tail], axis=0)
-
-        return callback
-
-    def norm(x):
-        check_input(x, norm=True)
-        head_norm = block_metric.norm(packed_head(x))
-        tail = x[repeated_size:]
-        return jnp.sqrt(head_norm**2 + epsilon * jnp.vdot(tail, tail))
-
-    return GramMetric(
-        solve=apply(block_metric.solve, epsilon),
-        norm=norm,
-        inv_sqrt=apply(block_metric.inv_sqrt, sqrt_epsilon),
-        inv_sqrt_transpose=apply(block_metric.inv_sqrt_transpose, sqrt_epsilon),
-    )
-
-
-def repeated_shifted_dense_metric(K, *, repeats: int, zero_pad_size: int, epsilon):
-    """Build a repeated shifted dense metric without repeating its factor.
-
-    The metric is ``blockdiag(K, ..., K, 0) + epsilon * I``, with ``repeats``
-    copies of the square positive-semidefinite matrix ``K`` and a trailing zero
-    block of size ``zero_pad_size``. ``epsilon`` must be a positive scalar.
-
-    The constructor factors ``K + epsilon * I`` once, stores one dense
-    Cholesky factor and the scalar shift, and batches all repeated blocks into
-    the right-hand-side columns of each triangular solve. It never forms or
-    stores the full block diagonal, repeated factors, or a padding vector.
-
-    The flattened parameter layout is the repeated ``K`` blocks followed by
-    the zero-padded coordinates. All four metric callbacks are provided;
-    ``solve``, ``inv_sqrt``, and ``inv_sqrt_transpose`` accept vectors or
-    matrices, while ``norm`` accepts a vector.
-    """
-
-    _validate_repeated_shifted_layout(repeats, zero_pad_size)
-    K = jnp.asarray(K)
-    if K.ndim != 2 or K.shape[0] != K.shape[1] or K.shape[0] == 0:
-        raise ValueError("K must be a nonempty square matrix")
-
-    original_epsilon = epsilon
-    epsilon = jnp.asarray(epsilon)
-    if epsilon.ndim != 0:
-        raise ValueError("epsilon must be a scalar")
-    dtype = jnp.result_type(K, epsilon, 1.0)
-    if not jnp.issubdtype(dtype, jnp.floating):
-        raise TypeError("K and epsilon must have a real floating-point dtype")
-    if (
-        not isinstance(original_epsilon, (jax.Array, jax.core.Tracer))
-        and float(original_epsilon) <= 0.0
-    ):
-        raise ValueError("epsilon must be positive")
-    K = K.astype(dtype)
-    epsilon = epsilon.astype(dtype)
-    epsilon = jnp.where(epsilon > 0.0, epsilon, jnp.nan)
-
-    block_size = K.shape[0]
-    shifted = K + epsilon * jnp.eye(block_size, dtype=K.dtype)
-    block_metric = metric_from_cholesky(jnp.linalg.cholesky(shifted))
-    return _repeated_shifted_metric(
-        block_metric, block_size, repeats, zero_pad_size, epsilon
-    )
-
-
-def _metric_from_quasiseparable(d, p, q, A, *, epsilon, parallel):
-    d = jnp.asarray(d) + epsilon
-    p = jnp.asarray(p)
-    q = jnp.asarray(q)
-    A = jnp.asarray(A)
-    n = d.shape[0]
-    if p.ndim != 2 or p.shape[0] != n:
-        raise ValueError("p must have shape (len(d), state_size)")
-    state_size = p.shape[1]
-    if q.shape != (n, state_size) or A.shape != (n, state_size, state_size):
-        raise ValueError(
-            "q must have shape (len(d), state_size) and A must have shape "
-            "(len(d), state_size, state_size)"
-        )
-    if parallel is None:
-        parallel = jax.default_backend() != "cpu" and d.dtype == jnp.float64
-    c, w = quasiseparable._cholesky(d, p, q, A)
-
-    def solve(x):
-        y = quasiseparable._forward_substitution(c, p, w, A, x.reshape(n, -1), parallel)
-        return quasiseparable._backward_substitution(c, p, w, A, y, parallel).reshape(
-            x.shape
-        )
-
-    def norm(x):
-        y = quasiseparable._cholesky_transpose_matvec(
-            c, p, w, A, x.reshape(n, -1), parallel
-        )
-        return jnp.linalg.norm(y)
-
-    def inv_sqrt(x):
-        return quasiseparable._backward_substitution(
-            c, p, w, A, x.reshape(n, -1), parallel
-        ).reshape(x.shape)
-
-    def inv_sqrt_transpose(x):
-        return quasiseparable._forward_substitution(
-            c, p, w, A, x.reshape(n, -1), parallel
-        ).reshape(x.shape)
-
-    return GramMetric(
-        solve=solve,
-        norm=norm,
-        inv_sqrt=inv_sqrt,
-        inv_sqrt_transpose=inv_sqrt_transpose,
-    )
-
-
-def repeated_shifted_state_space_metric(
-    t,
-    h,
-    Pinf,
-    transition,
-    *,
-    repeats: int,
-    zero_pad_size: int,
-    epsilon,
-    parallel=None,
-):
-    """Build a repeated shifted state-space kernel metric in linear storage.
-
-    ``t`` is a strictly increasing one-dimensional coordinate. ``h``,
-    ``Pinf``, and ``transition`` define a stationary state-space kernel; the
-    convenience function ``matern_state_space`` supplies these objects for the
-    Matérn-1/2, Matérn-3/2, and Matérn-5/2 kernels. Non-increasing coordinates
-    propagate ``NaN`` rather than silently defining a nonstationary factor.
-    ``transition(dt)`` returns the transpose of the textbook state transition
-    for each gap in ``dt``.
-
-    The resulting metric is ``blockdiag(K, ..., K, 0) + epsilon * I``, with
-    ``repeats`` copies of the implicit kernel Gram matrix ``K`` and a trailing
-    zero block of size ``zero_pad_size``. ``epsilon`` is added before the
-    quasiseparable Cholesky factorization. One structured factor is shared by
-    every repeated block, and all blocks are processed as batched right-hand
-    sides. No dense ``K``, repeated factor, full block diagonal, or padding
-    vector is formed.
-
-    ``parallel`` selects sequential or associative scans. The default uses the
-    process backend and chooses associative scans only for float64 metrics off
-    CPU; pass it explicitly when arrays use nondefault device placement. All
-    four metric callbacks are provided; ``solve``, ``inv_sqrt``, and
-    ``inv_sqrt_transpose`` accept vectors or matrices, while ``norm`` accepts a
-    vector.
-    """
-
-    _validate_repeated_shifted_layout(repeats, zero_pad_size)
-    t = jnp.asarray(t)
-    if t.ndim != 1 or t.shape[0] == 0:
-        raise ValueError("t must be a nonempty 1-D array")
-    d, p, q, A = quasiseparable._state_space_generators(t, h, Pinf, transition)
-
-    original_epsilon = epsilon
-    epsilon = jnp.asarray(epsilon)
-    if epsilon.ndim != 0:
-        raise ValueError("epsilon must be a scalar")
-    dtype = jnp.result_type(d, p, q, A, epsilon, 1.0)
-    if not jnp.issubdtype(dtype, jnp.floating):
-        raise TypeError(
-            "state-space generators and epsilon must have a real floating-point dtype"
-        )
-    if (
-        not isinstance(original_epsilon, (jax.Array, jax.core.Tracer))
-        and float(original_epsilon) <= 0.0
-    ):
-        raise ValueError("epsilon must be positive")
-    d = d.astype(dtype)
-    p = p.astype(dtype)
-    q = q.astype(dtype)
-    A = A.astype(dtype)
-    epsilon = epsilon.astype(dtype)
-    valid_coordinate = jnp.all(jnp.diff(t) > 0.0)
-    epsilon = jnp.where((epsilon > 0.0) & valid_coordinate, epsilon, jnp.nan)
-
-    block_metric = _metric_from_quasiseparable(
-        d, p, q, A, epsilon=epsilon, parallel=parallel
-    )
-    return _repeated_shifted_metric(
-        block_metric, d.shape[0], repeats, zero_pad_size, epsilon
-    )
-
-
-def _metric_with_compute_dtype(metric: GramMetric, dtype) -> GramMetric:
-    dtype = jnp.dtype(dtype)
-
-    def wrap(callback):
-        if callback is None:
-            return None
-
-        def apply(x):
-            return callback(x.astype(dtype)).astype(x.dtype)
-
-        return apply
-
-    return GramMetric(
-        solve=wrap(metric.solve),
-        norm=wrap(metric.norm),
-        inv_sqrt=wrap(metric.inv_sqrt),
-        inv_sqrt_transpose=wrap(metric.inv_sqrt_transpose),
-    )
+register_pytree_dataclass(
+    RepeatedFactorMetric,
+    data_fields=("F", "free_scale"),
+    meta_fields=("repeats", "size"),
+)

@@ -6,15 +6,16 @@ import pytest
 
 from nlls_gram import (
     IdentityMetric,
-    MetricContext,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
+    SolverContext,
+    register_pytree_dataclass,
 )
 
 REPEATS = 3
 BLOCK = 5
 N_M = REPEATS * BLOCK
-CTX = MetricContext()
+CTX = SolverContext()
 
 
 def make_factor(key, size):
@@ -97,19 +98,13 @@ def test_constructor_and_input_validation():
         RepeatedFactorMetric(jnp.eye(2), repeats=0)
     with pytest.raises(TypeError, match="floating"):
         RepeatedFactorMetric(jnp.eye(2, dtype=jnp.complex64))
-    with pytest.raises(ValueError, match="positive"):
-        IdentityMetric(0)
     with pytest.raises(ValueError, match="leading size"):
         RepeatedFactorMetric(jnp.eye(2)).factor_apply(jnp.zeros(3), CTX)
-    with pytest.raises(ValueError, match="vector or matrix"):
-        IdentityMetric(3).factor_apply(jnp.zeros((3, 2, 2)), CTX)
-    with pytest.raises(ValueError, match="vector"):
-        IdentityMetric(3).norm(jnp.zeros((3, 2)), CTX)
 
 
 def test_solver_passes_live_context_to_the_factor_ops():
-    # Every factor op receives a MetricContext carrying the flat iterate and
-    # the live RidgeLMState (recorded at trace time -- the fields are
+    # Every factor op receives a SolverContext carrying the flat iterate and
+    # the live LMState (recorded at trace time -- the fields are
     # tracers, their presence and shapes are static).
     seen = []
 
@@ -124,6 +119,8 @@ def test_solver_passes_live_context_to_the_factor_ops():
 
         factor_solve = factor_apply
         factor_solve_transpose = factor_apply
+
+    register_pytree_dataclass(Probe, data_fields=("free_scale",), meta_fields=("size",))
 
     A = jnp.asarray(np.random.default_rng(0).normal(size=(2, 4)), jnp.float32)
 

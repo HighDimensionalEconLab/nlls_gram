@@ -1,14 +1,19 @@
 """Opt-in successful-solve implicit-AD benchmarks."""
 
+import dataclasses
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
 import pytest
 
 from nlls_gram import (
+    SVD,
     LevenbergMarquardt,
+    LMAction,
     LMStatus,
-    MetricFactory,
-    metric_from_diagonal,
+    Metric,
+    register_pytree_dataclass,
 )
 
 
@@ -40,32 +45,66 @@ def _direct_problem(*, has_aux):
     return solve, p, status
 
 
-def _metric_factory_problem():
+@dataclass(frozen=True, eq=False)
+class TrackedDiagonalMetric(Metric):
+    """An iterate-tracking metric: the weights are a carried leaf, rebuilt
+    from the live iterate by the solve callback and frozen at the solution."""
+
+    weights: jax.Array
+    size: int = 8
+    free_scale: float = 1.0
+
+    def _scaled(self, v, factor):
+        return v * factor.reshape(factor.shape + (1,) * (v.ndim - 1))
+
+    def factor_apply(self, v, ctx):
+        return self._scaled(v, jnp.sqrt(self.weights))
+
+    def factor_solve(self, v, ctx):
+        return self._scaled(v, 1.0 / jnp.sqrt(self.weights))
+
+    def factor_solve_transpose(self, v, ctx):
+        return self.factor_solve(v, ctx)
+
+
+register_pytree_dataclass(
+    TrackedDiagonalMetric, data_fields=("weights", "free_scale"), meta_fields=("size",)
+)
+
+
+def _tracked_metric_problem():
     design = jnp.reshape(jnp.linspace(-0.8, 1.0, 32), (4, 8))
 
     def residual(x, _, p):
         return design @ x - p, {"weight": 1.0 + 0.1 * x**2}
 
-    factory = MetricFactory(
-        prepare=lambda x, args, p, aux: aux["weight"],
-        build=metric_from_diagonal,
-    )
+    x0 = jnp.zeros(8)
     solver = LevenbergMarquardt(
         residual,
         has_aux=True,
-        metric_factory=factory,
-        ad_solver="svd",
+        metric=TrackedDiagonalMetric(1.0 + 0.1 * x0**2),
+        ad_solver=SVD(),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )
-    x0 = jnp.zeros(8)
     p = jnp.linspace(-0.2, 0.3, 4)
 
+    def track_iterate(ctx):
+        return LMAction(
+            lm_state=dataclasses.replace(
+                ctx.lm_state, metric=TrackedDiagonalMetric(1.0 + 0.1 * ctx.x**2)
+            )
+        )
+
     def solve(parameter):
-        return solver.solve(x0, p=parameter, max_steps=48, atol=1e-6).x
+        return solver.solve(
+            x0, p=parameter, max_steps=48, atol=1e-6, callback=track_iterate
+        ).x
 
     def status(parameter):
-        return solver.solve(x0, p=parameter, max_steps=48, atol=1e-6).status
+        return solver.solve(
+            x0, p=parameter, max_steps=48, atol=1e-6, callback=track_iterate
+        ).status
 
     return solve, p, status
 
@@ -102,8 +141,8 @@ def _make_problem(case):
         return _direct_problem(has_aux=False)
     if case == "direct_aux":
         return _direct_problem(has_aux=True)
-    if case == "metric_factory":
-        return _metric_factory_problem()
+    if case == "tracked_metric":
+        return _tracked_metric_problem()
     return _vmapped_problem()
 
 
@@ -128,7 +167,7 @@ def _make_transformed(case, transform):
     return transformed, p
 
 
-@pytest.mark.parametrize("case", ["direct", "direct_aux", "metric_factory", "vmapped"])
+@pytest.mark.parametrize("case", ["direct", "direct_aux", "tracked_metric", "vmapped"])
 @pytest.mark.parametrize("transform", ["jvp", "vjp"])
 def test_successful_implicit_ad(benchmark, case, transform):
     _, status_parameter, status = _make_problem(case)

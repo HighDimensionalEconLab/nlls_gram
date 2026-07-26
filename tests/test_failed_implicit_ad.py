@@ -1,15 +1,46 @@
+import dataclasses
+from dataclasses import dataclass
+
 import jax
 import jax.numpy as jnp
 import pytest
 
 from nlls_gram import (
+    SVD,
+    DiagonalMetric,
+    GramCG,
+    IdentityPreconditioner,
     LevenbergMarquardt,
-    LMSolveAction,
+    LMAction,
     LMStatus,
-    MetricFactory,
+    Metric,
     MultiStart,
-    PreconditionerFactory,
-    metric_from_diagonal,
+    register_pytree_dataclass,
+)
+
+
+@dataclass(frozen=True, eq=False)
+class WeightedMetric(Metric):
+    """A metric whose diagonal weight is a carried leaf: a callback rebuilds
+    it from the live iterate, and the carried instance is frozen at the
+    solution under implicit AD."""
+
+    weight: jax.Array
+    size: int = 1
+    free_scale: float = 1.0
+
+    def factor_apply(self, v, ctx):
+        return jnp.sqrt(self.weight) * v
+
+    def factor_solve(self, v, ctx):
+        return v / jnp.sqrt(self.weight)
+
+    def factor_solve_transpose(self, v, ctx):
+        return self.factor_solve(v, ctx)
+
+
+register_pytree_dataclass(
+    WeightedMetric, data_fields=("weight", "free_scale"), meta_fields=("size",)
 )
 
 
@@ -63,30 +94,33 @@ def test_failed_lane_uses_initial_point_under_vmap_jvp_and_vjp():
     assert jnp.allclose(cotangent, jnp.asarray([1.0, 0.0]), atol=1e-6)
 
 
-def test_invalid_failed_result_uses_initial_aux_for_metric_factory():
+def test_invalid_failed_result_uses_initial_instances_for_a_carried_metric():
     def residual(x, _, p):
         root = jnp.sqrt(x)
         return root - p, {"weight": 1.0 + root}
 
-    factory = MetricFactory(
-        prepare=lambda x, args, p, aux: aux["weight"],
-        build=metric_from_diagonal,
-    )
+    x0 = jnp.ones(1)
     solver = LevenbergMarquardt(
         residual,
         has_aux=True,
-        metric_factory=factory,
-        ad_solver="svd",
+        metric=WeightedMetric(1.0 + jnp.sqrt(jnp.abs(x0))),
+        ad_solver=SVD(),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )
-    x0 = jnp.ones(1)
 
-    def invalidate(_):
-        return LMSolveAction(
+    def invalidate(ctx):
+        # Poison BOTH the iterate and the carried metric: the failed-lane
+        # tangent program must read the pre-loop instances, or the NaN
+        # weight reaches the whitening and the zero-tangent contract breaks.
+        return LMAction(
             stop=True,
             status=LMStatus.NONFINITE,
             x=-jnp.ones(1),
+            lm_state=dataclasses.replace(
+                ctx.lm_state,
+                metric=WeightedMetric(jnp.full((1,), jnp.nan, dtype=ctx.x.dtype)),
+            ),
         )
 
     def failed_outputs(p):
@@ -117,15 +151,10 @@ def test_failed_gram_cg_rebuilds_aux_for_preconditioner_factory():
         value = jnp.asarray([jnp.sum(x) - p])
         return value, {"scale": 1.0 + 0.1 * jnp.sum(x**2)}
 
-    factory = PreconditionerFactory(
-        prepare=lambda x, args, p, aux: aux["scale"],
-        apply=lambda state, value, damping: value / (state + damping),
-    )
     solver = LevenbergMarquardt(
         residual,
         has_aux=True,
-        linear_solver="gram_cg",
-        preconditioner_factory=factory,
+        linear_solver=GramCG(IdentityPreconditioner(), maxiter=8),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )
@@ -210,7 +239,7 @@ def test_failed_pytree_tangent_and_cotangent_are_zero():
 
     solver = LevenbergMarquardt(
         residual,
-        ad_solver="svd",
+        ad_solver=SVD(),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )
@@ -235,8 +264,8 @@ def test_failed_fixed_metric_tangent_and_cotangent_are_zero():
 
     solver = LevenbergMarquardt(
         residual,
-        metric=metric_from_diagonal(jnp.asarray([2.0, 3.0])),
-        ad_solver="svd",
+        metric=DiagonalMetric(jnp.asarray([2.0, 3.0])),
+        ad_solver=SVD(),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )
@@ -263,14 +292,10 @@ def test_successful_direct_aux_does_not_rebuild_aux_for_ad():
         jax.debug.callback(lambda _: calls.append(None), x, ordered=True)
         return x - p, {"value": x + p}
 
-    factory = MetricFactory(
-        prepare=lambda x, args, p, aux: jnp.ones_like(x),
-        build=metric_from_diagonal,
-    )
     solver = LevenbergMarquardt(
         residual,
         has_aux=True,
-        metric_factory=factory,
+        metric=DiagonalMetric(jnp.ones(1)),
         cache_jacobian=False,
         geodesic_acceleration=False,
     )

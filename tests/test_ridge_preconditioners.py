@@ -1,7 +1,5 @@
-# Float32 coverage for BlockEigenPreconditioner (plus the precision-neutral
-# contract tests: hashing, errors, retrace behavior). The float64 primary
-# coverage lives in test_float64_subprocess.py, matching the production
-# default.
+# Float32 coverage for BlockEigenPreconditioner. The float64 primary coverage
+# lives in test_float64_subprocess.py, matching the production default.
 import dataclasses
 
 import jax
@@ -14,13 +12,12 @@ from nlls_gram import (
     CG,
     BlockEigenPreconditioner,
     Cholesky,
-    LMSolveAction,
+    LMAction,
+    LMState,
     LMStatus,
-    MetricContext,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    RidgeLMState,
-    block_eigen_state,
+    SolverContext,
 )
 
 
@@ -29,68 +26,44 @@ def spd_blocks(key, groups, size):
     return jnp.einsum("gik,gjk->gij", root, root) + 0.5 * jnp.eye(size)
 
 
-def packed_state(key):
+@pytest.mark.parametrize("damping", [0.0, 0.37])
+def test_apply_matches_dense_inverse(damping):
     # Two ridge-flagged families (2 groups of 3, 1 group of 4) and one
-    # damping-only free family (1 group of 2), under a nontrivial
-    # permutation of the 12 coordinates.
-    keys = jax.random.split(key, 3)
+    # damping-only free family (1 group of 2), under a nontrivial permutation
+    # of the 12 coordinates.
+    keys = jax.random.split(jax.random.key(0), 3)
     family_a = spd_blocks(keys[0], 2, 3)
     family_b = spd_blocks(keys[1], 1, 4)
     family_free = spd_blocks(keys[2], 1, 2)
     permutation = jnp.asarray(np.random.default_rng(0).permutation(12))
-    state = block_eigen_state(
-        [(family_a, 1.0), (family_b, 1.0), (family_free, 0.0)], permutation
-    )
+    families = [(family_a, 1.0), (family_b, 1.0), (family_free, 0.0)]
     dense_permuted = jsp_linalg.block_diag(
         family_a[0], family_a[1], family_b[0], family_free[0]
     )
     ridge_mask = jnp.concatenate([jnp.ones(10), jnp.zeros(2)])
-    return state, dense_permuted, ridge_mask, permutation
-
-
-@pytest.mark.parametrize("damping", [0.0, 0.37])
-def test_apply_matches_dense_inverse(damping):
-    state, dense_permuted, ridge_mask, permutation = packed_state(jax.random.key(0))
     ridge = 0.05
-    ctx = MetricContext(
-        lm_state=RidgeLMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(ridge)),
-        args={"preconditioner": state},
+
+    preconditioner = BlockEigenPreconditioner(families, permutation)
+    ctx = SolverContext(
+        lm_state=LMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(ridge))
     )
-    preconditioner = BlockEigenPreconditioner()
     v = jax.random.normal(jax.random.key(1), (12,))
 
     selection = jnp.eye(12)[permutation]
     shifted = dense_permuted + jnp.diag(ridge_mask * ridge + damping)
-    dense_original = selection.T @ shifted @ selection
-    expected = jnp.linalg.solve(dense_original, v)
+    expected = jnp.linalg.solve(selection.T @ shifted @ selection, v)
 
     result = preconditioner.apply(v, jnp.asarray(damping), ctx)
     np.testing.assert_allclose(result, expected, rtol=2e-4, atol=2e-5)
 
 
-def test_value_hashing_and_config_equality():
-    assert BlockEigenPreconditioner() == BlockEigenPreconditioner("preconditioner")
-    assert hash(BlockEigenPreconditioner("k")) == hash(BlockEigenPreconditioner("k"))
-    assert BlockEigenPreconditioner("a") != BlockEigenPreconditioner("b")
-    assert CG(BlockEigenPreconditioner(), maxiter=64) == CG(
-        BlockEigenPreconditioner(), maxiter=64
-    )
-
-
-def test_missing_state_and_bad_builder_inputs():
-    preconditioner = BlockEigenPreconditioner()
-    ctx = MetricContext(
-        lm_state=RidgeLMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(1e-3)),
-        args={"other": 1.0},
-    )
-    with pytest.raises(ValueError, match="ctx.args"):
-        preconditioner.apply(jnp.ones(3), jnp.asarray(0.1), ctx)
+def test_constructor_rejects_mismatched_layouts():
     with pytest.raises(ValueError, match="permutation"):
-        block_eigen_state([(jnp.eye(2)[None], 1.0)], jnp.zeros(2))
+        BlockEigenPreconditioner([(jnp.eye(2)[None], 1.0)], jnp.zeros(2))
     with pytest.raises(ValueError, match="groups, size, size"):
-        block_eigen_state([(jnp.eye(2), 1.0)], jnp.arange(2))
+        BlockEigenPreconditioner([(jnp.eye(2), 1.0)], jnp.arange(2))
     with pytest.raises(ValueError, match="cover"):
-        block_eigen_state([(jnp.eye(2)[None], 1.0)], jnp.arange(3))
+        BlockEigenPreconditioner([(jnp.eye(2)[None], 1.0)], jnp.arange(3))
 
 
 REPEATS = 2
@@ -100,6 +73,7 @@ N_F = 2
 P_DIM = N_M + N_F
 M_RESID = 14
 RIDGE = 1e-3
+SOLVE_OPTIONS = dict(max_steps=60, gtol=1e-5, xtol=1e-7)
 
 
 def build_problem():
@@ -119,160 +93,163 @@ def build_problem():
     return metric, residual, G
 
 
-def exact_state(G):
-    # The exact whitened normal blocks: one metric-block group, one free
-    # group -- close enough to the operator that CG converges in a handful
-    # of iterations.
-    return block_eigen_state(
+def exact_preconditioner(G):
+    # The exact whitened normal blocks -- one metric-block group, one free
+    # group -- so CG converges in a handful of iterations.
+    return BlockEigenPreconditioner(
         [(G[:N_M, :N_M][None], 1.0), (G[N_M:, N_M:][None], 0.0)],
         jnp.arange(P_DIM),
     )
 
 
-def test_cg_solve_matches_cholesky_with_callback_rebuild():
+def scrambled_preconditioner():
+    # Same treedef as the exact one (one group of N_M, one of N_F), useless
+    # values: a plain diagonal that ignores the whitened operator's structure.
+    return BlockEigenPreconditioner(
+        [(100.0 * jnp.eye(N_M)[None], 1.0), (100.0 * jnp.eye(N_F)[None], 0.0)],
+        jnp.arange(P_DIM),
+    )
+
+
+def cholesky_reference(metric, residual):
+    return RidgeLevenbergMarquardt(
+        residual, metric=metric, ridge=RIDGE, linear_solver=Cholesky()
+    )
+
+
+def test_cg_solve_matches_cholesky():
     metric, residual, G = build_problem()
     p = {"scale": jnp.asarray(1.0)}
     x0 = jnp.zeros(P_DIM)
-    args = {"data": jnp.asarray(1.0), "preconditioner": exact_state(G)}
-    solve_options = dict(max_steps=60, gtol=1e-5, xtol=1e-7)
+    args = {"data": jnp.asarray(1.0)}
 
-    reference = RidgeLevenbergMarquardt(
-        residual, metric=metric, ridge=RIDGE, linear_solver=Cholesky()
-    ).solve(x0, args, p=p, **solve_options)
+    reference = cholesky_reference(metric, residual).solve(
+        x0, args, p=p, **SOLVE_OPTIONS
+    )
     assert int(reference.status) == int(LMStatus.CONVERGED)
-
-    def rebuild_callback(ctx):
-        # A real state swap mid-solve: scaled blocks at step 2 (values
-        # change -> args replacement path exercised, convergence suppressed
-        # for that step only).
-        fresh = block_eigen_state(
-            [(1.25 * G[:N_M, :N_M][None], 1.0), (1.25 * G[N_M:, N_M:][None], 0.0)],
-            jnp.arange(P_DIM),
-        )
-        swap = ctx.step == 2
-        new_state = jax.tree_util.tree_map(
-            lambda old, new: jnp.where(swap, new, old),
-            ctx.args["preconditioner"],
-            fresh,
-        )
-        return LMSolveAction(args={**ctx.args, "preconditioner": new_state})
 
     cg_solver = RidgeLevenbergMarquardt(
         residual,
         metric=metric,
         ridge=RIDGE,
-        linear_solver=CG(BlockEigenPreconditioner(), tol=1e-7, maxiter=200),
+        linear_solver=CG(exact_preconditioner(G), tol=1e-7, maxiter=200),
     )
-    result = cg_solver.solve(x0, args, p=p, callback=rebuild_callback, **solve_options)
+    result = cg_solver.solve(x0, args, p=p, **SOLVE_OPTIONS)
     assert int(result.status) == int(LMStatus.CONVERGED)
     # Both solves stop on the same gtol, and a ridge-scaled stopping rule
     # leaves x-slack ~ gtol / ridge (1e-2 here), so the agreement of two
     # independently converged solves is a measured property rather than a
-    # CG-tolerance bound -- platform BLAS ordering moves the last accepted
-    # step. Kept an order below that slack: tight enough to catch a wrong
-    # preconditioner (which breaks convergence outright) with real margin.
+    # CG-tolerance bound. Kept an order below that slack: tight enough to
+    # catch a wrong preconditioner (which breaks convergence outright).
     np.testing.assert_allclose(result.x, reference.x, rtol=2e-3, atol=2e-4)
 
 
-def test_ad_role_zero_damping_matches_cholesky_tangent():
-    # The EXPLICIT ad_solver config pins the AD CG's tol/maxiter (the
-    # ad_solver=None inheritance path is covered separately below).
+def test_callback_refresh_reaches_the_next_inner_solve():
+    # The contract: an instance a callback puts in the carried state is what
+    # the NEXT inner solve uses. Asserted on the step itself -- swapping the
+    # exact preconditioner into a scrambled solver's state must produce the
+    # step a solver BUILT with the exact one takes from the same state -- and
+    # that holds bit-for-bit on both x86 and ARM.
+    #
+    # It used to be asserted through "the refreshed solve reaches gtol", which
+    # measured something else. The residual here is linear, so with a starved
+    # maxiter=3 budget the endgame stalls at the float32 loss floor: once no
+    # trial strictly improves the loss, every step is rejected and damping
+    # ratchets to ~3e4. Whether gtol=1e-5 lands above or below that floor is
+    # platform arithmetic -- ARM reached 4.5e-6 and x86 stopped at 6.0e-5 --
+    # so the old assertion passed on the author's machine and failed in CI
+    # while the mechanism it was meant to check was working identically on
+    # both.
     metric, residual, G = build_problem()
     p = {"scale": jnp.asarray(1.0)}
-    p_dot = {"scale": jnp.asarray(1.0)}
     x0 = jnp.zeros(P_DIM)
-    args = {"data": jnp.asarray(1.0), "preconditioner": exact_state(G)}
-    solve_options = dict(max_steps=60, gtol=1e-5, xtol=1e-7)
 
-    def solved_x(solver):
-        def run(p_value):
-            return solver.solve(x0, args, p=p_value, **solve_options).x
-
-        return jax.jvp(run, (p,), (p_dot,))[1]
-
-    reference = solved_x(
-        RidgeLevenbergMarquardt(
-            residual, metric=metric, ridge=RIDGE, linear_solver=Cholesky()
-        )
-    )
-    cg_tangent = solved_x(
-        RidgeLevenbergMarquardt(
+    def solver_with(preconditioner):
+        return RidgeLevenbergMarquardt(
             residual,
             metric=metric,
             ridge=RIDGE,
-            linear_solver=CG(BlockEigenPreconditioner(), tol=1e-7, maxiter=200),
-            ad_solver=CG(BlockEigenPreconditioner(), tol=1e-7, maxiter=200),
+            linear_solver=CG(preconditioner, tol=0.0, maxiter=3),
         )
+
+    scrambled = solver_with(scrambled_preconditioner())
+    exact = solver_with(exact_preconditioner(G))
+
+    stale_state = scrambled.init(x0, p=p)
+    swapped_state = dataclasses.replace(
+        stale_state, preconditioner=exact_preconditioner(G)
     )
-    np.testing.assert_allclose(cg_tangent, reference, rtol=1e-3, atol=1e-4)
+    x_stale = scrambled.update(x0, stale_state, p=p)[0]
+    x_exact = exact.update(x0, exact.init(x0, p=p), p=p)[0]
+    x_swapped = scrambled.update(x0, swapped_state, p=p)[0]
+
+    # The carried instance drives the solve...
+    np.testing.assert_allclose(
+        np.asarray(x_swapped), np.asarray(x_exact), rtol=1e-6, atol=1e-7
+    )
+    # ...and the scrambled one it replaced gives a materially different step,
+    # so the check above is not vacuous.
+    assert float(jnp.linalg.norm(x_swapped - x_stale)) > 1.0
+
+    # End to end through a callback: the refreshed instance is the one carried
+    # out of the solve, and a starved scrambled run does not converge.
+    def refresh(ctx):
+        fresh = jax.lax.cond(
+            ctx.step == 1,
+            lambda: exact_preconditioner(G),
+            lambda: ctx.lm_state.preconditioner,
+        )
+        return LMAction(
+            lm_state=dataclasses.replace(ctx.lm_state, preconditioner=fresh)
+        )
+
+    refreshed = scrambled.solve(x0, p=p, max_steps=60, gtol=1e-5, callback=refresh)
+    stale = scrambled.solve(x0, p=p, max_steps=60, gtol=1e-5)
+    assert int(stale.status) == int(LMStatus.MAX_STEPS)
+    np.testing.assert_allclose(
+        refreshed.lm_state.preconditioner.eigenvalues[0],
+        exact_preconditioner(G).eigenvalues[0],
+        rtol=1e-6,
+    )
+    # The refresh has to help, even where the float32 floor stops it short of
+    # gtol: a strictly better stationarity than the run that never refreshed.
+    assert float(refreshed.info.grad_norm) < float(stale.info.grad_norm)
 
 
-def test_ad_solver_none_inherits_forward_cg_preconditioner():
-    # ad_solver=None under a CG forward hands the forward preconditioner to
-    # the undamped implicit solve (the typed apply is damping-analytic at
-    # zero damping), keeping the AD-default tolerance and budget.
+@pytest.mark.parametrize("ad_mode", ["explicit", "inherit", "inherit_knobs"])
+def test_ad_tangent_matches_cholesky(ad_mode):
+    # The zero-damping AD role applies the same typed preconditioner. With
+    # ad_solver=None the forward CARRIED instance is inherited at the
+    # AD-default tolerance and budget; CG(None, ...) inherits it while
+    # pinning the knobs.
     metric, residual, G = build_problem()
     p = {"scale": jnp.asarray(1.0)}
     p_dot = {"scale": jnp.asarray(1.0)}
     x0 = jnp.zeros(P_DIM)
-    args = {"data": jnp.asarray(1.0), "preconditioner": exact_state(G)}
-    solve_options = dict(max_steps=60, gtol=1e-5, xtol=1e-7)
-
-    inheriting = RidgeLevenbergMarquardt(
-        residual,
-        metric=metric,
-        ridge=RIDGE,
-        linear_solver=CG(BlockEigenPreconditioner(), tol=1e-7, maxiter=200),
-    )
-    assert inheriting.ad_solver_preconditioner == BlockEigenPreconditioner()
-    assert inheriting.ad_solver_tol is None
-    assert inheriting.ad_solver_maxiter is None
+    args = {"data": jnp.asarray(1.0)}
 
     def solved_x(solver):
         def run(p_value):
-            return solver.solve(x0, args, p=p_value, **solve_options).x
+            return solver.solve(x0, args, p=p_value, **SOLVE_OPTIONS).x
 
         return jax.jvp(run, (p,), (p_dot,))[1]
 
-    reference = solved_x(
-        RidgeLevenbergMarquardt(
-            residual, metric=metric, ridge=RIDGE, linear_solver=Cholesky()
-        )
+    forward = CG(exact_preconditioner(G), tol=1e-7, maxiter=200)
+    ad_solver = {
+        "explicit": CG(exact_preconditioner(G), tol=1e-7, maxiter=200),
+        "inherit": None,
+        "inherit_knobs": CG(None, tol=1e-7, maxiter=200),
+    }[ad_mode]
+    cg_solver = RidgeLevenbergMarquardt(
+        residual, metric=metric, ridge=RIDGE, linear_solver=forward, ad_solver=ad_solver
     )
-    np.testing.assert_allclose(solved_x(inheriting), reference, rtol=1e-3, atol=1e-4)
+    if ad_mode == "inherit":
+        assert cg_solver._ad_preconditioner_source == "carried"
+        assert cg_solver.ad_solver_tol is None
+    if ad_mode == "inherit_knobs":
+        assert cg_solver._ad_preconditioner_source == "carried"
+        assert cg_solver.ad_solver_tol == 1e-7
+        assert cg_solver.ad_solver_maxiter == 200
 
-
-def test_state_dataclass_survives_jit_boundary():
-    # The instance is a static config field: equal instances must not
-    # retrace when only the args-carried state values change.
-    state, _, _, _ = packed_state(jax.random.key(5))
-    preconditioner = BlockEigenPreconditioner()
-    traces = []
-
-    @jax.jit
-    def apply(v, damping, ridge, state):
-        traces.append(None)
-        ctx = MetricContext(
-            lm_state=RidgeLMState(damping=damping, ridge=ridge),
-            args={"preconditioner": state},
-        )
-        return preconditioner.apply(v, damping, ctx)
-
-    v = jax.random.normal(jax.random.key(6), (12,))
-    first = apply(v, jnp.asarray(0.1), jnp.asarray(0.01), state)
-    doubled = {
-        **state,
-        "families": tuple(
-            {**family, "eigenvalues": 2.0 * family["eigenvalues"]}
-            for family in state["families"]
-        ),
-    }
-    second = apply(v, jnp.asarray(0.1), jnp.asarray(0.01), doubled)
-    assert len(traces) == 1
-    assert not jnp.allclose(first, second)
-
-
-def test_dataclass_replace_keeps_identity():
-    config = CG(BlockEigenPreconditioner(), maxiter=32)
-    replaced = dataclasses.replace(config, maxiter=64)
-    assert replaced.preconditioner == config.preconditioner
+    reference = solved_x(cholesky_reference(metric, residual))
+    np.testing.assert_allclose(solved_x(cg_solver), reference, rtol=1e-3, atol=1e-4)

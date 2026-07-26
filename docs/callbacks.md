@@ -42,12 +42,25 @@ step, reported even when the step is rejected). Before the first update the
 loop's `LMInfo` uses sentinels `grad_norm=inf` and `step_norm=0`, so `gtol`
 and `xtol` cannot fire at step zero.
 
-Repeated rejections multiply the damping by `damping_increase` without bound,
-which can overflow in float32. The constructor's `max_damping` clamps the
-damping from above; leave it `None` for uncapped classic behavior. Accepted
-steps cannot underflow damping to zero: `min_damping=None` uses
-`jnp.finfo(residual.dtype).tiny`, while an explicit value selects a larger
-absolute floor.
+Damping is floored at `jnp.finfo(residual.dtype).tiny`, the smallest positive
+normal. This is an anti-underflow backstop, not regularization: the update is
+multiplicative, so a damping in a backend's flush-to-zero range would be
+absorbing — `0 * damping_increase` stays `0` and the solver could never
+re-damp after a rejected step. The floor sits far below the scale at which
+damping still perturbs the Gram diagonal, so it never alters a solve that was
+going to make progress. To hold a larger floor, or to cap damping from above,
+clamp it in a callback:
+
+```python
+damping = jnp.clip(ctx.lm_state.damping, 1e-12, 1e6)
+return LMAction(lm_state=dataclasses.replace(ctx.lm_state, damping=damping))
+```
+
+Left unclamped, repeated rejections multiply damping by `damping_increase`
+without bound and it can overflow to `inf` in float32. That is not a failure
+mode worth guarding: the step goes to zero, every trial is rejected, `x` stays
+at the last accepted iterate, and the solve ends at `MAX_STEPS` with the best
+point it found. For genuine regularization, use `RidgeLevenbergMarquardt`.
 
 Status codes are integer constants:
 
@@ -59,7 +72,7 @@ Status codes are integer constants:
 | `LMStatus.CALLBACK_STOP` | A callback stopped without a custom status. |
 | `LMStatus.RUNNING` | Internal running state, not a final successful status. |
 
-Callbacks receive an `LMSolveContext`:
+Callbacks receive an `LMContext`:
 
 | Field | Meaning |
 | --- | --- |
@@ -69,7 +82,7 @@ Callbacks receive an `LMSolveContext`:
 | `initial_lm_state` | State supplied to `solve` or created by `init`. |
 | `args`, `p`, `user_state` | Current auxiliary data, read-only external data, and user state. |
 
-A callback returns `None` or `LMSolveAction(...)`. Omitted action fields are left
+A callback returns `None` or `LMAction(...)`. Omitted action fields are left
 unchanged. The callback may set `stop`, `status`, `x`, `lm_state`, `args`, or
 `user_state`; it cannot replace `p`. When an action changes the values of `x`
 or `args`, that step's tolerance checks are skipped — the diagnostics describe
@@ -85,24 +98,24 @@ to second-guess a callback's explicit replacement.
 ### Resettable Hyperparameters
 
 `solve()` populates `lm_state.hyper` with an `LMHyperparams` of traced
-per-step values: `damping_decrease`, `damping_increase`, `min_damping`,
-`max_damping`, `geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`,
-and `iterative_maxiter`. Because they ride in the lm_state, a callback can reset
+per-step values: `damping_decrease`, `damping_increase`,
+`geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`, and
+`iterative_maxiter`. Because they ride in the lm_state, a callback can reset
 any of them mid-solve — exactly like a damping reset:
 
 ```python
 new_hyper = dataclasses.replace(
     ctx.lm_state.hyper, iterative_maxiter=jnp.asarray(40, jnp.int32)
 )
-return LMSolveAction(lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper))
+return LMAction(lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper))
 ```
 
-Two contracts: knobs constructed as `None` (uncapped `max_damping`,
-backend-default `iterative_maxiter`) are compiled out and stay `None` — a
+Two contracts: knobs constructed as `None` (backend-default
+`iterative_maxiter`) are compiled out and stay `None` — a
 callback cannot turn them on; and replacement values must be arrays of the same dtype (use
 `jnp.asarray`/`jnp.where`), since they live in the jitted loop carry. Static
 configuration — `linear_solver`, `geodesic_acceleration`, `cache_jacobian`,
-`has_aux`, the metric — shapes the compiled program and stays on the solver.
+`has_aux` — shapes the compiled program and stays on the solver.
 `init()` leaves `hyper=None`, which falls back to the constructor values and
 compiles to the same program with no extra per-call buffers — manual
 `update()` loops pay nothing. To schedule hyperparameters in a manual loop,
@@ -110,6 +123,52 @@ opt in with `dataclasses.replace(lm_state, hyper=solver.hyperparams(dtype))`.
 When chaining solves, a warm-started `lm_state` carries the *first* solver's
 hyperparameters; pass `dataclasses.replace(lm_state, hyper=None)` to re-derive
 them from the second solver's constructor.
+
+### Adapting the metric and preconditioner
+
+The metric and preconditioner instances ride in `lm_state.metric` and
+`lm_state.preconditioner`, so a callback adapts either by **constructing a
+new instance** — same type, same static fields, same leaf shapes and dtypes
+(a mismatch raises at trace time, naming the field). Construction is pure
+traced ops and never recompiles the loop. Gate an expensive rebuild
+(`BlockEigenPreconditioner`'s eigendecomposition, a `Nystrom` sketch) with
+`jax.lax.cond`, so it is paid only when the condition fires — a `jnp.where`
+merge over an unconditional rebuild pays it every step:
+
+```python
+def refresh(ctx):
+    precond = jax.lax.cond(
+        ctx.step % 32 == 0,
+        lambda: BlockEigenPreconditioner(build_families(ctx.x), PERMUTATION),
+        lambda: ctx.lm_state.preconditioner,
+    )
+    return LMAction(lm_state=dataclasses.replace(ctx.lm_state, preconditioner=precond))
+```
+
+What the solver does with a change:
+
+- a **preconditioner** refresh is free: staleness only moves the CG
+  iteration path, so nothing is invalidated and convergence tests run
+  normally;
+- a **metric** change stales the whitened solver caches (never the Jacobian
+  cache — \(J = \partial r/\partial x\) does not see the metric). For
+  `RidgeLevenbergMarquardt` it is additionally a **problem change** — the
+  metric defines the objective — so that step's convergence test is
+  suppressed, exactly like a ridge change. A consequence worth knowing: a
+  metric rebuilt on *every* accepted step suppresses convergence on every
+  accepted step, so `xtol` (accepted-only) can never fire — rebuild
+  conditionally, or stop via `gtol`/`atol`. `LevenbergMarquardt`'s metric is
+  damping geometry only (\(\|r\|^2\) did not move), so no suppression there.
+- detection is **by value** with a trace-time identity short-circuit: an
+  action built with `dataclasses.replace(ctx.lm_state, ...)` that passes the
+  instances through untouched costs no comparison ops at all.
+
+A callback that replaces `x` or `args` and uses a metric built from them
+must rebuild the metric **in the same action**. Under multi-start, drawn
+lanes inherit the caller's initial instances, so a lane's first step runs
+under the initial metric and the callback corrects it from step two.
+Under implicit AD the carried instances at the returned solution are frozen
+conditioning data — see [Implicit AD](implicit_ad.md).
 
 Under `jit=True`, callbacks must be JAX-traceable and return the same pytree
 structure on every iteration. Use `jnp.where` or `jax.lax.cond` for
@@ -121,14 +180,14 @@ residual-norm threshold:
 ```python
 import jax.numpy as jnp
 
-from nlls_gram import LMSolveAction, LMStatus
+from nlls_gram import LMAction, LMStatus
 
 
 def stopping_callback(ctx):
     nonfinite = ~jnp.isfinite(ctx.info.loss_candidate)
     converged = jnp.sqrt(ctx.info.loss) < 1e-8
     status = jnp.where(nonfinite, LMStatus.NONFINITE, LMStatus.CONVERGED)
-    return LMSolveAction(stop=nonfinite | converged, status=status)
+    return LMAction(stop=nonfinite | converged, status=status)
 
 
 result = solver.solve(
@@ -277,7 +336,7 @@ divergence:
 ```python
 def divergence_callback(ctx):
     nonfinite = ~jnp.isfinite(ctx.info.loss_candidate)
-    return LMSolveAction(stop=nonfinite, status=LMStatus.NONFINITE)
+    return LMAction(stop=nonfinite, status=LMStatus.NONFINITE)
 ```
 
 ### Epoch Resampling and Damping Reset
@@ -304,7 +363,7 @@ def epoch_callback(ctx):
         damping=jnp.where(boundary, ctx.initial_lm_state.damping, ctx.lm_state.damping),
     )
     new_key = jnp.where(boundary, key, ctx.user_state)
-    return LMSolveAction(args=new_args, lm_state=new_lm_state, user_state=new_key)
+    return LMAction(args=new_args, lm_state=new_lm_state, user_state=new_key)
 
 
 result = solver.solve(
@@ -318,13 +377,14 @@ result = solver.solve(
 
 (`dataclasses` here is the standard-library module.) This recipe composes
 with `cache_jacobian=True` without extra care: any action that changes the
-values of `x` or `args` invalidates the Jacobian cache automatically — and
-likewise the `metric_factory` prepared state, which is rebuilt at the new
-point on the next update.
+values of `x` or `args` invalidates the Jacobian cache automatically. A
+metric built from `x` or `args` is the callback's own responsibility —
+rebuild it in the same action (see "Adapting the metric and preconditioner"
+above).
 
 ### Scheduled Inner-Solve Accuracy
 
-With `linear_solver="gram_cg"`, cheap inexact steps are fine far from the solution
+With a Krylov `linear_solver`, cheap inexact steps are fine far from the solution
 (the accept/reject test absorbs them), but near convergence step quality
 limits the rate. Grow the CG budget once the loss crosses a threshold —
 one solve call, so implicit differentiation still applies:
@@ -332,10 +392,7 @@ one solve call, so implicit differentiation still applies:
 ```python
 solver = LevenbergMarquardt(
     residual_fn,
-    linear_solver="gram_cg",
-    iterative_maxiter=2,
-    dual_preconditioner=identity_preconditioner(),
-    ad_solver_preconditioner=identity_preconditioner(),
+    linear_solver=GramCG(IdentityPreconditioner(), maxiter=2),
 )
 
 
@@ -346,7 +403,7 @@ def grow_budget(ctx):
         ctx.lm_state.hyper.iterative_maxiter,
     )
     new_hyper = dataclasses.replace(ctx.lm_state.hyper, iterative_maxiter=new_maxiter)
-    return LMSolveAction(lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper))
+    return LMAction(lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper))
 
 
 result = solver.solve(x0, args, max_steps=200, atol=1e-8, callback=grow_budget)
@@ -355,17 +412,9 @@ result = solver.solve(x0, args, max_steps=200, atol=1e-8, callback=grow_budget)
 Alternatively, a relative `iterative_tol` adapts the inner accuracy
 automatically (CG's stopping test scales with the right-hand side, which is
 the shrinking outer residual). For a dense endgame instead, chain two solves:
-a coarse CG stage, then a dense solver (`auto`) warm-started with `result.x` and
+a coarse CG stage, then a `Cholesky()` solver warm-started with `result.x` and
 `result.lm_state` — the implicit derivative is unaffected since it is defined
 at the returned solution only.
-
-This schedule composes unchanged with Krylov recycling
-([`recycle=RecycleConfig(...)`](tuning_guide.md#recycling-and-deflation-across-steps)):
-`rank`/`window` are static shapes the callback must not touch, while the carried
-deflation basis shrinks the budget each step needs and the schedule then grows
-it toward the endgame. The callback contract is the same — preserve the recycle
-state with `dataclasses.replace(ctx.lm_state, ...)` (a fresh `LMState` that drops
-it is rejected, exactly like the Jacobian cache).
 
 ### Validation Early Stopping
 
@@ -376,7 +425,7 @@ their thresholds:
 def validation_callback(ctx):
     val_residual = validation_residual_fn(ctx.x, val_data)
     val_mse = jnp.mean(val_residual**2)
-    return LMSolveAction(stop=val_mse < val_threshold)
+    return LMAction(stop=val_mse < val_threshold)
 ```
 
 Evaluating validation metrics every step costs a residual pass per step; gate
@@ -411,7 +460,7 @@ def time_limit_callback(ctx):
         ctx.user_state,  # (start_time, budget_seconds)
         ctx.step,  # loop-varying arg so the call cannot be hoisted
     )
-    return LMSolveAction(stop=timed_out, status=TIME_LIMIT_STATUS)
+    return LMAction(stop=timed_out, status=TIME_LIMIT_STATUS)
 
 
 result = solver.solve(
@@ -458,7 +507,7 @@ def history_callback(ctx):
             ctx.user_state["damping"], ctx.info.damping[None], (ctx.step - 1,)
         ),
     }
-    return LMSolveAction(user_state=history)
+    return LMAction(user_state=history)
 
 
 result = solver.solve(

@@ -2,7 +2,13 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from nlls_gram import LevenbergMarquardt, identity_preconditioner
+from nlls_gram import (
+    QR,
+    Cholesky,
+    GramCG,
+    IdentityPreconditioner,
+    LevenbergMarquardt,
+)
 
 ITERATIVE_MAXITER = 8
 
@@ -36,20 +42,7 @@ def _make_large_interpolation_problem(
         features, ys = args
         return jnp.sin(features @ theta) - ys
 
-    solver_kwargs = {
-        "init_damping": 1e-2,
-        "linear_solver": linear_solver,
-    }
-    if linear_solver == "gram_cg":
-        solver_kwargs.update(
-            {
-                "iterative_tol": 0.0,
-                "iterative_atol": 0.0,
-                "iterative_maxiter": ITERATIVE_MAXITER,
-                "dual_preconditioner": identity_preconditioner(),
-                "ad_solver_preconditioner": identity_preconditioner(),
-            }
-        )
+    solver_kwargs = {"init_damping": 1e-2, "linear_solver": linear_solver}
 
     base_solver = LevenbergMarquardt(residual, **solver_kwargs)
     solver = LevenbergMarquardt(
@@ -78,10 +71,11 @@ def _make_large_interpolation_problem(
 @pytest.mark.parametrize(
     "linear_solver",
     [
-        "gram_cholesky",
-        "qr",
-        "gram_cg",
+        Cholesky(form="gram"),
+        QR(),
+        GramCG(IdentityPreconditioner(), maxiter=ITERATIVE_MAXITER),
     ],
+    ids=["gram_cholesky", "qr", "gram_cg"],
 )
 @pytest.mark.parametrize("geodesic_acceleration", [False, True])
 def test_large_rbf_interpolation_second_update(

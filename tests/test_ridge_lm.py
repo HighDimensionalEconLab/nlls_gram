@@ -9,15 +9,18 @@ import pytest
 from nlls_gram import (
     CG,
     QR,
+    SVD,
     Cholesky,
     CholeskyCache,
+    GramCG,
     IdentityMetric,
     IdentityPreconditioner,
+    LMState,
     Preconditioner,
     QRCache,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    RidgeLMState,
+    register_pytree_dataclass,
 )
 
 # Analytic linear-Gaussian testbed: r(theta) = A theta - b with m < p, the
@@ -260,29 +263,24 @@ def test_atol_is_conjunctive_an_interpolating_start_does_not_stop():
 
 def test_constructor_and_state_validation():
     metric = make_metric()
-    with pytest.raises(TypeError, match="Metric"):
-        RidgeLevenbergMarquardt(linear_residual, metric=object())
     with pytest.raises(ValueError, match="strictly positive"):
         RidgeLevenbergMarquardt(linear_residual, metric=metric, ridge=0.0)
     with pytest.raises(ValueError, match="strictly positive"):
         RidgeLevenbergMarquardt(linear_residual, metric=metric, ridge=-1e-3)
-    # String solver names are gone: the typed configs are the only spelling.
-    with pytest.raises(TypeError, match="solver config"):
-        RidgeLevenbergMarquardt(
-            linear_residual, metric=metric, linear_solver="cholesky"
-        )
-    with pytest.raises(TypeError, match="ad_solver must be None"):
-        RidgeLevenbergMarquardt(linear_residual, metric=metric, ad_solver="auto")
-    with pytest.raises(NotImplementedError, match="metric_factory"):
-        RidgeLevenbergMarquardt(linear_residual, metric=metric, metric_factory=object())
-    # Each config validates its own fields at construction; the CG
-    # preconditioner is a required typed Preconditioner in both roles.
-    with pytest.raises(TypeError):
-        CG(maxiter=100)
-    with pytest.raises(TypeError, match="Preconditioner"):
-        CG(preconditioner=lambda v, damping: v)
+    # An uncapped zero-tolerance CG loop has no stopping rule.
     with pytest.raises(ValueError, match="maxiter"):
         CG(IdentityPreconditioner(), tol=0.0)
+    # The dual operator never sees the penalty rows, so a Gram form would
+    # silently solve the UNPENALIZED subproblem.
+    for gram in (Cholesky(form="gram"), GramCG(IdentityPreconditioner(), maxiter=8)):
+        with pytest.raises(ValueError, match="penalty rows"):
+            RidgeLevenbergMarquardt(linear_residual, metric=metric, linear_solver=gram)
+    # QR has no AD rule (the implicit system is undamped, where its damping
+    # rows vanish); SVD has no forward rule.
+    with pytest.raises(ValueError, match="ad_solver"):
+        RidgeLevenbergMarquardt(linear_residual, metric=metric, ad_solver=QR())
+    with pytest.raises(ValueError, match="linear_solver"):
+        RidgeLevenbergMarquardt(linear_residual, metric=metric, linear_solver=SVD())
     # The metric must cover no more than the flattened iterate.
     small = RidgeLevenbergMarquardt(
         lambda theta: theta[:1], metric=IdentityMetric(3), ridge=1e-3
@@ -299,12 +297,12 @@ def test_constructor_and_state_validation():
     bare = RidgeLevenbergMarquardt(
         linear_residual, metric=make_metric(), ridge=1e-3, cache_jacobian=False
     )
-    bad = RidgeLMState(jnp.asarray(1e-3), None)
+    bad = LMState(jnp.asarray(1e-3), None)
     with pytest.raises(ValueError, match="ridge"):
         bare.update(jnp.zeros(P_DIM), bad)
     with pytest.raises(ValueError, match="ridge"):
         bare.solve(jnp.zeros(P_DIM), lm_state=bad, gtol=1e-5)
-    zero_ridge = RidgeLMState(jnp.asarray(1e-3), jnp.asarray(0.0))
+    zero_ridge = LMState(jnp.asarray(1e-3), jnp.asarray(0.0))
     with pytest.raises(ValueError, match="strictly positive"):
         bare.solve(jnp.zeros(P_DIM), lm_state=zero_ridge, gtol=1e-5)
 
@@ -447,7 +445,7 @@ def test_rejected_step_reuses_residual_and_jacobian():
 def test_normal_cg_preconditioner_changes_nothing():
     # M changes the CG iteration path, never the solved subproblem: a
     # Jacobi-style SPD Preconditioner subclass must reproduce the identity-M
-    # step -- and it receives the live MetricContext.
+    # step -- and it receives the live SolverContext.
     seen = []
 
     @dataclasses.dataclass(frozen=True, eq=False)
@@ -457,6 +455,8 @@ def test_normal_cg_preconditioner_changes_nothing():
         def apply(self, v, damping, ctx):
             seen.append(ctx is not None and ctx.lm_state is not None)
             return v / (self.scale + damping)
+
+    register_pytree_dataclass(JacobiPreconditioner, data_fields=("scale",))
 
     scale = jnp.asarray(RNG.uniform(0.5, 2.0, size=P_DIM), dtype=jnp.float32)
     preconditioned = build(

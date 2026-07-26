@@ -1,7 +1,7 @@
 """Per-update step cost: ridge LM (cholesky/qr/cg) vs metric LM at the
 kernel-driver problem sizes (p = repeats * n + free parameters, m residuals).
 The residual is a fixed random affine map so the benchmark isolates the
-solver's linear algebra, matching test_repeated_shifted_metric_benchmark's
+solver's linear algebra, matching test_metric_benchmark.py's
 kernel geometry.
 """
 
@@ -19,7 +19,6 @@ from nlls_gram import (
     LevenbergMarquardt,
     RepeatedFactorMetric,
     RidgeLevenbergMarquardt,
-    repeated_shifted_dense_metric,
 )
 
 SIGMA = 1.0
@@ -86,8 +85,11 @@ def test_update_step(
     device = devices[0]
     K, residual, x0 = _problem(n, repeats, free_size, m_resid, device)
     if configuration == "metric":
-        metric = repeated_shifted_dense_metric(
-            K, repeats=repeats, zero_pad_size=free_size, epsilon=EPSILON
+        shifted = K + EPSILON * jnp.eye(K.shape[0], dtype=K.dtype)
+        metric = RepeatedFactorMetric(
+            jnp.linalg.cholesky(shifted, upper=True),
+            repeats=repeats,
+            free_scale=EPSILON,
         )
         solver = LevenbergMarquardt(residual, metric=metric)
     else:

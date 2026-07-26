@@ -44,10 +44,10 @@ extra_javascript:
 nav:
   - Home: index.md
   - Ridge LM: ridge_lm.md
-  - Callbacks and Cookbook: callbacks.md
+  - Metric LM: metric_lm.md
+  - Metrics and Preconditioners: metrics.md
+  - Callbacks: callbacks.md
   - Multi-Start: multi_start.md
-  - Gram Metrics: metrics.md
-  - Utilities: utilities.md
   - Implicit Differentiation: implicit_ad.md
-  - Tuning Guide: tuning_guide.md
-  - Metric Gauss-Newton: gauss_newton.md
+  - Tuning: tuning_guide.md
+  - API: api.md
