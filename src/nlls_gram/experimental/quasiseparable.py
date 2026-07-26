@@ -31,6 +31,8 @@ from the exclusive-prefix carries in a vectorized post-map.
 import jax
 import jax.numpy as jnp
 
+from nlls_gram.utilities import HIGHEST, mm
+
 
 def matern_state_space(sigma, ell, nu):
     """Return the ``(h, Pinf, transition)`` state-space model of a Matern kernel.
@@ -144,10 +146,10 @@ def _state_space_generators(points, h, Pinf, transition):
     # The dt=0 shift trick makes A[0] = transition(0) = I.
     dt = points - jnp.concatenate([points[:1], points[:-1]])
     A = transition(dt)
-    hP = h @ Pinf
-    d = jnp.full((n,), hP @ h)
+    hP = mm(h, Pinf)
+    d = jnp.full((n,), mm(hP, h))
     q = jnp.broadcast_to(h, (n, h.shape[0]))
-    p = jnp.einsum("i,kij->kj", hP, A)
+    p = jnp.einsum("i,kij->kj", hP, A, precision=HIGHEST)
     return d, p, q, A
 
 
@@ -157,10 +159,10 @@ def _cholesky(d, p, q, A):
 
     def step(F, inputs):
         d_k, p_k, q_k, A_k = inputs
-        c_k = jnp.sqrt(d_k - p_k @ F @ p_k)
-        tmp = F @ A_k.T
-        w_k = (q_k - p_k @ tmp) / c_k
-        F_next = A_k @ tmp + jnp.outer(w_k, w_k)
+        c_k = jnp.sqrt(d_k - mm(p_k, mm(F, p_k)))
+        tmp = mm(F, A_k.T)
+        w_k = (q_k - mm(p_k, tmp)) / c_k
+        F_next = mm(A_k, tmp) + jnp.outer(w_k, w_k)
         return F_next, (c_k, w_k)
 
     F0 = jnp.zeros((m, m), dtype=d.dtype)
@@ -174,7 +176,7 @@ def _scan_affine(M, b, reverse=False):
     def combine(earlier, later):
         M1, b1 = earlier
         M2, b2 = later
-        return M2 @ M1, M2 @ b1 + b2
+        return mm(M2, M1), mm(M2, b1) + b2
 
     if reverse:
         M = M[::-1]
@@ -193,12 +195,12 @@ def _forward_substitution(c, p, w, A, y, parallel):
         M = A - w[:, :, None] * (p / c[:, None])[:, None, :]
         b = w[:, :, None] * (y / c[:, None])[:, None, :]
         G = _scan_affine(M, b)
-        return (y - jnp.einsum("km,kmr->kr", p, G)) / c[:, None]
+        return (y - jnp.einsum("km,kmr->kr", p, G, precision=HIGHEST)) / c[:, None]
 
     def step(G, inputs):
         c_k, p_k, w_k, A_k, y_k = inputs
-        x_k = (y_k - p_k @ G) / c_k
-        return A_k @ G + jnp.outer(w_k, x_k), x_k
+        x_k = (y_k - mm(p_k, G)) / c_k
+        return mm(A_k, G) + jnp.outer(w_k, x_k), x_k
 
     G0 = jnp.zeros((p.shape[1], y.shape[1]), dtype=y.dtype)
     _, x = jax.lax.scan(step, G0, (c, p, w, A, y))
@@ -212,12 +214,12 @@ def _backward_substitution(c, p, w, A, y, parallel):
         M = jnp.swapaxes(A, -1, -2) - p[:, :, None] * (w / c[:, None])[:, None, :]
         b = p[:, :, None] * (y / c[:, None])[:, None, :]
         G = _scan_affine(M, b, reverse=True)
-        return (y - jnp.einsum("km,kmr->kr", w, G)) / c[:, None]
+        return (y - jnp.einsum("km,kmr->kr", w, G, precision=HIGHEST)) / c[:, None]
 
     def step(G, inputs):
         c_k, p_k, w_k, A_k, y_k = inputs
-        x_k = (y_k - w_k @ G) / c_k
-        return A_k.T @ G + jnp.outer(p_k, x_k), x_k
+        x_k = (y_k - mm(w_k, G)) / c_k
+        return mm(A_k.T, G) + jnp.outer(p_k, x_k), x_k
 
     G0 = jnp.zeros((p.shape[1], y.shape[1]), dtype=y.dtype)
     _, x = jax.lax.scan(step, G0, (c, p, w, A, y), reverse=True)
@@ -233,12 +235,12 @@ def _cholesky_transpose_matvec(c, p, w, A, x, parallel):
             p[:, :, None] * x[:, None, :],
             reverse=True,
         )
-        return c[:, None] * x + jnp.einsum("km,kmr->kr", w, H)
+        return c[:, None] * x + jnp.einsum("km,kmr->kr", w, H, precision=HIGHEST)
 
     def step(H, inputs):
         c_k, p_k, w_k, A_k, x_k = inputs
-        z_k = c_k * x_k + w_k @ H
-        return A_k.T @ H + jnp.outer(p_k, x_k), z_k
+        z_k = c_k * x_k + mm(w_k, H)
+        return mm(A_k.T, H) + jnp.outer(p_k, x_k), z_k
 
     H0 = jnp.zeros((p.shape[1], x.shape[1]), dtype=x.dtype)
     _, z = jax.lax.scan(step, H0, (c, p, w, A, x), reverse=True)

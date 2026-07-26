@@ -46,6 +46,7 @@ from nlls_gram.utilities import (
     _where_tree,
     _zero_tangent_leaf,
     canonicalize_residual,
+    mm,
     register_pytree_dataclass,
 )
 
@@ -628,10 +629,10 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         # deficient B needs SVD(), which selects the minimum-norm tangent.
         n, m = Bt.shape
         if n > m:
-            factor = jsp_linalg.cho_factor(Bt.T @ Bt)
-            return -Bt @ jsp_linalg.cho_solve(factor, residual_p_dot)
-        factor = jsp_linalg.cho_factor(Bt @ Bt.T)
-        return -jsp_linalg.cho_solve(factor, Bt @ residual_p_dot)
+            factor = jsp_linalg.cho_factor(mm(Bt.T, Bt))
+            return -mm(Bt, jsp_linalg.cho_solve(factor, residual_p_dot))
+        factor = jsp_linalg.cho_factor(mm(Bt, Bt.T))
+        return -jsp_linalg.cho_solve(factor, mm(Bt, residual_p_dot))
 
     def _ad_tangent_lu(self, Bt, residual_p_dot):
         # Square B: u = -B^{-1} (dr/dp) p_dot, factored directly. The normal
@@ -649,7 +650,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         U, sigma, Vt = jnp.linalg.svd(Bt.T, full_matrices=False)
         cutoff = max(Bt.shape) * jnp.finfo(Bt.dtype).eps * sigma[0]
         inverted = jnp.where(sigma > cutoff, 1.0 / jnp.maximum(sigma, cutoff), 0.0)
-        return -Vt.T @ (inverted * (U.T @ residual_p_dot))
+        return -mm(Vt.T, inverted * mm(U.T, residual_p_dot))
 
     def _ad_tangent_krylov(
         self, config, theta, theta_jvp, residual_p_dot, whiten, whiten_transpose, ctx

@@ -32,7 +32,7 @@ import jax.scipy.linalg as jsp_linalg
 import jax.scipy.sparse.linalg as jsp_sparse_linalg
 
 from nlls_gram.preconditioners import Preconditioner
-from nlls_gram.utilities import _IdentityKey
+from nlls_gram.utilities import _IdentityKey, mm
 
 __all__ = [
     "CG",
@@ -295,7 +295,7 @@ class Cholesky(LinearSolver):
     def prepare(self, sub):
         n_m, ridge = sub.n_m, sub.ridge
         # B' = F_bar^{-T} J', shape (n, m). Every form below is built from it.
-        grad = sub.whitened_transpose(sub.Jt @ sub.resid)
+        grad = sub.whitened_transpose(mm(sub.Jt, sub.resid))
         if sub.penalized:
             grad = grad + ridge * sub.penalty_gradient
         gram = self._resolved_form(sub.m, sub.n, sub.penalized) == "gram"
@@ -303,8 +303,8 @@ class Cholesky(LinearSolver):
         def assemble():
             Bt = sub.whitened_transpose(sub.Jt)
             if gram:
-                return Bt.T @ Bt
-            normal = Bt @ Bt.T
+                return mm(Bt.T, Bt)
+            normal = mm(Bt, Bt.T)
             if not sub.penalized:
                 return normal
             diagonal = jnp.arange(n_m)
@@ -317,7 +317,9 @@ class Cholesky(LinearSolver):
         if gram:
             # u = -B'(D + damping I)^{-1} c on residual-space right-hand sides.
             def dual_step(c):
-                return -sub.whitened_transpose(sub.Jt @ jsp_linalg.cho_solve(factor, c))
+                return -sub.whitened_transpose(
+                    mm(sub.Jt, jsp_linalg.cho_solve(factor, c))
+                )
 
             velocity, correction = (lambda: dual_step(sub.resid)), dual_step
         else:
@@ -327,7 +329,7 @@ class Cholesky(LinearSolver):
 
             velocity = lambda: normal_step(grad)  # noqa: E731
             correction = lambda f_vv: normal_step(  # noqa: E731
-                sub.whitened_transpose(sub.Jt @ f_vv)
+                sub.whitened_transpose(mm(sub.Jt, f_vv))
             )
         return StepSolver(
             grad=grad,
@@ -369,7 +371,7 @@ class QR(LinearSolver):
     def prepare(self, sub):
         n, n_m, ridge, dtype = sub.n, sub.n_m, sub.ridge, sub.dtype
         sqrt_ridge = jnp.sqrt(ridge)
-        grad = sub.whitened_transpose(sub.Jt @ sub.resid)
+        grad = sub.whitened_transpose(mm(sub.Jt, sub.resid))
         if sub.penalized:
             grad = grad + ridge * sub.penalty_gradient
 
@@ -397,7 +399,9 @@ class QR(LinearSolver):
         Q_mu, R_mu = jnp.linalg.qr(damped_stack, mode="reduced")
 
         def damped_normal_matvec(v):
-            gauss_newton = sub.whitened_transpose(sub.Jt @ (sub.Jt.T @ sub.whitened(v)))
+            gauss_newton = sub.whitened_transpose(
+                mm(sub.Jt, mm(sub.Jt.T, sub.whitened(v)))
+            )
             shift = sub.damping * v
             if sub.penalized:
                 shift = shift + ridge * jnp.concatenate(
@@ -410,7 +414,7 @@ class QR(LinearSolver):
             # against R_mu, then ONE fixed iterative-refinement pass through
             # matvecs (Bjorck 1996 Sec. 6.6.5). The second-order correction
             # tolerates the squared conditioning; accept/reject guards it.
-            b = -sub.whitened_transpose(sub.Jt @ f_vv)
+            b = -sub.whitened_transpose(mm(sub.Jt, f_vv))
             half = jsp_linalg.solve_triangular(R_mu.T, b, lower=True)
             delta = jsp_linalg.solve_triangular(R_mu, half, lower=False)
             correction_rhs = b - damped_normal_matvec(delta)
@@ -421,7 +425,7 @@ class QR(LinearSolver):
             # min ||[R; sqrt(damping) I] delta + [Q'b; 0]||^2 solved through
             # Q2: exact and backward stable at cond(A), never cond(A)^2.
             rhs = jnp.concatenate([transformed_rhs, jnp.zeros(n, dtype=dtype)])
-            return -jsp_linalg.solve_triangular(R_mu, Q_mu.T @ rhs, lower=False)
+            return -jsp_linalg.solve_triangular(R_mu, mm(Q_mu.T, rhs), lower=False)
 
         return StepSolver(
             grad=grad,

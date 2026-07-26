@@ -8,6 +8,11 @@ which needs a subprocess to set the flag before JAX initializes.
 
 Nothing here promotes a solve to float64: nlls-gram has no ad/metric solve
 dtype knob, so float32 in must mean float32 out, at float32 accuracy.
+
+float32 is also where matmul precision bites: XLA:GPU serves float32
+``dot_general`` from TF32 tensor cores by default, at a 10-bit mantissa. The
+package pins every product it owns to HIGHEST, which the last test here
+asserts on the jaxpr -- device-independently, so CPU CI protects the GPU path.
 """
 
 import jax
@@ -229,3 +234,47 @@ def test_float32_gram_cg_converges_under_each_dual_preconditioner(name):
     assert int(result.status) == int(LMStatus.CONVERGED)
     assert result.x.dtype == jnp.float32
     np.testing.assert_allclose(np.asarray(result.x), min_norm(B), rtol=3e-3, atol=3e-4)
+
+
+def test_internal_matmuls_are_pinned_to_highest_precision():
+    # TF32 tensor cores serve float32 dot_general on Ampere by default, at a
+    # 10-bit mantissa (~1e-3). Forming a Gram matrix already squares the
+    # condition number, so every product the package owns is pinned. The
+    # residual below has no matmul of its own, so every dot_general in the
+    # trace belongs to the solver. Asserted on the jaxpr rather than on
+    # numbers: that holds on CPU, where the setting is a no-op, and so guards
+    # the GPU path from CI. tests/conftest.py sets the global default too, but
+    # only for the tests' own reference matmuls -- this must pass without it.
+    def elementwise_residual(x, args, p):
+        return x - p
+
+    solver = LevenbergMarquardt(
+        elementwise_residual, cache_jacobian=False, geodesic_acceleration=False
+    )
+    p0 = jnp.linspace(0.5, 1.5, N, dtype=jnp.float32)
+
+    def run(p):
+        return solver.solve(jnp.zeros(N, jnp.float32), None, p=p, max_steps=4).x
+
+    stack = [jax.make_jaxpr(run)(p0).jaxpr]
+    dots = []
+    while stack:
+        current = stack.pop()
+        for equation in current.eqns:
+            if equation.primitive.name == "dot_general":
+                dots.append(equation)
+            for value in equation.params.values():
+                if hasattr(value, "eqns"):
+                    stack.append(value)
+                elif hasattr(value, "jaxpr"):
+                    inner = value.jaxpr
+                    stack.append(inner.jaxpr if hasattr(inner, "jaxpr") else inner)
+
+    assert dots, "no dot_general in the trace; the assertion below is vacuous"
+    unpinned = [
+        equation
+        for equation in dots
+        if equation.params.get("precision")
+        != (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+    ]
+    assert not unpinned, "\n".join(str(equation)[:110] for equation in unpinned[:5])

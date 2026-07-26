@@ -89,3 +89,45 @@ the callback, any shape, and any instance **static field** (a metric's
 | `CONVERGED` but the residual is large | `atol` fired on the wrong scale, or `gtol` alone stopped a ridge level |
 | tangent finite but wrong | the `ad_solver`'s operator is singular for this shape — see [Metric LM](metric_lm.md#rank-deficiency-and-implicit-ad) |
 | every solve recompiles | a metric, preconditioner, or callback rebuilt per call |
+
+## GPU matmul precision in float32
+
+On an NVIDIA GPU from Ampere onward, XLA serves float32 `dot_general` from
+TF32 tensor cores by default: a 10-bit mantissa, so about \(10^{-3}\) relative
+error rather than float32's \(10^{-7}\). That is a poor trade here. Forming a
+Gram or normal matrix already squares the condition number, so paying TF32 on
+top spends roughly three decimal digits before the factorization starts —
+enough to move a converged step and to leave an implicit tangent visibly
+wrong.
+
+Every product **inside** this package is therefore pinned to
+`jax.lax.Precision.HIGHEST`, unconditionally and with no opt-out: the Gram and
+normal assembly, the matrix-free CG operator, the metric factor applications,
+the preconditioner contractions, and the implicit-AD solves. A float32 solve
+answers the same on GPU as on CPU, where the setting is a no-op.
+
+What the package cannot reach is **your** code — the matmuls inside your
+residual function, and any dense reference you compare against. Set the
+default near the top of a script:
+
+```python
+import jax
+
+jax.config.update("jax_default_matmul_precision", "highest")
+```
+
+or export `JAX_DEFAULT_MATMUL_PRECISION=highest`. There is no reason not to
+for this class of problem; TF32's speed only pays on large, well-conditioned
+matmuls, which is not what a least-squares solve is doing.
+
+The failure signature, if it is ever missed: results that agree between CPU
+and GPU to about three digits and no further, with the gap concentrated in
+whichever quantity passed through the most products — typically the tangent
+before the primal.
+
+CI has no GPU runner, so `tests/test_gpu.py` is skipped there. Run it on a
+GPU box explicitly:
+
+```bash
+uv run --group gpu pytest -q
+```

@@ -1,7 +1,7 @@
 """Solver-agnostic helpers: pytree selection/masking, jit static-key hashing,
-and residual-signature canonicalization.
+residual-signature canonicalization, and the pinned-precision matrix product.
 
-No solver, metric, or linear-algebra code lives here -- only plumbing both
+No solver or metric code lives here -- only plumbing both
 ``LevenbergMarquardt`` and ``RidgeLevenbergMarquardt`` share.
 """
 
@@ -10,6 +10,23 @@ import inspect
 
 import jax
 import jax.numpy as jnp
+
+# XLA:GPU serves float32 dot_general from TF32 tensor cores by default: a
+# 10-bit mantissa, so ~1e-3 relative error. Forming a Gram or normal matrix
+# already squares the condition number, and doing that at TF32 spends about
+# three decimal digits before the factorization starts -- enough to move a
+# converged step and to put an implicit tangent visibly off. Every product
+# inside the package goes through `mm` (or passes `precision=HIGHEST` to
+# einsum) so a float32 solve answers the same on GPU as on CPU, where the
+# setting is a no-op. Callers should also set
+# `jax.config.update("jax_default_matmul_precision", "highest")` near the top
+# of a script: that covers matmuls in their own residual functions, which the
+# package cannot reach from here.
+HIGHEST = jax.lax.Precision.HIGHEST
+
+
+def mm(a, b):
+    return jnp.matmul(a, b, precision=HIGHEST)
 
 
 def register_pytree_dataclass(cls, *, data_fields, meta_fields=()):

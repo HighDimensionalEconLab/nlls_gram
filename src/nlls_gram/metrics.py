@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 
 from nlls_gram.lm_types import SolverContext
-from nlls_gram.utilities import register_pytree_dataclass
+from nlls_gram.utilities import mm, register_pytree_dataclass
 
 __all__ = [
     "CholeskyMetric",
@@ -192,7 +192,7 @@ class CholeskyMetric(Metric):
 
     def factor_apply(self, v, ctx):
         _check_leading_size(v, self.size)
-        return self.L.T @ v
+        return mm(self.L.T, v)
 
     def factor_solve(self, v, ctx):
         _check_leading_size(v, self.size)
@@ -303,7 +303,7 @@ class RepeatedFactorMetric(Metric):
         ).reshape((self.size,) + trailing_shape)
 
     def factor_apply(self, v, ctx):
-        return self._map_blocks(lambda m: self.F @ m, v)
+        return self._map_blocks(lambda m: mm(self.F, m), v)
 
     def factor_solve(self, v, ctx):
         return self._map_blocks(

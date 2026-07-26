@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 
-from nlls_gram.utilities import register_pytree_dataclass
+from nlls_gram.utilities import HIGHEST, mm, register_pytree_dataclass
 
 
 class Preconditioner:
@@ -184,9 +184,13 @@ class BlockEigenPreconditioner(Preconditioner):
             segment = permuted[offset : offset + groups * size]
             offset += groups * size
             shift = ridge_weight * ridge + damping
-            coefficients = jnp.einsum("gab,ga->gb", V, segment.reshape(groups, size))
+            coefficients = jnp.einsum(
+                "gab,ga->gb", V, segment.reshape(groups, size), precision=HIGHEST
+            )
             pieces.append(
-                jnp.einsum("gab,gb->ga", V, coefficients / (values + shift)).reshape(-1)
+                jnp.einsum(
+                    "gab,gb->ga", V, coefficients / (values + shift), precision=HIGHEST
+                ).reshape(-1)
             )
         return jnp.concatenate(pieces)[self.inverse_permutation].astype(v.dtype)
 
@@ -236,11 +240,11 @@ class ShermanMorrisonPreconditioner(Preconditioner):
         object.__setattr__(self, "u", u)
         object.__setattr__(self, "weight", weight)
         object.__setattr__(self, "solve_u", solve_u)
-        object.__setattr__(self, "denominator", 1.0 / weight + u @ solve_u)
+        object.__setattr__(self, "denominator", 1.0 / weight + mm(u, solve_u))
 
     def apply(self, v, damping, ctx):
         y = self.solve(v)
-        return y - self.solve_u * ((self.u @ y) / self.denominator)
+        return y - self.solve_u * (mm(self.u, y) / self.denominator)
 
 
 register_pytree_dataclass(
@@ -277,7 +281,7 @@ class WoodburyPreconditioner(Preconditioner):
         object.__setattr__(self, "weights", weights)
         solve_U = self.solve(U)
         object.__setattr__(self, "solve_U", solve_U)
-        capacitance = jnp.diag(1.0 / weights) + U.T @ solve_U
+        capacitance = jnp.diag(1.0 / weights) + mm(U.T, solve_U)
         object.__setattr__(
             self, "capacitance_factor", jsp_linalg.cho_factor(capacitance)[0]
         )
@@ -285,9 +289,9 @@ class WoodburyPreconditioner(Preconditioner):
     def apply(self, v, damping, ctx):
         y = self.solve(v)
         correction = jsp_linalg.cho_solve(
-            (self.capacitance_factor, False), self.U.T @ y
+            (self.capacitance_factor, False), mm(self.U.T, y)
         )
-        return y - self.solve_U @ correction
+        return y - mm(self.solve_U, correction)
 
 
 register_pytree_dataclass(
@@ -400,7 +404,7 @@ class NystromPreconditioner(Preconditioner):
         finfo = jnp.finfo(dtype)
         nu = jnp.maximum(finfo.eps * jnp.linalg.norm(Y), finfo.tiny / finfo.eps)
         Y_nu = Y + nu * Omega
-        core = Omega.T @ Y_nu
+        core = mm(Omega.T, Y_nu)
         L = jnp.linalg.cholesky(0.5 * (core + core.T))
         B = jsp_linalg.solve_triangular(L, Y_nu.T, lower=True).T
         U, sigma, _ = jnp.linalg.svd(B, full_matrices=False)
@@ -411,8 +415,10 @@ class NystromPreconditioner(Preconditioner):
         # Regrouped so the apply is two (n, rank) matvecs instead of three.
         U, lam = self.basis, self.eigenvalues
         rho = lam[-1]
-        Utv = U.T @ v
-        return U @ (Utv / (lam + damping) - Utv / (rho + damping)) + v / (rho + damping)
+        Utv = mm(U.T, v)
+        return mm(U, Utv / (lam + damping) - Utv / (rho + damping)) + v / (
+            rho + damping
+        )
 
 
 register_pytree_dataclass(

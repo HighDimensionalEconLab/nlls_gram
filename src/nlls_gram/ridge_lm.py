@@ -51,6 +51,7 @@ from nlls_gram.utilities import (
     _where_tree,
     _zero_tangent_leaf,
     canonicalize_residual,
+    mm,
 )
 
 __all__ = [
@@ -1044,9 +1045,9 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
             self._extended_solve_transpose(Jt, ctx), dtype=residual.dtype
         )
         diag = jnp.arange(n_m)
-        normal_matrix = (Jt_sub @ Jt_sub.T).at[diag, diag].add(ridge_typed)
+        normal_matrix = mm(Jt_sub, Jt_sub.T).at[diag, diag].add(ridge_typed)
         factor = jsp_linalg.cho_factor(normal_matrix)
-        y_dot = jsp_linalg.cho_solve(factor, -(Jt_sub @ residual_p_dot))
+        y_dot = jsp_linalg.cho_solve(factor, -mm(Jt_sub, residual_p_dot))
         theta_dot = jnp.asarray(self._extended_solve(y_dot, ctx), residual.dtype)
         return unravel(theta_dot)
 
