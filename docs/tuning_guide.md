@@ -106,9 +106,20 @@ normal assembly, the matrix-free CG operator, the metric factor applications,
 the preconditioner contractions, and the implicit-AD solves. A float32 solve
 answers the same on GPU as on CPU, where the setting is a no-op.
 
-What the package cannot reach is **your** code — the matmuls inside your
-residual function, and any dense reference you compare against. Set the
-default near the top of a script:
+That is necessary but **not sufficient**, and on a GPU you must do one more
+thing. The package cannot reach the matmuls inside **your** residual, and the
+Jacobian is differentiated through those — so a TF32 residual hands the solver
+a Jacobian that is already wrong, and pinning everything downstream cannot
+recover it. Since a residual here is usually a neural network or a kernel
+evaluation, that is the normal case, not the exception. Measured on a dense
+underdetermined float32 problem on an RTX 3090:
+
+| | relative error |
+|---|---|
+| default | \(3.3 \times 10^{-4}\) |
+| `jax_default_matmul_precision="highest"` | \(1.6 \times 10^{-7}\) |
+
+So set it near the top of any script that will run on a GPU:
 
 ```python
 import jax
@@ -116,9 +127,9 @@ import jax
 jax.config.update("jax_default_matmul_precision", "highest")
 ```
 
-or export `JAX_DEFAULT_MATMUL_PRECISION=highest`. There is no reason not to
-for this class of problem; TF32's speed only pays on large, well-conditioned
-matmuls, which is not what a least-squares solve is doing.
+or export `JAX_DEFAULT_MATMUL_PRECISION=highest`. TF32's speed only pays on
+large well-conditioned matmuls, which is not what a least-squares solve is
+doing, so there is no reason to leave it off.
 
 The failure signature, if it is ever missed: results that agree between CPU
 and GPU to about three digits and no further, with the gap concentrated in
