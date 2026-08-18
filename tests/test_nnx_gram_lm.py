@@ -236,6 +236,43 @@ def test_draw_nnx_module_matches_inline_closure():
         assert jnp.allclose(got, want)
 
 
+class ScaledCurveMLP(nnx.Module):
+    def __init__(self, *, scale=2.0, rngs: nnx.Rngs):
+        self.scale = nnx.Variable(jnp.asarray(scale))
+        self.hidden = nnx.Linear(1, 8, rngs=rngs)
+        self.head = nnx.Linear(8, 1, rngs=rngs)
+
+    def __call__(self, x):
+        return self.scale[...] * self.head(nnx.tanh(self.hidden(x[:, None])))[:, 0]
+
+
+def test_draw_nnx_module_excludes_non_param_variables():
+    graphdef, theta_0, nondiff = nnx.split(
+        ScaledCurveMLP(rngs=nnx.Rngs(1)), nnx.Param, ...
+    )
+    assert len(jax.tree.leaves(nondiff)) == 1
+
+    draw = DrawNNXModule(ScaledCurveMLP)
+    theta, args_out = draw(jax.random.key(7), None, ("args",))
+    assert args_out == ("args",)
+    # Only the Param leaves are drawn; the residual's merge supplies nondiff.
+    assert jax.tree_util.tree_structure(theta) == jax.tree_util.tree_structure(theta_0)
+
+    ts = jnp.linspace(-1.0, 1.0, 32)
+    ys = jnp.sin(2.0 * ts)
+    theta_bad = jax.tree.map(lambda leaf: leaf * jnp.nan, theta_0)
+
+    def residual(theta, args, p):
+        ts, ys = args
+        return nnx.merge(graphdef, theta, nondiff)(ts) - ys
+
+    solver = LevenbergMarquardt(residual, init_damping=1e-2)
+    ms = MultiStart(key=jax.random.key(2), num_starts=4, draw=draw)
+    result = solver.solve(theta_bad, (ts, ys), max_steps=200, atol=5e-3, multi_start=ms)
+    assert int(result.status) == LMStatus.CONVERGED
+    assert bool(result.multi_start.accepted)
+
+
 @pytest.mark.parametrize("parallel", [False, True])
 def test_multi_start_draw_nnx_module_recovers_from_bad_init(parallel):
     ts = jnp.linspace(-1.0, 1.0, 32)

@@ -92,7 +92,9 @@ class DrawNNXModule:
 
     Given a ``MultiStart`` retry key, builds
     ``module_cls(*args, rngs=nnx.Rngs(key), **kwargs)`` and returns its ``nnx.Param``
-    state as the new solver start, passing ``args`` through unchanged. Use it instead
+    state as the new solver start, passing ``args`` through unchanged. Non-``Param``
+    Variables (scaling constants, statistics) are excluded from the drawn state --
+    the residual's ``nnx.merge`` supplies them alongside the graphdef. Use it instead
     of hand-rolling a re-init closure per driver::
 
         draw = DrawNNXModule(SequentialMLP, settings, dtype=dtype)
@@ -122,7 +124,7 @@ class DrawNNXModule:
         from flax import nnx
 
         module = self.module_cls(*self.args, rngs=nnx.Rngs(key), **dict(self.kwargs))
-        _, theta = nnx.split(module, nnx.Param)
+        _, theta, _ = nnx.split(module, nnx.Param, ...)
         return theta, args_old
 
     def __hash__(self):
