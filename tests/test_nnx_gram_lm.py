@@ -273,6 +273,24 @@ def test_draw_nnx_module_excludes_non_param_variables():
     assert bool(result.multi_start.accepted)
 
 
+def test_draw_nnx_module_wrt_filter():
+    wrt = nnx.All(nnx.Param, nnx.Not(nnx.PathContains("head")))
+    _, theta_0, _ = nnx.split(CurveMLP(rngs=nnx.Rngs(1)), wrt, ...)
+
+    draw = DrawNNXModule(CurveMLP, wrt=wrt)
+    theta, args_out = draw(jax.random.key(7), None, ("args",))
+    assert args_out == ("args",)
+    # Only the wrt-selected Params are drawn; the rest rides in the frozen state.
+    assert jax.tree_util.tree_structure(theta) == jax.tree_util.tree_structure(theta_0)
+
+    # wrt joins the value-hash spec.
+    assert DrawNNXModule(CurveMLP, wrt=wrt) == DrawNNXModule(CurveMLP, wrt=wrt)
+    assert hash(DrawNNXModule(CurveMLP, wrt=wrt)) == hash(
+        DrawNNXModule(CurveMLP, wrt=wrt)
+    )
+    assert DrawNNXModule(CurveMLP, wrt=wrt) != DrawNNXModule(CurveMLP)
+
+
 @pytest.mark.parametrize("parallel", [False, True])
 def test_multi_start_draw_nnx_module_recovers_from_bad_init(parallel):
     ts = jnp.linspace(-1.0, 1.0, 32)

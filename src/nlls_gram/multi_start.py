@@ -91,14 +91,21 @@ class DrawNNXModule:
     """Multi-start ``draw`` hook re-initializing a flax ``nnx.Module`` from a fresh key.
 
     Given a ``MultiStart`` retry key, builds
-    ``module_cls(*args, rngs=nnx.Rngs(key), **kwargs)`` and returns its ``nnx.Param``
-    state as the new solver start, passing ``args`` through unchanged. Non-``Param``
-    Variables (scaling constants, statistics) are excluded from the drawn state --
-    the residual's ``nnx.merge`` supplies them alongside the graphdef. Use it instead
-    of hand-rolling a re-init closure per driver::
+    ``module_cls(*args, rngs=nnx.Rngs(key), **kwargs)`` and returns its ``wrt``
+    state (default ``nnx.Param``) as the new solver start, passing ``args``
+    through unchanged. Non-``Param`` Variables (scaling constants, statistics)
+    are excluded from the drawn state -- the residual's ``nnx.merge`` supplies
+    them alongside the graphdef. Use it instead of hand-rolling a re-init
+    closure per driver::
 
         draw = DrawNNXModule(SequentialMLP, settings, dtype=dtype)
         ms = MultiStart(key=key, num_starts=5, draw=draw)
+
+    ``wrt`` is a keyword-only ``nnx`` filter (not forwarded to ``module_cls``):
+    when the solver's ``x0`` was split with a filter narrower than ``nnx.Param``
+    (e.g. ``nnx.All(nnx.Param, nnx.Not(nnx.PathContains("g")))`` to freeze a
+    Param into the nondiff state), pass the same filter so drawn states match
+    ``x0``'s pytree structure.
 
     The drawn parameter state must be type-stable against the solver's ``x0`` (same
     pytree structure, shapes, and dtypes) -- construct the module with a matching
@@ -106,34 +113,40 @@ class DrawNNXModule:
     ``nnx.GraphDef`` used by the residual's ``nnx.merge`` must come from the same
     ``module_cls(*args, **kwargs)`` spec.
 
-    Value-hashable on ``(module_cls, args, kwargs)`` with jit's strict-type semantics
-    (``1``, ``1.0``, and ``True`` key distinct compilations): equal specs compare equal
-    and share one jit compilation instead of recompiling per instance (a fresh closure
-    would not). ``args``/``kwargs`` must be hashable for that sharing, and their values
-    must not be mutated after construction (a stale key would reuse the wrong compile);
-    unhashable specs still work but recompile per instance. Requires ``flax`` installed
-    (imported lazily on first draw).
+    Value-hashable on ``(module_cls, wrt, args, kwargs)`` with jit's strict-type
+    semantics (``1``, ``1.0``, and ``True`` key distinct compilations): equal specs
+    compare equal and share one jit compilation instead of recompiling per instance
+    (a fresh closure would not). ``args``/``kwargs`` must be hashable for that
+    sharing, and their values must not be mutated after construction (a stale key
+    would reuse the wrong compile); unhashable specs still work but recompile per
+    instance. Requires ``flax`` installed (imported lazily on first draw).
     """
 
-    def __init__(self, module_cls, *args, **kwargs):
+    def __init__(self, module_cls, *args, wrt=None, **kwargs):
         self.module_cls = module_cls
         self.args = args
+        # None means nnx.Param, resolved at draw time to keep the flax import lazy.
+        self.wrt = wrt
         self.kwargs = tuple(sorted(kwargs.items()))
 
     def __call__(self, key, x_old, args_old):
         from flax import nnx
 
         module = self.module_cls(*self.args, rngs=nnx.Rngs(key), **dict(self.kwargs))
-        _, theta, _ = nnx.split(module, nnx.Param, ...)
+        wrt = nnx.Param if self.wrt is None else self.wrt
+        _, theta, _ = nnx.split(module, wrt, ...)
         return theta, args_old
 
     def __hash__(self):
-        return hash((self.module_cls, _typed_key(self.args), _typed_key(self.kwargs)))
+        return hash(
+            (self.module_cls, self.wrt, _typed_key(self.args), _typed_key(self.kwargs))
+        )
 
     def __eq__(self, other):
         return (
             isinstance(other, DrawNNXModule)
             and self.module_cls is other.module_cls
+            and self.wrt == other.wrt
             and _typed_key(self.args) == _typed_key(other.args)
             and _typed_key(self.kwargs) == _typed_key(other.kwargs)
         )
