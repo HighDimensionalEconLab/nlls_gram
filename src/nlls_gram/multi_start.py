@@ -44,30 +44,39 @@ class MultiStartInfo:
 class MultiStart:
     """Multi-start configuration for ``solve(multi_start=...)``.
 
-    ``draw(key, x, args) -> (x_new, args_new)`` generates a fresh initial
-    condition; it must be traceable and type-stable (returning the same pytree
-    structure, shapes, and dtypes as its ``(x, args)`` inputs). ``accept(key,
-    result) -> bool`` optionally overrides the success test (default:
-    ``CONVERGED`` plus ``MAX_STEPS`` when the solve's
-    ``max_steps_is_success=True``); it receives its own key so it can draw fresh
-    validation data, and may return any scalar boolean-like value.
-    Sequential mode (``parallel=False``) solves from ``(x0, args)`` and retries
-    on failure, chaining each attempt's *initial* values into the next
-    ``draw``; parallel mode solves all ``num_starts`` lanes under ``vmap``
-    (lane 0 = the caller's ``(x0, args)``, the rest drawn from the originals)
-    and selects the accepted lane with the lowest loss. The key schedule is
-    ``draw_key, accept_key = jax.random.split(jax.random.fold_in(key, k))``
-    for attempt ``k``.
+    Two attempt-boundary hooks, each optional but at least one required when
+    ``num_starts > 1``: ``draw(key, x, args) -> x_new`` generates a fresh
+    initial condition (``args`` is read-only context), and
+    ``reset_args(key, args) -> args_new`` re-initializes attempt-local solver
+    args (carried RNG streams, epoch counters, schedule state). Each must be
+    traceable and type-stable against its own input (``x`` for ``draw``,
+    ``args`` for ``reset_args``); an omitted hook passes its input through
+    unchanged. ``accept(key, result) -> bool`` optionally overrides the
+    success test (default: ``CONVERGED`` plus ``MAX_STEPS`` when the solve's
+    ``max_steps_is_success=True``); it receives its own key so it can draw
+    fresh validation data, and may return any scalar boolean-like value.
+    Sequential mode (``parallel=False``) solves from ``(x0, args)`` and
+    retries on failure, chaining each attempt's *initial* values into the next
+    hooks (``draw`` sees the previous attempt's initial args, never the
+    current attempt's reset output); parallel mode solves all ``num_starts``
+    lanes under ``vmap`` (lane 0 = the caller's ``(x0, args)``, the rest
+    drawn/reset from the originals) and selects the accepted lane with the
+    lowest loss. The key schedule is ``draw_key, accept_key, reset_key =
+    jax.random.split(jax.random.fold_in(key, k), 3)`` for attempt ``k``. A
+    ``reset_args`` that ignores its key and advances only a key carried
+    inside args resets every parallel retry lane identically; use the
+    per-lane ``reset_key`` when lanes must differ.
 
-    ``draw`` and ``accept`` enter the jit cache by identity (like
-    ``callback``): define them once at setup scope, not inline per call.
-    ``MultiStart`` is not a pytree -- ``solve`` unpacks it before tracing, with
-    ``key`` the only traced field.
+    ``draw``, ``reset_args``, and ``accept`` enter the jit cache by identity
+    (like ``callback``): define them once at setup scope, not inline per
+    call. ``MultiStart`` is not a pytree -- ``solve`` unpacks it before
+    tracing, with ``key`` the only traced field.
     """
 
     key: Any
     num_starts: int
     draw: Any = None
+    reset_args: Any = None
     accept: Any = None
     parallel: bool = False
 
@@ -76,15 +85,16 @@ class MultiStart:
             raise ValueError("num_starts must be a Python int >= 1")
         if self.num_starts < 1:
             raise ValueError("num_starts must be a Python int >= 1")
-        if self.num_starts > 1 and self.draw is None:
+        if self.num_starts > 1 and self.draw is None and self.reset_args is None:
             raise ValueError(
-                "num_starts > 1 requires draw; pass "
-                "draw=(key, x, args) -> (x_new, args_new)"
+                "num_starts > 1 requires draw and/or reset_args; pass "
+                "draw=(key, x, args) -> x_new and/or "
+                "reset_args=(key, args) -> args_new"
             )
-        if self.draw is not None and not callable(self.draw):
-            raise TypeError("draw must be callable")
-        if self.accept is not None and not callable(self.accept):
-            raise TypeError("accept must be callable")
+        for name in ("draw", "reset_args", "accept"):
+            hook = getattr(self, name)
+            if hook is not None and not callable(hook):
+                raise TypeError(f"{name} must be callable")
 
 
 class DrawNNXModule:
@@ -92,8 +102,9 @@ class DrawNNXModule:
 
     Given a ``MultiStart`` retry key, builds
     ``module_cls(*args, rngs=nnx.Rngs(key), **kwargs)`` and returns its ``wrt``
-    state (default ``nnx.Param``) as the new solver start, passing ``args``
-    through unchanged. Non-``Param`` Variables (scaling constants, statistics)
+    state (default ``nnx.Param``) as the new solver start; the ``(x_old,
+    args_old)`` inputs are ignored. Non-``Param`` Variables (scaling
+    constants, statistics)
     are excluded from the drawn state -- the residual's ``nnx.merge`` supplies
     them alongside the graphdef. Use it instead of hand-rolling a re-init
     closure per driver::
@@ -135,7 +146,7 @@ class DrawNNXModule:
         module = self.module_cls(*self.args, rngs=nnx.Rngs(key), **dict(self.kwargs))
         wrt = nnx.Param if self.wrt is None else self.wrt
         _, theta, _ = nnx.split(module, wrt, ...)
-        return theta, args_old
+        return theta
 
     def __hash__(self):
         return hash(
@@ -182,15 +193,20 @@ def _type_spec(tree):
     return treedef, specs
 
 
-def _check_drawn_types(x, args, drawn):
-    # Works on concrete draws and on jax.eval_shape outputs alike; a mismatch
-    # would otherwise surface as an inscrutable while_loop/vmap error.
-    if _type_spec(drawn) != _type_spec((x, args)):
+def _check_hook_types(name, contract, expected, got):
+    # Works on concrete hook outputs and on jax.eval_shape outputs alike; a
+    # mismatch would otherwise surface as an inscrutable while_loop/vmap error.
+    if _type_spec(got) != _type_spec(expected):
         raise ValueError(
-            "multi_start.draw must return (x, args) matching the structure, "
-            f"shapes, and dtypes of its inputs; expected {_type_spec((x, args))}, "
-            f"got {_type_spec(drawn)}"
+            f"multi_start.{name} must return {contract} matching the structure, "
+            f"shapes, and dtypes of its input; expected {_type_spec(expected)}, "
+            f"got {_type_spec(got)}"
         )
+
+
+def _attempt_keys(key, attempt):
+    # The documented per-attempt schedule: (draw_key, accept_key, reset_key).
+    return jax.random.split(jax.random.fold_in(key, attempt), 3)
 
 
 def _multi_start_python_impl(
@@ -209,6 +225,7 @@ def _multi_start_python_impl(
     callback,
     num_starts,
     draw,
+    reset_args,
     accept,
     parallel,
 ):
@@ -230,7 +247,7 @@ def _multi_start_python_impl(
             xtol,
             callback,
         )
-        accept_key = jax.random.split(jax.random.fold_in(key, attempt))[1]
+        accept_key = _attempt_keys(key, attempt)[1]
         loss = solver._ranking_objective(result, p, callback)
         success = _attempt_success(accept_fn, accept_key, result, loss)
         return result, loss, bool(success)
@@ -242,9 +259,13 @@ def _multi_start_python_impl(
             if lane == 0:
                 x_l, args_l = x, args
             else:
-                draw_key = jax.random.split(jax.random.fold_in(key, lane))[0]
-                x_l, args_l = draw(draw_key, x, args)
-                _check_drawn_types(x, args, (x_l, args_l))
+                keys = _attempt_keys(key, lane)
+                x_l = x if draw is None else draw(keys[0], x, args)
+                args_l = args if reset_args is None else reset_args(keys[2], args)
+                if draw is not None:
+                    _check_hook_types("draw", "x", x, x_l)
+                if reset_args is not None:
+                    _check_hook_types("reset_args", "args", args, args_l)
             result, loss, success = run_attempt(x_l, cold, args_l, lane)
             better = (
                 best is None
@@ -259,9 +280,17 @@ def _multi_start_python_impl(
         x_a, args_a, lm_state_a = x, args, lm_state
         for attempt in range(num_starts):
             if attempt > 0:
-                draw_key = jax.random.split(jax.random.fold_in(key, attempt))[0]
-                x_a, args_a = draw(draw_key, x_a, args_a)
-                _check_drawn_types(x, args, (x_a, args_a))
+                keys = _attempt_keys(key, attempt)
+                # draw sees the previous attempt's initial args, pre-reset.
+                x_next = x_a if draw is None else draw(keys[0], x_a, args_a)
+                args_next = (
+                    args_a if reset_args is None else reset_args(keys[2], args_a)
+                )
+                if draw is not None:
+                    _check_hook_types("draw", "x", x, x_next)
+                if reset_args is not None:
+                    _check_hook_types("reset_args", "args", args, args_next)
+                x_a, args_a = x_next, args_next
                 lm_state_a = cold
             result, loss, success = run_attempt(x_a, lm_state_a, args_a, attempt)
             take = (
@@ -301,6 +330,7 @@ def _multi_start_sequential_impl(
     xtol,
     callback,
     draw,
+    reset_args,
     accept,
 ):
     accept_fn = accept
@@ -320,7 +350,7 @@ def _multi_start_sequential_impl(
             xtol,
             callback,
         )
-        accept_key = jax.random.split(jax.random.fold_in(key, attempt))[1]
+        accept_key = _attempt_keys(key, attempt)[1]
         loss = solver._ranking_objective(result, p, callback)
         success = _attempt_success(accept_fn, accept_key, result, loss)
         # p is loop-invariant: splice it out of the carried result and
@@ -329,7 +359,7 @@ def _multi_start_sequential_impl(
 
     zero = jnp.asarray(0, dtype=jnp.int32)
     best, best_loss, done = run_attempt(x, lm_state, args, zero)
-    if draw is None:
+    if draw is None and reset_args is None:
         info = MultiStartInfo(zero, done, jnp.asarray(1, dtype=jnp.int32), best_loss)
         return dataclasses.replace(best, p=p, multi_start=info)
 
@@ -341,8 +371,10 @@ def _multi_start_sequential_impl(
 
     def body(carry):
         attempt, x_prev, args_prev, best, best_loss, best_attempt, _ = carry
-        draw_key = jax.random.split(jax.random.fold_in(key, attempt))[0]
-        x_next, args_next = draw(draw_key, x_prev, args_prev)
+        keys = _attempt_keys(key, attempt)
+        # draw sees the previous attempt's initial args, pre-reset.
+        x_next = x_prev if draw is None else draw(keys[0], x_prev, args_prev)
+        args_next = args_prev if reset_args is None else reset_args(keys[2], args_prev)
         result, loss, success = run_attempt(x_next, cold, args_next, attempt)
         # First success wins (the loop exits); among failures keep the lowest
         # masked loss, and an all-inf history always yields to the newest
@@ -384,22 +416,32 @@ def _multi_start_parallel_impl(
     xtol,
     callback,
     draw,
+    reset_args,
     accept,
     num_starts,
 ):
     accept_fn = accept
     lanes = jnp.arange(num_starts, dtype=jnp.int32)
     attempt_keys = jax.vmap(lambda i: jax.random.fold_in(key, i))(lanes)
-    lane_keys = jax.vmap(jax.random.split)(attempt_keys)
+    lane_keys = jax.vmap(lambda k: jax.random.split(k, 3))(attempt_keys)
     accept_keys = lane_keys[:, 1]
     draw_keys = lane_keys[1:, 0]
-    xs_drawn, args_drawn = jax.vmap(lambda k: draw(k, x, args))(draw_keys)
+    reset_keys = lane_keys[1:, 2]
 
     def prepend(first, rest):
         return jnp.concatenate([jnp.asarray(first)[None], rest], axis=0)
 
-    xs = jax.tree.map(prepend, x, xs_drawn)
-    args_lanes = None if args is None else jax.tree.map(prepend, args, args_drawn)
+    # An omitted hook leaves its input unbatched (vmapped with in_axes=None).
+    if draw is None:
+        xs, x_axis = x, None
+    else:
+        xs_drawn = jax.vmap(lambda k: draw(k, x, args))(draw_keys)
+        xs, x_axis = jax.tree.map(prepend, x, xs_drawn), 0
+    if reset_args is None or args is None:
+        args_lanes, args_axis = args, None
+    else:
+        args_reset = jax.vmap(lambda k: reset_args(k, args))(reset_keys)
+        args_lanes, args_axis = jax.tree.map(prepend, args, args_reset), 0
     # Under vmap the cache-reuse cond lowers to a select that evaluates both
     # branches, so a warm Jacobian cache cannot save work: drop it uniformly.
     cold = solver._cold_state(lm_state)
@@ -423,9 +465,9 @@ def _multi_start_parallel_impl(
         success = _attempt_success(accept_fn, accept_key, result, loss)
         return dataclasses.replace(result, p=None), loss, success
 
-    results, losses, successes = jax.vmap(
-        solve_lane, in_axes=(0, None if args is None else 0, 0)
-    )(xs, args_lanes, accept_keys)
+    results, losses, successes = jax.vmap(solve_lane, in_axes=(x_axis, args_axis, 0))(
+        xs, args_lanes, accept_keys
+    )
 
     # Lowest masked loss among successful lanes; with none, lowest loss
     # overall (all-inf falls back to lane 0). argmin ties break low-index.
@@ -446,8 +488,8 @@ def _multi_start_parallel_impl(
 
 
 _multi_start_sequential_jit = jax.jit(
-    _multi_start_sequential_impl, static_argnums=(0, 8, 13, 14, 15)
+    _multi_start_sequential_impl, static_argnums=(0, 8, 13, 14, 15, 16)
 )
 _multi_start_parallel_jit = jax.jit(
-    _multi_start_parallel_impl, static_argnums=(0, 7, 12, 13, 14, 15)
+    _multi_start_parallel_impl, static_argnums=(0, 7, 12, 13, 14, 15, 16)
 )

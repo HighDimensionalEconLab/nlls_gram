@@ -23,7 +23,7 @@ from nlls_gram.multi_start import (
     MultiStart,
     _accept_converged,
     _accept_converged_or_max_steps,
-    _check_drawn_types,
+    _check_hook_types,
     _multi_start_parallel_jit,
     _multi_start_python_impl,
     _multi_start_sequential_jit,
@@ -500,6 +500,9 @@ class LevenbergMarquardtBase:
         if multi_start is not None:
             num_starts = multi_start.num_starts
             draw = _hashable_hook(multi_start.draw if num_starts > 1 else None)
+            reset_args = _hashable_hook(
+                multi_start.reset_args if num_starts > 1 else None
+            )
             default_accept = (
                 _accept_converged_or_max_steps
                 if max_steps_is_success
@@ -509,9 +512,13 @@ class LevenbergMarquardtBase:
                 default_accept if multi_start.accept is None else multi_start.accept
             )
             parallel = multi_start.parallel and num_starts > 1
-            if draw is not None and jit:
-                drawn = jax.eval_shape(draw, multi_start.key, x0, args)
-                _check_drawn_types(x0, args, drawn)
+            if jit:
+                if draw is not None:
+                    drawn = jax.eval_shape(draw, multi_start.key, x0, args)
+                    _check_hook_types("draw", "x", x0, drawn)
+                if reset_args is not None:
+                    reset = jax.eval_shape(reset_args, multi_start.key, args)
+                    _check_hook_types("reset_args", "args", args, reset)
 
             @jax.custom_jvp
             def solve_multi_start_with_ad_p(
@@ -533,6 +540,7 @@ class LevenbergMarquardtBase:
                     jit,
                     num_starts,
                     draw,
+                    reset_args,
                     accept,
                     parallel,
                 )
@@ -657,6 +665,7 @@ class LevenbergMarquardtBase:
         jit,
         num_starts,
         draw,
+        reset_args,
         accept,
         parallel,
     ):
@@ -677,6 +686,7 @@ class LevenbergMarquardtBase:
                 callback,
                 num_starts,
                 draw,
+                reset_args,
                 accept,
                 parallel,
             )
@@ -696,6 +706,7 @@ class LevenbergMarquardtBase:
                 xtol,
                 callback,
                 draw,
+                reset_args,
                 accept,
                 num_starts,
             )
@@ -715,6 +726,7 @@ class LevenbergMarquardtBase:
             xtol,
             callback,
             draw,
+            reset_args,
             accept,
         )
 

@@ -134,7 +134,7 @@ def multi_start_residual(theta, args, p):
 
 
 def multi_start_draw(key, x, args):
-    return jax.random.uniform(key, x.shape, x.dtype, 0.5, 3.0), args
+    return jax.random.uniform(key, x.shape, x.dtype, 0.5, 3.0)
 
 
 def test_parallel_multi_start_runs_on_gpu():

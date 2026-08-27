@@ -173,7 +173,7 @@ def test_failed_status_returns_zero_tangents():
 
 
 def draw_perturbed(key, x, args):
-    return x + 0.1 * jax.random.normal(key, x.shape, dtype=x.dtype), args
+    return x + 0.1 * jax.random.normal(key, x.shape, dtype=x.dtype)
 
 
 def test_multi_start_gradient_flows_through_the_winner():

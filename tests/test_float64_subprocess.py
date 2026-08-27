@@ -229,7 +229,7 @@ assert int(cb_result.status) == LMStatus.CONVERGED, int(cb_result.status)
 
 
 def draw_zeros(key, x, args):
-    return jnp.zeros_like(x), args
+    return jnp.zeros_like(x)
 
 
 solver = LevenbergMarquardt(residual_fn, init_damping=1e-2)

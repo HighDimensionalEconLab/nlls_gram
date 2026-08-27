@@ -133,12 +133,12 @@ def test_save_steps_histories():
 
 
 def draw_perturbed(key, x, args):
-    return x + 0.1 * jax.random.normal(key, x.shape, dtype=x.dtype), args
+    return x + 0.1 * jax.random.normal(key, x.shape, dtype=x.dtype)
 
 
 def draw_nan_recovery(key, x, args):
     fresh = 0.5 * jax.random.normal(key, x.shape, dtype=x.dtype)
-    return fresh, args
+    return fresh
 
 
 @pytest.mark.parametrize("parallel", [False, True])

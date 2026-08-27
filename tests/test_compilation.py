@@ -231,7 +231,7 @@ def test_matrix_free_path_never_factorizes():
 
 
 def draw_shifted(key, x, args):
-    return x + 0.1 * jax.random.normal(key, x.shape, x.dtype), args
+    return x + 0.1 * jax.random.normal(key, x.shape, x.dtype)
 
 
 def test_multi_start_reuses_its_driver_compilation():

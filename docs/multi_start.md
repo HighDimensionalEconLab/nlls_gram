@@ -16,8 +16,9 @@ def residual(theta, args, p):
     return theta[0] ** 2 - p  # stalls when started at theta = 0
 
 def draw(key, x, args):
-    # Fresh initial condition; args may be redrawn too (see below).
-    return jax.random.uniform(key, x.shape, x.dtype, 0.5, 3.0), args
+    # Fresh initial condition; attempt-local args state has its own hook
+    # (reset_args, below).
+    return jax.random.uniform(key, x.shape, x.dtype, 0.5, 3.0)
 
 solver = LevenbergMarquardt(residual)
 ms = MultiStart(key=jax.random.key(0), num_starts=5, draw=draw)
@@ -26,7 +27,7 @@ result.multi_start.attempt        # which start won (0 = your x0)
 result.multi_start.attempts_run   # how many solves actually ran
 ```
 
-`draw` and `accept` are jit **static** arguments, so they key the compile by
+`draw`, `reset_args`, and `accept` are jit **static** arguments, so they key the compile by
 their `__hash__`/`__eq__`. Plain functions, lambdas, and closures hash **by
 identity** — define them once at setup scope, never as fresh lambdas at the
 call site, or each one recompiles. A value-hashable hook keys by value instead:
@@ -38,34 +39,45 @@ keys, new `x0`/`args` values, and (in sequential mode) a different
 `num_starts = 1` to `N > 1` (or back) compiles once more: the single-start
 form never draws, so it is a structurally different program.
 
-## The draw contract
+## The draw and reset_args contracts
 
 ```python
 def draw(key, x_old, args_old):
     ...
-    return x_new, args_new
+    return x_new
+
+
+def reset_args(key, args_old):
+    ...
+    return args_new
 ```
 
-`draw` must be traceable and **type-stable**: the returned `(x, args)` must
-match the input pytree structure, shapes, and dtypes exactly (checked up front
-with an abstract `jax.eval_shape` trace under `jit=True`; the first concrete
-draw is checked under `jit=False`). What it draws is up to you — reinitialize
-a network, perturb the previous start, resample the data inside `args`, or any
-combination. `p` is deliberately **not** an input and cannot change across
-starts: it is the differentiation target, and the implicit gradient is taken
-at a single fixed `p`.
+Two independent attempt-boundary hooks; each is optional, and `num_starts > 1`
+requires at least one. `draw` generates a fresh initial condition (`args_old`
+is read-only context — drawing bounds or scales carried in args); `reset_args`
+re-initializes attempt-local solver args (carried RNG streams, epoch
+counters, annealing-schedule state — anything an in-solve `callback` mutates
+that a retry must not inherit). An omitted hook passes its input through
+unchanged. Both must be traceable and **type-stable** against their own input
+— `x` for `draw`, `args` for `reset_args` (checked up front with an abstract
+`jax.eval_shape` trace under `jit=True`; the first concrete call is checked
+under `jit=False`). `p` is deliberately **not** an input and cannot change
+across starts: it is the differentiation target, and the implicit gradient is
+taken at a single fixed `p`.
 
-In **sequential** mode `draw` receives the previous attempt's *initial*
-values — the original `(x0, args)` for the first retry, then each drawn
-`(x, args)` in turn — never the solver-mutated `result.x`/`result.args`. In
-**parallel** mode every lane draws from the original `(x0, args)`.
+In **sequential** mode both hooks receive the previous attempt's *initial*
+values — the original `(x0, args)` for the first retry, then each attempt's
+drawn/reset values in turn — never the solver-mutated
+`result.x`/`result.args`, and `draw` sees the previous attempt's initial
+args, not the current attempt's reset output. In **parallel** mode every
+lane draws and resets from the original `(x0, args)`.
 
 A flax `nnx` reinitialization draw:
 
 ```python
 def draw(key, x_old, args_old):
     _, theta = nnx.split(PolicyMLP(settings, rngs=nnx.Rngs(key)), nnx.Param)
-    return theta, args_old
+    return theta
 ```
 
 `DrawNNXModule` packages exactly this draw so you skip the per-driver closure:
@@ -77,24 +89,30 @@ draw = DrawNNXModule(PolicyMLP, settings, dtype=dtype)  # equal specs share one 
 ```
 
 It rebuilds `module_cls(*args, rngs=nnx.Rngs(key), **kwargs)` on each retry and returns its
-`nnx.Param` state, passing `args` through unchanged. The drawn state must be type-stable against
+`nnx.Param` state. The drawn state must be type-stable against
 `x0` (same structure, shapes, dtypes), so construct the module with a matching `param_dtype`/`dtype`
 (e.g. thread `dtype=` through). Unlike a fresh closure it is **value-hashable** on
 `(module_cls, args, kwargs)`, so equal specs share a single jit compilation instead of recompiling.
 
-A data-resampling draw (mv2020 style), threading a key inside `args`:
+A data-resampling reset (mv2020 style), composing with any draw:
 
 ```python
-def draw(key, x_old, args_old):
-    init_key, exo_key, carry_key = jax.random.split(key, 3)
-    _, theta = nnx.split(PolicyMLP(settings, rngs=nnx.Rngs(init_key)), nnx.Param)
-    args_new = args_old.replace(
+def reset_args(key, args_old):
+    exo_key, carry_key = jax.random.split(key)
+    return args_old.replace(
         exo=simulate_markov_chain(exo_key, s_0, P_cumsum, train_T),
         key=carry_key,
         epoch=jnp.asarray(0, jnp.int32),
     )
-    return theta, args_new
+
+
+ms = MultiStart(key=key, num_starts=5, draw=draw, reset_args=reset_args)
 ```
+
+A `reset_args` that ignores its key and chains a key carried inside `args`
+(reproducible attempt streams seeded independently of the multi-start key) is
+fine sequentially, but resets every parallel retry lane identically — use the
+per-lane key when lanes must differ.
 
 ## The accept hook
 
@@ -147,23 +165,23 @@ The ranking loss is the sum of squared residuals at the returned solution
 `callback` is present), masked to `+inf` when nonfinite; ties break to the
 lowest attempt index. `MultiStartInfo.loss` records the winner's value.
 
-Identical `draw` keys are used in both modes (below), so a draw that ignores
-`(x_old, args_old)` produces the same candidate starts sequentially and in
-parallel; the modes still may pick different winners (first-accepted vs
-best-of-batch).
+Identical hook keys are used in both modes (below), so hooks that ignore
+their previous-attempt inputs produce the same candidate starts sequentially
+and in parallel; the modes still may pick different winners (first-accepted
+vs best-of-batch).
 
 ## Key schedule
 
 For attempt/lane `k`:
 
 ```python
-draw_key, accept_key = jax.random.split(jax.random.fold_in(key, k))
+draw_key, accept_key, reset_key = jax.random.split(jax.random.fold_in(key, k), 3)
 ```
 
 Attempt 0 is always the caller's `(x0, args)` and never consumes its
-`draw_key`. The schedule is a documented contract (pinned by tests), so runs
-are reproducible and an attempt's draws do not depend on how many attempts ran
-before it.
+`draw_key`/`reset_key`. The schedule is a documented contract (pinned by
+tests), so runs are reproducible and an attempt's draws do not depend on how
+many attempts ran before it.
 
 ## Differentiation
 

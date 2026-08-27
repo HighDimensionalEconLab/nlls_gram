@@ -46,27 +46,27 @@ def residual_nan(theta, args, p):
 
 
 def draw_normal(key, x, args):
-    return jax.random.normal(key, x.shape, x.dtype), args
+    return jax.random.normal(key, x.shape, x.dtype)
 
 
 def draw_chain(key, x, args):
-    return 0.3 * x + jax.random.normal(key, x.shape, x.dtype), args
+    return 0.3 * x + jax.random.normal(key, x.shape, x.dtype)
 
 
 def draw_uniform(key, x, args):
-    return jax.random.uniform(key, x.shape, x.dtype, -3.0, 3.0), args
+    return jax.random.uniform(key, x.shape, x.dtype, -3.0, 3.0)
 
 
 def draw_zeros(key, x, args):
-    return jnp.zeros_like(x), args
+    return jnp.zeros_like(x)
 
 
 def draw_constant(key, x, args):
-    return x, args
+    return x
 
 
 def draw_jump(key, x, args):
-    return jax.random.uniform(key, x.shape, x.dtype, 1.5, 3.0), args
+    return jax.random.uniform(key, x.shape, x.dtype, 1.5, 3.0)
 
 
 def accept_deep_basin(key, result):
@@ -86,7 +86,7 @@ CALLS = {"draw": 0, "accept": 0}
 
 def counting_draw(key, x, args):
     CALLS["draw"] += 1
-    return jax.random.normal(key, x.shape, x.dtype), args
+    return jax.random.normal(key, x.shape, x.dtype)
 
 
 def counting_accept(key, result):
@@ -97,6 +97,8 @@ def counting_accept(key, result):
 RECORDED_ACCEPT_KEYS = []
 RECORDED_DRAW_KEYS = []
 RECORDED_DRAW_INPUTS = []
+RECORDED_RESET_KEYS = []
+RECORDED_RESET_INPUTS = []
 
 
 def recording_accept(key, result):
@@ -107,12 +109,18 @@ def recording_accept(key, result):
 def recording_draw(key, x, args):
     RECORDED_DRAW_KEYS.append(key)
     RECORDED_DRAW_INPUTS.append((x, args))
-    return 0.5 * x - 1.0, args
+    return 0.5 * x - 1.0
+
+
+def recording_reset(key, args):
+    RECORDED_RESET_KEYS.append(key)
+    RECORDED_RESET_INPUTS.append(args)
+    return args + 1.0
 
 
 def attempt_subkeys(key, k):
-    draw_key, accept_key = jax.random.split(jax.random.fold_in(key, k))
-    return draw_key, accept_key
+    draw_key, accept_key, reset_key = jax.random.split(jax.random.fold_in(key, k), 3)
+    return draw_key, accept_key, reset_key
 
 
 def keys_equal(a, b):
@@ -199,7 +207,7 @@ def test_sequential_all_fail_returns_best_finite_loss():
     manual = []
     for k in range(num_starts):
         if k > 0:
-            x_a, _ = draw_chain(attempt_subkeys(key, k)[0], x_a, None)
+            x_a = draw_chain(attempt_subkeys(key, k)[0], x_a, None)
         manual.append(solver.solve(x_a, p=p, max_steps=2, atol=1e-9))
     losses = jnp.array([float(r.info.loss) for r in manual])
     expected = int(jnp.argmin(losses))
@@ -285,18 +293,25 @@ def test_accept_true_on_nonfinite_result_never_wins(parallel):
     assert not bool(result.multi_start.accepted)
 
 
-def test_accept_and_draw_receive_documented_key_schedule():
+def test_hooks_receive_documented_key_schedule():
     RECORDED_ACCEPT_KEYS.clear()
     RECORDED_DRAW_KEYS.clear()
     RECORDED_DRAW_INPUTS.clear()
+    RECORDED_RESET_KEYS.clear()
+    RECORDED_RESET_INPUTS.clear()
     solver = LevenbergMarquardt(residual_inconsistent, init_damping=1.0)
     key = jax.random.key(7)
     num_starts = 3
     ms = MultiStart(
-        key=key, num_starts=num_starts, draw=recording_draw, accept=recording_accept
+        key=key,
+        num_starts=num_starts,
+        draw=recording_draw,
+        reset_args=recording_reset,
+        accept=recording_accept,
     )
     solver.solve(
         jnp.array([0.0]),
+        jnp.asarray(0.5),
         p=jnp.asarray(0.0),
         max_steps=3,
         atol=1e-9,
@@ -306,16 +321,20 @@ def test_accept_and_draw_receive_documented_key_schedule():
 
     assert len(RECORDED_ACCEPT_KEYS) == num_starts
     assert len(RECORDED_DRAW_KEYS) == num_starts - 1
+    assert len(RECORDED_RESET_KEYS) == num_starts - 1
     for k in range(num_starts):
         assert keys_equal(RECORDED_ACCEPT_KEYS[k], attempt_subkeys(key, k)[1])
     for k in range(1, num_starts):
         assert keys_equal(RECORDED_DRAW_KEYS[k - 1], attempt_subkeys(key, k)[0])
+        assert keys_equal(RECORDED_RESET_KEYS[k - 1], attempt_subkeys(key, k)[2])
 
 
-def test_sequential_draw_receives_previous_initial_values():
+def test_sequential_hooks_receive_previous_initial_values():
     RECORDED_ACCEPT_KEYS.clear()
     RECORDED_DRAW_KEYS.clear()
     RECORDED_DRAW_INPUTS.clear()
+    RECORDED_RESET_KEYS.clear()
+    RECORDED_RESET_INPUTS.clear()
 
     def residual(theta, args, p):
         return jnp.array([theta[0] - args, theta[0] - args - 10.0])
@@ -326,7 +345,12 @@ def test_sequential_draw_receives_previous_initial_values():
     solver = LevenbergMarquardt(residual, init_damping=1.0)
     x0 = jnp.array([2.0])
     args0 = jnp.asarray(0.5)
-    ms = MultiStart(key=jax.random.key(8), num_starts=3, draw=recording_draw)
+    ms = MultiStart(
+        key=jax.random.key(8),
+        num_starts=3,
+        draw=recording_draw,
+        reset_args=recording_reset,
+    )
     result = solver.solve(
         x0,
         args0,
@@ -338,15 +362,19 @@ def test_sequential_draw_receives_previous_initial_values():
         jit=False,
     )
 
-    # draw sees each attempt's INITIAL (x, args) -- the previous draw's output
-    # chain -- never the callback-mutated finals.
+    # Both hooks see each attempt's INITIAL values -- the previous hooks'
+    # output chain -- never the callback-mutated finals; draw sees the
+    # previous attempt's initial args, not the current attempt's reset.
     assert len(RECORDED_DRAW_INPUTS) == 2
+    assert len(RECORDED_RESET_INPUTS) == 2
     x_in_1, args_in_1 = RECORDED_DRAW_INPUTS[0]
     x_in_2, args_in_2 = RECORDED_DRAW_INPUTS[1]
     assert jnp.allclose(x_in_1, x0)
     assert jnp.allclose(args_in_1, args0)
     assert jnp.allclose(x_in_2, 0.5 * x0 - 1.0)
-    assert jnp.allclose(args_in_2, args0)
+    assert jnp.allclose(args_in_2, args0 + 1.0)
+    assert jnp.allclose(RECORDED_RESET_INPUTS[0], args0)
+    assert jnp.allclose(RECORDED_RESET_INPUTS[1], args0 + 1.0)
     # The returned result carries the winner's final (mutated) args.
     assert float(result.args) > float(args0)
 
@@ -376,8 +404,7 @@ def test_parallel_matches_manual_vmap_recipe():
     result = solver.solve(x0, max_steps=100, gtol=1e-4, multi_start=ms)
 
     lanes = [x0] + [
-        draw_uniform(attempt_subkeys(key, k)[0], x0, None)[0]
-        for k in range(1, num_starts)
+        draw_uniform(attempt_subkeys(key, k)[0], x0, None) for k in range(1, num_starts)
     ]
     batched = jax.vmap(lambda x: solver.solve(x, max_steps=100, gtol=1e-4))(
         jnp.stack(lanes)
@@ -424,8 +451,7 @@ def test_parallel_all_fail_and_all_nonfinite_fallbacks():
     )
 
     lanes = [x0] + [
-        draw_chain(attempt_subkeys(key, k)[0], x0, None)[0]
-        for k in range(1, num_starts)
+        draw_chain(attempt_subkeys(key, k)[0], x0, None) for k in range(1, num_starts)
     ]
     losses = jnp.array(
         [float(solver.solve(x, p=p, max_steps=2, atol=1e-9).info.loss) for x in lanes]
@@ -617,18 +643,29 @@ def test_multi_start_validation_errors():
         MultiStart(key=key, num_starts=2)
     with pytest.raises(TypeError, match="draw must be callable"):
         MultiStart(key=key, num_starts=2, draw=5)
+    with pytest.raises(TypeError, match="reset_args must be callable"):
+        MultiStart(key=key, num_starts=1, reset_args=5)
     with pytest.raises(TypeError, match="accept must be callable"):
         MultiStart(key=key, num_starts=1, accept=5)
+    # Either hook alone satisfies the num_starts > 1 requirement.
+    MultiStart(key=key, num_starts=2, reset_args=recording_reset)
 
     solver = LevenbergMarquardt(residual_linear, init_damping=1e-2)
     x0 = jnp.zeros(2)
 
     def bad_draw(key, x, args):
-        return x[:1], args
+        return x[:1]
 
     bad = MultiStart(key=key, num_starts=2, draw=bad_draw)
     with pytest.raises(ValueError, match="draw must return"):
         solver.solve(x0, p=jnp.asarray(3.0), atol=1e-6, multi_start=bad)
+
+    def bad_reset(key, args):
+        return (args, args)
+
+    bad_reset_ms = MultiStart(key=key, num_starts=2, reset_args=bad_reset)
+    with pytest.raises(ValueError, match="reset_args must return"):
+        solver.solve(x0, p=jnp.asarray(3.0), atol=1e-6, multi_start=bad_reset_ms)
 
     def vector_accept(key, result):
         return jnp.array([True, False])
@@ -677,14 +714,14 @@ def test_save_steps_composes_with_multi_start():
 
 
 @pytest.mark.parametrize("parallel", [False, True])
-def test_mv2020_style_draw_resamples_args(parallel):
+def test_mv2020_style_reset_resamples_args(parallel):
     def residual(theta, args, p):
         return theta - args["data"] * p
 
-    def draw_resample(key, x, args):
+    def reset_resample(key, args):
         data_key, carry_key = jax.random.split(key)
         data = jax.random.normal(data_key, args["data"].shape, args["data"].dtype)
-        return jnp.zeros_like(x), {"data": data, "key": carry_key}
+        return {"data": data, "key": carry_key}
 
     def resample_callback(ctx):
         def fresh(_):
@@ -702,7 +739,11 @@ def test_mv2020_style_draw_resamples_args(parallel):
     x0 = jnp.array([jnp.nan, jnp.nan, jnp.nan])  # forces one retry
     p = jnp.asarray(2.0)
     ms = MultiStart(
-        key=jax.random.key(23), num_starts=3, draw=draw_resample, parallel=parallel
+        key=jax.random.key(23),
+        num_starts=3,
+        draw=draw_zeros,
+        reset_args=reset_resample,
+        parallel=parallel,
     )
 
     def solved(p_value):
@@ -719,7 +760,7 @@ def test_mv2020_style_draw_resamples_args(parallel):
     result = solved(p)
     assert int(result.status) == LMStatus.CONVERGED
     assert int(result.multi_start.attempt) >= 1
-    # The winner's args were resampled (by draw and by the callback).
+    # The winner's args were resampled (by reset_args and by the callback).
     assert not jnp.allclose(result.args["data"], args0["data"])
     # With a callback present the ranking loss is recomputed at the returned
     # (x, args, p), where info.loss may be stale.
@@ -802,7 +843,7 @@ class ScaledDraw:  # eq=True dataclass: instances are NOT hashable
     scale: float
 
     def __call__(self, key, x, args):
-        return self.scale * jax.random.normal(key, x.shape, x.dtype), args
+        return self.scale * jax.random.normal(key, x.shape, x.dtype)
 
 
 @dataclasses.dataclass
@@ -840,16 +881,17 @@ def test_unhashable_callable_hooks_work_under_jit(parallel):
     assert int(result.multi_start.attempt) >= 1
 
 
-def test_args_only_redraw_invalidates_jacobian_cache():
+def test_reset_only_retry_invalidates_jacobian_cache():
+    # No draw at all: retries keep x and re-initialize args only.
     def residual(theta, args, p):
         return jnp.array([args[0] * theta[0] - 4.0])
 
     solver = LevenbergMarquardt(residual, init_damping=1e-2, cache_jacobian=True)
 
-    def draw_args_only(key, x, args):
-        return x, jnp.array([2.0])
+    def reset_args_only(key, args):
+        return jnp.array([2.0])
 
-    ms = MultiStart(key=jax.random.key(25), num_starts=2, draw=draw_args_only)
+    ms = MultiStart(key=jax.random.key(25), num_starts=2, reset_args=reset_args_only)
     result = solver.solve(
         jnp.array([1.0]),
         jnp.array([jnp.nan]),
@@ -860,6 +902,32 @@ def test_args_only_redraw_invalidates_jacobian_cache():
     assert int(result.status) == LMStatus.CONVERGED
     assert int(result.multi_start.attempt) == 1
     assert jnp.allclose(result.x[0], 2.0, atol=1e-6)
+
+
+def test_parallel_reset_receives_pristine_args_and_lane_keys():
+    RECORDED_RESET_KEYS.clear()
+    RECORDED_RESET_INPUTS.clear()
+    solver = LevenbergMarquardt(residual_inconsistent, init_damping=1.0)
+    key = jax.random.key(30)
+    args0 = jnp.asarray(0.5)
+    ms = MultiStart(key=key, num_starts=3, reset_args=recording_reset, parallel=True)
+    solver.solve(
+        jnp.array([0.0]),
+        args0,
+        p=jnp.asarray(0.0),
+        max_steps=2,
+        max_steps_is_success=False,
+        atol=1e-9,
+        multi_start=ms,
+        jit=False,
+    )
+
+    # Every retry lane resets from the pristine args with its own lane key;
+    # lane 0 never resets.
+    assert len(RECORDED_RESET_INPUTS) == 2
+    for lane, args_in in enumerate(RECORDED_RESET_INPUTS, start=1):
+        assert jnp.allclose(args_in, args0)
+        assert keys_equal(RECORDED_RESET_KEYS[lane - 1], attempt_subkeys(key, lane)[2])
 
 
 @pytest.mark.parametrize("parallel", [False, True])

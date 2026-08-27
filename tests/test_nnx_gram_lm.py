@@ -102,7 +102,7 @@ def draw_curve_params(key, x, args):
     from flax.nnx import Rngs
 
     _, theta = nnx.split(CurveMLP(rngs=Rngs(key)), nnx.Param)
-    return theta, args
+    return theta
 
 
 @pytest.mark.parametrize("parallel", [False, True])
@@ -158,10 +158,9 @@ def test_draw_nnx_module_value_semantics():
     assert hash(DrawNNXModule(CurveMLP, 1)) != hash(DrawNNXModule(CurveMLP, 1.0))
     assert DrawNNXModule(CurveMLP, k=1) != DrawNNXModule(CurveMLP, k=1.0)
 
-    # Callable as a draw hook, returning the module's nnx.Param pytree unchanged args.
+    # Callable as a draw hook, returning the module's nnx.Param pytree.
     key = jax.random.key(7)
-    theta, args_out = draw(key, None, ("args",))
-    assert args_out == ("args",)
+    theta = draw(key, None, ("args",))
     _, expected = nnx.split(CurveMLP(rngs=nnx.Rngs(key)), nnx.Param)
     assert jax.tree_util.tree_structure(theta) == jax.tree_util.tree_structure(expected)
 
@@ -196,7 +195,7 @@ def test_draw_nnx_module_shares_one_compilation():
     def make_closure():
         def draw(key, x, args):
             _, theta = nnx.split(CurveMLP(rngs=nnx.Rngs(key)), nnx.Param)
-            return theta, args
+            return theta
 
         return draw
 
@@ -253,8 +252,7 @@ def test_draw_nnx_module_excludes_non_param_variables():
     assert len(jax.tree.leaves(nondiff)) == 1
 
     draw = DrawNNXModule(ScaledCurveMLP)
-    theta, args_out = draw(jax.random.key(7), None, ("args",))
-    assert args_out == ("args",)
+    theta = draw(jax.random.key(7), None, ("args",))
     # Only the Param leaves are drawn; the residual's merge supplies nondiff.
     assert jax.tree_util.tree_structure(theta) == jax.tree_util.tree_structure(theta_0)
 
@@ -278,8 +276,7 @@ def test_draw_nnx_module_wrt_filter():
     _, theta_0, _ = nnx.split(CurveMLP(rngs=nnx.Rngs(1)), wrt, ...)
 
     draw = DrawNNXModule(CurveMLP, wrt=wrt)
-    theta, args_out = draw(jax.random.key(7), None, ("args",))
-    assert args_out == ("args",)
+    theta = draw(jax.random.key(7), None, ("args",))
     # Only the wrt-selected Params are drawn; the rest rides in the frozen state.
     assert jax.tree_util.tree_structure(theta) == jax.tree_util.tree_structure(theta_0)
 
