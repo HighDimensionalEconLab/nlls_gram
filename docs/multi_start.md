@@ -12,19 +12,22 @@ import jax
 import jax.numpy as jnp
 from nlls_gram import MultiStart, LevenbergMarquardt
 
+
 def residual(theta, args, p):
     return theta[0] ** 2 - p  # stalls when started at theta = 0
+
 
 def draw(key, x, args):
     # Fresh initial condition; attempt-local args state has its own hook
     # (reset_args, below).
     return jax.random.uniform(key, x.shape, x.dtype, 0.5, 3.0)
 
+
 solver = LevenbergMarquardt(residual)
 ms = MultiStart(key=jax.random.key(0), num_starts=5, draw=draw)
 result = solver.solve(jnp.zeros(1), p=jnp.asarray(4.0), atol=1e-8, multi_start=ms)
-result.multi_start.attempt        # which start won (0 = your x0)
-result.multi_start.attempts_run   # how many solves actually ran
+result.multi_start.attempt  # which start won (0 = your x0)
+result.multi_start.attempts_run  # how many solves actually ran
 ```
 
 `draw`, `reset_args`, and `accept` are jit **static** arguments, so they key the compile by
@@ -128,6 +131,7 @@ def accept(key, result):
     policy = nnx.merge(graphdef, result.x)
     test_exo = simulate_markov_chain(key, s_0_test, P_cumsum, test_T)
     return euler_mean_abs(policy, test_exo) < 5e-5
+
 
 ms = MultiStart(key=key, num_starts=5, draw=draw, accept=accept)
 ```

@@ -1037,17 +1037,23 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         theta, unravel, residual, theta_jvp, residual_p_dot = self._ad_linearization(
             x, args, p, p_dot
         )
-        n_m = self._block_sizes(theta.shape[0])[0]
+        n_m, n_f = self._block_sizes(theta.shape[0])
         ctx = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
         Jt = self._assemble_jt(theta_jvp, theta, residual)
         ridge_typed = jnp.asarray(ridge, dtype=residual.dtype)
         Jt_sub = jnp.asarray(
             self._extended_solve_transpose(Jt, ctx), dtype=residual.dtype
         )
-        diag = jnp.arange(n_m)
-        normal_matrix = mm(Jt_sub, Jt_sub.T).at[diag, diag].add(ridge_typed)
-        factor = jsp_linalg.cho_factor(normal_matrix)
-        y_dot = jsp_linalg.cho_solve(factor, -mm(Jt_sub, residual_p_dot))
+        if n_f == 0 and Jt_sub.shape[0] > Jt_sub.shape[1]:
+            diag = jnp.arange(Jt_sub.shape[1])
+            dual_matrix = mm(Jt_sub.T, Jt_sub).at[diag, diag].add(ridge_typed)
+            factor = jsp_linalg.cho_factor(dual_matrix)
+            y_dot = -mm(Jt_sub, jsp_linalg.cho_solve(factor, residual_p_dot))
+        else:
+            diag = jnp.arange(n_m)
+            normal_matrix = mm(Jt_sub, Jt_sub.T).at[diag, diag].add(ridge_typed)
+            factor = jsp_linalg.cho_factor(normal_matrix)
+            y_dot = jsp_linalg.cho_solve(factor, -mm(Jt_sub, residual_p_dot))
         theta_dot = jnp.asarray(self._extended_solve(y_dot, ctx), residual.dtype)
         return unravel(theta_dot)
 

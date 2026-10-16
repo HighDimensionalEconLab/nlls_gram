@@ -22,13 +22,13 @@ never materializes either.
 
 ```python
 class Metric:
-    size: int             # static: the metric block, the leading coordinates of x
-    free_scale = 1.0      # traced leaf: damping weight on everything past it
+    size: int  # static: the metric block, the leading coordinates of x
+    free_scale = 1.0  # traced leaf: damping weight on everything past it
 
-    def factor_apply(v, ctx): ...           # F v
-    def factor_solve(v, ctx): ...           # F^-1 v
-    def factor_solve_transpose(v, ctx): ... # F^-T v
-    def norm(v, ctx): ...                   # ||F v||, defaulted
+    def factor_apply(v, ctx): ...  # F v
+    def factor_solve(v, ctx): ...  # F^-1 v
+    def factor_solve_transpose(v, ctx): ...  # F^-T v
+    def norm(v, ctx): ...  # ||F v||, defaulted
 ```
 
 Ops read `self` and act on metric-block vectors, or matrices whose *leading*
@@ -53,7 +53,7 @@ An SPD approximation of the damped inverse, for the Krylov configs.
 
 ```python
 class Preconditioner:
-    def apply(v, damping, ctx): ...   # ~ (operator + damping I)^-1 v
+    def apply(v, damping, ctx): ...  # ~ (operator + damping I)^-1 v
 ```
 
 Which space `v` lives in is named by the config: `CG` is parameter space,
@@ -96,12 +96,14 @@ A custom metric or preconditioner is a small frozen dataclass registered with
 ```python
 from dataclasses import dataclass
 
+
 @dataclass(frozen=True, eq=False)
 class JacobiPreconditioner(Preconditioner):
     diagonal: jax.Array
 
     def apply(self, v, damping, ctx):
         return v / (self.diagonal + damping)
+
 
 register_pytree_dataclass(JacobiPreconditioner, data_fields=("diagonal",))
 ```

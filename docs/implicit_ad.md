@@ -82,6 +82,7 @@ def residual(x, args, p):
     value = model_residual(x, args, p)
     return value, {"fit": summary(x, p)}
 
+
 solver = LevenbergMarquardt(residual, has_aux=True)
 grad = jax.grad(lambda p: solver.solve(x0, args, p=p, atol=1e-8).aux["fit"])(p)
 ```

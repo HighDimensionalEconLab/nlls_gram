@@ -1,5 +1,3 @@
-"""Cold compilation timings for the implicit-AD benchmark matrix."""
-
 import argparse
 import json
 import platform
@@ -9,38 +7,55 @@ import timeit
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 
-from benchmarks.test_implicit_ad_benchmark import _make_transformed
-
-CASES = ("direct", "direct_aux", "metric_factory", "vmapped")
-TRANSFORMS = ("jvp", "vjp")
+from benchmarks.conftest import _benchmark_supports_float64
+from benchmarks.test_implicit_ad_benchmark import (
+    SOLVER_CASES,
+    TRANSFORMS,
+    _make_transformed,
+)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--repeat", type=int, default=5)
+    parser.add_argument("--repeat", type=int, default=3)
+    parser.add_argument(
+        "--dtypes",
+        nargs="+",
+        default=None,
+        choices=["float32", "float64"],
+    )
     args = parser.parse_args()
-    if args.repeat <= 0:
-        raise ValueError("--repeat must be positive")
+    if args.dtypes is None:
+        args.dtypes = (
+            ["float32", "float64"] if _benchmark_supports_float64() else ["float32"]
+        )
 
+    dtype_map = {"float32": jnp.float32, "float64": jnp.float64}
     timings = {}
-    for transform in TRANSFORMS:
-        for case in CASES:
-            samples = []
-            for _ in range(args.repeat):
-                jax.clear_caches()
-                transformed, parameter = _make_transformed(case, transform)
-                start = timeit.default_timer()
-                compiled = transformed.lower(parameter).compile()
-                elapsed = timeit.default_timer() - start
-                value = compiled(parameter)
-                jax.block_until_ready(value)
-                samples.append(elapsed)
-            timings[f"{transform}-{case}"] = {
-                "median_seconds": statistics.median(samples),
-                "samples_seconds": samples,
-            }
+    for dtype_name in args.dtypes:
+        dtype = dtype_map[dtype_name]
+        with jax.enable_x64(dtype == jnp.float64):
+            for transform in TRANSFORMS:
+                for case in SOLVER_CASES:
+                    samples = []
+                    for _ in range(args.repeat):
+                        jax.clear_caches()
+                        transformed, parameter = _make_transformed(
+                            case, transform, dtype=dtype
+                        )
+                        start = timeit.default_timer()
+                        compiled = transformed.lower(parameter).compile()
+                        elapsed = timeit.default_timer() - start
+                        value = compiled(parameter)
+                        jax.block_until_ready(value)
+                        samples.append(elapsed)
+                    timings[f"{dtype_name}-{transform}-{case}"] = {
+                        "median_seconds": statistics.median(samples),
+                        "samples_seconds": samples,
+                    }
 
     payload = {
         "commit": subprocess.run(

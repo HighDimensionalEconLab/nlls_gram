@@ -149,8 +149,9 @@ documents the mechanics for composing it into a callback of your own:
 from nlls_gram import AnnealRidge
 
 anneal = AnnealRidge(ridge_floor=1e-8, decrease=0.1)
-result = solver.solve(x0, callback=anneal, user_state=anneal.init_state(),
-                      atol=1e-8, max_steps=500)
+result = solver.solve(
+    x0, callback=anneal, user_state=anneal.init_state(), atol=1e-8, max_steps=500
+)
 ```
 
 The callback multiplies `lm_state.ridge` by `decrease` whenever the inner
@@ -233,7 +234,7 @@ machine-perfect residual; the calibrated one, 0.1%). The solver reports
 to an order of magnitude before any pilot run, so the recipe is simply
 
 ```python
-gtol = 1e-3 * ridge * jnp.sqrt(q)   # q = the solution's squared (RKHS) seminorm
+gtol = 1e-3 * ridge * jnp.sqrt(q)  # q = the solution's squared (RKHS) seminorm
 result = solver.solve(x0, max_steps=400, gtol=gtol, atol=2e-8)
 ```
 
@@ -410,6 +411,7 @@ pay it every step):
 ```python
 anneal = AnnealRidge(ridge_floor=1e-11)
 
+
 def callback(ctx):
     action = anneal(ctx)
     advanced = action.lm_state.ridge < ctx.lm_state.ridge
@@ -423,13 +425,19 @@ def callback(ctx):
         lm_state=dataclasses.replace(action.lm_state, preconditioner=precond),
     )
 
+
 solver = RidgeLevenbergMarquardt(
-    residual_fn, metric=metric,
-    linear_solver=CG(BlockEigenPreconditioner(build_families(x0), PERMUTATION),
-                     tol=1e-10, maxiter=2500),
+    residual_fn,
+    metric=metric,
+    linear_solver=CG(
+        BlockEigenPreconditioner(build_families(x0), PERMUTATION),
+        tol=1e-10,
+        maxiter=2500,
+    ),
 )
-result = solver.solve(x0, callback=callback, user_state=anneal.init_state(),
-                      max_steps=120, gtol=1e-11)
+result = solver.solve(
+    x0, callback=callback, user_state=anneal.init_state(), max_steps=120, gtol=1e-11
+)
 ```
 
 The AD-role CG applies the **carried** instance at zero damping — a

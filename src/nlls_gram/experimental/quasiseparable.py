@@ -202,7 +202,7 @@ def _forward_substitution(c, p, w, A, y, parallel):
         x_k = (y_k - mm(p_k, G)) / c_k
         return mm(A_k, G) + jnp.outer(w_k, x_k), x_k
 
-    G0 = jnp.zeros((p.shape[1], y.shape[1]), dtype=y.dtype)
+    G0 = jnp.zeros((p.shape[1], y.shape[1]), dtype=jnp.result_type(c, p, w, A, y))
     _, x = jax.lax.scan(step, G0, (c, p, w, A, y))
     return x
 
@@ -221,7 +221,7 @@ def _backward_substitution(c, p, w, A, y, parallel):
         x_k = (y_k - mm(w_k, G)) / c_k
         return mm(A_k.T, G) + jnp.outer(p_k, x_k), x_k
 
-    G0 = jnp.zeros((p.shape[1], y.shape[1]), dtype=y.dtype)
+    G0 = jnp.zeros((p.shape[1], y.shape[1]), dtype=jnp.result_type(c, p, w, A, y))
     _, x = jax.lax.scan(step, G0, (c, p, w, A, y), reverse=True)
     return x
 
@@ -242,6 +242,6 @@ def _cholesky_transpose_matvec(c, p, w, A, x, parallel):
         z_k = c_k * x_k + mm(w_k, H)
         return mm(A_k.T, H) + jnp.outer(p_k, x_k), z_k
 
-    H0 = jnp.zeros((p.shape[1], x.shape[1]), dtype=x.dtype)
+    H0 = jnp.zeros((p.shape[1], x.shape[1]), dtype=jnp.result_type(c, p, w, A, x))
     _, z = jax.lax.scan(step, H0, (c, p, w, A, x), reverse=True)
     return z

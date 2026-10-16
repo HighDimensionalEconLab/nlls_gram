@@ -40,12 +40,15 @@ order — and returns a residual pytree, or `(residual, aux)` with
 import jax.numpy as jnp
 from nlls_gram import LevenbergMarquardt
 
+
 def residual(x, args, p):
     return args["design"] @ x - p["target"]
 
+
 solver = LevenbergMarquardt(residual)
-result = solver.solve(jnp.zeros(8), {"design": design}, p={"target": y},
-                      max_steps=200, atol=1e-8)
+result = solver.solve(
+    jnp.zeros(8), {"design": design}, p={"target": y}, max_steps=200, atol=1e-8
+)
 result.x, result.status, result.steps
 ```
 
@@ -63,8 +66,9 @@ solver = RidgeLevenbergMarquardt(collocation_residual, metric=metric, ridge=1e-4
 
 # Anneal the ridge toward the interpolating limit on stationarity.
 anneal = AnnealRidge(ridge_floor=1e-10)
-result = solver.solve(x0, callback=anneal, user_state=anneal.init_state(),
-                      gtol=1e-8, atol=1e-8)
+result = solver.solve(
+    x0, callback=anneal, user_state=anneal.init_state(), gtol=1e-8, atol=1e-8
+)
 ```
 
 The metric covers the leading `metric.size` coordinates; anything past that is

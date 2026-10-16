@@ -27,7 +27,7 @@ The Krylov configs default to `tol=None` (a dtype default: `1e-10` in float64,
 usually better than either alone:
 
 ```python
-CG(precond, tol=0.0, atol=0.0, maxiter=8)     # cheap, fixed
+CG(precond, tol=0.0, atol=0.0, maxiter=8)  # cheap, fixed
 ```
 
 then raise `iterative_maxiter` from a callback as the loss falls — see
