@@ -4,7 +4,7 @@ import pytest
 
 from benchmarks.conftest import benchmark_batch_size, benchmark_direction_count
 from nlls_gram import (
-     CG,
+    CG,
     LU,
     SVD,
     Cholesky,
@@ -55,10 +55,7 @@ def _make_large_ad_problem(solver_case, *, device=None, dtype=jnp.float32):
         jnp.asarray(n, dtype=dtype)
     )
     p = jax.random.normal(k_p, (k_dir,), dtype=dtype) * 0.2
-    p_batch = (
-        p[None, :]
-        + jax.random.normal(k_p, (batch, k_dir), dtype=dtype) * 0.02
-    )
+    p_batch = p[None, :] + jax.random.normal(k_p, (batch, k_dir), dtype=dtype) * 0.02
     tol = 1e-5 if dtype == jnp.float32 else 1e-8
 
     def residual(x, _, param):
@@ -164,9 +161,7 @@ def test_large_implicit_ad(benchmark, device, dtype, solver_case, transform):
             solver_case, device=device, dtype=dtype
         )
         assert bool(jnp.all(status(p) == LMStatus.CONVERGED))
-        fn, arg = _make_transformed(
-            solver_case, transform, device=device, dtype=dtype
-        )
+        fn, arg = _make_transformed(solver_case, transform, device=device, dtype=dtype)
         warmup = fn(arg)
         jax.block_until_ready(warmup)
 

@@ -226,10 +226,7 @@ def test_ridge_solve_and_ad(benchmark, device, dtype, configuration, transform):
             jnp.asarray(p_dim, dtype=dtype)
         )
         p = jax.random.normal(k4, (k_dir,), dtype=dtype) * 0.2
-        p_batch = (
-            p[None, :]
-            + jax.random.normal(k4, (batch, k_dir), dtype=dtype) * 0.02
-        )
+        p_batch = p[None, :] + jax.random.normal(k4, (batch, k_dir), dtype=dtype) * 0.02
 
         def residual(theta, _, param):
             return A @ (theta + 0.02 * theta**2) - proj_in @ param
@@ -282,9 +279,7 @@ def test_ridge_solve_and_ad(benchmark, device, dtype, configuration, transform):
                 precond = BlockEigenPreconditioner(
                     [
                         (
-                            jnp.broadcast_to(
-                                jnp.eye(n, dtype=dtype), (repeats, n, n)
-                            ),
+                            jnp.broadcast_to(jnp.eye(n, dtype=dtype), (repeats, n, n)),
                             1.0,
                         ),
                         (jnp.eye(free_size, dtype=dtype)[None], 0.0),

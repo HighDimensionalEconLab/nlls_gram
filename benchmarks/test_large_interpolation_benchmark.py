@@ -123,9 +123,7 @@ def test_large_rbf_interpolation_solve_and_ad(
         features = jnp.exp(-0.5 * scaled_distance**2) / jnp.sqrt(
             jnp.asarray(n_centers, dtype=dtype)
         )
-        features = features.at[:, :n_samples].add(
-            2.0 * jnp.eye(n_samples, dtype=dtype)
-        )
+        features = features.at[:, :n_samples].add(2.0 * jnp.eye(n_samples, dtype=dtype))
         k1, k2, k3 = jax.random.split(jax.random.key(7), 3)
         proj_in = jax.random.normal(k1, (n_samples, k_dir), dtype=dtype) / jnp.sqrt(
             jnp.asarray(k_dir, dtype=dtype)
@@ -136,8 +134,7 @@ def test_large_rbf_interpolation_solve_and_ad(
         theta_true = jnp.cos(jnp.linspace(0.0, 6.0, n_centers, dtype=dtype)) * 0.1
         p = jax.random.normal(k3, (k_dir,), dtype=dtype) * 0.02
         p_batch = (
-            p[None, :]
-            + jax.random.normal(k3, (batch, k_dir), dtype=dtype) * 0.005
+            p[None, :] + jax.random.normal(k3, (batch, k_dir), dtype=dtype) * 0.005
         )
         ys_base = jnp.sin(features @ theta_true)
 
