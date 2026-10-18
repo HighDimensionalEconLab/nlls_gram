@@ -45,6 +45,10 @@
 ::: nlls_gram.SolverContext
 ::: nlls_gram.register_pytree_dataclass
 
+## Residuals
+
+::: nlls_gram.vmap_rows
+
 ## Multi-start
 
 ::: nlls_gram.MultiStart

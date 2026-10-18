@@ -49,5 +49,6 @@ nav:
   - Callbacks: callbacks.md
   - Multi-Start: multi_start.md
   - Implicit Differentiation: implicit_ad.md
+  - Row-wise Residuals: vmap_rows.md
   - Tuning: tuning_guide.md
   - API: api.md

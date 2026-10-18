@@ -20,7 +20,10 @@ selection of the returned root lives:
 
 Both take the same typed linear-solver configs -- ``Cholesky()``, ``QR()``,
 ``CG(preconditioner)``, ``GramCG(preconditioner)`` -- and the same
-``ad_solver`` menu, defaulting to the forward family.
+``ad_solver`` menu, defaulting to the forward family. ``vmap_rows`` is
+``jax.vmap`` for a per-row residual block, with a derivative rule that
+computes each row's gradient once per linearization and reuses it across
+the Jacobian assembly.
 
 The package depends only on JAX. Tuning heuristics:
 https://highdimensionaleconlab.github.io/nlls_gram/tuning_guide/
@@ -66,6 +69,7 @@ from nlls_gram.preconditioners import (
 )
 from nlls_gram.ridge_lm import AnnealRidge, RidgeLevenbergMarquardt
 from nlls_gram.utilities import register_pytree_dataclass
+from nlls_gram.vmap_rows import vmap_rows
 
 __all__ = [
     "CG",
@@ -103,4 +107,5 @@ __all__ = [
     "SolverContext",
     "WoodburyPreconditioner",
     "register_pytree_dataclass",
+    "vmap_rows",
 ]

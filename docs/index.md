@@ -108,5 +108,6 @@ normal or dual factorization would square it.
 - [Metrics and preconditioners](metrics.md) — the two hook types
 - [Callbacks](callbacks.md) — the solve loop and its cookbook
 - [Implicit differentiation](implicit_ad.md) — the AD contract
+- [Row-wise residuals](vmap_rows.md) — `vmap_rows` for simulated-path residuals
 - [Tuning](tuning_guide.md) — picking a solver and a schedule
 - [API](api.md)

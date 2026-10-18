@@ -96,6 +96,22 @@ residual space), and `SVD()` for rank-deficient tangents. A knob that exists
 for only one method is a field on that method, so it cannot be passed with
 another.
 
+## Row-wise residuals
+
+For an expensive per-state residual vmapped over a simulated path, replace
+that `jax.vmap` with `vmap_rows`: the same values, with each row's gradient
+computed once per linearization and reused across the Jacobian assembly
+instead of one pass of the row function per row and Jacobian column (or
+cotangent row).
+
+```python
+from nlls_gram import vmap_rows
+
+
+@vmap_rows(in_axes=(0, None, None))
+def euler_residual(state, policy, p): ...
+```
+
 ## Docs
 
 <https://highdimensionaleconlab.github.io/nlls_gram/>
