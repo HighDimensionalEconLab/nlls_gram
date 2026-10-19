@@ -8,7 +8,13 @@ import jax.numpy as jnp
 import numpy as np
 from jax.flatten_util import ravel_pytree
 
-from nlls_gram import LevenbergMarquardt, LMStatus, vmap_rows
+from nlls_gram import (
+    IdentityMetric,
+    LevenbergMarquardt,
+    LMStatus,
+    RidgeLevenbergMarquardt,
+    vmap_rows,
+)
 
 N = 8
 WIDTH = 16
@@ -150,3 +156,25 @@ def test_composes_with_jit_and_outer_vmap():
     np.testing.assert_allclose(
         candidate, reference, rtol=tol, atol=tol * float(jnp.abs(reference).max())
     )
+
+
+def test_jacobian_chunk_matches_one_batch():
+    # The cached Jacobian after one step is the assembled matrix itself.
+    theta, args, p = problem()
+    for solver_cls, kwargs in (
+        (LevenbergMarquardt, {}),
+        (
+            RidgeLevenbergMarquardt,
+            {"metric": IdentityMetric(ravel_pytree(theta)[0].size), "ridge": 1e-4},
+        ),
+    ):
+        jacobians = []
+        for chunk in (None, 4):
+            solver = solver_cls(rows, jacobian_chunk=chunk, **kwargs)
+            lm_state = solver.init(theta, args, p=p)
+            jacobians.append(solver.update(theta, lm_state, args, p)[1].Jt)
+        batch, chunked = jacobians
+        tol = 1e3 * float(jnp.finfo(batch.dtype).eps)
+        np.testing.assert_allclose(
+            chunked, batch, rtol=tol, atol=tol * float(jnp.abs(batch).max())
+        )

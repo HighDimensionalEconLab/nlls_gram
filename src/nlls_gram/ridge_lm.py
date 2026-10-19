@@ -300,7 +300,8 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
     inner-solve setup between the velocity and geodesic-acceleration solves:
 
     - ``Cholesky()`` (the default): dense normal equations. ``J'`` is
-      materialized per ``jacobian_mode``, ``J~'`` follows by one batched
+      materialized per ``jacobian_mode`` (in ``lax.map`` chunks of
+      ``jacobian_chunk`` when set), ``J~'`` follows by one batched
       ``factor_solve_transpose``, and the assembled
       ``G = J~'J~ + ridge E`` (``ridge`` added on the metric-block diagonal
       only) is cached across rejected steps (only the damping shift
@@ -412,6 +413,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         damping_increase=4.0,
         linear_solver=Cholesky(),  # noqa: B008 -- frozen, immutable default
         jacobian_mode="auto",
+        jacobian_chunk=None,
         ad_solver=None,
         has_aux=False,
         cache_jacobian=True,
@@ -443,6 +445,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
         self.damping_increase = damping_increase
         self.linear_solver = linear_solver
         self.jacobian_mode = jacobian_mode
+        self.jacobian_chunk = jacobian_chunk
         self.ad_solver = ad_solver
         self._validate_configuration(linear_solver, ad_solver, penalized=True)
         # The configs' numeric fields fold into the traced LMHyperparams carry
@@ -548,6 +551,7 @@ class RidgeLevenbergMarquardt(LevenbergMarquardtBase):
                 damping_increase,
                 _config_static_key(linear_solver, baked=False),
                 jacobian_mode,
+                jacobian_chunk,
                 _config_static_key(ad_solver, baked=True),
                 has_aux,
                 self.cache_jacobian,

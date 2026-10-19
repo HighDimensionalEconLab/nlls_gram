@@ -111,13 +111,18 @@ def test_jacobian_assembly(benchmark, device, dtype, n_firms, block):
 
 
 @pytest.mark.parametrize("n_firms", [128, 1024])
-@pytest.mark.parametrize("block", ["vmap", "vmap_rows"])
-def test_update_step(benchmark, device, dtype, n_firms, block):
+@pytest.mark.parametrize(
+    ("block", "jacobian_chunk"),
+    [("vmap", None), ("vmap_rows", None), ("vmap_rows", 16)],
+    ids=["vmap", "vmap_rows", "vmap_rows-chunk16"],
+)
+def test_update_step(benchmark, device, dtype, n_firms, block, jacobian_chunk):
     theta, args, p = problem(device, dtype, n_firms)
     solver = LevenbergMarquardt(
         make_residual(BLOCKS[block]),
         geodesic_acceleration=True,
         cache_jacobian=False,
+        jacobian_chunk=jacobian_chunk,
     )
     with jax.default_device(device):
         lm_state = solver.init(theta, args, p=p)

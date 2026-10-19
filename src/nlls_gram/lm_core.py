@@ -141,12 +141,22 @@ class LevenbergMarquardtBase:
         return "fwd" if n <= m else "rev"
 
     def _assemble_jt(self, jvp_fn, theta, resid):
+        # The basis goes through the linearization in one batch, or in chunks
+        # of jacobian_chunk so the batched pass's live intermediates scale
+        # with the chunk instead of with m or n.
+        def over_basis(fn, basis):
+            if self.jacobian_chunk is None:
+                return jax.vmap(fn)(basis)
+            return jax.lax.map(fn, basis, batch_size=self.jacobian_chunk)
+
         if self._resolve_jacobian_mode(resid.shape[0], theta.shape[0]) == "fwd":
             parameter_basis = jnp.eye(theta.shape[0], dtype=theta.dtype)
-            return jax.vmap(jvp_fn)(parameter_basis)
+            return over_basis(jvp_fn, parameter_basis)
         transpose_fn = jax.linear_transpose(jvp_fn, theta)
         residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
-        return jax.vmap(lambda cotangent: transpose_fn(cotangent)[0])(residual_basis).T
+        return over_basis(
+            lambda cotangent: transpose_fn(cotangent)[0], residual_basis
+        ).T
 
     def _dense_resid_jt_aux(self, residual_flat, theta):
         if self.has_aux:

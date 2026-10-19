@@ -99,6 +99,14 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
     disjunctive: ``atol`` on the residual norm, ``gtol`` on the whitened
     stationarity ``info.grad_norm``, ``xtol`` on an accepted step's whitened
     norm; any one firing reports ``CONVERGED``.
+
+    ``jacobian_mode`` picks the side of the dense assembly (``"auto"``:
+    forward over the ``n`` parameters when ``n <= m``, reverse over the ``m``
+    residuals otherwise). ``jacobian_chunk`` pushes that basis through the
+    linearization in ``lax.map`` chunks of this many instead of one ``vmap``,
+    so the live intermediates of a residual with a long backward pass (a
+    simulated path) scale with the chunk rather than with ``m``, at the cost
+    of sequential chunks; ``None`` is one batch.
     """
 
     def __init__(
@@ -111,6 +119,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         damping_increase=4.0,
         linear_solver=Cholesky(),  # noqa: B008 -- frozen, immutable default
         jacobian_mode="auto",
+        jacobian_chunk=None,
         ad_solver=None,
         has_aux=False,
         cache_jacobian=True,
@@ -131,6 +140,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         self.damping_increase = damping_increase
         self.linear_solver = linear_solver
         self.jacobian_mode = jacobian_mode
+        self.jacobian_chunk = jacobian_chunk
         self.ad_solver = ad_solver
         self._validate_configuration(linear_solver, ad_solver, penalized=False)
         krylov = isinstance(linear_solver, (CG, GramCG))
@@ -222,6 +232,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
                 damping_increase,
                 _config_static_key(linear_solver, baked=False),
                 jacobian_mode,
+                jacobian_chunk,
                 _config_static_key(ad_solver, baked=True),
                 has_aux,
                 self.cache_jacobian,

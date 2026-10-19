@@ -82,6 +82,18 @@ Jacobians, one reverse pass per row with the tangent carried through it,
 which is \(O(m)\) work like the native forward pass but with a longer tape.
 The benchmark's full LM step includes the geodesic term.
 
+## Chunking the assembly
+
+What `vmap_rows` leaves is the path: the unit cotangents carried backward
+through the simulation `scan`, an \((m, m, N)\) array plus the matching
+activations. `jacobian_chunk=c` on the solver pushes the basis through the
+linearization in `lax.map` chunks of \(c\) instead of one `vmap`, so that
+array becomes \((c, m, N)\). Measured on an H100 at \(N = 16384\) with
+\(m = 256\) rows: one batch holds 16.7 GB of temporaries (largest array
+8.6 GB) in 1.36 s; chunks of 64 hold 11.9 GB (largest 2.1 GB) in 1.40 s.
+Smaller chunks save nothing more, since the row block's own activations,
+linear in \(m\), are then the floor.
+
 ## Using it
 
 ```python
