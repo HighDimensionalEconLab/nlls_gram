@@ -8,6 +8,7 @@ implicit-AD wrapper live here.
 """
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
@@ -36,6 +37,14 @@ from nlls_gram.utilities import (
     _where_tree,
     _zero_tangent_leaf,
 )
+
+
+# The residual evaluation that sizes the initial state runs outside the jitted
+# loop; keying it on the solver's value means a repeated solve with an equal
+# configuration retraces nothing.
+@functools.partial(jax.jit, static_argnums=0)
+def _init_residual_and_aux(solver, x, args, p):
+    return solver._residual_and_aux(x, args, p)
 
 
 class LevenbergMarquardtBase:

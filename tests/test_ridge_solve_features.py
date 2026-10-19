@@ -244,11 +244,10 @@ def test_equal_settings_solvers_share_the_compiled_solve_loop():
     assert hash(a) == hash(b)
     a.solve(jnp.zeros(P_DIM), B, max_steps=10, gtol=1e-4)
     count_after_first = traces["count"]
-    # Every ridge solve pays exactly ONE eager residual call (the
-    # unconditional init that resolves ridge/dtype); an equal-config solver
-    # must add nothing beyond that -- no retrace of the compiled loop.
+    # The init residual evaluation and the loop are both keyed on the
+    # solver's value, so an equal-config solver traces nothing.
     b.solve(jnp.zeros(P_DIM), B, max_steps=10, gtol=1e-4)
-    assert traces["count"] == count_after_first + 1
+    assert traces["count"] == count_after_first
     # Any static-setting change is a different solver, including a change
     # buried inside the typed config. IdentityPreconditioner() is stateless
     # and value-equal, so a rebuilt equal-valued CG config SHARES the
@@ -307,16 +306,16 @@ def test_traced_changes_do_not_retrace_the_loop():
     solver.solve(x0, max_steps=30, gtol=1e-4)
     baseline = traces["count"]
 
-    # Different ridge VALUE through a caller-supplied state: +1 eager init
-    # residual call, zero retraces.
+    # Different ridge VALUE through a caller-supplied state: zero retraces
+    # (init's residual evaluation is keyed on the solver, like the loop).
     state = solver.init(x0)
     state = dataclasses.replace(state, ridge=jnp.asarray(3e-3))
     solver.solve(x0, lm_state=state, max_steps=30, gtol=1e-4)
-    assert traces["count"] == baseline + 1
+    assert traces["count"] == baseline
 
     # A different max_steps budget reuses the loop too.
     solver.solve(x0, max_steps=200, gtol=1e-4)
-    assert traces["count"] == baseline + 2
+    assert traces["count"] == baseline
 
     # The continuation callback (a NEW problem: callback identity keys the
     # compile) traces once, then repeat solves with the same callback reuse
@@ -326,7 +325,7 @@ def test_traced_changes_do_not_retrace_the_loop():
     solver.solve(x0, max_steps=60, gtol=1e-4, callback=callback, user_state=us0)
     with_callback = traces["count"]
     solver.solve(x0, max_steps=60, gtol=1e-4, callback=callback, user_state=us0)
-    assert traces["count"] == with_callback + 1
+    assert traces["count"] == with_callback
 
 
 def test_rejected_step_skips_assembly():

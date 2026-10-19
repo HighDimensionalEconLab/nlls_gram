@@ -32,7 +32,7 @@ from nlls_gram.linear_solvers import (
     Subproblem,
     _config_static_key,
 )
-from nlls_gram.lm_core import LevenbergMarquardtBase
+from nlls_gram.lm_core import LevenbergMarquardtBase, _init_residual_and_aux
 from nlls_gram.lm_types import (
     LMInfo,
     LMState,
@@ -251,7 +251,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         ``update`` loops carry no extra buffers; ``solve`` populates it.
         """
         self._check_residual_args(args, p)
-        residual, aux = self._residual_and_aux(x0, args, p)
+        residual, aux = _init_residual_and_aux(self, x0, args, p)
         theta, _ = ravel_pytree(x0)
         n_m, _ = self._block_sizes(theta.size)
         dtype = residual.dtype
