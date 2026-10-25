@@ -74,25 +74,28 @@ contractions and the cotangents handed to the path, \(m \times m \times
 \dim x_s\) over the unit cotangents, which is the same in both columns.
 
 The rule is exact. \(J\) is the same matrix, Jacobian-vector products are
-the same, and the geodesic term `jvp(jvp(r))` differentiates through
-`jacrev`, so the second directional derivative is exact as well. That term
-and the implicit-AD tangent \(\partial r / \partial p\) are plain `jvp`s
-outside the linearization: each re-enters the rule and rebuilds the row
-Jacobians, one reverse pass per row with the tangent carried through it,
-which is \(O(m)\) work like the native forward pass but with a longer tape.
-The benchmark's full LM step includes the geodesic term.
+the same, and plain directional `jvp` calls outside `jax.linearize` -- the
+geodesic second directional derivative `jvp(jvp(r))` and the implicit-AD
+tangent \(\partial r / \partial p\) -- take the native forward-mode
+`jvp(vmap(g))` path directly without building row Jacobians.
 
-## Chunking the assembly
+## Chunking
 
-What `vmap_rows` leaves is the path: the unit cotangents carried backward
-through the simulation `scan`, an \((m, m, N)\) array plus the matching
-activations. `jacobian_chunk=c` on the solver pushes the basis through the
-linearization in `lax.map` chunks of \(c\) instead of one `vmap`, so that
-array becomes \((c, m, N)\). Measured on an H100 at \(N = 16384\) with
-\(m = 256\) rows: one batch holds 16.7 GB of temporaries (largest array
-8.6 GB) in 1.36 s; chunks of 64 hold 11.9 GB (largest 2.1 GB) in 1.40 s.
-Smaller chunks save nothing more, since the row block's own activations,
-linear in \(m\), are then the floor.
+When the row function itself has large per-row reverse-mode intermediates,
+`vmap_rows(..., chunk_size=k)` evaluates the per-row `jacrev` pass under
+`jax.linearize` via `jax.lax.map(..., batch_size=k)` instead of a single
+`vmap` over all \(m\) rows, while keeping the forward evaluation as `vmap`.
+
+What `vmap_rows` leaves outside the row block is the path: the unit
+cotangents carried backward through the simulation `scan`, an \((m, m, N)\)
+array plus the matching activations. `jacobian_chunk=c` on the solver pushes
+the basis through the linearization in `lax.map` chunks of \(c\) instead of
+one `vmap`, so that array becomes \((c, m, N)\). Measured on an H100 at
+\(N = 16384\) with \(m = 256\) rows: one batch holds 16.7 GB of temporaries
+(largest array 8.6 GB) in 1.36 s; chunks of 64 hold 11.9 GB (largest 2.1 GB)
+in 1.40 s. Smaller chunks save nothing more, since the row block's own
+activations, linear in \(m\), are then the floor (unless chunked with
+`chunk_size` on `vmap_rows`).
 
 ## Using it
 

@@ -178,3 +178,38 @@ def test_jacobian_chunk_matches_one_batch():
         np.testing.assert_allclose(
             chunked, batch, rtol=tol, atol=tol * float(jnp.abs(batch).max())
         )
+
+
+def test_chunk_size_and_default_in_axes():
+    theta, args, p = problem()
+    reference = jax.jit(lambda th: assemble(native, th, args, p))(theta)
+    tol = 1e3 * float(jnp.finfo(reference[0].dtype).eps)
+    for chunk in (1, 4):
+        chunked = make_residual(vmap_rows(in_axes=IN_AXES, chunk_size=chunk)(euler_row))
+        candidate = jax.jit(lambda th, fn=chunked: assemble(fn, th, args, p))(theta)
+        for a, b in zip(reference, candidate, strict=True):
+            np.testing.assert_allclose(
+                b, a, rtol=tol, atol=tol * float(jnp.abs(a).max())
+            )
+
+    @vmap_rows
+    def row_default(x, next_shocks, params, p):
+        return euler_row(x, 0, next_shocks, params, p)[0]
+
+    def residual_default(th):
+        x0, shocks, next_shocks, _ = args
+        xs = simulate(x0, shocks, th, p)
+        return row_default(xs, next_shocks, th, p)
+
+    def residual_vmap(th):
+        x0, shocks, next_shocks, _ = args
+        xs = simulate(x0, shocks, th, p)
+        return jax.vmap(
+            lambda x, ns, pr, p_: euler_row(x, 0, ns, pr, p_)[0],
+            in_axes=(0, None, None, None),
+        )(xs, next_shocks, th, p)
+
+    J_default = jax.jit(jax.jacrev(residual_default))(theta)
+    J_vmap = jax.jit(jax.jacrev(residual_vmap))(theta)
+    for a, b in zip(jax.tree.leaves(J_vmap), jax.tree.leaves(J_default), strict=True):
+        np.testing.assert_allclose(b, a, rtol=tol, atol=tol * float(jnp.abs(a).max()))
