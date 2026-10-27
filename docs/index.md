@@ -85,7 +85,7 @@ method, so it cannot be passed with another.
 | config | system | dimension | when |
 |---|---|---|---|
 | `Cholesky()` | dense, auto gram/normal | \(\min(m, n)\) | the default |
-| `QR()` | damping-row QR of \([\tilde J;\sqrt\lambda I]\) | \(n\) | tiny damping or ridge; rank-safe |
+| `QR()` | damping-row QR, auto gram/normal | \(\min(m, n)\) | tiny damping or ridge; rank-safe; float32 |
 | `CG(precond)` | matrix-free normal | \(n\) | \(n \lesssim m\), no dense \(J\) |
 | `GramCG(precond)` | matrix-free dual | \(m\) | \(m \ll n\), no dense \(J\) |
 | `LU()` | dense solve of \(B\) | \(n\) | `ad_solver` only: square tangents |

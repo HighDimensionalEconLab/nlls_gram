@@ -12,12 +12,12 @@ Change the linear solver when a specific symptom appears:
 | symptom | try |
 |---|---|
 | \(n\) in the thousands, dense \(J\) too big to form | `GramCG(precond)` when \(m \ll n\), else `CG(precond)` |
-| step accuracy degrades as ridge or damping shrinks | `QR()` — it works at \(\operatorname{cond}(A)\), not \(\operatorname{cond}(A)^2\) |
+| step accuracy degrades as ridge or damping shrinks, or a float32 solve floors well above the residual's precision | `QR()` — it works at \(\operatorname{cond}(A)\), not \(\operatorname{cond}(A)^2\), in both the gram (\(m \times m\)) and normal (\(n \times n\)) forms |
 | non-finite step on a rank-deficient Jacobian | `QR()` (rank-safe) or `Cholesky()` |
 | tangent is NaN or wrong under implicit AD | `ad_solver=SVD()` |
 
-`Cholesky()` picks the smaller of the \(m \times m\) dual and the \(n \times
-n\) normal system by shape. Forcing `form=` is a cost decision only — for
+`Cholesky()` and `QR()` pick the smaller of the \(m \times m\) dual and the
+\(n \times n\) normal system by shape. Forcing `form=` is a cost decision only — for
 \(\lambda > 0\) both give the same step.
 
 ## Inner-solve budget

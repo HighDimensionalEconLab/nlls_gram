@@ -66,6 +66,8 @@ FORWARD_SOLVERS = {
     "cholesky_gram": Cholesky(form="gram"),
     "cholesky_normal": Cholesky(form="normal"),
     "qr": QR(),
+    "qr_gram": QR(form="gram"),
+    "qr_normal": QR(form="normal"),
     "cg": CG(IdentityPreconditioner(), tol=1e-12, maxiter=400),
     "gram_cg": GramCG(IdentityPreconditioner(), tol=1e-12, maxiter=400),
 }

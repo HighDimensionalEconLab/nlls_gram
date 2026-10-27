@@ -98,11 +98,12 @@ class CholeskyCache:
 class QRCache:
     """Per-``(x, ridge)`` cache carried by the :class:`QR` path.
 
-    ``R`` is the R factor of the augmented whitened stack
+    In the normal form ``R`` is the R factor of the augmented whitened stack
     ``[J~; sqrt(ridge) [I 0] | b~]`` -- its first ``n`` columns are the R
     factor of the stack and its last column carries ``Q'b``, so the velocity
-    solve is backward stable with no normal equations. ``valid``/``ridge``
-    have the :class:`CholeskyCache` semantics.
+    solve is backward stable with no normal equations. In the gram form it
+    is the thin QR of ``J~'`` stacked as ``[Q_1; R_1]``, shape ``(n + m, m)``.
+    ``valid``/``ridge`` have the :class:`CholeskyCache` semantics.
     """
 
     R: jax.Array
@@ -341,29 +342,65 @@ class Cholesky(LinearSolver):
 
 @dataclass(frozen=True)
 class QR(LinearSolver):
-    """Damping-row QR of the augmented whitened stack.
+    """Damping-row QR, accurate at ``cond(A)`` rather than ``cond(A)^2``.
 
-    One QR of ``[J~; sqrt(ridge) [I 0] | b~]`` (the penalty rows and the
-    ``b~`` tail only for the ridge solver) is cached per ``(x, ridge)``: its
-    leading columns are the stack's R factor and its last column carries
-    ``Q'b``, so the velocity is a backward-stable least-squares solve with NO
-    normal equations -- More 1978's damping-row structure, accurate at
-    ``cond(A)`` rather than ``cond(A)^2``. Each step re-factors only the
-    damping rows, and those rows keep the system full rank for any
-    ``damping > 0``, so a rank-deficient Jacobian is handled rather than
-    producing a non-finite step. No knobs.
+    ``form="normal"`` is one QR of the augmented whitened stack
+    ``[J~; sqrt(ridge) [I 0] | b~]`` (the penalty rows and the ``b~`` tail
+    only for the ridge solver), cached per ``(x, ridge)``: its leading columns
+    are the stack's R factor and its last column carries ``Q'b``, so the
+    velocity is a backward-stable least-squares solve with NO normal
+    equations -- More 1978's damping-row structure. Each step re-factors only
+    the ``n`` damping rows, ``[R; sqrt(damping) I]``.
+
+    ``form="gram"`` is the dual: the step ``u = -J~'(J~J~' + damping I)^{-1} c``
+    is the leading ``n`` components of the minimum-norm solution of the wide
+    system ``[J~, sqrt(damping) I] w = c``, which a thin QR of the transpose
+    computes through ONE triangular solve, so it is accurate at
+    ``cond([J~, sqrt(damping) I])`` where the gram Cholesky squares it. The
+    thin QR ``J~' = Q_1 R_1`` is cached per ``(x, ridge)`` and each step
+    re-factors only the ``2m x m`` stack ``[R_1; sqrt(damping) I]``, so the
+    cost matches the gram Cholesky's rather than the ``n x n`` normal form's.
+
+    ``form="auto"`` (the default) takes gram when ``n > m`` and the subproblem
+    is unpenalized, as :class:`Cholesky` does; the penalty rows have no dual
+    analogue. In either form the damping rows keep the system full rank for
+    any ``damping > 0``, so a rank-deficient Jacobian is handled rather than
+    producing a non-finite step.
 
     Forward only: the implicit-AD system is undamped, so the damping rows that
     make this path well posed vanish there. Use ``SVD()`` for a rank-deficient
     tangent.
     """
 
+    form: str = "auto"
+
     supports_ad = False
 
+    def __post_init__(self):
+        if self.form not in ("auto", "gram", "normal"):
+            raise ValueError(
+                f"QR.form must be 'auto', 'gram', or 'normal'; got {self.form!r}"
+            )
+
+    @property
+    def supports_penalty(self):
+        return self.form != "gram"
+
+    def _resolved_form(self, m, n, penalized):
+        if penalized:
+            return "normal"
+        if self.form != "auto":
+            return self.form
+        return "gram" if n > m else "normal"
+
     def new_cache(self, m, n, n_m, dtype, penalized):
-        rows = min(m + n_m, n + 1) if penalized else min(m, n + 1)
+        if self._resolved_form(m, n, penalized) == "gram":
+            shape = (n + m, m)
+        else:
+            rows = min(m + n_m, n + 1) if penalized else min(m, n + 1)
+            shape = (rows, n + 1)
         return QRCache(
-            R=jnp.zeros((rows, n + 1), dtype=dtype),
+            R=jnp.zeros(shape, dtype=dtype),
             valid=jnp.asarray(False, dtype=jnp.bool_),
             ridge=jnp.zeros((), dtype=dtype),
         )
@@ -374,6 +411,8 @@ class QR(LinearSolver):
         grad = sub.whitened_transpose(mm(sub.Jt, sub.resid))
         if sub.penalized:
             grad = grad + ridge * sub.penalty_gradient
+        if self._resolved_form(sub.m, sub.n, sub.penalized) == "gram":
+            return self._prepare_gram(sub, grad)
 
         def assemble():
             Bt = sub.whitened_transpose(sub.Jt)
@@ -432,6 +471,36 @@ class QR(LinearSolver):
             velocity=velocity,
             correction=correction,
             make_cache=lambda valid: QRCache(qr_R, valid, ridge),
+        )
+
+    def _prepare_gram(self, sub, grad):
+        n, m, dtype = sub.n, sub.m, sub.dtype
+
+        def assemble():
+            Q_1, R_1 = jnp.linalg.qr(sub.whitened_transpose(sub.Jt), mode="reduced")
+            return jnp.concatenate([Q_1, R_1], axis=0)
+
+        payload = sub.cached(assemble)
+        Q_1, R_1 = payload[:n], payload[n:]
+        # [R_1; sqrt(damping) I] = Q_mu R_mu gives the thin QR of the wide
+        # system's transpose, [J~'; sqrt(damping) I] = blockdiag(Q_1, I) Q_mu
+        # R_mu, so its minimum-norm solution for a residual-space c is
+        # blockdiag(Q_1, I) Q_mu R_mu^{-T} c and the step is minus its leading
+        # n components.
+        damped_stack = jnp.concatenate(
+            [R_1, jnp.sqrt(sub.damping) * jnp.eye(m, dtype=dtype)], axis=0
+        )
+        Q_mu, R_mu = jnp.linalg.qr(damped_stack, mode="reduced")
+
+        def dual_step(c):
+            half = jsp_linalg.solve_triangular(R_mu.T, c, lower=True)
+            return -mm(Q_1, mm(Q_mu[:m], half))
+
+        return StepSolver(
+            grad=grad,
+            velocity=lambda: dual_step(sub.resid),
+            correction=dual_step,
+            make_cache=lambda valid: QRCache(payload, valid, sub.ridge),
         )
 
 

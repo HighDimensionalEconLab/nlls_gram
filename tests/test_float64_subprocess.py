@@ -859,6 +859,8 @@ for label, kwargs in [
     ("cholesky_gram", dict(linear_solver=Cholesky(form="gram"))),
     ("cholesky_normal", dict(linear_solver=Cholesky(form="normal"))),
     ("qr", dict(linear_solver=QR())),
+    ("qr_gram", dict(linear_solver=QR(form="gram"))),
+    ("qr_normal", dict(linear_solver=QR(form="normal"))),
     ("cg", dict(linear_solver=CG(precond, maxiter=8), ad_solver=SVD())),
     ("gram_cg", dict(linear_solver=GramCG(precond, maxiter=8))),
     ("ad_auto_svd", dict()),

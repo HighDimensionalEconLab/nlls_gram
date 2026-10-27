@@ -272,7 +272,11 @@ def test_constructor_and_state_validation():
         CG(IdentityPreconditioner(), tol=0.0)
     # The dual operator never sees the penalty rows, so a Gram form would
     # silently solve the UNPENALIZED subproblem.
-    for gram in (Cholesky(form="gram"), GramCG(IdentityPreconditioner(), maxiter=8)):
+    for gram in (
+        Cholesky(form="gram"),
+        QR(form="gram"),
+        GramCG(IdentityPreconditioner(), maxiter=8),
+    ):
         with pytest.raises(ValueError, match="penalty rows"):
             RidgeLevenbergMarquardt(linear_residual, metric=metric, linear_solver=gram)
     # QR has no AD rule (the implicit system is undamped, where its damping

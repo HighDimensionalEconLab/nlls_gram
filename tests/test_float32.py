@@ -72,6 +72,8 @@ FORWARD = {
     "cholesky_gram": Cholesky(form="gram"),
     "cholesky_normal": Cholesky(form="normal"),
     "qr": QR(),
+    "qr_gram": QR(form="gram"),
+    "qr_normal": QR(form="normal"),
     "cg": CG(IdentityPreconditioner(), tol=1e-7, maxiter=200),
     "gram_cg": GramCG(IdentityPreconditioner(), tol=1e-7, maxiter=200),
 }
