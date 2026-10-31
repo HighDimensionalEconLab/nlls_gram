@@ -922,3 +922,49 @@ for label, ad in [("square_auto_lu", None), ("square_lu", LU()), ("square_svd", 
         text=True,
     )
     assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_newton_float64_and_float32_under_x64():
+    script = r"""
+import jax
+jax.config.update("jax_enable_x64", True)
+import jax.numpy as jnp
+import numpy as np
+
+from nlls_gram import Cholesky, LU, Newton, NewtonStatus, QR, SVD
+
+# 1. Float64 exactness: log(x) from x = 10 accepts alpha = 0.4096 after 5 trials
+s_log = Newton(lambda x: jnp.log(x), c1=1e-4, decrease_factor=0.8, maxls=30)
+x0_64 = jnp.array([10.0], dtype=jnp.float64)
+x1_64, _, info_64 = s_log.update(x0_64, s_log.init(x0_64))
+assert x1_64.dtype == jnp.float64
+assert int(info_64.num_linesearch_steps) == 5
+np.testing.assert_allclose(float(info_64.stepsize), 0.4096, rtol=1e-14)
+res_log = s_log.solve(x0_64, atol=1e-13, max_steps=15)
+assert int(res_log.status) == int(NewtonStatus.CONVERGED)
+np.testing.assert_allclose(float(res_log.x[0]), 1.0, atol=1e-13)
+
+# 2. Float32 problem under x64 stays float32 end-to-end
+A32 = jnp.array([[1.0, 2.0, -1.0], [0.5, -1.0, 3.0]], dtype=jnp.float32)
+p32 = jnp.array([1.0, -2.0], dtype=jnp.float32)
+x0_32 = jnp.zeros(3, dtype=jnp.float32)
+for ls in (Cholesky(), QR(), SVD()):
+    s32 = Newton(lambda x, _, p: A32 @ x - p, linear_solver=ls, cache_jacobian=True)
+    res32 = s32.solve(x0_32, p=p32, atol=1e-5, max_steps=5)
+    assert int(res32.status) == int(NewtonStatus.CONVERGED)
+    assert res32.x.dtype == jnp.float32
+    assert res32.info.loss.dtype == jnp.float32
+    assert res32.info.stepsize.dtype == jnp.float32
+    grad32 = jax.grad(
+        lambda p: jnp.sum(s32.solve(x0_32, p=p, atol=1e-5, max_steps=5).x)
+    )(p32)
+    assert grad32.dtype == jnp.float32
+    assert jnp.all(jnp.isfinite(grad32))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(script)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr + result.stdout

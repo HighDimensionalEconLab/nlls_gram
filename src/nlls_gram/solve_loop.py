@@ -1,15 +1,14 @@
-"""The LM solve loop: the jitted ``lax.while_loop`` driver, its Python mirror,
+"""The solve loop: the jitted ``lax.while_loop`` driver, its Python mirror,
 and the ``save_steps`` history buffers.
 
 Both drivers consume an informal solver protocol -- ``update``,
-``_apply_action``, ``_converged``, ``_residual_and_aux``, ``_initial_info``,
-``_cast_state``, ``has_aux`` -- implemented by ``LevenbergMarquardtBase``.
+``_apply_action``, ``_converged``, ``_step_failure_status``,
+``_residual_and_aux``, ``_initial_info``, ``_cast_state``, ``has_aux`` --
+implemented by ``LevenbergMarquardtBase``.
 """
 
 import jax
 import jax.numpy as jnp
-
-from nlls_gram.lm_types import LMContext, LMSolveResult, LMStatus
 
 
 # save_steps bookkeeping shared by the jitted and Python solve loops: row `step` of
@@ -91,6 +90,9 @@ def _solve_loop_impl(
     xtol,
     callback,
 ):
+    status_cls = solver._status_cls
+    context_cls = solver._context_cls
+    result_cls = solver._result_cls
     history = _init_history(solver, x, args, p, history_len)
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
     info = solver._initial_info(x, lm_state, args, p)
@@ -108,11 +110,11 @@ def _solve_loop_impl(
     stop = initial_nonfinite | initial_converged
     status = jnp.where(
         initial_nonfinite,
-        jnp.asarray(LMStatus.NONFINITE, dtype=jnp.int32),
+        jnp.asarray(status_cls.NONFINITE, dtype=jnp.int32),
         jnp.where(
             initial_converged,
-            jnp.asarray(LMStatus.CONVERGED, dtype=jnp.int32),
-            jnp.asarray(LMStatus.RUNNING, dtype=jnp.int32),
+            jnp.asarray(status_cls.CONVERGED, dtype=jnp.int32),
+            jnp.asarray(status_cls.RUNNING, dtype=jnp.int32),
         ),
     )
 
@@ -125,11 +127,14 @@ def _solve_loop_impl(
         x_old, lm_state_old = x, lm_state
         x, lm_state, info = solver.update(x, lm_state, args, p)
         step = step + jnp.asarray(1, dtype=jnp.int32)
-        current_nonfinite = ~jnp.isfinite(info.loss)
+        step_failure = solver._step_failure_status(info)
+        current_nonfinite = (~jnp.isfinite(info.loss)) | (
+            step_failure == jnp.asarray(status_cls.NONFINITE, dtype=jnp.int32)
+        )
 
         action = None
         if callback is not None:
-            ctx = LMContext(
+            ctx = context_cls(
                 step,
                 x,
                 x_old,
@@ -145,6 +150,9 @@ def _solve_loop_impl(
         action, x, lm_state, args, user_state, problem_changed = solver._apply_action(
             action, x, lm_state, args, user_state
         )
+        retry_changed = solver._action_rescued(
+            action, lm_state, lm_state_old, problem_changed
+        )
         history = _record_history(history, step, x, info, args)
 
         callback_stop = (
@@ -153,28 +161,38 @@ def _solve_loop_impl(
             else jnp.asarray(action.stop, dtype=jnp.bool_)
         )
         callback_status = (
-            jnp.asarray(LMStatus.CALLBACK_STOP, dtype=jnp.int32)
+            jnp.asarray(status_cls.CALLBACK_STOP, dtype=jnp.int32)
             if action.status is None
             else jnp.asarray(action.status, dtype=jnp.int32)
         )
         # info describes the pre-action (x, args); if the action changed them,
-        # the tolerances must wait for a fresh update.
-        converged = solver._converged(info, atol, gtol, xtol) & ~problem_changed
+        # the tolerances and any pre-action step failure wait for a fresh update.
+        raw_converged = solver._converged(info, atol, gtol, xtol)
+        converged = raw_converged & ~problem_changed
+        step_failed = (
+            (step_failure != jnp.asarray(status_cls.RUNNING, dtype=jnp.int32))
+            & ~raw_converged
+            & ~retry_changed
+        )
         reached_max = step >= max_steps
-        stop = current_nonfinite | callback_stop | converged | reached_max
+        stop = current_nonfinite | callback_stop | converged | step_failed | reached_max
         status = jnp.where(
             current_nonfinite,
-            jnp.asarray(LMStatus.NONFINITE, dtype=jnp.int32),
+            jnp.asarray(status_cls.NONFINITE, dtype=jnp.int32),
             jnp.where(
                 callback_stop,
                 callback_status,
                 jnp.where(
                     converged,
-                    jnp.asarray(LMStatus.CONVERGED, dtype=jnp.int32),
+                    jnp.asarray(status_cls.CONVERGED, dtype=jnp.int32),
                     jnp.where(
-                        reached_max,
-                        jnp.asarray(LMStatus.MAX_STEPS, dtype=jnp.int32),
-                        jnp.asarray(LMStatus.RUNNING, dtype=jnp.int32),
+                        step_failed,
+                        step_failure,
+                        jnp.where(
+                            reached_max,
+                            jnp.asarray(status_cls.MAX_STEPS, dtype=jnp.int32),
+                            jnp.asarray(status_cls.RUNNING, dtype=jnp.int32),
+                        ),
                     ),
                 ),
             ),
@@ -191,7 +209,7 @@ def _solve_loop_impl(
     if solver.has_aux:
         final_aux = solver._residual_and_aux(x, args, p)[1]
     x_history, aux_history, args_history = _finalize_history(history, step, final_aux)
-    return LMSolveResult(
+    return result_cls(
         x,
         lm_state,
         info,
@@ -224,30 +242,36 @@ def _solve_python_impl(
     xtol,
     callback,
 ):
+    status_cls = solver._status_cls
+    context_cls = solver._context_cls
+    result_cls = solver._result_cls
     history = _init_history(solver, x, args, p, history_len)
     info = solver._initial_info(x, lm_state, args, p)
     lm_state = solver._cast_state(lm_state, info.loss.dtype)
     initial_lm_state = lm_state
-    status = LMStatus.RUNNING
+    status = status_cls.RUNNING
     steps = 0
     if not bool(jnp.isfinite(info.loss)):
-        status = LMStatus.NONFINITE
+        status = status_cls.NONFINITE
     elif bool(solver._converged(info, atol, gtol, xtol)):
-        status = LMStatus.CONVERGED
+        status = status_cls.CONVERGED
 
     for steps in range(1, max_steps + 1):
-        if status != LMStatus.RUNNING:
+        if status != status_cls.RUNNING:
             steps -= 1
             break
         x_old, lm_state_old = x, lm_state
         x, lm_state, info = solver.update(x, lm_state, args, p)
-        if not bool(jnp.isfinite(info.loss)):
-            status = LMStatus.NONFINITE
+        step_failure = int(solver._step_failure_status(info))
+        if not bool(jnp.isfinite(info.loss)) or step_failure == int(
+            status_cls.NONFINITE
+        ):
+            status = status_cls.NONFINITE
             history = _record_history(history, steps, x, info, args)
             break
         action = None
         if callback is not None:
-            ctx = LMContext(
+            ctx = context_cls(
                 jnp.asarray(steps, dtype=jnp.int32),
                 x,
                 x_old,
@@ -263,29 +287,40 @@ def _solve_python_impl(
         action, x, lm_state, args, user_state, problem_changed = solver._apply_action(
             action, x, lm_state, args, user_state
         )
+        retry_changed = solver._action_rescued(
+            action, lm_state, lm_state_old, problem_changed
+        )
         history = _record_history(history, steps, x, info, args)
         if action.stop is not None and bool(action.stop):
             status = (
-                LMStatus.CALLBACK_STOP if action.status is None else int(action.status)
+                status_cls.CALLBACK_STOP
+                if action.status is None
+                else int(action.status)
             )
             break
         # info describes the pre-action (x, args); if the action changed
-        # them, the tolerances must wait for a fresh update.
-        if bool(solver._converged(info, atol, gtol, xtol)) and not bool(
-            problem_changed
+        # them, the tolerances and any pre-action step failure wait for a fresh update.
+        raw_converged = bool(solver._converged(info, atol, gtol, xtol))
+        if raw_converged and not bool(problem_changed):
+            status = status_cls.CONVERGED
+            break
+        if (
+            step_failure != int(status_cls.RUNNING)
+            and not raw_converged
+            and not bool(retry_changed)
         ):
-            status = LMStatus.CONVERGED
+            status = step_failure
             break
     else:
         steps = max_steps
 
-    if status == LMStatus.RUNNING:
-        status = LMStatus.MAX_STEPS
+    if status == status_cls.RUNNING:
+        status = status_cls.MAX_STEPS
     final_aux = None
     if solver.has_aux:
         final_aux = solver._residual_and_aux(x, args, p)[1]
     x_history, aux_history, args_history = _finalize_history(history, steps, final_aux)
-    return LMSolveResult(
+    return result_cls(
         x,
         lm_state,
         info,

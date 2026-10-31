@@ -5,17 +5,15 @@ Levenberg-Marquardt nonlinear least squares for JAX, built for
 parameters than equations, so a zero-residual root is not unique and *which*
 root you get is part of the contract.
 
-Two solvers differ in where that selection lives.
-
-| | `RidgeLevenbergMarquardt` | `LevenbergMarquardt` |
-|---|---|---|
-| minimizes | \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) | \(\|r(x)\|^2\) |
-| selection lives in | the **objective** | the **damping geometry** |
-| converges to | the minimum-\(W\)-seminorm interpolant | the minimum-\(W\)-norm correction limit |
-| use when | the interpolant is the deliverable | the root is a means to an end |
-
-Both share one `init`/`update`/`solve` protocol, one `Metric`, one linear-solver
+Four solvers share one `init`/`update`/`solve` protocol, one linear-solver
 menu, and one implicit-AD contract.
+
+| | `RidgeLevenbergMarquardt` | `LevenbergMarquardt` | `RidgeNewton` | `Newton` |
+|---|---|---|---|---|
+| minimizes | \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) | \(\|r(x)\|^2\) | \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) | \(\|r(x)\|^2\) |
+| globalization | trust-region damping | trust-region damping | Armijo backtracking line search | Armijo backtracking line search |
+| step direction | damped ridge minimum-\(W\)-norm | damped minimum-\(W\)-norm | ridge minimum-\(W\)-norm | minimum-\(W\)-norm \(-\bar F^{-1}(J \bar F^{-1})^+ r\) |
+| use when | the interpolant is the deliverable | rank-deficient or curved paths need trust-region damping | RKHS / kernel ridge problems where full steps dominate | well-conditioned systems or with `reg > 0` + `geodesic_acceleration=True` |
 
 ## Install
 
@@ -78,18 +76,18 @@ a **free block**, unpenalized by the ridge solver. Calibrate `gtol` as roughly
 
 ## Linear solvers
 
-The same typed configs serve both solvers, in both the forward and the
+The same typed configs serve all four solvers, in both the forward and the
 implicit-AD role. A knob that exists for only one method is a field on that
 method, so it cannot be passed with another.
 
 | config | system | dimension | when |
 |---|---|---|---|
 | `Cholesky()` | dense, auto gram/normal | \(\min(m, n)\) | the default |
-| `QR()` | damping-row QR, auto gram/normal | \(\min(m, n)\) | tiny damping or ridge; rank-safe; float32 |
+| `QR()` | damping-row QR, auto gram/normal | \(\min(m, n)\) | tiny damping or ridge; rank-safe when damped (`LM` or `reg > 0`); float32 |
 | `CG(precond)` | matrix-free normal | \(n\) | \(n \lesssim m\), no dense \(J\) |
 | `GramCG(precond)` | matrix-free dual | \(m\) | \(m \ll n\), no dense \(J\) |
-| `LU()` | dense solve of \(B\) | \(n\) | `ad_solver` only: square tangents |
-| `SVD()` | pseudoinverse | — | `ad_solver` only: rank-deficient tangents |
+| `LU()` | dense solve of \(J\) or \(B\) | \(n\) | `Newton` forward and `ad_solver` for square systems |
+| `SVD()` | pseudoinverse | — | `Newton` forward and `ad_solver` for rank-deficient systems |
 
 For \(\lambda > 0\) the gram and normal forms compute the *same* step (the
 push-through identity), so the choice is about cost, not semantics. A
@@ -105,6 +103,7 @@ normal or dual factorization would square it.
 
 - [Ridge LM](ridge_lm.md) — the objective, whitening, ridge continuation, stopping
 - [Metric LM](metric_lm.md) — the damping geometry and its minimum-norm limit
+- [Newton](newton.md) — undamped minimum-norm Newton / Gauss-Newton with Armijo backtracking
 - [Metrics and preconditioners](metrics.md) — the two hook types
 - [Callbacks](callbacks.md) — the solve loop and its cookbook
 - [Implicit differentiation](implicit_ad.md) — the AD contract

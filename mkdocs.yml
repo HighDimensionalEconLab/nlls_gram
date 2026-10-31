@@ -45,6 +45,7 @@ nav:
   - Home: index.md
   - Ridge LM: ridge_lm.md
   - Metric LM: metric_lm.md
+  - Newton: newton.md
   - Metrics and Preconditioners: metrics.md
   - Callbacks: callbacks.md
   - Multi-Start: multi_start.md

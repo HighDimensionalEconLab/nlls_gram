@@ -4,6 +4,8 @@
 
 ::: nlls_gram.RidgeLevenbergMarquardt
 ::: nlls_gram.LevenbergMarquardt
+::: nlls_gram.RidgeNewton
+::: nlls_gram.Newton
 ::: nlls_gram.AnnealRidge
 
 ## Linear solvers
@@ -42,6 +44,13 @@
 ::: nlls_gram.LMContext
 ::: nlls_gram.LMAction
 ::: nlls_gram.LMSolveResult
+::: nlls_gram.NewtonState
+::: nlls_gram.NewtonInfo
+::: nlls_gram.NewtonStatus
+::: nlls_gram.NewtonHyperparams
+::: nlls_gram.NewtonContext
+::: nlls_gram.NewtonAction
+::: nlls_gram.NewtonSolveResult
 ::: nlls_gram.SolverContext
 ::: nlls_gram.register_pytree_dataclass
 

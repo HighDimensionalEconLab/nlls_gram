@@ -46,6 +46,7 @@ from nlls_gram.lm_types import (
     _cast_hyper,
     _damping_floor,
 )
+from nlls_gram.newton_types import NewtonAction, NewtonContext
 from nlls_gram.utilities import (
     _static_key_component,
     _where_tree,
@@ -180,7 +181,8 @@ class AnnealRidge:
         return {"reference": infinity, "previous": infinity}
 
     def __call__(self, ctx):
-        ridge = ctx.lm_state.ridge
+        state = ctx.state
+        ridge = state.ridge
         dtype = ridge.dtype
         grad_norm = jnp.asarray(ctx.info.grad_norm, dtype=dtype)
         reference = jnp.asarray(ctx.user_state["reference"], dtype=dtype)
@@ -215,17 +217,16 @@ class AnnealRidge:
         advanced = new_ridge < ridge
         fresh_level = jnp.asarray(jnp.inf, dtype)
         state_dtype = jnp.asarray(ctx.user_state["reference"]).dtype
-        return LMAction(
-            lm_state=dataclasses.replace(ctx.lm_state, ridge=new_ridge),
-            user_state={
-                "reference": jnp.where(advanced, fresh_level, reference).astype(
-                    state_dtype
-                ),
-                "previous": jnp.where(advanced, fresh_level, grad_norm).astype(
-                    state_dtype
-                ),
-            },
-        )
+        new_state = dataclasses.replace(state, ridge=new_ridge)
+        new_user_state = {
+            "reference": jnp.where(advanced, fresh_level, reference).astype(
+                state_dtype
+            ),
+            "previous": jnp.where(advanced, fresh_level, grad_norm).astype(state_dtype),
+        }
+        if isinstance(ctx, NewtonContext):
+            return NewtonAction(newton_state=new_state, user_state=new_user_state)
+        return LMAction(lm_state=new_state, user_state=new_user_state)
 
 
 class RidgeLevenbergMarquardt(LevenbergMarquardtBase):

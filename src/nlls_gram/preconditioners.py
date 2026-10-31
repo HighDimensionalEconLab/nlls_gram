@@ -166,9 +166,9 @@ class BlockEigenPreconditioner(Preconditioner):
         object.__setattr__(self, "inverse_permutation", jnp.argsort(permutation))
 
     def apply(self, v, damping, ctx):
-        # LevenbergMarquardt carries no ridge, so its metric-block families
-        # shift by the damping alone.
-        carried = ctx.lm_state.ridge
+        # LevenbergMarquardt and Newton carry no ridge, so their metric-block
+        # families shift by the damping alone.
+        carried = getattr(ctx.lm_state, "ridge", None)
         ridge = (
             jnp.zeros((), v.dtype)
             if carried is None

@@ -34,6 +34,8 @@ from nlls_gram import (
     LevenbergMarquardt,
     LMState,
     LMStatus,
+    Newton,
+    NewtonStatus,
     NystromPreconditioner,
     PaddedPreconditioner,
     ShermanMorrisonPreconditioner,
@@ -273,6 +275,52 @@ def test_internal_matmuls_are_pinned_to_highest_precision():
                     stack.append(inner.jaxpr if hasattr(inner, "jaxpr") else inner)
 
     assert dots, "no dot_general in the trace; the assertion below is vacuous"
+    unpinned = [
+        equation
+        for equation in dots
+        if equation.params.get("precision")
+        != (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+    ]
+    assert not unpinned, "\n".join(str(equation)[:110] for equation in unpinned[:5])
+
+
+@pytest.mark.parametrize("ls", [Cholesky(), QR(), SVD()])
+def test_newton_internal_matmuls_pinned_to_highest_and_dtype_pure(ls):
+    def elementwise_residual(x, args, p):
+        return x[:M] + x[M : 2 * M] - p
+
+    solver = Newton(elementwise_residual, linear_solver=ls)
+    p0 = jnp.linspace(0.5, 1.5, M, dtype=jnp.float32)
+    x0 = jnp.zeros(2 * M, jnp.float32)
+
+    res = solver.solve(x0, None, p=p0, max_steps=4, atol=1e-5)
+    assert int(res.status) == int(NewtonStatus.CONVERGED)
+    assert res.x.dtype == jnp.float32
+    assert res.info.loss.dtype == jnp.float32
+    assert res.info.stepsize.dtype == jnp.float32
+
+    def run(p):
+        return solver.solve(x0, None, p=p, max_steps=4).x
+
+    stack = [jax.make_jaxpr(run)(p0).jaxpr]
+    dots = []
+    while stack:
+        current = stack.pop()
+        for equation in current.eqns:
+            if equation.primitive.name == "dot_general":
+                dots.append(equation)
+            for value in equation.params.values():
+                if hasattr(value, "eqns"):
+                    stack.append(value)
+                elif hasattr(value, "jaxpr"):
+                    inner = value.jaxpr
+                    stack.append(inner.jaxpr if hasattr(inner, "jaxpr") else inner)
+                elif isinstance(value, (tuple, list)):
+                    for item in value:
+                        if hasattr(item, "jaxpr"):
+                            stack.append(item.jaxpr)
+
+    assert dots
     unpinned = [
         equation
         for equation in dots

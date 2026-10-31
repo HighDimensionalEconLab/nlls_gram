@@ -37,10 +37,11 @@ class SolverContext:
 
     - ``x``: the current FLATTENED iterate (the whole parameter vector, not
       just the metric block).
-    - ``lm_state``: the live :class:`LMState` (damping, ridge, caches, and
-      the carried metric/preconditioner instances). In the implicit-AD rule
-      this is the returned state under ``stop_gradient`` -- inert
-      conditioning data, like the ridge.
+    - ``lm_state``: the live :class:`LMState` or :class:`~nlls_gram.NewtonState`
+      (damping, ridge, caches, and the carried metric/preconditioner
+      instances), also accessible via the solver-neutral :attr:`state`
+      property. In the implicit-AD rule this is the returned state under
+      ``stop_gradient`` -- inert conditioning data, like the ridge.
     - ``args`` / ``p``: the residual's auxiliary data and differentiation
       parameters as passed to ``solve``/``update``.
     """
@@ -49,6 +50,11 @@ class SolverContext:
     lm_state: Any = None
     args: Any = None
     p: Any = None
+
+    @property
+    def state(self):
+        """Solver-neutral alias for :attr:`lm_state`."""
+        return self.lm_state
 
 
 class LMStatus(enum.IntEnum):
@@ -287,6 +293,10 @@ class LMContext:
     p: Any
     user_state: Any
     info: Any
+
+    @property
+    def state(self):
+        return self.lm_state
 
 
 @jax.tree_util.register_dataclass

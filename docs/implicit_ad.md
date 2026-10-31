@@ -15,11 +15,24 @@ $$
 \dot x = -F^{-1}B^{+}K\dot p ,
 $$
 
-the **minimum-\(W\)-norm** tangent — the same selection the forward solve
-makes, so the derivative is consistent with the solution it differentiates.
-For `RidgeLevenbergMarquardt` the ridge makes the system positive definite and
-the rule is the plain solve of \((\tilde J^\top\tilde J + \lambda E)\dot y =
--\tilde J^\top K\dot p\).
+the **minimum-\(W\)-norm** tangent — the same local selection rule the forward
+step uses in both `LevenbergMarquardt` and `Newton` (reducing to the
+minimum-Euclidean-norm tangent \(\dot x = -J^+ K \dot p\) when `metric=None`).
+
+When the root is locally unique (for example, a full-rank square system with
+\(r(x^*, a, p) = 0\)), this selected tangent equals the exact sensitivity of the
+solver's returned root \(x^*(p)\). On an underdetermined problem whose Jacobian
+row space rotates with \(p\), the selected tangent \(\dot x = -F^{-1} B^+ K \dot p\)
+is the minimum-norm tangent to the solution manifold \(r(x, a, p) = 0\) at
+\(x^*\), which differs in general from the path derivative of a fixed
+initialization's trajectory by the rotation of \(\text{range}(J^\top)\). For
+`RidgeLevenbergMarquardt` and `RidgeNewton` the ridge makes the system positive
+definite and the rule solves the Gauss-Newton linearized stationarity system
+\((\tilde J^\top\tilde J + \lambda E)\dot y = -\tilde J^\top K\dot p\). Note
+that on nonzero-residual least-squares or positive-ridge problems, all four
+solvers differentiate the Gauss-Newton linearization (omitting the second-order
+residual-Hessian term \(\sum_i r_i \nabla^2_{xx} r_i\)), which becomes exact as
+\(\|r(x^*)\|_2 \to 0\).
 
 Reverse mode comes from JAX transposing that linear tangent program, so `grad`,
 `vjp`, `hessian`, and `vmap` all work without a separate implementation.

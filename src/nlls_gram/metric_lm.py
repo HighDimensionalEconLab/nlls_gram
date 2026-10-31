@@ -592,7 +592,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             # avoidable work -- solve the unwhitened system directly. This is
             # the same uniqueness that makes the plain factorization valid.
             Jt = self._assemble_jt(theta_jvp, theta, residual)
-            return unravel(self._ad_tangent_lu(Jt, residual_p_dot))
+            return unravel(self._ad_tangent_lu(Jt, residual_p_dot, ad_success))
         ctx = SolverContext(x=theta, lm_state=lm_state, args=args, p=p)
         n_m, n_f = self._block_sizes(theta.shape[0])
         dtype = residual.dtype
@@ -612,6 +612,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
                 whiten,
                 whiten_transpose,
                 ctx,
+                ad_success,
             )
         else:
             # B' = F_bar^{-T} J', shape (n, m).
@@ -619,7 +620,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             u = (
                 self._ad_tangent_svd(Bt, residual_p_dot)
                 if isinstance(resolved, SVD)
-                else self._ad_tangent_dense(Bt, residual_p_dot)
+                else self._ad_tangent_dense(Bt, residual_p_dot, ad_success)
             )
         # S = F_bar^{-1} is not self-adjoint, and a matrix-free factor may
         # be opaque to JAX's transpose machinery, so declare its transpose
@@ -634,23 +635,29 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         )
         return unravel(theta_dot)
 
-    def _ad_tangent_dense(self, Bt, residual_p_dot):
+    def _ad_tangent_dense(self, Bt, residual_p_dot, ad_success=True):
         # Undamped Gauss-Newton tangent: u = -B^+ (dr/dp) p_dot through the
         # smaller of the two normal systems. Requires full rank; a rank-
         # deficient B needs SVD(), which selects the minimum-norm tangent.
         n, m = Bt.shape
         if n > m:
-            factor = jsp_linalg.cho_factor(mm(Bt.T, Bt))
+            gram = mm(Bt.T, Bt)
+            gram = jnp.where(ad_success, gram, jnp.eye(m, dtype=Bt.dtype))
+            factor = jsp_linalg.cho_factor(gram)
             return -mm(Bt, jsp_linalg.cho_solve(factor, residual_p_dot))
-        factor = jsp_linalg.cho_factor(mm(Bt, Bt.T))
+        normal = mm(Bt, Bt.T)
+        normal = jnp.where(ad_success, normal, jnp.eye(n, dtype=Bt.dtype))
+        factor = jsp_linalg.cho_factor(normal)
         return -jsp_linalg.cho_solve(factor, mm(Bt, residual_p_dot))
 
-    def _ad_tangent_lu(self, Bt, residual_p_dot):
+    def _ad_tangent_lu(self, Bt, residual_p_dot, ad_success=True):
         # Square B: u = -B^{-1} (dr/dp) p_dot, factored directly. The normal
         # form (B'B)^{-1}B' is algebraically the same map here but numerically
         # worse, at cond(B)^2. Reverse mode transposes this solve, which is the
         # same factorization applied to B'.
-        return -jnp.linalg.solve(Bt.T, residual_p_dot)
+        n = Bt.shape[0]
+        B = jnp.where(ad_success, Bt.T, jnp.eye(n, dtype=Bt.dtype))
+        return -jnp.linalg.solve(B, residual_p_dot)
 
     def _ad_tangent_svd(self, Bt, residual_p_dot):
         # Spectral filter: u = -B^+ (dr/dp) p_dot, the minimum-metric-norm
@@ -660,11 +667,21 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
         # tangent program, so the map stays linear in residual_p_dot.
         U, sigma, Vt = jnp.linalg.svd(Bt.T, full_matrices=False)
         cutoff = max(Bt.shape) * jnp.finfo(Bt.dtype).eps * sigma[0]
-        inverted = jnp.where(sigma > cutoff, 1.0 / jnp.maximum(sigma, cutoff), 0.0)
+        mask = sigma > cutoff
+        safe_sigma = jnp.where(mask, sigma, jnp.ones_like(sigma))
+        inverted = jnp.where(mask, 1.0 / safe_sigma, jnp.zeros_like(sigma))
         return -mm(Vt.T, inverted * mm(U.T, residual_p_dot))
 
     def _ad_tangent_krylov(
-        self, config, theta, theta_jvp, residual_p_dot, whiten, whiten_transpose, ctx
+        self,
+        config,
+        theta,
+        theta_jvp,
+        residual_p_dot,
+        whiten,
+        whiten_transpose,
+        ctx,
+        ad_success=True,
     ):
         dtype = residual_p_dot.dtype
         transpose_fn = jax.linear_transpose(theta_jvp, theta)
@@ -685,7 +702,9 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             # The AD system is undamped, so the preconditioner sees zero
             # damping (requires_positive_damping hooks were rejected).
             def apply_M(v):
-                return ad_preconditioner.apply(v, zero_damping, ctx)
+                return jnp.where(
+                    ad_success, ad_preconditioner.apply(v, zero_damping, ctx), v
+                )
 
         def cg(matvec, rhs, preconditioner=apply_M):
             solution, _ = jsp_sparse_linalg.cg(
@@ -704,7 +723,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             # the null(B') component of y -- unlike the normal form, where the
             # preconditioner must preserve range(B').
             def dual_matvec(y):
-                return B(Bt(y))
+                return jnp.where(ad_success, B(Bt(y)), y)
 
             y = jax.lax.custom_linear_solve(
                 dual_matvec,
@@ -720,7 +739,7 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
             value = Bt(B(u))
             if penalty is not None:
                 value = value + jnp.asarray(penalty, dtype=dtype) * u
-            return value
+            return jnp.where(ad_success, value, u)
 
         if penalty is not None:
             # N = B'B + penalty I is SPD, so CG converges for any right-hand
@@ -743,7 +762,11 @@ class LevenbergMarquardt(LevenbergMarquardtBase):
                 # parameter-space one CG's own operator takes. Handing it an
                 # m-vector is a shape error at best and a wrong tangent at
                 # worst.
-                return cg(lambda w: B(Bt(w)), y, preconditioner=None)
+                return cg(
+                    lambda w: jnp.where(ad_success, B(Bt(w)), w),
+                    y,
+                    preconditioner=None,
+                )
 
         rhs = -Bt(residual_p_dot)
         return jax.lax.custom_linear_solve(

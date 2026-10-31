@@ -17,7 +17,9 @@ from jax.flatten_util import ravel_pytree
 
 from nlls_gram.lm_types import (
     LMAction,
+    LMContext,
     LMHyperparams,
+    LMSolveResult,
     LMStatus,
 )
 from nlls_gram.multi_start import (
@@ -78,7 +80,14 @@ class LevenbergMarquardtBase:
 
     # Whether a callback-replaced metric moves the objective (the ridge
     # solver's penalty embeds it) or only the damping geometry.
+    _action_cls = LMAction
+    _context_cls = LMContext
+    _result_cls = LMSolveResult
+    _status_cls = LMStatus
+    _state_field = "lm_state"
+    _has_metric = True
     _metric_defines_objective = False
+    _forward_role_attr = "supports_forward"
 
     def _check_registered_instance(self, instance, keyword):
         if instance is None:
@@ -111,7 +120,7 @@ class LevenbergMarquardtBase:
         ridge solver handing its penalized subproblem to a dual form that
         never sees the penalty rows.
         """
-        role = [(linear_solver, "linear_solver", "supports_forward")]
+        role = [(linear_solver, "linear_solver", self._forward_role_attr)]
         if ad_solver is not None:
             role.append((ad_solver, "ad_solver", "supports_ad"))
         for config, keyword, attribute in role:
@@ -127,6 +136,12 @@ class LevenbergMarquardtBase:
                 )
         if self.jacobian_mode not in ("auto", "fwd", "rev"):
             raise ValueError(f"unknown jacobian_mode: {self.jacobian_mode}")
+        if self.jacobian_chunk is not None and (
+            isinstance(self.jacobian_chunk, bool)
+            or not isinstance(self.jacobian_chunk, int)
+            or self.jacobian_chunk <= 0
+        ):
+            raise ValueError("jacobian_chunk must be a positive int or None")
 
     def _cold_state(self, lm_state):
         # Drawn multi-start lanes must not reuse caches built at another
@@ -153,18 +168,27 @@ class LevenbergMarquardtBase:
         # The basis goes through the linearization in one batch, or in chunks
         # of jacobian_chunk so the batched pass's live intermediates scale
         # with the chunk instead of with m or n.
-        def over_basis(fn, basis):
-            if self.jacobian_chunk is None:
-                return jax.vmap(fn)(basis)
-            return jax.lax.map(fn, basis, batch_size=self.jacobian_chunk)
+        def over_basis(fn, size, dtype):
+            if self.jacobian_chunk is None or self.jacobian_chunk >= size:
+                return jax.vmap(fn)(jnp.eye(size, dtype=dtype))
+
+            def eval_idx(idx):
+                basis_vec = (jnp.arange(size) == idx).astype(dtype)
+                return fn(basis_vec)
+
+            return jax.lax.map(
+                eval_idx,
+                jnp.arange(size, dtype=jnp.int32),
+                batch_size=self.jacobian_chunk,
+            )
 
         if self._resolve_jacobian_mode(resid.shape[0], theta.shape[0]) == "fwd":
-            parameter_basis = jnp.eye(theta.shape[0], dtype=theta.dtype)
-            return over_basis(jvp_fn, parameter_basis)
+            return over_basis(jvp_fn, theta.shape[0], theta.dtype)
         transpose_fn = jax.linear_transpose(jvp_fn, theta)
-        residual_basis = jnp.eye(resid.shape[0], dtype=resid.dtype)
         return over_basis(
-            lambda cotangent: transpose_fn(cotangent)[0], residual_basis
+            lambda cotangent: transpose_fn(cotangent)[0],
+            resid.shape[0],
+            resid.dtype,
         ).T
 
     def _dense_resid_jt_aux(self, residual_flat, theta):
@@ -310,8 +334,21 @@ class LevenbergMarquardtBase:
 
     def _action_or_default(self, action):
         if action is None:
-            return LMAction()
+            return self._action_cls()
         return action
+
+    def _action_state(self, action):
+        return getattr(action, self._state_field)
+
+    def _result_state(self, result):
+        return getattr(result, self._state_field)
+
+    def _step_failure_status(self, info):
+        return jnp.where(
+            ~jnp.isfinite(info.loss),
+            jnp.asarray(self._status_cls.NONFINITE, dtype=jnp.int32),
+            jnp.asarray(self._status_cls.RUNNING, dtype=jnp.int32),
+        )
 
     def _check_instance_structure(self, new, previous, name):
         # Trace-time guard mirroring the hyper contract: a replaced instance
@@ -332,15 +369,16 @@ class LevenbergMarquardtBase:
 
         if spec(new) != spec(previous):
             raise ValueError(
-                f"the callback action replaced lm_state.{name} with a "
+                f"the callback action replaced {self._state_field}.{name} with a "
                 "different type, structure, or leaf shape/dtype/weak-type; "
                 "rebuild the same class with arrays matching the carried "
                 "instance, and preserve untouched fields with "
-                "dataclasses.replace(ctx.lm_state, ...)"
+                f"dataclasses.replace(ctx.{self._state_field}, ...)"
             )
 
     def _apply_action(self, action, x, lm_state, args, user_state):
         action = self._action_or_default(action)
+        action_state = self._action_state(action)
         # The step's diagnostics and every cache describe the pre-action
         # problem, so they are stale iff the action actually changed the
         # values -- a traced comparison, so a jit-style callback that returns
@@ -351,15 +389,15 @@ class LevenbergMarquardtBase:
         if action.x is not None:
             xargs_changed = xargs_changed | _tree_changed(action.x, x)
             x = action.x
-        if action.lm_state is not None:
+        if action_state is not None:
             previous = lm_state
-            lm_state = action.lm_state
+            lm_state = action_state
             if self.cache_jacobian and lm_state.jacobian_valid is None:
                 raise ValueError(
                     "cache_jacobian=True but the callback action returned an "
-                    "lm_state without the Jacobian cache; use "
-                    "dataclasses.replace(ctx.lm_state, ...) to preserve the "
-                    "cache fields"
+                    f"{self._state_field} without the Jacobian cache; use "
+                    f"dataclasses.replace(ctx.{self._state_field}, ...) to "
+                    "preserve the cache fields"
                 )
             self._check_action_state(lm_state)
             # Trace-time guard so the hyper contract fails identically with
@@ -374,22 +412,25 @@ class LevenbergMarquardtBase:
             ):
                 raise ValueError(
                     "the callback action changed the structure or dtypes of "
-                    "lm_state.hyper; reset values with "
-                    "dataclasses.replace(ctx.lm_state.hyper, ...) using arrays "
-                    "of the same dtype — a knob constructed as None cannot be "
-                    "enabled mid-solve"
+                    f"{self._state_field}.hyper; reset values with "
+                    f"dataclasses.replace(ctx.{self._state_field}.hyper, ...) "
+                    "using arrays of the same dtype — a knob constructed as "
+                    "None cannot be enabled mid-solve"
                 )
-            self._check_instance_structure(lm_state.metric, previous.metric, "metric")
+            if self._has_metric:
+                self._check_instance_structure(
+                    lm_state.metric, previous.metric, "metric"
+                )
+                # A changed metric moves the ridge objective (suppressing this
+                # step's convergence test) but only re-whitens the metric
+                # solver's; both stale the whitening-dependent solver caches,
+                # neither the Jacobian cache -- J = dr/dx does not see the
+                # metric. Preconditioner changes are deliberately not compared:
+                # staleness only moves the CG iteration path.
+                metric_changed = _tree_changed(lm_state.metric, previous.metric)
             self._check_instance_structure(
                 lm_state.preconditioner, previous.preconditioner, "preconditioner"
             )
-            # A changed metric moves the ridge objective (suppressing this
-            # step's convergence test) but only re-whitens the metric
-            # solver's; both stale the whitening-dependent solver caches,
-            # neither the Jacobian cache -- J = dr/dx does not see the
-            # metric. Preconditioner changes are deliberately not compared:
-            # staleness only moves the CG iteration path.
-            metric_changed = _tree_changed(lm_state.metric, previous.metric)
             lm_state, state_changed = self._apply_action_state(lm_state, previous)
             if self._metric_defines_objective:
                 state_changed = state_changed | metric_changed
@@ -407,14 +448,26 @@ class LevenbergMarquardtBase:
                     lm_state, jacobian_valid=lm_state.jacobian_valid & ~xargs_changed
                 )
         touched = (
-            action.x is not None
-            or action.args is not None
-            or action.lm_state is not None
+            action.x is not None or action.args is not None or action_state is not None
         )
         lm_state = self._invalidate_caches(
             lm_state, action, touched, problem_changed | metric_changed
         )
         return action, x, lm_state, args, user_state, problem_changed
+
+    def _action_rescued(self, action, lm_state, previous, problem_changed):
+        if self._action_state(action) is None:
+            return problem_changed
+        metric_changed = (
+            _tree_changed(lm_state.metric, previous.metric)
+            if self._has_metric
+            else jnp.asarray(False)
+        )
+        hyper_changed = _tree_changed(lm_state.hyper, previous.hyper)
+        precond_changed = _tree_changed(
+            lm_state.preconditioner, previous.preconditioner
+        )
+        return problem_changed | metric_changed | hyper_changed | precond_changed
 
     # Subclass hooks for the callback-action path. The defaults are inert.
     def _check_action_state(self, lm_state):
@@ -498,6 +551,41 @@ class LevenbergMarquardtBase:
 
             jax.grad(lambda p: objective(solver.solve(x0, p=p).x, p))(p)
         """
+        return self._run_solve(
+            x0,
+            args,
+            p=p,
+            state=lm_state,
+            max_steps=max_steps,
+            max_steps_is_success=max_steps_is_success,
+            atol=atol,
+            gtol=gtol,
+            xtol=xtol,
+            callback=callback,
+            user_state=user_state,
+            save_steps=save_steps,
+            multi_start=multi_start,
+            jit=jit,
+        )
+
+    def _run_solve(
+        self,
+        x0,
+        args=None,
+        *,
+        p=None,
+        state=None,
+        max_steps=256,
+        max_steps_is_success=True,
+        atol=0.0,
+        gtol=0.0,
+        xtol=0.0,
+        callback=None,
+        user_state=None,
+        save_steps=False,
+        multi_start=None,
+        jit=True,
+    ):
         self._check_residual_args(args, p)
         if max_steps <= 0:
             raise ValueError("max_steps must be positive")
@@ -511,7 +599,7 @@ class LevenbergMarquardtBase:
             raise ValueError("xtol must be nonnegative")
         self._validate_tolerances(atol, gtol, xtol)
         callback = _hashable_hook(callback)
-        lm_state = self._solve_lm_state(x0, args, p, lm_state)
+        lm_state = self._solve_lm_state(x0, args, p, state)
         if lm_state.hyper is None:
             lm_state = dataclasses.replace(lm_state, hyper=self.hyperparams())
         history_len = max_steps + 1 if save_steps else None
@@ -757,9 +845,10 @@ class LevenbergMarquardtBase:
         initial_x, initial_args, initial_p = jax.tree.map(
             jax.lax.stop_gradient, initial_ad_point[:3]
         )
-        ad_success = result.status == LMStatus.CONVERGED
+        status_cls = self._status_cls
+        ad_success = result.status == status_cls.CONVERGED
         if max_steps_is_success:
-            ad_success = ad_success | (result.status == LMStatus.MAX_STEPS)
+            ad_success = ad_success | (result.status == status_cls.MAX_STEPS)
         ad_x = _where_tree(ad_success, result.x, initial_x)
         ad_args = _where_tree(ad_success, result.args, initial_args)
         ad_p = _where_tree(ad_success, result.p, initial_p)

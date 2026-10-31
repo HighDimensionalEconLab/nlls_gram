@@ -2,10 +2,14 @@
 
 ## Picking a solver
 
-Start with `RidgeLevenbergMarquardt` when the interpolant is the deliverable
-and `LevenbergMarquardt` when the root is a means to an end. Defaults —
-`Cholesky()`, `geodesic_acceleration=True`, `cache_jacobian=True` — are the
-right first try for both.
+Start with `RidgeLevenbergMarquardt` when the interpolant is the deliverable,
+`LevenbergMarquardt` when the root is a means to an end on a curved or
+rank-deficient landscape, and `Newton` when the Jacobian is well-conditioned
+and undamped full steps or cheap residual-only Armijo trials are faster than
+trust-region re-factorizations. Defaults —
+`Cholesky()`, `geodesic_acceleration=True`, `cache_jacobian=True` for LM, and
+`Cholesky()`, `cache_jacobian=False` for `Newton` — are the
+right first try.
 
 Change the linear solver when a specific symptom appears:
 
@@ -13,7 +17,7 @@ Change the linear solver when a specific symptom appears:
 |---|---|
 | \(n\) in the thousands, dense \(J\) too big to form | `GramCG(precond)` when \(m \ll n\), else `CG(precond)` |
 | step accuracy degrades as ridge or damping shrinks, or a float32 solve floors well above the residual's precision | `QR()` — it works at \(\operatorname{cond}(A)\), not \(\operatorname{cond}(A)^2\), in both the gram (\(m \times m\)) and normal (\(n \times n\)) forms |
-| non-finite step on a rank-deficient Jacobian | `QR()` (rank-safe) or `Cholesky()` |
+| non-finite step on a rank-deficient Jacobian | `QR()` (rank-safe for damped `LM` or `Newton(reg=...)`), or `SVD()` for undamped `Newton` |
 | tangent is NaN or wrong under implicit AD | `ad_solver=SVD()` |
 
 `Cholesky()` and `QR()` pick the smaller of the \(m \times m\) dual and the
