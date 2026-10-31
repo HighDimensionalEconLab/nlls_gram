@@ -7,21 +7,25 @@
 [![License: MIT](https://img.shields.io/github/license/HighDimensionalEconLab/nlls_gram)](https://github.com/HighDimensionalEconLab/nlls_gram/blob/main/LICENSE)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 
-Levenberg-Marquardt nonlinear least squares for JAX pytrees, aimed at solving
-systems of equations. The core use case is **underdetermined** systems — more
-parameters than residuals — where a zero-residual root is not unique and
-something must select *which* interpolant is returned. Two solvers differ in
-where that selection lives:
+Levenberg-Marquardt and Newton nonlinear least squares for JAX pytrees, aimed at
+solving systems of equations. The core use case is **underdetermined** systems —
+more parameters than residuals — where a zero-residual root is not unique and
+something must select *which* interpolant is returned. Two solvers share a
+unified `init`/`update`/`solve` protocol and support both unpenalized and
+ridge-penalized modes:
 
-- **`RidgeLevenbergMarquardt`** puts it in the **objective**, minimizing
-  \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) for a positive-definite metric
-  \(W\) on the metric block of \(x = [x_m; x_f]\) (the free block stays
-  unpenalized). Annealing \(\lambda\) toward zero converges to the
-  minimum-seminorm — e.g. minimum-RKHS-norm — interpolant, by classical
-  nonlinear Tikhonov regularization. Every inner problem is a well-posed NLLS.
-- **`LevenbergMarquardt`** puts it in the **damping geometry**: standard
-  damped LM whose trust region is measured in \(W\), so the small-damping
-  Gauss-Newton limit is the minimum-\(W\)-norm correction.
+- **`LevenbergMarquardt`** (trust-region damping) and **`Newton`** (Armijo
+  backtracking line search) with **`ridge=<positive scalar>`** put the selection
+  in the **objective**, minimizing \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) for a
+  positive-definite metric \(W\) on the metric block of \(x = [x_m; x_f]\) (the
+  free block stays unpenalized). Annealing \(\lambda\) toward zero tracks global
+  (or local-basin) minimizers toward the minimum-seminorm — e.g.
+  minimum-RKHS-norm — interpolant, by classical nonlinear Tikhonov
+  regularization. Every inner problem is a well-posed NLLS.
+- **`LevenbergMarquardt`** and **`Newton`** with **`ridge=None`** (the default)
+  put the selection in the **step geometry**: minimizing \(\|r(x)\|^2\) where
+  the trust region or Gauss-Newton pseudoinverse is measured in \(W\), so the
+  step direction is the minimum-\(W\)-norm correction.
 
 Both take a residual over `(x)`, `(x, args)`, or `(x, args, p)`, flatten any
 pytree `x`, expose per-step `update(...)` and an internally jitted `solve(...)`
@@ -44,13 +48,13 @@ uv add nlls-gram "jax[cuda13]"
 
 ```python
 import jax.numpy as jnp
-from nlls_gram import AnnealRidge, RidgeLevenbergMarquardt, RepeatedFactorMetric
+from nlls_gram import AnnealRidge, LevenbergMarquardt, RepeatedFactorMetric
 
 # W = blockdiag(K, K): the RKHS seminorm over two coefficient blocks. The
 # constructor takes the FACTOR; shift a semidefinite K by epsilon*I first.
 metric = RepeatedFactorMetric(jnp.linalg.cholesky(K, upper=True), repeats=2)
 
-solver = RidgeLevenbergMarquardt(collocation_residual, metric=metric, ridge=1e-4)
+solver = LevenbergMarquardt(collocation_residual, metric=metric, ridge=1e-4)
 
 # Anneal the ridge toward the interpolating limit on stationarity.
 anneal = AnnealRidge(ridge_floor=1e-10)
@@ -88,13 +92,13 @@ Pass `metric=` to weight the damping geometry.
 
 ## Linear solvers
 
-The same typed configs serve both solvers, forward and in the implicit-AD
-role: `Cholesky()` (the default, auto-selecting the smaller of the dual and
-normal systems), `QR()` (damping-row QR — stable at tiny damping and
-rank-safe), `CG(precond)` and `GramCG(precond)` (matrix-free in parameter and
-residual space), and `SVD()` for rank-deficient tangents. A knob that exists
-for only one method is a field on that method, so it cannot be passed with
-another.
+The same typed configs serve both solvers: `Cholesky()` (the default,
+auto-selecting the smaller of the dual and normal systems), `QR()`
+(damping-row QR in the forward role — stable at tiny damping and rank-safe when
+damped), `CG(precond)` and `GramCG(precond)` (matrix-free in parameter and
+residual space), `LU()` for square systems, and `SVD()` for rank-deficient
+steps or implicit-AD tangents. A knob that exists for only one method is a
+field on that method, so it cannot be passed with another.
 
 ## Row-wise residuals
 

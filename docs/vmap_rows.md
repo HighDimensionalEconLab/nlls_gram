@@ -140,7 +140,7 @@ It composes with `jit`, `scan`, and an outer `vmap`.
 
 ## Measured
 
-`benchmarks/test_vmap_rows_benchmark.py` assembles the Jacobian of a
+`benchmarks/test_benchmarks.py` assembles the Jacobian and takes a step on a
 simulated-path residual (\(m = 64\) states of \(N\) firms, \(Q = 3\)
 successors, a width-16 two-layer policy, \(n = 321\)) under both
 decorators. Temporary memory of the compiled program and median time:

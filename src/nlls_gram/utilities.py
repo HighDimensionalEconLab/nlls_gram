@@ -2,7 +2,7 @@
 residual-signature canonicalization, and the pinned-precision matrix product.
 
 No solver or metric code lives here -- only plumbing both
-``LevenbergMarquardt`` and ``RidgeLevenbergMarquardt`` share.
+``LevenbergMarquardt`` and ``Newton`` share.
 """
 
 import dataclasses

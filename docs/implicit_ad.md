@@ -25,11 +25,11 @@ solver's returned root \(x^*(p)\). On an underdetermined problem whose Jacobian
 row space rotates with \(p\), the selected tangent \(\dot x = -F^{-1} B^+ K \dot p\)
 is the minimum-norm tangent to the solution manifold \(r(x, a, p) = 0\) at
 \(x^*\), which differs in general from the path derivative of a fixed
-initialization's trajectory by the rotation of \(\text{range}(J^\top)\). For
-`RidgeLevenbergMarquardt` and `RidgeNewton` the ridge makes the system positive
-definite and the rule solves the Gauss-Newton linearized stationarity system
-\((\tilde J^\top\tilde J + \lambda E)\dot y = -\tilde J^\top K\dot p\). Note
-that on nonzero-residual least-squares or positive-ridge problems, all four
+initialization's trajectory by the rotation of \(\text{range}(J^\top)\). When
+`ridge` is active in `LevenbergMarquardt` or `Newton`, the ridge makes the
+system positive definite and the rule solves the Gauss-Newton linearized
+stationarity system \((\tilde J^\top\tilde J + \lambda E)\dot y = -\tilde J^\top K\dot p\).
+Note that on nonzero-residual least-squares or positive-ridge problems, both
 solvers differentiate the Gauss-Newton linearization (omitting the second-order
 residual-Hessian term \(\sum_i r_i \nabla^2_{xx} r_i\)), which becomes exact as
 \(\|r(x^*)\|_2 \to 0\).

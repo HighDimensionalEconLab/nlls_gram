@@ -9,7 +9,7 @@ things:
 
 Instances of both are **JAX pytrees**: array fields are traced leaves, the
 type plus its static fields are structure. They ride inside the solver state
-(`lm_state.metric`, `lm_state.preconditioner`), so a `solve` callback adapts
+(`state.metric`, `state.preconditioner`), so a `solve` callback adapts
 one by **calling the constructor again** with fresh arrays — same type, same
 leaf shapes and dtypes, pure traced ops, no recompilation. See
 [Callbacks](callbacks.md) for the adaptation rules.
@@ -33,7 +33,7 @@ class Metric:
 
 Ops read `self` and act on metric-block vectors, or matrices whose *leading*
 axis is `size` (columns are batched). `ctx` is a `SolverContext` carrying the
-flat iterate and the live `LMState`, so an exotic metric can key off either.
+flat iterate and the live solver `state`, so an exotic metric can key off either.
 Shipped implementations:
 
 | | \(W\) |

@@ -1,12 +1,15 @@
 # Ridge Levenberg–Marquardt
 
-`RidgeLevenbergMarquardt` solves underdetermined interpolation problems by
-minimizing a **ridge objective** whose small-ridge limit is the
-minimum-seminorm interpolant. Where
-[`LevenbergMarquardt`](index.md) encodes the selection in a parameter-space
-*metric* (the algorithm's damping geometry), this solver encodes it in the
-*objective* — every inner problem is a well-posed nonlinear least squares
-that any solver can attack with textbook guarantees.
+`LevenbergMarquardt(..., ridge=<positive scalar>)` (and its Armijo line-search
+counterpart [`Newton(..., ridge=<positive scalar>)`](newton.md)) solves
+underdetermined interpolation problems by minimizing a **ridge objective**
+whose small-ridge limit is the minimum-seminorm interpolant. Where unpenalized
+[`LevenbergMarquardt(..., ridge=None)`](metric_lm.md) encodes the selection in a
+parameter-space *metric* (the algorithm's damping geometry), setting a positive
+`ridge` encodes it in the *objective* — every inner problem is a well-posed
+nonlinear least squares that any solver can attack with textbook guarantees.
+When `metric=None`, `ridge` defaults the metric to the Euclidean identity over
+all coordinates (\(\|r(x)\|^2 + \lambda\,\|x\|_2^2\)).
 
 ## Problem statement
 
@@ -41,8 +44,9 @@ F_\lambda(x) \;=\; \|r(x)\|^2 + \lambda\,\|x_m\|_W^2 .
 $$
 
 Under the identification condition (plus standard local regularity of an
-isolated constrained minimizer) each fixed-\(\lambda\) problem has an
-isolated minimizer \(x_\lambda\), and
+isolated constrained minimizer), global minimizers \(x_\lambda\) (or local
+minimizers along a continuation branch inside the basin of \(x^\dagger\))
+satisfy
 
 $$
 x_\lambda \;=\; x^\dagger + O(\lambda) \quad\text{as } \lambda \downarrow 0
@@ -54,8 +58,9 @@ purpose: plain Gauss–Newton on an underdetermined system converges to *some*
 interpolant, and characterizing **which** one requires either an explicit
 null-space correction (Campbell–Kunkel–Bobinyec 2012, relaxed in
 Pes–Rodriguez 2022) or an affine residual (Izmailov–Solodov 2026). With the
-ridge objective no such characterization is needed — the minimizer itself
-carries the selection, at any solver accuracy.
+ridge objective no such characterization is needed — the stationary point of
+\(F_\lambda\) itself carries the selection once `gtol` resolves the null-space
+stationarity condition.
 
 ## The whitened change of variables
 
@@ -150,11 +155,16 @@ from nlls_gram import AnnealRidge
 
 anneal = AnnealRidge(ridge_floor=1e-8, decrease=0.1)
 result = solver.solve(
-    x0, callback=anneal, user_state=anneal.init_state(), atol=1e-8, max_steps=500
+    x0,
+    callback=anneal,
+    user_state=anneal.init_state(),
+    gtol=1e-8,
+    atol=1e-8,
+    max_steps=500,
 )
 ```
 
-The callback multiplies `lm_state.ridge` by `decrease` whenever the inner
+The callback multiplies `state.ridge` by `decrease` whenever the inner
 fixed-\(\lambda\) problem is approximately stationary (`info.grad_norm`
 below `grad_rtol` relative to its reference at the current level), never
 below `ridge_floor`. Two pacing notes from production use: the per-level
@@ -301,7 +311,7 @@ Shipped metrics:
   already hold it): `F = jnp.linalg.cholesky(K, upper=True)`. All repeated
   blocks and all batched columns share a single triangular product/solve.
 
-The metric instance rides in `lm_state.metric`, so a callback may replace
+The metric instance rides in `state.metric`, so a callback may replace
 it mid-solve by constructing a new instance of the same type (see
 [Callbacks](callbacks.md)); the solver treats the change as a problem
 change — the metric defines this objective — suppressing that step's
@@ -396,9 +406,9 @@ shipped workhorse: a block-diagonal approximation over a chosen grouping of
 the whitened coordinates, eigendecomposed in the constructor and applied
 with the damping-analytic shift \(\Lambda +
 \texttt{ridge\_weight}\cdot\lambda + \mu\) (metric-block families carry the
-live ridge read from `ctx.lm_state.ridge`, free-block families are
+live ridge read from `ctx.state.ridge`, free-block families are
 damping-only). The eigenbasis rides in the carried instance
-(`lm_state.preconditioner`).
+(`state.preconditioner`).
 
 **Adaptive refreshes through the solve callback.** A callback rebuilds the
 instance from the live iterate by calling the constructor; staleness only
@@ -414,21 +424,22 @@ anneal = AnnealRidge(ridge_floor=1e-11)
 
 def callback(ctx):
     action = anneal(ctx)
-    advanced = action.lm_state.ridge < ctx.lm_state.ridge
+    advanced = action.state.ridge < ctx.state.ridge
     precond = jax.lax.cond(
         advanced,
         lambda: BlockEigenPreconditioner(build_families(ctx.x), PERMUTATION),
-        lambda: ctx.lm_state.preconditioner,
+        lambda: ctx.state.preconditioner,
     )
     return dataclasses.replace(
         action,
-        lm_state=dataclasses.replace(action.lm_state, preconditioner=precond),
+        state=dataclasses.replace(action.state, preconditioner=precond),
     )
 
 
-solver = RidgeLevenbergMarquardt(
+solver = LevenbergMarquardt(
     residual_fn,
     metric=metric,
+    ridge=1e-4,
     linear_solver=CG(
         BlockEigenPreconditioner(build_families(x0), PERMUTATION),
         tol=1e-10,

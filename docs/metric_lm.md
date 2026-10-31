@@ -33,7 +33,7 @@ Gauss-Newton step above.
 **This selects the correction, not the iterate.** The returned root is
 \(x_0 + \sum_k s_k\), so it is the *path* that carries the geometry. When you
 want the interpolant itself to be minimum-seminorm, the selection belongs in
-the objective — use [`RidgeLevenbergMarquardt`](ridge_lm.md).
+the objective — pass a positive `ridge` to [`LevenbergMarquardt`](ridge_lm.md).
 
 ## Choosing the metric
 

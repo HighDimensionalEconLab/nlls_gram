@@ -4,11 +4,13 @@ and the ``save_steps`` history buffers.
 Both drivers consume an informal solver protocol -- ``update``,
 ``_apply_action``, ``_converged``, ``_step_failure_status``,
 ``_residual_and_aux``, ``_initial_info``, ``_cast_state``, ``has_aux`` --
-implemented by ``LevenbergMarquardtBase``.
+implemented by ``SolverBase``.
 """
 
 import jax
 import jax.numpy as jnp
+
+from nlls_gram.types import CallbackContext, SolveResult, SolverStatus
 
 
 # save_steps bookkeeping shared by the jitted and Python solve loops: row `step` of
@@ -79,7 +81,7 @@ def _finalize_history(history, steps, final_aux):
 def _solve_loop_impl(
     solver,
     x,
-    lm_state,
+    state,
     args,
     p,
     user_state,
@@ -90,20 +92,20 @@ def _solve_loop_impl(
     xtol,
     callback,
 ):
-    status_cls = solver._status_cls
-    context_cls = solver._context_cls
-    result_cls = solver._result_cls
+    status_cls = SolverStatus
+    context_cls = CallbackContext
+    result_cls = SolveResult
     history = _init_history(solver, x, args, p, history_len)
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
-    info = solver._initial_info(x, lm_state, args, p)
+    info = solver._initial_info(x, state, args, p)
     # Recast the state's scalars (damping, hyperparameters, and any
     # solver-specific carried scalars) and the tolerances to the residual
     # dtype so the while_loop carry matches what update() returns.
     atol = jnp.asarray(atol, dtype=info.loss.dtype)
     gtol = jnp.asarray(gtol, dtype=info.loss.dtype)
     xtol = jnp.asarray(xtol, dtype=info.loss.dtype)
-    lm_state = solver._cast_state(lm_state, info.loss.dtype)
-    initial_lm_state = lm_state
+    state = solver._cast_state(state, info.loss.dtype)
+    initial_state = state
     step = jnp.asarray(0, dtype=jnp.int32)
     initial_nonfinite = ~jnp.isfinite(info.loss)
     initial_converged = solver._converged(info, atol, gtol, xtol)
@@ -123,9 +125,9 @@ def _solve_loop_impl(
         return (~stop) & (step < max_steps)
 
     def body(carry):
-        x, lm_state, args, user_state, history, _, step, _, _ = carry
-        x_old, lm_state_old = x, lm_state
-        x, lm_state, info = solver.update(x, lm_state, args, p)
+        x, state, args, user_state, history, _, step, _, _ = carry
+        x_old, state_old = x, state
+        x, state, info = solver.update(x, state, args, p)
         step = step + jnp.asarray(1, dtype=jnp.int32)
         step_failure = solver._step_failure_status(info)
         current_nonfinite = (~jnp.isfinite(info.loss)) | (
@@ -138,20 +140,20 @@ def _solve_loop_impl(
                 step,
                 x,
                 x_old,
-                lm_state,
-                lm_state_old,
-                initial_lm_state,
+                state,
+                state_old,
+                initial_state,
                 args,
                 p,
                 user_state,
                 info,
             )
             action = callback(ctx)
-        action, x, lm_state, args, user_state, problem_changed = solver._apply_action(
-            action, x, lm_state, args, user_state
+        action, x, state, args, user_state, problem_changed = solver._apply_action(
+            action, x, state, args, user_state
         )
         retry_changed = solver._action_rescued(
-            action, lm_state, lm_state_old, problem_changed
+            action, state, state_old, problem_changed
         )
         history = _record_history(history, step, x, info, args)
 
@@ -197,21 +199,21 @@ def _solve_loop_impl(
                 ),
             ),
         )
-        return x, lm_state, args, user_state, history, info, step, status, stop
+        return x, state, args, user_state, history, info, step, status, stop
 
     carry = jax.lax.while_loop(
         cond,
         body,
-        (x, lm_state, args, user_state, history, info, step, status, stop),
+        (x, state, args, user_state, history, info, step, status, stop),
     )
-    x, lm_state, args, user_state, history, info, step, status, _ = carry
+    x, state, args, user_state, history, info, step, status, _ = carry
     final_aux = None
     if solver.has_aux:
         final_aux = solver._residual_and_aux(x, args, p)[1]
     x_history, aux_history, args_history = _finalize_history(history, step, final_aux)
     return result_cls(
         x,
-        lm_state,
+        state,
         info,
         step,
         status,
@@ -231,7 +233,7 @@ _solve_loop_jit = jax.jit(_solve_loop_impl, static_argnums=(0, 6, 11))
 def _solve_python_impl(
     solver,
     x,
-    lm_state,
+    state,
     args,
     p,
     user_state,
@@ -242,13 +244,16 @@ def _solve_python_impl(
     xtol,
     callback,
 ):
-    status_cls = solver._status_cls
-    context_cls = solver._context_cls
-    result_cls = solver._result_cls
+    status_cls = SolverStatus
+    context_cls = CallbackContext
+    result_cls = SolveResult
     history = _init_history(solver, x, args, p, history_len)
-    info = solver._initial_info(x, lm_state, args, p)
-    lm_state = solver._cast_state(lm_state, info.loss.dtype)
-    initial_lm_state = lm_state
+    info = solver._initial_info(x, state, args, p)
+    atol = jnp.asarray(atol, dtype=info.loss.dtype)
+    gtol = jnp.asarray(gtol, dtype=info.loss.dtype)
+    xtol = jnp.asarray(xtol, dtype=info.loss.dtype)
+    state = solver._cast_state(state, info.loss.dtype)
+    initial_state = state
     status = status_cls.RUNNING
     steps = 0
     if not bool(jnp.isfinite(info.loss)):
@@ -260,37 +265,37 @@ def _solve_python_impl(
         if status != status_cls.RUNNING:
             steps -= 1
             break
-        x_old, lm_state_old = x, lm_state
-        x, lm_state, info = solver.update(x, lm_state, args, p)
+        x_old, state_old = x, state
+        x, state, info = solver.update(x, state, args, p)
         step_failure = int(solver._step_failure_status(info))
-        if not bool(jnp.isfinite(info.loss)) or step_failure == int(
+        current_nonfinite = not bool(jnp.isfinite(info.loss)) or step_failure == int(
             status_cls.NONFINITE
-        ):
-            status = status_cls.NONFINITE
-            history = _record_history(history, steps, x, info, args)
-            break
+        )
         action = None
         if callback is not None:
             ctx = context_cls(
                 jnp.asarray(steps, dtype=jnp.int32),
                 x,
                 x_old,
-                lm_state,
-                lm_state_old,
-                initial_lm_state,
+                state,
+                state_old,
+                initial_state,
                 args,
                 p,
                 user_state,
                 info,
             )
             action = callback(ctx)
-        action, x, lm_state, args, user_state, problem_changed = solver._apply_action(
-            action, x, lm_state, args, user_state
+        action, x, state, args, user_state, problem_changed = solver._apply_action(
+            action, x, state, args, user_state
         )
         retry_changed = solver._action_rescued(
-            action, lm_state, lm_state_old, problem_changed
+            action, state, state_old, problem_changed
         )
         history = _record_history(history, steps, x, info, args)
+        if current_nonfinite:
+            status = status_cls.NONFINITE
+            break
         if action.stop is not None and bool(action.stop):
             status = (
                 status_cls.CALLBACK_STOP
@@ -322,7 +327,7 @@ def _solve_python_impl(
     x_history, aux_history, args_history = _finalize_history(history, steps, final_aux)
     return result_cls(
         x,
-        lm_state,
+        state,
         info,
         jnp.asarray(steps, dtype=jnp.int32),
         jnp.asarray(status, dtype=jnp.int32),

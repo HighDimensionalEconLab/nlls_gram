@@ -5,15 +5,17 @@ Levenberg-Marquardt nonlinear least squares for JAX, built for
 parameters than equations, so a zero-residual root is not unique and *which*
 root you get is part of the contract.
 
-Four solvers share one `init`/`update`/`solve` protocol, one linear-solver
-menu, and one implicit-AD contract.
+Two solvers share one `init`/`update`/`solve` protocol, one linear-solver
+menu, and one implicit-AD contract. Both accept `ridge=None` (unpenalized
+nonlinear least squares) or `ridge=<positive scalar>` (Tikhonov-penalized
+ridge objective):
 
-| | `RidgeLevenbergMarquardt` | `LevenbergMarquardt` | `RidgeNewton` | `Newton` |
+| | `LevenbergMarquardt(..., ridge=...)` | `LevenbergMarquardt` | `Newton(..., ridge=...)` | `Newton` |
 |---|---|---|---|---|
 | minimizes | \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) | \(\|r(x)\|^2\) | \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) | \(\|r(x)\|^2\) |
 | globalization | trust-region damping | trust-region damping | Armijo backtracking line search | Armijo backtracking line search |
 | step direction | damped ridge minimum-\(W\)-norm | damped minimum-\(W\)-norm | ridge minimum-\(W\)-norm | minimum-\(W\)-norm \(-\bar F^{-1}(J \bar F^{-1})^+ r\) |
-| use when | the interpolant is the deliverable | rank-deficient or curved paths need trust-region damping | RKHS / kernel ridge problems where full steps dominate | well-conditioned systems or with `reg > 0` + `geodesic_acceleration=True` |
+| use when | the interpolant is the deliverable | rank-deficient or curved paths need trust-region damping | RKHS / kernel ridge problems where full steps dominate | well-conditioned systems or with residual-coupled `damping > 0` + `geodesic_acceleration=True` |
 
 ## Install
 
@@ -54,13 +56,13 @@ result.x, result.status, result.steps
 
 ```python
 import jax.numpy as jnp
-from nlls_gram import AnnealRidge, RidgeLevenbergMarquardt, RepeatedFactorMetric
+from nlls_gram import AnnealRidge, LevenbergMarquardt, RepeatedFactorMetric
 
 # W = blockdiag(K, K) for a kernel Gram matrix K: the RKHS seminorm over two
 # coefficient blocks. The constructor takes the FACTOR.
 metric = RepeatedFactorMetric(jnp.linalg.cholesky(K, upper=True), repeats=2)
 
-solver = RidgeLevenbergMarquardt(collocation_residual, metric=metric, ridge=1e-4)
+solver = LevenbergMarquardt(collocation_residual, metric=metric, ridge=1e-4)
 
 # Anneal the ridge toward the interpolating limit on stationarity.
 anneal = AnnealRidge(ridge_floor=1e-10)
@@ -76,14 +78,15 @@ a **free block**, unpenalized by the ridge solver. Calibrate `gtol` as roughly
 
 ## Linear solvers
 
-The same typed configs serve all four solvers, in both the forward and the
-implicit-AD role. A knob that exists for only one method is a field on that
-method, so it cannot be passed with another.
+The same typed configs serve both solvers (`LevenbergMarquardt` and `Newton`),
+in both the forward and the implicit-AD role (`QR()` is forward-only). A knob
+that exists for only one method is a field on that method, so it cannot be
+passed with another.
 
 | config | system | dimension | when |
 |---|---|---|---|
 | `Cholesky()` | dense, auto gram/normal | \(\min(m, n)\) | the default |
-| `QR()` | damping-row QR, auto gram/normal | \(\min(m, n)\) | tiny damping or ridge; rank-safe when damped (`LM` or `reg > 0`); float32 |
+| `QR()` | damping-row QR, auto gram/normal | \(\min(m, n)\) | forward-only; tiny damping or ridge; rank-safe when damped (`LM` or `damping > 0`); float32 |
 | `CG(precond)` | matrix-free normal | \(n\) | \(n \lesssim m\), no dense \(J\) |
 | `GramCG(precond)` | matrix-free dual | \(m\) | \(m \ll n\), no dense \(J\) |
 | `LU()` | dense solve of \(J\) or \(B\) | \(n\) | `Newton` forward and `ad_solver` for square systems |
@@ -94,10 +97,11 @@ push-through identity), so the choice is about cost, not semantics. A
 `preconditioner` is required for the Krylov configs —
 `IdentityPreconditioner()` is the explicit opt-out.
 
-`ad_solver=None` (the default) matches the forward family where its undamped
-operator is invertible, and otherwise picks by shape: `LU()` when \(m = n\),
-`SVD()` when not. Both track \(\text{cond}(B)\); routing either through a
-normal or dual factorization would square it.
+When `ridge=None`, `ad_solver=None` (the default) matches the forward family
+where its undamped operator is invertible, and otherwise picks by shape: `LU()`
+when \(m = n\), `SVD()` when not. When `ridge > 0`, `ad_solver=None` uses
+matrix-free normal `CG` when the forward solver is `CG` and dense `Cholesky`
+otherwise.
 
 ## Where to go next
 

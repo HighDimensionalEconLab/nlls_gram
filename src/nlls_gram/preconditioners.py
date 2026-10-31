@@ -36,7 +36,7 @@ class Preconditioner:
     class must be registered with
     :func:`~nlls_gram.register_pytree_dataclass` -- the solvers reject
     unregistered instances. The instance rides inside the solver state
-    (``lm_state.preconditioner``), so a ``solve`` callback refreshes it by
+    (``state.preconditioner``), so a ``solve`` callback refreshes it by
     calling the CONSTRUCTOR again with fresh arrays -- same type, same leaf
     shapes and dtypes, pure traced ops, no recompilation. Never
     ``dataclasses.replace`` a preconditioner: ``replace`` re-runs
@@ -99,7 +99,7 @@ class BlockEigenPreconditioner(Preconditioner):
         v  ->  V ((V' v) / (Lambda + ridge_weight * ridge + damping)) V'
 
     per block -- analytic in both the live ``damping`` (traced; it changes per
-    LM step) and the live ``ridge`` (read from ``ctx.lm_state.ridge``, so
+    step) and the live ``ridge`` (read from ``ctx.state.ridge``, so
     ridge continuation composes with no refresh).
 
     ``families`` is a sequence of ``(blocks, ridge_weight)`` pairs:
@@ -166,9 +166,9 @@ class BlockEigenPreconditioner(Preconditioner):
         object.__setattr__(self, "inverse_permutation", jnp.argsort(permutation))
 
     def apply(self, v, damping, ctx):
-        # LevenbergMarquardt and Newton carry no ridge, so their metric-block
-        # families shift by the damping alone.
-        carried = getattr(ctx.lm_state, "ridge", None)
+        # Unpenalized solves carry no ridge, so their metric-block families
+        # shift by the damping alone.
+        carried = getattr(ctx.state, "ridge", None)
         ridge = (
             jnp.zeros((), v.dtype)
             if carried is None
@@ -412,13 +412,19 @@ class NystromPreconditioner(Preconditioner):
         object.__setattr__(self, "eigenvalues", jnp.maximum(sigma**2 - nu, 0.0))
 
     def apply(self, v, damping, ctx):
-        # Regrouped so the apply is two (n, rank) matvecs instead of three.
+        # Compute the orthogonal complement v_perp = v - U (U'v) before dividing
+        # by rho + damping so small spectral terms Utv / (lam + damping) never
+        # cancel against Utv / (rho + damping); omit v_perp when rank == n.
         U, lam = self.basis, self.eigenvalues
-        rho = lam[-1]
+        finfo = jnp.finfo(v.dtype)
+        floor = jnp.maximum(finfo.eps * lam[0], finfo.tiny)
+        lam_shift = jnp.maximum(lam + damping, floor)
         Utv = mm(U.T, v)
-        return mm(U, Utv / (lam + damping) - Utv / (rho + damping)) + v / (
-            rho + damping
-        )
+        if self.rank == self.n:
+            return mm(U, Utv / lam_shift)
+        rho_shift = jnp.maximum(lam[-1] + damping, floor)
+        v_perp = v - mm(U, Utv)
+        return mm(U, Utv / lam_shift) + v_perp / rho_shift
 
 
 register_pytree_dataclass(

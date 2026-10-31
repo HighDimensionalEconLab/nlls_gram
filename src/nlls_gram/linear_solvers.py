@@ -1,26 +1,30 @@
 """Typed linear-solver configs, and the contract they implement.
 
-A config selects the algebra for the LM subproblem (``linear_solver``) or the
-implicit-AD solve (``ad_solver``) and carries that method's own knobs as
+A config selects the algebra for the forward subproblem (``linear_solver``) or
+the implicit-AD solve (``ad_solver``) and carries that method's own knobs as
 fields, so an option that exists for only one method cannot be passed with
 another. Configs compare and hash by value, so equal configs key the same
 compiled solve loop; construct them inline freely.
 
-Each config owns two things the solver used to branch on by name:
+Each config owns two things:
 
-- ``new_cache(sub_shapes)`` builds its reject-step cache, so ``init`` never
-  asks "which solver am I".
-- ``prepare(sub)`` receives a :class:`Subproblem` and returns a
-  :class:`StepSolver` -- the gradient, a velocity solve, a general solve for
-  the geodesic correction, and a cache constructor. Dispatch happens once at
-  trace time, so the compiled program is identical to a hand-written branch.
+- ``new_cache(m, n, n_m, dtype, penalized)`` builds its reject-step cache, so
+  ``init`` never branches on the solver type.
+- ``prepare(sub)`` (and ``prepare_newton(sub)``) receives a :class:`Subproblem`
+  and returns a :class:`StepSolver` (or :class:`NewtonStep`). Dispatch happens
+  once at trace time, so the compiled program is identical to a hand-written
+  branch.
 
 The menu:
 
-- :class:`Cholesky` (the default): dense normal equations.
+- :class:`Cholesky` (the default): dense normal or dual equations.
 - :class:`QR`: MINPACK-structured damping-row QR, stable at tiny
   ridge/damping where forming a normal matrix squares the condition number.
 - :class:`CG`: matrix-free preconditioned CG on the normal operator.
+- :class:`GramCG`: matrix-free preconditioned CG on the dual operator.
+- :class:`LU`: direct nonsymmetric solve for square ``Newton`` and ``ad_solver``
+  systems.
+- :class:`SVD`: spectral-filter pseudoinverse for ``Newton`` and ``ad_solver``.
 """
 
 from dataclasses import dataclass
@@ -55,17 +59,26 @@ def _config_static_key(config, *, baked):
     # arrays reach the compiled program: threaded through the carried state
     # (forward role) -> key by pytree structure, so equal-config fresh
     # instances share a compile; baked in as closure constants (explicit
-    # ad_solver role) -> key by identity, so different values never share
-    # one. Everything else is a value-hashable dataclass and keys as itself.
+    # ad_solver role with array leaves) -> key by identity, while leafless
+    # preconditioners (e.g. IdentityPreconditioner) key by structure. Forward
+    # Krylov tolerances and maxiter ride as traced scalars in state.hyper, so
+    # only whether maxiter is None enters the forward static key.
     if config is None or not isinstance(config, (CG, GramCG)):
         return config
     precond = config.preconditioner
     if precond is None:
         precond_key = None
-    elif baked:
+    elif baked and jax.tree_util.tree_leaves(precond):
         precond_key = _IdentityKey(precond)
     else:
         precond_key = jax.tree_util.tree_structure(precond)
+    if not baked:
+        return (
+            type(config),
+            precond_key,
+            config.maxiter is None,
+            getattr(config, "penalty", None),
+        )
     return (
         type(config),
         precond_key,
@@ -241,9 +254,9 @@ class LinearSolver:
       reject-step reuse;
     - ``supports_forward`` / ``supports_newton`` / ``supports_ad``: the
       ``linear_solver`` (for LM and Newton) and ``ad_solver`` roles;
-    - ``supports_penalty``: whether the config can carry
-      :class:`~nlls_gram.RidgeLevenbergMarquardt`'s penalty rows. The dual
-      operator never sees them, so the Gram forms cannot.
+    - ``supports_penalty``: whether the config can carry the ``ridge``
+      penalty rows. The dual operator never sees them, so the Gram forms
+      cannot.
     """
 
     materializes_jacobian = True
@@ -256,7 +269,7 @@ class LinearSolver:
         """The reject-step cache pytree at ``init``, or ``None``."""
         return None
 
-    def _validate_newton_shape(self, m, n):
+    def _validate_newton_shape(self, m, n, damped=False):
         pass
 
     def prepare(self, sub):
@@ -369,7 +382,9 @@ class Cholesky(LinearSolver):
             make_cache=lambda valid: CholeskyCache(matrix, valid, ridge),
         )
 
-    def _validate_newton_shape(self, m, n):
+    def _validate_newton_shape(self, m, n, damped=False):
+        if damped:
+            return
         if self.form == "gram" and m > n:
             raise ValueError(
                 f"Cholesky(form='gram') in Newton requires m <= n, but got m={m}, "
@@ -409,7 +424,17 @@ class Cholesky(LinearSolver):
             )
             factor = jsp_linalg.cho_factor(shifted)
             L_or_U = factor[0]
-            factor_ok = jnp.all(jnp.isfinite(L_or_U)) & jnp.all(jnp.diag(L_or_U) > tiny)
+            diag_L = jnp.diag(L_or_U)
+            eps = jnp.finfo(dtype).eps
+            diag_mat = jnp.diag(shifted)
+            scale_floor = max(sub.m, sub.n) * eps * jnp.max(diag_L)
+            col_floor = jnp.sqrt(max(sub.m, sub.n) * eps * jnp.maximum(diag_mat, tiny))
+            cutoff = jnp.where(
+                sub.damping > 0,
+                tiny,
+                jnp.maximum(tiny, jnp.maximum(scale_floor, col_floor)),
+            )
+            factor_ok = jnp.all(jnp.isfinite(L_or_U)) & jnp.all(diag_L > cutoff)
             d = -jsp_linalg.cho_solve(factor, grad)
             solve_ok = (
                 factor_ok & jnp.all(jnp.isfinite(grad)) & jnp.all(jnp.isfinite(d))
@@ -426,7 +451,6 @@ class Cholesky(LinearSolver):
                 ),
             )
 
-        self._validate_newton_shape(sub.m, sub.n)
         grad = sub.whitened_transpose(mm(sub.Jt, sub.resid))
         gram = self._resolved_form(sub.m, sub.n, False) == "gram"
 
@@ -448,12 +472,14 @@ class Cholesky(LinearSolver):
         factor = jsp_linalg.cho_factor(shifted)
         L_or_U = factor[0]
         diag_L = jnp.diag(L_or_U)
+        eps = jnp.finfo(sub.dtype).eps
+        diag_mat = jnp.diag(shifted)
+        scale_floor = max(sub.m, sub.n) * eps * jnp.max(diag_L)
+        col_floor = jnp.sqrt(max(sub.m, sub.n) * eps * jnp.maximum(diag_mat, tiny))
         cutoff = jnp.where(
             sub.damping > 0,
             tiny,
-            jnp.maximum(
-                tiny, max(sub.m, sub.n) * jnp.finfo(sub.dtype).eps * jnp.max(diag_L)
-            ),
+            jnp.maximum(tiny, jnp.maximum(scale_floor, col_floor)),
         )
         factor_ok = jnp.all(jnp.isfinite(L_or_U)) & jnp.all(diag_L > cutoff)
         if gram:
@@ -539,7 +565,7 @@ class QR(LinearSolver):
 
     def new_cache(self, m, n, n_m, dtype, penalized):
         if self._resolved_form(m, n, penalized) == "gram":
-            shape = (n + m, m)
+            shape = (n + m, m) if m <= n else (n, n + m)
         else:
             rows = min(m + n_m, n + 1) if penalized else min(m, n + 1)
             shape = (rows, n + 1)
@@ -619,13 +645,17 @@ class QR(LinearSolver):
 
     def _prepare_gram(self, sub, grad):
         n, m, dtype = sub.n, sub.m, sub.dtype
+        k = min(n, m)
+        concat_axis = 0 if m <= n else 1
 
         def assemble():
             Q_1, R_1 = jnp.linalg.qr(sub.whitened_transpose(sub.Jt), mode="reduced")
-            return jnp.concatenate([Q_1, R_1], axis=0)
+            return jnp.concatenate([Q_1, R_1], axis=concat_axis)
 
         payload = sub.cached(assemble)
-        Q_1, R_1 = payload[:n], payload[n:]
+        Q_1, R_1 = (
+            (payload[:n], payload[n:]) if m <= n else (payload[:, :n], payload[:, n:])
+        )
         # [R_1; sqrt(damping) I] = Q_mu R_mu gives the thin QR of the wide
         # system's transpose, [J~'; sqrt(damping) I] = blockdiag(Q_1, I) Q_mu
         # R_mu, so its minimum-norm solution for a residual-space c is
@@ -638,7 +668,7 @@ class QR(LinearSolver):
 
         def dual_step(c):
             half = jsp_linalg.solve_triangular(R_mu.T, c, lower=True)
-            return -mm(Q_1, mm(Q_mu[:m], half))
+            return -mm(Q_1, mm(Q_mu[:k], half))
 
         return StepSolver(
             grad=grad,
@@ -647,7 +677,9 @@ class QR(LinearSolver):
             make_cache=lambda valid: QRCache(payload, valid, sub.ridge),
         )
 
-    def _validate_newton_shape(self, m, n):
+    def _validate_newton_shape(self, m, n, damped=False):
+        if damped:
+            return
         if self.form == "gram" and m > n:
             raise ValueError(
                 f"QR(form='gram') in Newton requires m <= n, but got m={m}, n={n}: "
@@ -662,21 +694,25 @@ class QR(LinearSolver):
             )
 
     def prepare_newton(self, sub):
-        if not sub.penalized:
-            self._validate_newton_shape(sub.m, sub.n)
         grad = sub.whitened_transpose(mm(sub.Jt, sub.resid))
         if sub.penalized:
             grad = grad + sub.ridge * sub.penalty_gradient
         tiny = jnp.finfo(sub.dtype).tiny
         if self._resolved_form(sub.m, sub.n, sub.penalized) == "gram":
             n, m, dtype = sub.n, sub.m, sub.dtype
+            k = min(n, m)
+            concat_axis = 0 if m <= n else 1
 
             def assemble():
                 Q_1, R_1 = jnp.linalg.qr(sub.whitened_transpose(sub.Jt), mode="reduced")
-                return jnp.concatenate([Q_1, R_1], axis=0)
+                return jnp.concatenate([Q_1, R_1], axis=concat_axis)
 
             payload = sub.cached(assemble)
-            Q_1, R_1 = payload[:n], payload[n:]
+            Q_1, R_1 = (
+                (payload[:n], payload[n:])
+                if m <= n
+                else (payload[:, :n], payload[:, n:])
+            )
 
             def _damped_gram(_):
                 damped_stack = jnp.concatenate(
@@ -689,12 +725,19 @@ class QR(LinearSolver):
                     & jnp.all(jnp.isfinite(R_mu))
                     & jnp.all(diag_abs > tiny)
                 )
-                Q_mu_top = Q_mu[:m]
+                Q_mu_top = Q_mu[:k]
                 half = jsp_linalg.solve_triangular(R_mu.T, sub.resid, lower=True)
                 d = -mm(Q_1, mm(Q_mu_top, half))
                 return d, r_ok, Q_mu_top, R_mu
 
             def _undamped_gram(_):
+                if m > n:
+                    return (
+                        jnp.zeros(n, dtype=dtype),
+                        jnp.asarray(False, dtype=jnp.bool_),
+                        jnp.zeros((k, m), dtype=dtype),
+                        jnp.eye(m, dtype=dtype),
+                    )
                 diag_abs = jnp.abs(jnp.diag(R_1))
                 cutoff = jnp.maximum(
                     tiny, max(m, n) * jnp.finfo(dtype).eps * jnp.max(diag_abs)
@@ -702,7 +745,7 @@ class QR(LinearSolver):
                 r_ok = jnp.all(jnp.isfinite(payload)) & jnp.all(diag_abs > cutoff)
                 half = jsp_linalg.solve_triangular(R_1.T, sub.resid, lower=True)
                 d = -mm(Q_1, half)
-                return d, r_ok, jnp.zeros((m, m), dtype=dtype), R_1
+                return d, r_ok, jnp.zeros((k, m), dtype=dtype), R_1
 
             d, r_ok, Q_mu_top, R_eff = jax.lax.cond(
                 sub.damping > 0, _damped_gram, _undamped_gram, operand=None
@@ -713,7 +756,7 @@ class QR(LinearSolver):
                 proj = jax.lax.cond(
                     sub.damping > 0,
                     lambda h: mm(Q_mu_top, h),
-                    lambda h: h,
+                    lambda h: h[:k],
                     half,
                 )
                 return -mm(Q_1, proj)
@@ -902,7 +945,7 @@ class CG(_KrylovConfig):
 
         # The CARRIED instance, so a callback refresh reaches the very next
         # inner solve; the config's own field only seeds the initial state.
-        precond = ctx.lm_state.preconditioner
+        precond = ctx.state.preconditioner
 
         def apply_M(v):
             return precond.apply(v, damping, ctx)
@@ -925,7 +968,9 @@ class CG(_KrylovConfig):
             make_cache=lambda valid: None,
         )
 
-    def _validate_newton_shape(self, m, n):
+    def _validate_newton_shape(self, m, n, damped=False):
+        if damped:
+            return
         if n > m:
             raise ValueError(
                 f"linear_solver=CG(...) in Newton requires n <= m, but got m={m}, "
@@ -934,8 +979,6 @@ class CG(_KrylovConfig):
             )
 
     def prepare_newton(self, sub):
-        if not sub.penalized:
-            self._validate_newton_shape(sub.m, sub.n)
         step_solver = self.prepare(sub)
         grad = step_solver.grad
         d = step_solver.velocity()
@@ -986,7 +1029,7 @@ class GramCG(_KrylovConfig):
 
         # The CARRIED instance, so a callback refresh reaches the very next
         # inner solve; the config's own field only seeds the initial state.
-        precond = ctx.lm_state.preconditioner
+        precond = ctx.state.preconditioner
 
         def apply_M(v):
             return precond.apply(v, damping, ctx)
@@ -1014,7 +1057,9 @@ class GramCG(_KrylovConfig):
             make_cache=lambda valid: None,
         )
 
-    def _validate_newton_shape(self, m, n):
+    def _validate_newton_shape(self, m, n, damped=False):
+        if damped:
+            return
         if m > n:
             raise ValueError(
                 f"linear_solver=GramCG(...) in Newton requires m <= n, but got m={m}, "
@@ -1023,8 +1068,6 @@ class GramCG(_KrylovConfig):
             )
 
     def prepare_newton(self, sub):
-        if not sub.penalized:
-            self._validate_newton_shape(sub.m, sub.n)
         step_solver = self.prepare(sub)
         grad = step_solver.grad
         d = step_solver.velocity()
@@ -1067,7 +1110,7 @@ class LU(LinearSolver):
     def prepare(self, sub):
         raise NotImplementedError("LU is not a damped LM forward solver")
 
-    def _validate_newton_shape(self, m, n):
+    def _validate_newton_shape(self, m, n, damped=False):
         if m != n:
             raise ValueError(
                 f"linear_solver=LU() in Newton requires a square system (m == n), "
@@ -1076,7 +1119,6 @@ class LU(LinearSolver):
             )
 
     def prepare_newton(self, sub):
-        self._validate_newton_shape(sub.m, sub.n)
         Bt = sub.whitened_transpose(sub.Jt)
         grad = mm(Bt, sub.resid)
         lu, piv = jsp_linalg.lu_factor(Bt.T)
@@ -1085,7 +1127,11 @@ class LU(LinearSolver):
         cutoff = jnp.maximum(
             tiny, max(sub.m, sub.n) * jnp.finfo(sub.dtype).eps * jnp.max(diag_abs)
         )
-        lu_ok = jnp.all(jnp.isfinite(lu)) & jnp.all(diag_abs > cutoff)
+        lu_ok = (
+            (sub.damping == 0)
+            & jnp.all(jnp.isfinite(lu))
+            & jnp.all(diag_abs > cutoff)
+        )
         d = -jsp_linalg.lu_solve((lu, piv), sub.resid)
         solve_ok = lu_ok & jnp.all(jnp.isfinite(grad)) & jnp.all(jnp.isfinite(d))
         return NewtonStep(

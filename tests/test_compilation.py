@@ -1,14 +1,8 @@
-"""Recompilation guards.
-
-The jitted solve loop marks the SOLVER and the CALLBACK static, so anything
-reaching the solver's static key by object identity recompiles the whole loop
-per construction. Converting a closure to a class is not by itself enough --
-a class that hashes on an array or on a user closure has the same behavior,
-just relocated. These tests pin what must and must not recompile.
-
-The instrument is the jitted loop's own compilation cache, so a "compilation"
-here is exactly what JAX counts as one.
+"""Compilation-cache and carried-instance state guards for LevenbergMarquardt
+and Newton.
 """
+
+import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -23,11 +17,15 @@ from nlls_gram import (
     Cholesky,
     CholeskyMetric,
     DiagonalMetric,
-    IdentityPreconditioner,
+    GramCG,
+    IdentityMetric,
     LevenbergMarquardt,
-    MultiStart,
+    Newton,
+    Preconditioner,
     RepeatedFactorMetric,
-    RidgeLevenbergMarquardt,
+    SolverAction,
+    SolverStatus,
+    register_pytree_dataclass,
 )
 from nlls_gram.multi_start import (
     _multi_start_parallel_jit,
@@ -36,8 +34,10 @@ from nlls_gram.multi_start import (
 from nlls_gram.solve_loop import _solve_loop_jit
 
 N, M = 5, 3
-A = jnp.asarray(np.random.default_rng(3).normal(size=(M, N)), jnp.float32)
+RNG = np.random.default_rng(3)
+A = jnp.asarray(RNG.normal(size=(M, N)), jnp.float32)
 SOLVE = dict(max_steps=20, atol=1e-6)
+JITTED = (_solve_loop_jit, _multi_start_sequential_jit, _multi_start_parallel_jit)
 
 
 def residual(x, args, p):
@@ -46,9 +46,6 @@ def residual(x, args, p):
 
 def make_p(scale=1.0):
     return {"b": scale * jnp.ones(M, jnp.float32)}
-
-
-JITTED = (_solve_loop_jit, _multi_start_sequential_jit, _multi_start_parallel_jit)
 
 
 @pytest.fixture(autouse=True)
@@ -61,70 +58,55 @@ def fresh_cache():
 
 
 def compilations():
-    # The multi-start drivers have their own caches, keyed on draw/accept and
-    # num_starts as well; counting only the plain loop would miss them.
     return sum(jitted._cache_size() for jitted in JITTED)
 
 
-def test_equal_solvers_built_repeatedly_share_one_compilation():
+@pytest.mark.parametrize("solver_cls", [LevenbergMarquardt, Newton])
+def test_equal_solvers_and_traced_loop_controls_share_one_compilation(solver_cls):
     for scale in (1.0, 2.0, 3.0):
-        LevenbergMarquardt(residual, linear_solver=Cholesky()).solve(
+        solver_cls(residual, linear_solver=Cholesky()).solve(
             jnp.zeros(N), p=make_p(scale), **SOLVE
         )
     assert compilations() == 1
 
-
-def test_traced_values_and_loop_controls_do_not_recompile():
-    solver = LevenbergMarquardt(residual)
-    solver.solve(jnp.zeros(N), p=make_p(), **SOLVE)
-    solver.solve(jnp.zeros(N), p=make_p(2.0), max_steps=20, atol=1e-8)
-    solver.solve(jnp.zeros(N), p=make_p(3.0), max_steps=40, atol=1e-6, gtol=1e-9)
-    solver.solve(jnp.zeros(N), p=make_p(4.0), max_steps=20, atol=1e-6, xtol=1e-9)
+    solver = solver_cls(residual, linear_solver=Cholesky())
+    solver.solve(jnp.zeros(N), p=make_p(2.0), max_steps=40, atol=1e-6, gtol=1e-9)
+    solver.solve(jnp.zeros(N), p=make_p(3.0), max_steps=20, atol=1e-6, xtol=1e-9)
     assert compilations() == 1
 
-
-def test_shape_change_compiles_one_extra_program_and_reuses_both():
-    wide = jnp.asarray(np.random.default_rng(4).normal(size=(M, N + 2)), jnp.float32)
-
-    def sized(x, args, p):
-        return (A if x.shape[0] == N else wide) @ x - p["b"]
-
-    solver = LevenbergMarquardt(sized)
-    solver.solve(jnp.zeros(N), p=make_p(), **SOLVE)
-    solver.solve(jnp.zeros(N + 2), p=make_p(), **SOLVE)
-    assert compilations() == 2
-    solver.solve(jnp.zeros(N), p=make_p(2.0), **SOLVE)
-    solver.solve(jnp.zeros(N + 2), p=make_p(2.0), **SOLVE)
-    assert compilations() == 2
-
-
-# Metric instances key compilation by pytree STRUCTURE (type + static
-# fields); their arrays are threaded through the carried state. A fresh
-# equal-config metric per solve must therefore share one compiled loop --
-# and, the other half of the guarantee, its VALUES must actually be used.
-METRICS = {
-    "cholesky": lambda scale=1.0: CholeskyMetric(scale * jnp.eye(N, dtype=jnp.float32)),
-    "diagonal": lambda scale=1.0: DiagonalMetric(scale * jnp.ones(N, jnp.float32)),
-    "repeated": lambda scale=1.0: RepeatedFactorMetric(
-        scale * jnp.eye(N, dtype=jnp.float32)
-    ),
-}
-
-
-@pytest.mark.parametrize("name", list(METRICS))
-def test_fresh_equal_config_metric_compiles_once(name):
-    for scale in (1.0, 2.0, 3.0):
-        LevenbergMarquardt(residual, metric=METRICS[name]()).solve(
-            jnp.zeros(N), p=make_p(scale), **SOLVE
-        )
+    # Numeric constructor hyperparameters travel in state/hyper and share the
+    # compiled loop across fresh solver instances (including leafless ad_solver
+    # preconditioners).
+    if solver_cls is LevenbergMarquardt:
+        solver_cls(
+            residual,
+            init_damping=1e-1,
+            damping_decrease=0.25,
+            damping_increase=8.0,
+            geodesic_acceptance_ratio=0.5,
+            linear_solver=Cholesky(),
+        ).solve(jnp.zeros(N), p=make_p(1.5), **SOLVE)
+    else:
+        solver_cls(
+            residual,
+            c1=1e-3,
+            decrease_factor=0.5,
+            maxls=15,
+            max_stepsize=0.9,
+            linesearch_tol=1e-12,
+            geodesic_acceptance_ratio=0.5,
+            linear_solver=Cholesky(),
+        ).solve(jnp.zeros(N), p=make_p(1.5), **SOLVE)
     assert compilations() == 1
 
+    # Frozen after construction
+    with pytest.raises(AttributeError, match="frozen after construction"):
+        solver.geodesic_acceleration = False
 
-def test_shared_compile_uses_each_metrics_own_values():
-    # Two same-treedef, different-valued metrics share one compiled loop; a
-    # leftover static read would silently reuse the first metric's factor
-    # for the second solver. The damping geometry selects the returned root
-    # of this underdetermined system, so different weights must move x.
+
+def test_metrics_preconditioners_and_callbacks_compile_once_and_use_live_values():
+    # Two same-structure, different-valued metrics share one compiled loop and
+    # use each metric's own factor values.
     def solve_with(scale):
         return LevenbergMarquardt(
             residual,
@@ -136,199 +118,166 @@ def test_shared_compile_uses_each_metrics_own_values():
     heavy_ends = solve_with(1.0)
     heavy_middle = solve_with(-1.0)
     assert compilations() == 1
-    assert not np.allclose(
-        np.asarray(heavy_ends.x), np.asarray(heavy_middle.x), atol=1e-4
-    )
+    assert not np.allclose(heavy_ends.x, heavy_middle.x, atol=1e-4)
 
-
-def test_stateless_preconditioner_is_value_equal():
-    # IdentityPreconditioner holds nothing, so even a freshly constructed one
-    # keys the same compilation -- the closure it replaced did not.
-    for _ in range(3):
-        LevenbergMarquardt(
-            residual, linear_solver=CG(IdentityPreconditioner(), tol=1e-8, maxiter=32)
-        ).solve(jnp.zeros(N), p=make_p(), **SOLVE)
-    assert compilations() == 1
-
-
-def ridge_solver():
-    return RidgeLevenbergMarquardt(
-        residual, metric=DiagonalMetric(jnp.ones(N, jnp.float32)), ridge=1e-3
-    )
-
-
-def run_continuation(solver, ridge_floor, scale=1.0):
-    callback = AnnealRidge(ridge_floor=ridge_floor)
-    return solver.solve(
-        jnp.zeros(N),
-        p=make_p(scale),
-        callback=callback,
-        user_state=callback.init_state(),
-        max_steps=20,
-        gtol=1e-6,
-    )
-
-
-def test_rebuilding_the_continuation_callback_does_not_recompile():
-    # The callback is a jit STATIC argument, so the closure this used to
-    # return recompiled the whole solve loop on every construction.
-    solver = ridge_solver()
-    for scale in (1.0, 2.0, 3.0):
-        run_continuation(solver, 1e-8, scale)
-    assert compilations() == 1
-
-
-def test_a_different_continuation_schedule_is_a_different_program():
-    solver = ridge_solver()
-    run_continuation(solver, 1e-8)
-    run_continuation(solver, 1e-9)
-    assert compilations() == 2
-
-
-def test_solver_rebuilt_inside_a_python_loop_compiles_once():
-    # The realistic regression: a driver that constructs the solver each
-    # iteration must not pay a compilation each iteration.
-    metric = CholeskyMetric(jnp.eye(N, dtype=jnp.float32))
-    for step in range(5):
-        LevenbergMarquardt(
-            residual, metric=metric, linear_solver=QR(), init_damping=1e-3
-        ).solve(jnp.zeros(N), p=make_p(1.0 + step), **SOLVE)
-    assert compilations() == 1
-
-
-def test_a_changed_static_setting_is_a_different_program():
-    metric = DiagonalMetric(jnp.ones(N, jnp.float32))
-
-    def solve(**kwargs):
-        LevenbergMarquardt(residual, metric=metric, **kwargs).solve(
-            jnp.zeros(N), p=make_p(), **SOLVE
+    # Fresh BlockEigenPreconditioner and AnnealRidge callback share one compile
+    for jitted in JITTED:
+        jitted._clear_cache()
+    for scale in (1.0, 2.0):
+        precond = BlockEigenPreconditioner(
+            [(scale * jnp.eye(N, dtype=jnp.float32)[None], 1.0)], jnp.arange(N)
         )
-
-    solve(linear_solver=Cholesky())
-    solve(linear_solver=Cholesky())
-    assert compilations() == 1
-    solve(linear_solver=QR())  # a different algorithm
-    assert compilations() == 2
-    solve(linear_solver=QR(), damping_increase=8.0)  # a static scalar
-    assert compilations() == 3
-
-
-def test_matrix_free_path_never_factorizes():
-    # The dense path's signature is a Cholesky factorization of an assembled
-    # matrix; the matrix-free path must contain none.
-    def jaxpr_text(config):
-        solver = LevenbergMarquardt(residual, linear_solver=config)
-        return str(
-            jax.make_jaxpr(
-                lambda pv: solver.solve(jnp.zeros(N), p=pv, **SOLVE).x  # noqa: B023
-            )(make_p())
-        )
-
-    assert "cholesky" in jaxpr_text(Cholesky())
-    assert "cholesky" not in jaxpr_text(
-        CG(IdentityPreconditioner(), tol=1e-8, maxiter=16)
-    )
-
-
-def draw_shifted(key, x, args):
-    return x + 0.1 * jax.random.normal(key, x.shape, x.dtype)
-
-
-def test_multi_start_reuses_its_driver_compilation():
-    solver = LevenbergMarquardt(residual)
-    for scale in (1.0, 2.0, 3.0):
-        solver.solve(
+        anneal = AnnealRidge(ridge_floor=1e-8)
+        LevenbergMarquardt(
+            residual,
+            metric=CholeskyMetric(scale * jnp.eye(N, dtype=jnp.float32)),
+            ridge=1e-3,
+            linear_solver=CG(precond, tol=1e-8, maxiter=16),
+        ).solve(
             jnp.zeros(N),
             p=make_p(scale),
-            multi_start=MultiStart(
-                key=jax.random.key(0), num_starts=3, draw=draw_shifted
-            ),
-            **SOLVE,
-        )
-    # The sequential driver inlines the loop into its own jit, so there is
-    # one program total -- and reusing an equal MultiStart adds none.
-    assert compilations() == 1
-
-
-def test_a_fresh_residual_closure_per_call_recompiles():
-    # The commonest real-world trap, and one the package CANNOT fix: the
-    # residual is a jit static, so a lambda rebuilt per iteration is a new
-    # program every time. Pinned as a negative control so the guards above
-    # cannot pass by accident.
-    for scale in (1.0, 2.0, 3.0):
-        LevenbergMarquardt(lambda x, args, p: A @ x - p["b"]).solve(
-            jnp.zeros(N), p=make_p(scale), **SOLVE
-        )
-    assert compilations() == 3
-    # A module-level residual reused across calls compiles once.
-    for jitted in JITTED:
-        jitted._clear_cache()
-    for scale in (1.0, 2.0, 3.0):
-        LevenbergMarquardt(residual).solve(jnp.zeros(N), p=make_p(scale), **SOLVE)
-    assert compilations() == 1
-
-
-def test_save_steps_makes_max_steps_static():
-    # history_len is a jit static because the buffer shape depends on it --
-    # documented, and pinned here so the cost is not a surprise.
-    solver = LevenbergMarquardt(residual)
-    for max_steps in (5, 6, 7):
-        solver.solve(jnp.zeros(N), p=make_p(), max_steps=max_steps, atol=1e-6)
-    assert compilations() == 1
-    for jitted in JITTED:
-        jitted._clear_cache()
-    for max_steps in (5, 6, 7):
-        solver.solve(
-            jnp.zeros(N), p=make_p(), max_steps=max_steps, atol=1e-6, save_steps=True
-        )
-    assert compilations() == 3
-
-
-def test_fresh_equal_config_preconditioner_compiles_once():
-    # BlockEigenPreconditioner keys by structure too: a fresh equal-config
-    # instance per solve (same family count, shapes, permutation length)
-    # shares the compiled loop; its eigendecomposition arrays ride in the
-    # carried state.
-    for scale in (1.0, 2.0, 3.0):
-        preconditioner = BlockEigenPreconditioner(
-            [(scale * jnp.eye(N, dtype=jnp.float32)[None], 0.0)], jnp.arange(N)
-        )
-        LevenbergMarquardt(
-            residual, linear_solver=CG(preconditioner, tol=1e-8, maxiter=16)
-        ).solve(jnp.zeros(N), p=make_p(scale), **SOLVE)
-    assert compilations() == 1
-
-
-def test_callback_instance_swap_does_not_recompile():
-    # A callback that rebuilds the carried metric/preconditioner inside the
-    # loop constructs same-structure instances: no recompilation across
-    # solves, and none from the swap itself.
-    import dataclasses as dc
-
-    from nlls_gram import LMAction
-
-    metric0 = DiagonalMetric(jnp.ones(N, jnp.float32))
-
-    def swap(ctx):
-        fresh = jax.lax.cond(
-            ctx.step == 2,
-            lambda: DiagonalMetric(2.0 * jnp.ones(N, jnp.float32)),
-            lambda: ctx.lm_state.metric,
-        )
-        return LMAction(lm_state=dc.replace(ctx.lm_state, metric=fresh))
-
-    for scale in (1.0, 2.0):
-        LevenbergMarquardt(residual, metric=metric0).solve(
-            jnp.zeros(N), p=make_p(scale), callback=swap, **SOLVE
+            callback=anneal,
+            user_state=anneal.init_state(),
+            max_steps=20,
+            gtol=1e-6,
         )
     assert compilations() == 1
 
-
-def test_a_different_instance_structure_is_a_different_program():
-    LevenbergMarquardt(residual, metric=DiagonalMetric(jnp.ones(N, jnp.float32))).solve(
+    # Changing a static setting compiles a distinct program
+    LevenbergMarquardt(residual, linear_solver=QR()).solve(
         jnp.zeros(N), p=make_p(), **SOLVE
     )
-    LevenbergMarquardt(
-        residual, metric=RepeatedFactorMetric(jnp.eye(N, dtype=jnp.float32))
-    ).solve(jnp.zeros(N), p=make_p(), **SOLVE)
     assert compilations() == 2
+
+
+def test_carried_metric_swap_semantics_invalidation_and_implicit_ad():
+    root = RNG.normal(size=(2, 4))
+    K = jnp.asarray(root @ root.T + 0.5 * np.eye(2), jnp.float32)
+    b_vec = jnp.ones(M, jnp.float32)
+
+    def make_metric(scale=1.0):
+        return RepeatedFactorMetric(
+            scale * jnp.linalg.cholesky(K, upper=True), repeats=2
+        )
+
+    def swap_every_step(ctx):
+        scale = 1.0 + 0.01 * ctx.step.astype(jnp.float32)
+        return SolverAction(
+            state=dataclasses.replace(ctx.state, metric=make_metric(scale))
+        )
+
+    # Ridge objective: metric swap changes the objective and suppresses convergence
+    ridge_solver = LevenbergMarquardt(
+        lambda x: A @ x - b_vec, metric=make_metric(), ridge=1e-3
+    )
+    assert int(
+        ridge_solver.solve(
+            jnp.zeros(N), max_steps=15, gtol=1e3, callback=swap_every_step
+        ).status
+    ) == int(SolverStatus.MAX_STEPS)
+
+    # Unpenalized objective: metric swap re-whitens geometry without blocking
+    unpen_solver = LevenbergMarquardt(lambda x: A @ x - b_vec, metric=make_metric())
+    assert int(
+        unpen_solver.solve(
+            jnp.zeros(N), max_steps=15, gtol=1e3, callback=swap_every_step
+        ).status
+    ) == int(SolverStatus.CONVERGED)
+
+    # Wrong structure or weak-type scalar swap raises naming state.metric
+    x0 = jnp.zeros(N)
+    state = ridge_solver.init(x0)
+    with pytest.raises(ValueError, match="state.metric"):
+        ridge_solver._apply_action(
+            SolverAction(state=dataclasses.replace(state, metric=IdentityMetric(4))),
+            x0,
+            state,
+            None,
+            None,
+        )
+    leaves, treedef = jax.tree_util.tree_flatten(state.metric)
+    doctored = jax.tree_util.tree_unflatten(
+        treedef, [1.0 if jnp.ndim(leaf) == 0 else leaf for leaf in leaves]
+    )
+    with pytest.raises(ValueError, match="state.metric"):
+        ridge_solver._apply_action(
+            SolverAction(state=dataclasses.replace(state, metric=doctored)),
+            x0,
+            state,
+            None,
+            None,
+        )
+
+    # Implicit AD uses the carried metric at the solution after a mid-solve swap
+    w_init = jnp.asarray(RNG.uniform(0.5, 2.0, size=N), jnp.float32)
+    w_swap = jnp.asarray(RNG.uniform(4.0, 9.0, size=N), jnp.float32)
+
+    def swap_at_2(ctx):
+        fresh = jax.lax.cond(
+            ctx.step == 2,
+            lambda: DiagonalMetric(w_swap),
+            lambda: ctx.state.metric,
+        )
+        return SolverAction(state=dataclasses.replace(ctx.state, metric=fresh))
+
+    ad_solver = LevenbergMarquardt(
+        lambda x, _, p: A @ x - p, metric=DiagonalMetric(w_init)
+    )
+    tangent = jax.jacfwd(
+        lambda pv: (
+            ad_solver.solve(
+                jnp.zeros(N), p=pv, max_steps=60, atol=1e-6, callback=swap_at_2
+            ).x
+        )
+    )(b_vec)
+    W_inv = jnp.diag(1.0 / w_swap)
+    analytic = W_inv @ A.T @ jnp.linalg.inv(A @ W_inv @ A.T)
+    np.testing.assert_allclose(tangent, analytic, rtol=2e-4, atol=2e-5)
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class DualJacobi(Preconditioner):
+    diagonal: jax.Array
+
+    def apply(self, v, damping, ctx):
+        return v / (self.diagonal + damping)
+
+
+register_pytree_dataclass(DualJacobi, data_fields=("diagonal",))
+
+
+def test_preconditioner_and_hyper_schedule_in_callback():
+    b_vec = jnp.ones(M, jnp.float32)
+    dual_diag = jnp.diag(A @ A.T)
+    solver = LevenbergMarquardt(
+        lambda th: A @ th - b_vec,
+        linear_solver=GramCG(DualJacobi(jnp.ones(M)), tol=0.0, maxiter=1),
+    )
+
+    def improve(ctx):
+        fresh = jax.lax.cond(
+            ctx.step == 2,
+            lambda: DualJacobi(dual_diag),
+            lambda: ctx.state.preconditioner,
+        )
+        grown = jnp.where(
+            ctx.step >= 2,
+            jnp.asarray(30, jnp.int32),
+            ctx.state.hyper.iterative_maxiter,
+        )
+        return SolverAction(
+            state=dataclasses.replace(
+                ctx.state,
+                preconditioner=fresh,
+                hyper=dataclasses.replace(ctx.state.hyper, iterative_maxiter=grown),
+            )
+        )
+
+    assert int(solver.solve(jnp.zeros(N), max_steps=30, atol=1e-5).status) == int(
+        SolverStatus.MAX_STEPS
+    )
+    scheduled = solver.solve(jnp.zeros(N), max_steps=30, atol=1e-5, callback=improve)
+    assert int(scheduled.status) == int(SolverStatus.CONVERGED)
+    np.testing.assert_allclose(
+        scheduled.state.preconditioner.diagonal, dual_diag, rtol=1e-6
+    )

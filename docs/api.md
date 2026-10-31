@@ -2,9 +2,7 @@
 
 ## Solvers
 
-::: nlls_gram.RidgeLevenbergMarquardt
 ::: nlls_gram.LevenbergMarquardt
-::: nlls_gram.RidgeNewton
 ::: nlls_gram.Newton
 ::: nlls_gram.AnnealRidge
 
@@ -37,21 +35,17 @@
 
 ## State and results
 
+::: nlls_gram.SolverStatus
+::: nlls_gram.SolverAction
+::: nlls_gram.CallbackContext
+::: nlls_gram.SolveResult
+::: nlls_gram.SolverContext
 ::: nlls_gram.LMState
 ::: nlls_gram.LMInfo
-::: nlls_gram.LMStatus
 ::: nlls_gram.LMHyperparams
-::: nlls_gram.LMContext
-::: nlls_gram.LMAction
-::: nlls_gram.LMSolveResult
 ::: nlls_gram.NewtonState
 ::: nlls_gram.NewtonInfo
-::: nlls_gram.NewtonStatus
 ::: nlls_gram.NewtonHyperparams
-::: nlls_gram.NewtonContext
-::: nlls_gram.NewtonAction
-::: nlls_gram.NewtonSolveResult
-::: nlls_gram.SolverContext
 ::: nlls_gram.register_pytree_dataclass
 
 ## Residuals

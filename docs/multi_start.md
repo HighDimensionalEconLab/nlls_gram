@@ -2,7 +2,7 @@
 
 `solve(multi_start=MultiStart(...))` retries a failed solve from fresh initial
 conditions, or races several starts in parallel and keeps the best one. Either
-way it returns a **single** `LMSolveResult` — the selected solution — with
+way it returns a **single** `SolveResult` — the selected solution — with
 diagnostics attached at `result.multi_start` (a `MultiStartInfo`). With
 `multi_start=None` (the default) nothing changes: the solve takes exactly the
 plain code path.
@@ -25,7 +25,13 @@ def draw(key, x, args):
 
 solver = LevenbergMarquardt(residual)
 ms = MultiStart(key=jax.random.key(0), num_starts=5, draw=draw)
-result = solver.solve(jnp.zeros(1), p=jnp.asarray(4.0), atol=1e-8, multi_start=ms)
+result = solver.solve(
+    jnp.zeros(1),
+    p=jnp.asarray(4.0),
+    atol=1e-8,
+    max_steps_is_success=False,
+    multi_start=ms,
+)
 result.multi_start.attempt  # which start won (0 = your x0)
 result.multi_start.attempts_run  # how many solves actually ran
 ```
@@ -120,7 +126,7 @@ per-lane key when lanes must differ.
 ## The accept hook
 
 By default an attempt succeeds when its finite-loss result has status
-`LMStatus.CONVERGED` or `LMStatus.MAX_STEPS`, matching
+`SolverStatus.CONVERGED` or `SolverStatus.MAX_STEPS`, matching
 `solve(max_steps_is_success=True)`. Pass `max_steps_is_success=False` to retry
 after budget exhaustion. Pass `accept` to override the status test entirely —
 for example to require a fresh-data validation metric rather than trusting the
@@ -212,7 +218,7 @@ solve; a drawn retry cannot rescue an invalid original point.
 
 ## Interactions
 
-- **`lm_state` warm starts** — the caller's `lm_state` applies to attempt 0;
+- **`state` warm starts** — the caller's `state` applies to attempt 0;
   drawn attempts inherit its damping and hyperparameters but the Jacobian
   cache is invalidated (it described a different `(x, args)`). In parallel
   mode the cache is dropped on all lanes: under `vmap` the cache-reuse branch

@@ -10,8 +10,8 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from nlls_gram.lm_types import LMStatus
 from nlls_gram.solve_loop import _solve_loop_impl, _solve_python_impl
+from nlls_gram.types import SolverStatus
 from nlls_gram.utilities import _typed_key
 
 __all__ = ["DrawNNXModule", "MultiStart", "MultiStartInfo"]
@@ -20,7 +20,7 @@ __all__ = ["DrawNNXModule", "MultiStart", "MultiStartInfo"]
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class MultiStartInfo:
-    """Diagnostics attached to ``LMSolveResult.multi_start`` by a multi-start solve.
+    """Diagnostics attached to ``SolveResult.multi_start`` by a multi-start solve.
 
     ``attempt`` is the winning attempt/lane index (0 = the caller's
     ``(x0, args)``), ``accepted`` whether the winner passed the success test
@@ -28,10 +28,9 @@ class MultiStartInfo:
     ``attempts_run`` how many starts were solved (sequential mode stops at the
     first success; parallel mode always runs ``num_starts``). ``loss`` is the
     ranking objective used for selection -- the sum of squared residuals at the
-    returned solution for ``LevenbergMarquardt``, the ridge objective for
-    ``RidgeLevenbergMarquardt`` -- masked to ``+inf`` when nonfinite. Note
-    ``accepted`` describes the multi-start success test, not ``LMInfo.accepted``
-    (last-step acceptance).
+    returned solution when ``ridge=None``, the ridge objective when ``ridge`` is
+    active -- masked to ``+inf`` when nonfinite. Note ``accepted`` describes
+    the multi-start success test, not ``info.accepted`` (last-step acceptance).
     """
 
     attempt: jax.Array
@@ -164,11 +163,13 @@ class DrawNNXModule:
 
 
 def _accept_converged(_, result):
-    return result.status == LMStatus.CONVERGED
+    return result.status == SolverStatus.CONVERGED
 
 
 def _accept_converged_or_max_steps(_, result):
-    return (result.status == LMStatus.CONVERGED) | (result.status == LMStatus.MAX_STEPS)
+    return (result.status == SolverStatus.CONVERGED) | (
+        result.status == SolverStatus.MAX_STEPS
+    )
 
 
 def _attempt_success(accept_fn, accept_key, result, loss):
@@ -212,7 +213,7 @@ def _attempt_keys(key, attempt):
 def _multi_start_python_impl(
     solver,
     x,
-    lm_state,
+    state,
     args,
     p,
     user_state,
@@ -230,13 +231,13 @@ def _multi_start_python_impl(
     parallel,
 ):
     accept_fn = accept
-    cold = solver._cold_state(lm_state)
+    cold = solver._cold_state(state)
 
-    def run_attempt(x_a, lm_state_a, args_a, attempt):
+    def run_attempt(x_a, state_a, args_a, attempt):
         result = _solve_python_impl(
             solver,
             x_a,
-            lm_state_a,
+            state_a,
             args_a,
             p,
             user_state,
@@ -277,7 +278,7 @@ def _multi_start_python_impl(
                 best_attempt, accepted = lane, success
         attempts_run = num_starts
     else:
-        x_a, args_a, lm_state_a = x, args, lm_state
+        x_a, args_a, state_a = x, args, state
         for attempt in range(num_starts):
             if attempt > 0:
                 keys = _attempt_keys(key, attempt)
@@ -291,8 +292,8 @@ def _multi_start_python_impl(
                 if reset_args is not None:
                     _check_hook_types("reset_args", "args", args, args_next)
                 x_a, args_a = x_next, args_next
-                lm_state_a = cold
-            result, loss, success = run_attempt(x_a, lm_state_a, args_a, attempt)
+                state_a = cold
+            result, loss, success = run_attempt(x_a, state_a, args_a, attempt)
             take = (
                 best is None
                 or success
@@ -317,7 +318,7 @@ def _multi_start_python_impl(
 def _multi_start_sequential_impl(
     solver,
     x,
-    lm_state,
+    state,
     args,
     p,
     user_state,
@@ -335,11 +336,11 @@ def _multi_start_sequential_impl(
 ):
     accept_fn = accept
 
-    def run_attempt(x_a, lm_state_a, args_a, attempt):
+    def run_attempt(x_a, state_a, args_a, attempt):
         result = _solve_loop_impl(
             solver,
             x_a,
-            lm_state_a,
+            state_a,
             args_a,
             p,
             user_state,
@@ -358,12 +359,12 @@ def _multi_start_sequential_impl(
         return dataclasses.replace(result, p=None), loss, success
 
     zero = jnp.asarray(0, dtype=jnp.int32)
-    best, best_loss, done = run_attempt(x, lm_state, args, zero)
+    best, best_loss, done = run_attempt(x, state, args, zero)
     if draw is None and reset_args is None:
         info = MultiStartInfo(zero, done, jnp.asarray(1, dtype=jnp.int32), best_loss)
         return dataclasses.replace(best, p=p, multi_start=info)
 
-    cold = solver._cold_state(lm_state)
+    cold = solver._cold_state(state)
 
     def cond(carry):
         attempt, _, _, _, _, _, done = carry
@@ -404,7 +405,7 @@ def _multi_start_sequential_impl(
 def _multi_start_parallel_impl(
     solver,
     x,
-    lm_state,
+    state,
     args,
     p,
     user_state,
@@ -444,7 +445,7 @@ def _multi_start_parallel_impl(
         args_lanes, args_axis = jax.tree.map(prepend, args, args_reset), 0
     # Under vmap the cache-reuse cond lowers to a select that evaluates both
     # branches, so a warm Jacobian cache cannot save work: drop it uniformly.
-    cold = solver._cold_state(lm_state)
+    cold = solver._cold_state(state)
 
     def solve_lane(x_lane, args_lane, accept_key):
         result = _solve_loop_impl(

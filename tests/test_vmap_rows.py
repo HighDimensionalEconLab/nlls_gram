@@ -11,8 +11,7 @@ from jax.flatten_util import ravel_pytree
 from nlls_gram import (
     IdentityMetric,
     LevenbergMarquardt,
-    LMStatus,
-    RidgeLevenbergMarquardt,
+    SolverStatus,
     vmap_rows,
 )
 
@@ -135,7 +134,7 @@ def test_solver_takes_the_same_steps():
         solver = LevenbergMarquardt(residual, geodesic_acceleration=True)
         results.append(solver.solve(theta, args, p=p, max_steps=100, atol=1e-4))
     reference, candidate = results
-    assert candidate.status == LMStatus.CONVERGED
+    assert candidate.status == SolverStatus.CONVERGED
     assert int(candidate.steps) == int(reference.steps)
     np.testing.assert_allclose(
         ravel_pytree(candidate.x)[0], ravel_pytree(reference.x)[0], rtol=1e-3
@@ -161,18 +160,15 @@ def test_composes_with_jit_and_outer_vmap():
 def test_jacobian_chunk_matches_one_batch():
     # The cached Jacobian after one step is the assembled matrix itself.
     theta, args, p = problem()
-    for solver_cls, kwargs in (
-        (LevenbergMarquardt, {}),
-        (
-            RidgeLevenbergMarquardt,
-            {"metric": IdentityMetric(ravel_pytree(theta)[0].size), "ridge": 1e-4},
-        ),
+    for kwargs in (
+        {},
+        {"metric": IdentityMetric(ravel_pytree(theta)[0].size), "ridge": 1e-4},
     ):
         jacobians = []
         for chunk in (None, 4):
-            solver = solver_cls(rows, jacobian_chunk=chunk, **kwargs)
-            lm_state = solver.init(theta, args, p=p)
-            jacobians.append(solver.update(theta, lm_state, args, p)[1].Jt)
+            solver = LevenbergMarquardt(rows, jacobian_chunk=chunk, **kwargs)
+            state = solver.init(theta, args, p=p)
+            jacobians.append(solver.update(theta, state, args, p)[1].Jt)
         batch, chunked = jacobians
         tol = 1e3 * float(jnp.finfo(batch.dtype).eps)
         np.testing.assert_allclose(

@@ -1,13 +1,11 @@
 """The positive-definite metric both solvers take, given through factor
 callbacks.
 
-One contract serves two roles. For
-:class:`~nlls_gram.RidgeLevenbergMarquardt` the metric ``W`` weights the
-OBJECTIVE's penalty, ``ridge * ||x_m||_W^2``; for
-:class:`~nlls_gram.LevenbergMarquardt` it is the damping geometry, so the
-small-damping Gauss-Newton limit selects minimum-``W``-norm corrections.
-Either way the solver runs in the whitened variable and never materializes
-``W`` or its factor.
+One contract serves two roles. When ``ridge`` is active, the metric ``W``
+weights the OBJECTIVE's penalty, ``ridge * ||x_m||_W^2``; when ``ridge=None``
+it is the step geometry, so the small-damping Gauss-Newton limit selects
+minimum-``W``-norm corrections. Either way the solver runs in the whitened
+variable and never materializes ``W`` or its factor.
 """
 
 from dataclasses import dataclass, field
@@ -16,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 
-from nlls_gram.lm_types import SolverContext
+from nlls_gram.types import SolverContext
 from nlls_gram.utilities import mm, register_pytree_dataclass
 
 __all__ = [
@@ -53,14 +51,14 @@ class Metric:
 
     Every op receives a :class:`~nlls_gram.SolverContext` carrying the
     solver's live state, so an exotic metric can key off the iterate through
-    ``ctx.x`` and ``ctx.lm_state``.
+    ``ctx.x`` and ``ctx.state``.
 
     Metric instances are JAX PYTREES: array fields are traced leaves, the
     type plus its static fields are structure. Every concrete class must be
     registered with
     :func:`~nlls_gram.register_pytree_dataclass` -- the solvers reject
     unregistered instances. The instance rides inside the solver state
-    (``lm_state.metric``), so a ``solve`` callback replaces the metric by
+    (``state.metric``), so a ``solve`` callback replaces the metric by
     constructing a new instance of the same type (same static fields, same
     leaf shapes and dtypes) -- pure traced ops, no recompilation. Equal-config
     instances with fresh arrays share one compiled solve loop.

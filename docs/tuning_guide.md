@@ -2,11 +2,12 @@
 
 ## Picking a solver
 
-Start with `RidgeLevenbergMarquardt` when the interpolant is the deliverable,
-`LevenbergMarquardt` when the root is a means to an end on a curved or
-rank-deficient landscape, and `Newton` when the Jacobian is well-conditioned
-and undamped full steps or cheap residual-only Armijo trials are faster than
-trust-region re-factorizations. Defaults —
+Start with `LevenbergMarquardt(..., ridge=<positive scalar>)` (or
+`Newton(..., ridge=<positive scalar>)`) when the interpolant is the deliverable,
+unpenalized `LevenbergMarquardt` (`ridge=None`) when the root is a means to an
+end on a curved or rank-deficient landscape, and `Newton` when the Jacobian is
+well-conditioned and undamped full steps or cheap residual-only Armijo trials
+are faster than trust-region re-factorizations. Defaults —
 `Cholesky()`, `geodesic_acceleration=True`, `cache_jacobian=True` for LM, and
 `Cholesky()`, `cache_jacobian=False` for `Newton` — are the
 right first try.
@@ -17,7 +18,7 @@ Change the linear solver when a specific symptom appears:
 |---|---|
 | \(n\) in the thousands, dense \(J\) too big to form | `GramCG(precond)` when \(m \ll n\), else `CG(precond)` |
 | step accuracy degrades as ridge or damping shrinks, or a float32 solve floors well above the residual's precision | `QR()` — it works at \(\operatorname{cond}(A)\), not \(\operatorname{cond}(A)^2\), in both the gram (\(m \times m\)) and normal (\(n \times n\)) forms |
-| non-finite step on a rank-deficient Jacobian | `QR()` (rank-safe for damped `LM` or `Newton(reg=...)`), or `SVD()` for undamped `Newton` |
+| non-finite step on a rank-deficient Jacobian | `QR()` (rank-safe for damped `LM` or `Newton(damping=...)`), or `SVD()` for undamped `Newton(damping=0.0)` |
 | tangent is NaN or wrong under implicit AD | `ad_solver=SVD()` |
 
 `Cholesky()` and `QR()` pick the smaller of the \(m \times m\) dual and the
@@ -50,12 +51,13 @@ Damping is bounded only by an anti-underflow floor at
 `jnp.finfo(residual.dtype).tiny`; there is no upper cap. Letting damping fall
 freely is the point — the endgame wants it to vanish so the step approaches
 Gauss–Newton and the minimum-norm limit. Clamp it in a callback on the rare
-problem that needs a bound (see [Callbacks](callbacks.md)), and use
-`RidgeLevenbergMarquardt` when what you actually want is regularization.
+problem that needs a bound (see [Callbacks](callbacks.md)), and pass a positive
+`ridge` to `LevenbergMarquardt` or `Newton` when what you actually want is
+regularization.
 
 ## The ridge schedule
 
-For `RidgeLevenbergMarquardt`, a fixed ridge leaves an \(O(\text{ridge})\)
+When `ridge` is active, a fixed ridge leaves an \(O(\text{ridge})\)
 bias. `AnnealRidge(ridge_floor=...)` anneals toward the interpolating
 limit, advancing a level whenever the current one is stationary.
 

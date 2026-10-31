@@ -2,7 +2,7 @@
 
 ## Solve Loop and Callbacks
 
-`solve` runs repeated LM updates and returns an `LMSolveResult`:
+`solve` runs repeated solver updates and returns a `SolveResult`:
 
 ```python
 result = solver.solve(
@@ -16,16 +16,16 @@ x = result.x
 ```
 
 `max_steps` is always enforced. Three optional tolerances stop with
-`LMStatus.CONVERGED`; each defaults to `0.0`, which disables that check:
+`SolverStatus.CONVERGED`; each defaults to `0.0`, which disables that check:
 
-- `atol`: residual norm, \(\sqrt{\sum_i r_i^2} < \texttt{atol}\).
-- `gtol`: gradient norm, \(\|J^\top r\|_2 < \texttt{gtol}\), evaluated at the
+- `atol`: residual norm, \(\sqrt{\sum_i r_i^2} < \texttt{atol}\) (or `<= atol` as a conjunctive filter on `(gtol | xtol)` when `ridge > 0`).
+- `gtol`: whitened gradient norm, \(\|B^\top r\|_2 < \texttt{gtol}\) (with \(B = J \bar F^{-1}\), reducing to \(\|J^\top r\|_2\) under the Euclidean metric, or \(\|\tilde J^\top r + \lambda [y_m; 0]\|_2\) when `ridge > 0`), evaluated at the
   pre-step parameters of the step just taken.
-- `xtol`: step norm, \(\|s\|_2 < \texttt{xtol}\), checked only when the step
+- `xtol`: whitened step norm, \(\|\bar F s\|_2 < \texttt{xtol}\), checked only when the step
   was accepted (rejected steps say nothing about stationarity).
 
 With all three at zero the solve runs until `max_steps` unless a callback
-stops it. The returned status remains `LMStatus.MAX_STEPS`, but the default
+stops it. The returned status remains `SolverStatus.MAX_STEPS`, but the default
 `max_steps_is_success=True` treats that finite result as usable for implicit AD
 and default multi-start acceptance. Set it to `False` when budget exhaustion
 must use the strict failed-solve path. `max_steps_is_success` is a static Python
@@ -35,11 +35,11 @@ concrete numbers, not tracers from an enclosing `jax.jit`.
 `solve(jit=True)` is the default and jits the loop; use `jit=False` for
 debugging Python callbacks.
 
-The per-step diagnostics behind these rules are exposed on `LMInfo` as
+The per-step diagnostics behind these rules are exposed on `LMInfo` (or `NewtonInfo`) as
 `grad_norm` (\(\|J^\top r\|_2\), nearly free in the dense paths since
 \(J^\top\) is already materialized) and `step_norm` (norm of the candidate
 step, reported even when the step is rejected). Before the first update the
-loop's `LMInfo` uses sentinels `grad_norm=inf` and `step_norm=0`, so `gtol`
+loop's `info` uses sentinels `grad_norm=inf` and `step_norm=0`, so `gtol`
 and `xtol` cannot fire at step zero.
 
 Damping is floored at `jnp.finfo(residual.dtype).tiny`, the smallest positive
@@ -52,44 +52,49 @@ going to make progress. To hold a larger floor, or to cap damping from above,
 clamp it in a callback:
 
 ```python
-damping = jnp.clip(ctx.lm_state.damping, 1e-12, 1e6)
-return LMAction(lm_state=dataclasses.replace(ctx.lm_state, damping=damping))
+damping = jnp.clip(ctx.state.damping, 1e-12, 1e6)
+return SolverAction(state=dataclasses.replace(ctx.state, damping=damping))
 ```
 
 Left unclamped, repeated rejections multiply damping by `damping_increase`
 without bound and it can overflow to `inf` in float32. That is not a failure
 mode worth guarding: the step goes to zero, every trial is rejected, `x` stays
 at the last accepted iterate, and the solve ends at `MAX_STEPS` with the best
-point it found. For genuine regularization, use `RidgeLevenbergMarquardt`.
+point it found. For genuine regularization, pass a positive `ridge` to
+`LevenbergMarquardt` or `Newton`.
 
-Status codes are integer constants:
+Status codes are integer constants on `SolverStatus`:
 
 | Status | Meaning |
 | --- | --- |
-| `LMStatus.CONVERGED` | A tolerance (`atol`, `gtol`, or `xtol`) was met. |
-| `LMStatus.MAX_STEPS` | `max_steps` was reached; usable by default, strict when `max_steps_is_success=False`. |
-| `LMStatus.NONFINITE` | The current loss is nonfinite, or a callback chose this status. |
-| `LMStatus.CALLBACK_STOP` | A callback stopped without a custom status. |
-| `LMStatus.RUNNING` | Internal running state, not a final successful status. |
+| `SolverStatus.CONVERGED` | A tolerance (`atol`, `gtol`, or `xtol`) was met. |
+| `SolverStatus.MAX_STEPS` | `max_steps` was reached; usable by default, strict when `max_steps_is_success=False`. |
+| `SolverStatus.NONFINITE` | The current loss is nonfinite, or a callback chose this status. |
+| `SolverStatus.CALLBACK_STOP` | A callback stopped without a custom status. |
+| `SolverStatus.LINE_SEARCH_FAILED` | (`Newton` only) Armijo backtracking exhausted `maxls` trials. |
+| `SolverStatus.LINEAR_SOLVE_FAILED` | (`Newton` only) Linear solve encountered a singular or nonfinite pivot. |
+| `SolverStatus.NON_DESCENT` | (`Newton` only) Computed direction is not a descent direction at a non-root point. |
+| `SolverStatus.STAGNATION` | (`Newton` only) Scaled step underflowed (`x + step == x`). |
+| `SolverStatus.RUNNING` | Internal running state, not a final successful status. |
 
-Callbacks receive an `LMContext`:
+Callbacks receive a `CallbackContext`:
 
 | Field | Meaning |
 | --- | --- |
 | `step` | One-based step number just completed. |
-| `x`, `lm_state`, `info` | Accepted/rejected step result and LM diagnostics. |
-| `x_old`, `lm_state_old` | Values before that step. |
-| `initial_lm_state` | State supplied to `solve` or created by `init`. |
+| `x`, `state`, `info` | Accepted/rejected step result and solver diagnostics. |
+| `x_old`, `state_old` | Values before that step. |
+| `initial_state` | State supplied to `solve` or created by `init`. |
 | `args`, `p`, `user_state` | Current auxiliary data, read-only external data, and user state. |
 
-A callback returns `None` or `LMAction(...)`. Omitted action fields are left
-unchanged. The callback may set `stop`, `status`, `x`, `lm_state`, `args`, or
+A callback returns `None` or `SolverAction(...)`. Omitted action fields are left
+unchanged. The callback may set `stop`, `status`, `x`, `state`, `args`, or
 `user_state`; it cannot replace `p`. When an action changes the values of `x`
 or `args`, that step's tolerance checks are skipped — the diagnostics describe
 the pre-action problem — and resume after the next update.
 
 A callback that replaces `x` or `args` with a point that is not valid for the
-residual or implicit AD must also stop with `status=LMStatus.NONFINITE` (or
+residual or implicit AD must also stop with `status=SolverStatus.NONFINITE` (or
 another failed status). In particular, a replacement on the final iteration is
 otherwise reported as `MAX_STEPS`, which is intentionally AD-successful by
 default; the solver does not pay for another unconditional residual check just
@@ -97,17 +102,17 @@ to second-guess a callback's explicit replacement.
 
 ### Resettable Hyperparameters
 
-`solve()` populates `lm_state.hyper` with an `LMHyperparams` of traced
+`solve()` populates `state.hyper` with an `LMHyperparams` (or `NewtonHyperparams`) of traced
 per-step values: `damping_decrease`, `damping_increase`,
 `geodesic_acceptance_ratio`, `iterative_tol`, `iterative_atol`, and
-`iterative_maxiter`. Because they ride in the lm_state, a callback can reset
+`iterative_maxiter` (or line-search/regularization fields for `Newton`). Because they ride in `state`, a callback can reset
 any of them mid-solve — exactly like a damping reset:
 
 ```python
 new_hyper = dataclasses.replace(
-    ctx.lm_state.hyper, iterative_maxiter=jnp.asarray(40, jnp.int32)
+    ctx.state.hyper, iterative_maxiter=jnp.asarray(40, jnp.int32)
 )
-return LMAction(lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper))
+return SolverAction(state=dataclasses.replace(ctx.state, hyper=new_hyper))
 ```
 
 Two contracts: knobs constructed as `None` (backend-default
@@ -119,15 +124,15 @@ configuration — `linear_solver`, `geodesic_acceleration`, `cache_jacobian`,
 `init()` leaves `hyper=None`, which falls back to the constructor values and
 compiles to the same program with no extra per-call buffers — manual
 `update()` loops pay nothing. To schedule hyperparameters in a manual loop,
-opt in with `dataclasses.replace(lm_state, hyper=solver.hyperparams(dtype))`.
-When chaining solves, a warm-started `lm_state` carries the *first* solver's
-hyperparameters; pass `dataclasses.replace(lm_state, hyper=None)` to re-derive
+opt in with `dataclasses.replace(state, hyper=solver.hyperparams(dtype))`.
+When chaining solves, a warm-started `state` carries the *first* solver's
+hyperparameters; pass `dataclasses.replace(state, hyper=None)` to re-derive
 them from the second solver's constructor.
 
 ### Adapting the metric and preconditioner
 
-The metric and preconditioner instances ride in `lm_state.metric` and
-`lm_state.preconditioner`, so a callback adapts either by **constructing a
+The metric and preconditioner instances ride in `state.metric` and
+`state.preconditioner`, so a callback adapts either by **constructing a
 new instance** — same type, same static fields, same leaf shapes and dtypes
 (a mismatch raises at trace time, naming the field). Construction is pure
 traced ops and never recompiles the loop. Gate an expensive rebuild
@@ -140,9 +145,9 @@ def refresh(ctx):
     precond = jax.lax.cond(
         ctx.step % 32 == 0,
         lambda: BlockEigenPreconditioner(build_families(ctx.x), PERMUTATION),
-        lambda: ctx.lm_state.preconditioner,
+        lambda: ctx.state.preconditioner,
     )
-    return LMAction(lm_state=dataclasses.replace(ctx.lm_state, preconditioner=precond))
+    return SolverAction(state=dataclasses.replace(ctx.state, preconditioner=precond))
 ```
 
 What the solver does with a change:
@@ -151,16 +156,16 @@ What the solver does with a change:
   iteration path, so nothing is invalidated and convergence tests run
   normally;
 - a **metric** change stales the whitened solver caches (never the Jacobian
-  cache — \(J = \partial r/\partial x\) does not see the metric). For
-  `RidgeLevenbergMarquardt` it is additionally a **problem change** — the
-  metric defines the objective — so that step's convergence test is
-  suppressed, exactly like a ridge change. A consequence worth knowing: a
-  metric rebuilt on *every* accepted step suppresses convergence on every
-  accepted step, so `xtol` (accepted-only) can never fire — rebuild
-  conditionally, or stop via `gtol`/`atol`. `LevenbergMarquardt`'s metric is
-  damping geometry only (\(\|r\|^2\) did not move), so no suppression there.
+  cache — \(J = \partial r/\partial x\) does not see the metric). When `ridge`
+  is active it is additionally a **problem change** — the metric defines the
+  objective — so that step's convergence test is suppressed, exactly like a
+  ridge change. A consequence worth knowing: a metric rebuilt on *every*
+  accepted step suppresses convergence on every accepted step, so `xtol`
+  (accepted-only) can never fire — rebuild conditionally, or stop via
+  `gtol`/`atol`. With `ridge=None`, the metric is step geometry only
+  (\(\|r\|^2\) did not move), so no suppression there.
 - detection is **by value** with a trace-time identity short-circuit: an
-  action built with `dataclasses.replace(ctx.lm_state, ...)` that passes the
+  action built with `dataclasses.replace(ctx.state, ...)` that passes the
   instances through untouched costs no comparison ops at all.
 
 A callback that replaces `x` or `args` and uses a metric built from them
@@ -180,14 +185,14 @@ residual-norm threshold:
 ```python
 import jax.numpy as jnp
 
-from nlls_gram import LMAction, LMStatus
+from nlls_gram import SolverAction, SolverStatus
 
 
 def stopping_callback(ctx):
     nonfinite = ~jnp.isfinite(ctx.info.loss_candidate)
     converged = jnp.sqrt(ctx.info.loss) < 1e-8
-    status = jnp.where(nonfinite, LMStatus.NONFINITE, LMStatus.CONVERGED)
-    return LMAction(stop=nonfinite | converged, status=status)
+    status = jnp.where(nonfinite, SolverStatus.NONFINITE, SolverStatus.CONVERGED)
+    return SolverAction(stop=nonfinite | converged, status=status)
 
 
 result = solver.solve(
@@ -218,10 +223,10 @@ import time
 
 train_step = jax.jit(solver.update)
 
-lm_state = solver.init(x, args)
+state = solver.init(x, args)
 start = time.perf_counter()
 for step in range(max_steps):
-    x, lm_state, info = train_step(x, lm_state, args)
+    x, state, info = train_step(x, state, args)
     if not bool(jnp.isfinite(info.loss_candidate)):
         break  # diverged
     if float(info.loss) < loss_threshold:
@@ -259,7 +264,7 @@ def solve_start(x0):
 
 
 results = jax.vmap(solve_start)(x0_batch)
-converged = results.status == LMStatus.CONVERGED
+converged = results.status == SolverStatus.CONVERGED
 loss = jnp.where(converged, results.info.loss, jnp.inf)
 best = jnp.argmin(loss)
 x_best = jax.tree.map(lambda leaf: leaf[best], results.x)
@@ -300,7 +305,7 @@ def logging_callback(ctx):
         "step {step}: loss={loss:.3e} damping={damping:.1e}",
         step=ctx.step,
         loss=ctx.info.loss,
-        damping=ctx.lm_state.damping,
+        damping=ctx.state.damping,
     )
 
 
@@ -317,7 +322,7 @@ def logging_callback(ctx):
             "step {step}: loss={loss:.3e} damping={damping:.1e}",
             step=ctx.step,
             loss=ctx.info.loss,
-            damping=ctx.lm_state.damping,
+            damping=ctx.state.damping,
         )
 
     jax.lax.cond(ctx.step % 10 == 0, log, lambda _: None, operand=None)
@@ -336,7 +341,7 @@ divergence:
 ```python
 def divergence_callback(ctx):
     nonfinite = ~jnp.isfinite(ctx.info.loss_candidate)
-    return LMAction(stop=nonfinite, status=LMStatus.NONFINITE)
+    return SolverAction(stop=nonfinite, status=SolverStatus.NONFINITE)
 ```
 
 ### Epoch Resampling and Damping Reset
@@ -358,12 +363,12 @@ def epoch_callback(ctx):
     new_args = jax.tree.map(
         lambda new, old: jnp.where(boundary, new, old), resampled, ctx.args
     )
-    new_lm_state = dataclasses.replace(
-        ctx.lm_state,
-        damping=jnp.where(boundary, ctx.initial_lm_state.damping, ctx.lm_state.damping),
+    new_state = dataclasses.replace(
+        ctx.state,
+        damping=jnp.where(boundary, ctx.initial_state.damping, ctx.state.damping),
     )
     new_key = jnp.where(boundary, key, ctx.user_state)
-    return LMAction(args=new_args, lm_state=new_lm_state, user_state=new_key)
+    return SolverAction(args=new_args, state=new_state, user_state=new_key)
 
 
 result = solver.solve(
@@ -400,10 +405,10 @@ def grow_budget(ctx):
     new_maxiter = jnp.where(
         ctx.info.loss < 1e-2,
         jnp.asarray(40, jnp.int32),
-        ctx.lm_state.hyper.iterative_maxiter,
+        ctx.state.hyper.iterative_maxiter,
     )
-    new_hyper = dataclasses.replace(ctx.lm_state.hyper, iterative_maxiter=new_maxiter)
-    return LMAction(lm_state=dataclasses.replace(ctx.lm_state, hyper=new_hyper))
+    new_hyper = dataclasses.replace(ctx.state.hyper, iterative_maxiter=new_maxiter)
+    return SolverAction(state=dataclasses.replace(ctx.state, hyper=new_hyper))
 
 
 result = solver.solve(x0, args, max_steps=200, atol=1e-8, callback=grow_budget)
@@ -413,7 +418,7 @@ Alternatively, a relative `iterative_tol` adapts the inner accuracy
 automatically (CG's stopping test scales with the right-hand side, which is
 the shrinking outer residual). For a dense endgame instead, chain two solves:
 a coarse CG stage, then a `Cholesky()` solver warm-started with `result.x` and
-`result.lm_state` — the implicit derivative is unaffected since it is defined
+`result.state` — the implicit derivative is unaffected since it is defined
 at the returned solution only.
 
 ### Validation Early Stopping
@@ -425,7 +430,7 @@ their thresholds:
 def validation_callback(ctx):
     val_residual = validation_residual_fn(ctx.x, val_data)
     val_mse = jnp.mean(val_residual**2)
-    return LMAction(stop=val_mse < val_threshold)
+    return SolverAction(stop=val_mse < val_threshold)
 ```
 
 Evaluating validation metrics every step costs a residual pass per step; gate
@@ -445,7 +450,7 @@ import time
 import numpy as np
 from jax.experimental import io_callback
 
-TIME_LIMIT_STATUS = 100  # any int outside the LMStatus constants
+TIME_LIMIT_STATUS = 100  # any int outside the SolverStatus constants
 
 
 def over_time_budget(start_and_budget, _step):
@@ -460,7 +465,7 @@ def time_limit_callback(ctx):
         ctx.user_state,  # (start_time, budget_seconds)
         ctx.step,  # loop-varying arg so the call cannot be hoisted
     )
-    return LMAction(stop=timed_out, status=TIME_LIMIT_STATUS)
+    return SolverAction(stop=timed_out, status=TIME_LIMIT_STATUS)
 
 
 result = solver.solve(
@@ -507,7 +512,7 @@ def history_callback(ctx):
             ctx.user_state["damping"], ctx.info.damping[None], (ctx.step - 1,)
         ),
     }
-    return LMAction(user_state=history)
+    return SolverAction(user_state=history)
 
 
 result = solver.solve(
