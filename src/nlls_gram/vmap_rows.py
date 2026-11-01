@@ -122,12 +122,15 @@ def vmap_rows(f=None, *, in_axes=None, chunk_size=None):
         if chunk_size is None:
             jac, r = jax.vmap(row, in_axes=axes)(*primals)
         else:
+
             def to_axis0(a, ax):
                 return jax.tree.map(
-                    lambda axis, sub: sub
-                    if axis is None
-                    else jax.tree.map(
-                        lambda x: jnp.moveaxis(x, axis, 0) if axis != 0 else x, sub
+                    lambda axis, sub: (
+                        sub
+                        if axis is None
+                        else jax.tree.map(
+                            lambda x: jnp.moveaxis(x, axis, 0) if axis != 0 else x, sub
+                        )
                     ),
                     ax,
                     a,

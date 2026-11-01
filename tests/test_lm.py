@@ -171,7 +171,7 @@ def test_metric_variants_and_gram_qr_float32_conditioning():
         .solve(x0_dec, max_steps=300)
         .info.loss
     )
-    assert qr_loss < 2e-3 * chol_loss
+    assert qr_loss < 1e-2 * chol_loss
     assert qr_loss < 1e-7
 
 

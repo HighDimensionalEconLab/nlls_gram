@@ -1128,9 +1128,7 @@ class LU(LinearSolver):
             tiny, max(sub.m, sub.n) * jnp.finfo(sub.dtype).eps * jnp.max(diag_abs)
         )
         lu_ok = (
-            (sub.damping == 0)
-            & jnp.all(jnp.isfinite(lu))
-            & jnp.all(diag_abs > cutoff)
+            (sub.damping == 0) & jnp.all(jnp.isfinite(lu)) & jnp.all(diag_abs > cutoff)
         )
         d = -jsp_linalg.lu_solve((lu, piv), sub.resid)
         solve_ok = lu_ok & jnp.all(jnp.isfinite(grad)) & jnp.all(jnp.isfinite(d))
