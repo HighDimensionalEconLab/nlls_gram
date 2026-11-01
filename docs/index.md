@@ -13,7 +13,7 @@ ridge objective):
 | | `LevenbergMarquardt(..., ridge=...)` | `LevenbergMarquardt` | `Newton(..., ridge=...)` | `Newton` |
 |---|---|---|---|---|
 | minimizes | \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) | \(\|r(x)\|^2\) | \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) | \(\|r(x)\|^2\) |
-| globalization | trust-region damping | trust-region damping | Armijo backtracking line search | Armijo backtracking line search |
+| globalization | trust-region damping + Armijo backtracking | trust-region damping + Armijo backtracking | Armijo backtracking line search | Armijo backtracking line search |
 | step direction | damped ridge minimum-\(W\)-norm | damped minimum-\(W\)-norm | ridge minimum-\(W\)-norm | minimum-\(W\)-norm \(-\bar F^{-1}(J \bar F^{-1})^+ r\) |
 | use when | the interpolant is the deliverable | rank-deficient or curved paths need trust-region damping | RKHS / kernel ridge problems where full steps dominate | well-conditioned systems or with residual-coupled `damping > 0` + `geodesic_acceleration=True` |
 

@@ -168,6 +168,11 @@ class LMHyperparams:
     iterative_tol: jax.Array
     iterative_atol: jax.Array
     iterative_maxiter: jax.Array | None
+    c1: jax.Array = 1e-4
+    decrease_factor: jax.Array = 0.5
+    maxls: jax.Array = 20
+    max_stepsize: jax.Array = 1.0
+    linesearch_tol: jax.Array = 0.0
 
 
 def _damping_floor(dtype):
@@ -204,6 +209,11 @@ def _cast_lm_hyper(hyper, dtype):
         None
         if hyper.iterative_maxiter is None
         else jnp.asarray(hyper.iterative_maxiter, dtype=jnp.int32),
+        c1=jnp.asarray(hyper.c1, dtype=dtype),
+        decrease_factor=jnp.asarray(hyper.decrease_factor, dtype=dtype),
+        maxls=jnp.asarray(hyper.maxls, dtype=jnp.int32),
+        max_stepsize=jnp.asarray(hyper.max_stepsize, dtype=dtype),
+        linesearch_tol=jnp.asarray(hyper.linesearch_tol, dtype=dtype),
     )
 
 
@@ -332,6 +342,8 @@ class LMInfo:
     penalty_value: jax.Array | None = None
     penalty_grad_norm: jax.Array | None = None
     aux: Any = None
+    stepsize: jax.Array | None = None
+    num_linesearch_steps: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass

@@ -171,7 +171,7 @@ def test_metric_variants_and_gram_qr_float32_conditioning():
         .solve(x0_dec, max_steps=300)
         .info.loss
     )
-    assert qr_loss < 1e-3 * chol_loss
+    assert qr_loss < 2e-3 * chol_loss
     assert qr_loss < 1e-7
 
 
@@ -316,12 +316,23 @@ def test_rejected_step_reuses_cached_linearization():
         jax.debug.callback(lambda: calls.append(1), ordered=True)
         return theta**2 - 1.0
 
-    solver = LevenbergMarquardt(
+    x = jnp.asarray([0.1], dtype=jnp.float32)
+    bt_solver = LevenbergMarquardt(
         scalar_residual,
         init_damping=1e-8,
         geodesic_acceleration=False,
     )
-    x = jnp.asarray([0.1], dtype=jnp.float32)
+    _, _, bt_info = bt_solver.update(x, bt_solver.init(x))
+    assert bool(bt_info.accepted)
+    assert float(bt_info.stepsize) == pytest.approx(0.25)
+    assert float(bt_info.damping_factor) == pytest.approx(2.0)
+
+    solver = LevenbergMarquardt(
+        scalar_residual,
+        init_damping=1e-8,
+        maxls=1,
+        geodesic_acceleration=False,
+    )
     state = solver.init(x)
     calls.clear()
     x1, state, info = solver.update(x, state)

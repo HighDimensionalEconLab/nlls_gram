@@ -41,8 +41,13 @@ recompilation.
 
 ## Damping
 
-`init_damping=1e-3` with `damping_decrease=0.5` / `damping_increase=4.0` is
-the standard schedule. Reach for the others only on evidence:
+`init_damping=1e-3` with `damping_decrease=0.5` / `damping_increase=4.0` and
+Armijo backtracking (`maxls=20`, `c1=1e-4`, `decrease_factor=0.5`) is the
+standard schedule: when a step is accepted at step size \(\alpha \le 1\),
+damping scales by \(\min(\text{damping\_increase}, \text{damping\_decrease} / \alpha)\)
+(or `damping_increase` on rejection). Pass `maxls=1` for single-trial
+accept/reject updates without backtracking. Reach for the others only on
+evidence:
 
 - `geodesic_acceptance_ratio` — lower it when the second-order correction is
   being accepted on steps where it overshoots.

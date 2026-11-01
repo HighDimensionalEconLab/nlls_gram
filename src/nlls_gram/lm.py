@@ -19,6 +19,7 @@ from nlls_gram.linear_solvers import (
 )
 from nlls_gram.solver_base import (
     SolverBase,
+    _armijo_backtracking,
     _init_residual_and_aux,
     _validate_ridge_value,
 )
@@ -31,6 +32,7 @@ from nlls_gram.types import (
     _cast_lm_hyper,
     _damping_floor,
 )
+from nlls_gram.utilities import mm
 
 __all__ = [
     "AnnealRidge",
@@ -192,6 +194,11 @@ class LevenbergMarquardt(SolverBase):
         init_damping=1e-3,
         damping_decrease=0.5,
         damping_increase=4.0,
+        c1=1e-4,
+        decrease_factor=0.5,
+        maxls=20,
+        max_stepsize=1.0,
+        linesearch_tol=0.0,
         linear_solver=Cholesky(),  # noqa: B008 -- frozen, immutable default
         jacobian_mode="auto",
         jacobian_chunk=None,
@@ -222,6 +229,11 @@ class LevenbergMarquardt(SolverBase):
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
         self.damping_increase = damping_increase
+        self.c1 = c1
+        self.decrease_factor = decrease_factor
+        self.maxls = maxls
+        self.max_stepsize = max_stepsize
+        self.linesearch_tol = linesearch_tol
 
         self._static_key = self._common_static_key()
         self._static_hash = hash(self._static_key)
@@ -244,6 +256,11 @@ class LevenbergMarquardt(SolverBase):
             None
             if self.iterative_maxiter is None
             else jnp.asarray(self.iterative_maxiter, dtype=jnp.int32),
+            c1=jnp.asarray(self.c1, dtype=dtype),
+            decrease_factor=jnp.asarray(self.decrease_factor, dtype=dtype),
+            maxls=jnp.asarray(self.maxls, dtype=jnp.int32),
+            max_stepsize=jnp.asarray(self.max_stepsize, dtype=dtype),
+            linesearch_tol=jnp.asarray(self.linesearch_tol, dtype=dtype),
         )
 
     def init(self, x0, args=None, *, p=None):
@@ -341,6 +358,8 @@ class LevenbergMarquardt(SolverBase):
             grad_norm=infinity,
             step_norm=zero,
             aux=aux,
+            stepsize=zero,
+            num_linesearch_steps=jnp.asarray(0, dtype=jnp.int32),
             **ridge_fields,
         )
 
@@ -409,19 +428,16 @@ class LevenbergMarquardt(SolverBase):
         grad = step_solver.grad
         velocity_sub = step_solver.velocity()
         velocity = jnp.asarray(self._extended_solve(velocity_sub, ctx), dtype=dtype)
-
-        def trial_penalty(step_sub):
-            return jnp.sum((y_m + step_sub[:n_m]) ** 2)
-
-        resid_velocity = residual_value(theta + velocity)
-        resid_loss_velocity = jnp.sum(resid_velocity**2)
-        if self.penalized:
-            penalty_velocity = trial_penalty(velocity_sub)
-            loss_velocity = resid_loss_velocity + ridge * penalty_velocity
-        else:
-            penalty_velocity = None
-            loss_velocity = resid_loss_velocity
         zero = jnp.zeros((), dtype=dtype)
+        one = jnp.ones((), dtype=dtype)
+        slope = mm(grad, velocity_sub)
+        descent_ok = (
+            jnp.isfinite(loss_old)
+            & jnp.all(jnp.isfinite(velocity_sub))
+            & jnp.all(jnp.isfinite(velocity))
+            & jnp.isfinite(slope)
+            & (slope < zero)
+        )
 
         if self.geodesic_acceleration:
             geodesic_acceptance_ratio = jnp.asarray(
@@ -431,7 +447,7 @@ class LevenbergMarquardt(SolverBase):
                 acceleration_sub,
                 acceleration,
                 acceleration_ratio,
-                ratio_accepted,
+                raw_ratio_accepted,
             ) = self._geodesic_correction(
                 residual_flat,
                 theta,
@@ -442,62 +458,70 @@ class LevenbergMarquardt(SolverBase):
                 geodesic_acceptance_ratio,
                 dtype,
             )
-            accelerated_step = velocity + 0.5 * acceleration
-            accelerated_step_sub = velocity_sub + 0.5 * acceleration_sub
-            inf = jnp.asarray(jnp.inf, dtype=dtype)
-            if self.penalized:
-
-                def accelerated_objective(_):
-                    resid_accel = residual_value(theta + accelerated_step)
-                    return jnp.sum(resid_accel**2), trial_penalty(accelerated_step_sub)
-
-                resid_loss_accelerated, penalty_accelerated = jax.lax.cond(
-                    ratio_accepted,
-                    accelerated_objective,
-                    lambda _: (inf, inf),
-                    operand=None,
-                )
-                loss_accelerated = resid_loss_accelerated + ridge * penalty_accelerated
-            else:
-                resid_loss_accelerated = jax.lax.cond(
-                    ratio_accepted,
-                    lambda _: jnp.sum(residual_value(theta + accelerated_step) ** 2),
-                    lambda _: inf,
-                    operand=None,
-                )
-                penalty_accelerated = None
-                loss_accelerated = resid_loss_accelerated
-
-            used_geodesic = ratio_accepted & (loss_accelerated <= loss_velocity)
-            step = jnp.where(used_geodesic, accelerated_step, velocity)
-            step_sub = jnp.where(used_geodesic, accelerated_step_sub, velocity_sub)
-            loss_candidate = jnp.where(used_geodesic, loss_accelerated, loss_velocity)
-            if self.penalized:
-                resid_loss_candidate = jnp.where(
-                    used_geodesic, resid_loss_accelerated, resid_loss_velocity
-                )
-                penalty_candidate = jnp.where(
-                    used_geodesic, penalty_accelerated, penalty_velocity
-                )
+            ratio_accepted = (
+                descent_ok
+                & raw_ratio_accepted
+                & jnp.all(jnp.isfinite(acceleration_sub))
+                & jnp.all(jnp.isfinite(acceleration))
+            )
+            u_a = jnp.where(
+                ratio_accepted, acceleration_sub, jnp.zeros_like(velocity_sub)
+            )
+            a = jnp.where(ratio_accepted, acceleration, jnp.zeros_like(velocity))
+            u_a_m = u_a[:n_m] if self.penalized else None
         else:
-            step = velocity
-            step_sub = velocity_sub
-            loss_candidate = loss_velocity
-            if self.penalized:
-                resid_loss_candidate = resid_loss_velocity
-                penalty_candidate = penalty_velocity
-            used_geodesic = jnp.asarray(False)
+            u_a = None
+            a = None
+            u_a_m = None
             acceleration_ratio = zero
+            ratio_accepted = jnp.asarray(False, dtype=jnp.bool_)
 
-        improved = (
-            jnp.all(jnp.isfinite(step))
-            & jnp.isfinite(loss_candidate)
-            & (loss_candidate < loss_old)
+        (
+            theta_new,
+            loss,
+            resid_loss_new,
+            penalty_new,
+            loss_candidate,
+            improved,
+            stepsize,
+            trial_stepsize,
+            trials,
+            _,
+        ) = _armijo_backtracking(
+            residual_value,
+            theta,
+            loss_old,
+            velocity,
+            slope,
+            hyper,
+            descent_ok,
+            a=a,
+            y_m=y_m if self.penalized else None,
+            u_m=velocity_sub[:n_m] if self.penalized else None,
+            u_a_m=u_a_m,
+            ridge=ridge if self.penalized else None,
+            resid_loss_old=resid_loss_old if self.penalized else None,
+            penalty_old=penalty_value_old if self.penalized else None,
         )
-        theta_new = jnp.where(improved, theta + step, theta)
-        damping_factor = jnp.where(improved, damping_decrease, damping_increase)
+
+        safe_alpha = jnp.where(improved, stepsize, one)
+        damping_factor = jnp.where(
+            improved,
+            jnp.minimum(damping_increase, damping_decrease / safe_alpha),
+            damping_increase,
+        )
         new_damping = jnp.maximum(damping * damping_factor, damping_floor)
-        loss = jnp.where(improved, loss_candidate, loss_old)
+        used_geodesic = improved & ratio_accepted
+        step_alpha = jnp.where(
+            improved,
+            stepsize,
+            jnp.where(trial_stepsize > zero, trial_stepsize, one),
+        )
+        step_sub = (
+            step_alpha * velocity_sub
+            if u_a is None
+            else step_alpha * velocity_sub + 0.5 * (step_alpha**2) * u_a
+        )
 
         instances = dict(metric=state.metric, preconditioner=state.preconditioner)
         ridge_state = ridge if self.penalized else None
@@ -524,8 +548,8 @@ class LevenbergMarquardt(SolverBase):
         if self.penalized:
             ridge_info = dict(
                 ridge=ridge,
-                resid_loss=jnp.where(improved, resid_loss_candidate, resid_loss_old),
-                penalty_value=jnp.where(improved, penalty_candidate, penalty_value_old),
+                resid_loss=resid_loss_new,
+                penalty_value=penalty_new,
                 penalty_grad_norm=jnp.linalg.norm(penalty_gradient),
             )
         else:
@@ -546,6 +570,8 @@ class LevenbergMarquardt(SolverBase):
                 grad_norm=jnp.linalg.norm(grad),
                 step_norm=jnp.linalg.norm(step_sub),
                 aux=aux,
+                stepsize=stepsize,
+                num_linesearch_steps=trials,
                 **ridge_info,
             ),
         )

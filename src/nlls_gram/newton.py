@@ -23,7 +23,11 @@ from nlls_gram.linear_solvers import (
     GramCG,
     Subproblem,
 )
-from nlls_gram.solver_base import SolverBase, _init_residual_and_aux
+from nlls_gram.solver_base import (
+    SolverBase,
+    _armijo_backtracking,
+    _init_residual_and_aux,
+)
 from nlls_gram.types import (
     NewtonHyperparams,
     NewtonInfo,
@@ -35,153 +39,6 @@ from nlls_gram.types import (
 from nlls_gram.utilities import mm
 
 __all__ = ["Newton"]
-
-
-def _armijo_backtracking(
-    residual_value,
-    theta,
-    loss_old,
-    d,
-    slope,
-    hyper,
-    active,
-    *,
-    a=None,
-    y_m=None,
-    u_m=None,
-    u_a_m=None,
-    ridge=None,
-    resid_loss_old=None,
-    penalty_old=None,
-):
-    dtype = loss_old.dtype
-    zero = jnp.zeros((), dtype=dtype)
-    one = jnp.ones((), dtype=dtype)
-    c1 = jnp.asarray(hyper.c1, dtype=dtype)
-    decrease_factor = jnp.asarray(hyper.decrease_factor, dtype=dtype)
-    maxls = jnp.where(
-        active,
-        jnp.asarray(hyper.maxls, dtype=jnp.int32),
-        jnp.asarray(0, dtype=jnp.int32),
-    )
-    max_stepsize = jnp.asarray(hyper.max_stepsize, dtype=dtype)
-    linesearch_tol = jnp.asarray(hyper.linesearch_tol, dtype=dtype)
-    alpha0 = jnp.minimum(one, max_stepsize)
-    penalized = ridge is not None
-    if not penalized:
-        resid_loss_old = loss_old
-        penalty_old = zero
-
-    def cond(carry):
-        trial, _, accepted, stagnated, _, _, _, _, _, _ = carry
-        return (~accepted) & (~stagnated) & (trial < maxls)
-
-    def body(carry):
-        (
-            trial,
-            alpha,
-            _,
-            _,
-            theta_kept,
-            loss_kept,
-            resid_loss_kept,
-            penalty_kept,
-            _,
-            _,
-        ) = carry
-        step_theta = alpha * d if a is None else alpha * d + 0.5 * (alpha**2) * a
-        cand_theta = theta + step_theta
-        cand_finite = jnp.all(jnp.isfinite(cand_theta))
-        same_theta = cand_finite & jnp.all(cand_theta == theta)
-        cand_resid = residual_value(cand_theta)
-        cand_resid_loss = jnp.sum(cand_resid**2)
-        if penalized:
-            step_u_m = (
-                alpha * u_m if u_a_m is None else alpha * u_m + 0.5 * (alpha**2) * u_a_m
-            )
-            cand_penalty = jnp.sum((y_m + step_u_m) ** 2)
-            cand_loss = cand_resid_loss + ridge * cand_penalty
-        else:
-            cand_penalty = zero
-            cand_loss = cand_resid_loss
-        trial_finite = (
-            cand_finite
-            & jnp.all(jnp.isfinite(cand_resid))
-            & jnp.isfinite(cand_resid_loss)
-            & jnp.isfinite(cand_loss)
-        )
-        rhs = loss_old + 2.0 * c1 * alpha * slope + 2.0 * linesearch_tol
-        ok = (~same_theta) & trial_finite & (cand_loss <= rhs)
-        new_trial = trial + jnp.asarray(1, dtype=jnp.int32)
-        new_theta = jnp.where(ok, cand_theta, theta_kept)
-        new_loss = jnp.where(ok, cand_loss, loss_kept)
-        new_resid_loss = jnp.where(ok, cand_resid_loss, resid_loss_kept)
-        new_penalty = jnp.where(ok, cand_penalty, penalty_kept)
-        next_alpha = jnp.where(
-            ok | same_theta | (new_trial >= maxls),
-            alpha,
-            alpha * decrease_factor,
-        )
-        last_loss = jnp.where(same_theta, loss_old, cand_loss)
-        return (
-            new_trial,
-            next_alpha,
-            ok,
-            same_theta,
-            new_theta,
-            new_loss,
-            new_resid_loss,
-            new_penalty,
-            alpha,
-            last_loss,
-        )
-
-    init_carry = (
-        jnp.asarray(0, dtype=jnp.int32),
-        alpha0,
-        jnp.asarray(False, dtype=jnp.bool_),
-        jnp.asarray(False, dtype=jnp.bool_),
-        theta,
-        loss_old,
-        resid_loss_old,
-        penalty_old,
-        zero,
-        loss_old,
-    )
-    (
-        trials,
-        _,
-        accepted,
-        stagnated,
-        theta_new,
-        loss_new,
-        resid_loss_new,
-        penalty_new,
-        last_alpha,
-        last_loss,
-    ) = jax.lax.while_loop(cond, body, init_carry)
-    stepsize = jnp.where(accepted, last_alpha, zero)
-    step_status = jnp.where(
-        accepted,
-        jnp.asarray(SolverStatus.RUNNING, dtype=jnp.int32),
-        jnp.where(
-            stagnated,
-            jnp.asarray(SolverStatus.STAGNATION, dtype=jnp.int32),
-            jnp.asarray(SolverStatus.LINE_SEARCH_FAILED, dtype=jnp.int32),
-        ),
-    )
-    return (
-        theta_new,
-        loss_new,
-        resid_loss_new,
-        penalty_new,
-        last_loss,
-        accepted,
-        stepsize,
-        last_alpha,
-        trials,
-        step_status,
-    )
 
 
 class Newton(SolverBase):
