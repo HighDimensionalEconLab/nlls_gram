@@ -9,14 +9,18 @@ import pytest
 
 from nlls_gram import (
     CG,
+    PDAS,
     QR,
     SVD,
     AnnealRidge,
     BlockEigenPreconditioner,
     Cholesky,
+    Complementarity,
+    FischerBurmeister,
     GramCG,
     IdentityPreconditioner,
     LevenbergMarquardt,
+    Minimum,
     MultiStart,
     Newton,
     RepeatedFactorMetric,
@@ -321,3 +325,32 @@ def test_state_space_metric_multi_start_and_failed_lane_ad_on_gpu(dtype):
             multi_start=ms,
         )
         assert int(res_ms.status) == int(SolverStatus.CONVERGED)
+
+        # 3. Complementarity Euler equation on GPU across PDAS, FB, and Minimum
+        beta = jnp.asarray(0.95, dtype=dtype)
+        r_gross = jnp.asarray(1.05, dtype=dtype)
+        y0 = jnp.asarray(1.1, dtype=dtype)
+        kappa = 1.0 / (beta * r_gross)
+        w_grid = jnp.linspace(0.5, 2.2, 16, dtype=dtype)
+        a_exact = jnp.maximum(0.0, (w_grid - kappa * y0) / (1.0 + kappa * r_gross))
+        a_init = jnp.full_like(w_grid, 0.25)
+
+        def euler_gpu(a, _, y):
+            return Complementarity(
+                lhs=a, rhs=1.0 / (w_grid - a) - beta * r_gross / (r_gross * a + y)
+            )
+
+        for cfg in (
+            PDAS(tau_init=0.05, tau_min=1e-4),
+            FischerBurmeister(mu_init=0.05, mu_min=1e-5),
+            Minimum(),
+        ):
+            sol_comp = LevenbergMarquardt(euler_gpu, complementarity=cfg).solve(
+                a_init, p=y0, max_steps=60, atol=atol
+            )
+            assert int(sol_comp.status) == int(SolverStatus.CONVERGED)
+            assert sol_comp.x.dtype == dtype
+            assert next(iter(sol_comp.x.devices())).platform in GPU_PLATFORMS
+            np.testing.assert_allclose(
+                np.asarray(sol_comp.x), np.asarray(a_exact), atol=2e-4
+            )

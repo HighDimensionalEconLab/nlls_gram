@@ -14,16 +14,20 @@ import pytest
 
 from nlls_gram import (
     CG,
+    PDAS,
     QR,
     SVD,
     AnnealRidge,
     Cholesky,
     CholeskyMetric,
+    Complementarity,
     DiagonalMetric,
+    FischerBurmeister,
     GramCG,
     IdentityPreconditioner,
     LevenbergMarquardt,
     LMState,
+    Minimum,
     MultiStart,
     Newton,
     RepeatedFactorMetric,
@@ -291,6 +295,40 @@ def _run_x64_checks():
         assert res_ms.x_history.dtype == jnp.float32
         assert res_ms.multi_start.loss.dtype == jnp.float32
         assert res_ms.status.dtype == jnp.int32
+
+    # 7. Complementarity in float64 and float32 non-promotion
+    w64 = jnp.linspace(0.6, 2.0, 6, dtype=jnp.float64)
+    beta64, r64, y64 = jnp.float64(0.95), jnp.float64(1.05), jnp.float64(1.1)
+    kappa64 = 1.0 / (beta64 * r64)
+    a_exact64 = jnp.maximum(0.0, (w64 - kappa64 * y64) / (1.0 + kappa64 * r64))
+
+    def euler64(a, _, y):
+        return Complementarity(
+            lhs=a, rhs=1.0 / (w64 - a) - beta64 * r64 / (r64 * a + y)
+        )
+
+    for cfg in (
+        PDAS(tau_init=0.05, tau_min=1e-8),
+        FischerBurmeister(mu_init=0.05, mu_min=1e-10),
+        Minimum(),
+    ):
+        sol64 = LevenbergMarquardt(euler64, complementarity=cfg).solve(
+            jnp.full_like(w64, 0.2), p=y64, max_steps=60, atol=1e-12
+        )
+        assert sol64.x.dtype == jnp.float64
+        np.testing.assert_allclose(sol64.x, a_exact64, atol=1e-11)
+
+        s32 = LevenbergMarquardt(
+            lambda x, _, p: Complementarity(lhs=x, rhs=x - p),
+            complementarity=cfg,
+        )
+        jpr32 = jax.make_jaxpr(
+            lambda p, s=s32: (
+                s.solve(jnp.ones(3, jnp.float32), p=p, max_steps=6, atol=1e-5).x
+            )
+        )(jnp.ones(3, jnp.float32))
+        bad32 = promotions(str(jpr32))
+        assert not bad32, f"Complementarity {cfg} promoted to f64: {bad32}"
 
 
 def test_float64_and_x64_nonpromotion_in_subprocess():

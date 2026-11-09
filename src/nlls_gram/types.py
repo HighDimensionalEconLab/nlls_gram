@@ -19,18 +19,78 @@ import jax
 import jax.numpy as jnp
 
 __all__ = [
+    "PDAS",
     "CallbackContext",
+    "Complementarity",
+    "Equality",
+    "FischerBurmeister",
+    "Inequality",
     "LMHyperparams",
     "LMInfo",
     "LMState",
+    "Minimum",
     "NewtonHyperparams",
     "NewtonInfo",
     "NewtonState",
+    "Residuals",
     "SolveResult",
     "SolverAction",
     "SolverContext",
     "SolverStatus",
 ]
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Equality:
+    value: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Inequality:
+    value: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Complementarity:
+    lhs: Any
+    rhs: Any
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class Residuals:
+    residual: Any = None
+    equality: Any = None
+    inequality: Any = None
+    complementarity: Any = None
+
+
+@dataclass(frozen=True)
+class Minimum:
+    c_scale: Any = 1.0
+    w_comp: float = 1.0
+
+
+@dataclass(frozen=True)
+class PDAS:
+    c_scale: Any = 1.0
+    w_comp: float = 1.0
+    tau_init: float = 0.0
+    tau_min: float = 0.0
+    tau_decay: float = 0.5
+
+
+@dataclass(frozen=True)
+class FischerBurmeister:
+    c_scale: Any = 1.0
+    w_comp: float = 1.0
+    mu_init: float = 0.0
+    mu_min: float = 0.0
+    mu_decay: float = 0.5
+    eps_safe: float | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -271,6 +331,7 @@ class LMState:
     solver_cache: Any = None
     metric: Any = None
     preconditioner: Any = None
+    homotopy: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -344,6 +405,8 @@ class LMInfo:
     aux: Any = None
     stepsize: jax.Array | None = None
     num_linesearch_steps: jax.Array | None = None
+    homotopy: jax.Array | None = None
+    complementarity_changed: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -445,6 +508,7 @@ class NewtonState:
     ridge: jax.Array | None = None
     metric: Any = None
     preconditioner: Any = None
+    homotopy: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -522,3 +586,5 @@ class NewtonInfo:
     penalty_value: jax.Array | None = None
     penalty_grad_norm: jax.Array | None = None
     aux: Any = None
+    homotopy: jax.Array | None = None
+    complementarity_changed: jax.Array | None = None

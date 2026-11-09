@@ -76,6 +76,38 @@ If the anneal freezes: widen `decrease` (e.g. `0.01`) first, since larger
 jumps keep the per-level references generous; `stall_rtol ~ 0.99` is the
 escape hatch when it does not.
 
+## Complementarity constraints
+
+See [Complementarity](complementarity.md) for the mathematical formulations and
+interface. Four rules cover algorithm selection and problem setup:
+
+- **Default to `PDAS()` or `Minimum()`** when `lhs` and `rhs` depend on the
+  same policy parameters (for example, an Euler equation with the budget
+  constraint substituted in). Both take the same Gauss-Newton steps when full
+  steps are accepted, run about 20–25% faster than `FischerBurmeister()`, and
+  reach full machine precision ($10^{-7}$ in `float32`, $10^{-15}$ in
+  `float64`). `PDAS()` is the safer default because it freezes the active-set
+  mask during line search and blocks `CONVERGED` on any step where the active
+  set flips (`info.complementarity_changed`).
+- **Switch to `FischerBurmeister()` (or `PDAS(tau_init=...)`)** when `lhs` and
+  `rhs` depend on different variable blocks (such as separate primal controls
+  and shadow multipliers) and hard active-set selection stalls from an initial
+  guess where an entire variable block only appears in the unselected branch.
+  `FischerBurmeister()` keeps strictly positive Jacobian weights on both
+  `lhs` and `rhs` everywhere away from the origin even at $\mu = 0$.
+- **Leave homotopy off (`tau_init=0.0`, `mu_init=0.0`) unless active-set
+  chattering appears.** Positive homotopy temperatures require extra steps to
+  decay down to the snap threshold $\sqrt{\varepsilon_{\text{mach}}}$. Reach
+  for `PDAS(tau_init=...)` or `FischerBurmeister(mu_init=...)` only when a poor
+  initialization causes the active set to cycle or stall.
+- **Eliminate simple accounting identities when using the Gram form.**
+  Substituting a linear law of motion or budget constraint directly into
+  `Complementarity(lhs, rhs)` (`residual=None`) halves the row count $m$
+  compared to carrying separate equality and complementarity blocks, cutting
+  the $m \times m$ Gram factorization cost by 2–3x. When keeping both blocks,
+  match units between `lhs` and `rhs` with `c_scale` ($\tilde{a} =
+  \text{lhs} / c_{\text{scale}}$) and balance block magnitudes with `w_comp`.
+
 ## Free to sweep without recompiling
 
 Traced, so changing them reuses the compiled loop: `atol`/`gtol`/`xtol`, the
@@ -99,6 +131,7 @@ the callback, any shape, and any instance **static field** (a metric's
 | status `MAX_STEPS`, loss flat | damping stuck high; check `info.damping` |
 | `CONVERGED` but the residual is large | `atol` fired on the wrong scale, or `gtol` alone stopped a ridge level |
 | tangent finite but wrong | the `ad_solver`'s operator is singular for this shape — see [Metric LM](metric_lm.md#rank-deficiency-and-implicit-ad) |
+| complementarity solve stalls at `MAX_STEPS` with zero step on some coordinates | `lhs` and `rhs` depend on decoupled variable blocks and hard active-set selection dropped a block's Jacobian column — try `FischerBurmeister()` or `PDAS(tau_init=...)` |
 | every solve recompiles | a metric, preconditioner, or callback rebuilt per call |
 
 ## GPU matmul precision in float32

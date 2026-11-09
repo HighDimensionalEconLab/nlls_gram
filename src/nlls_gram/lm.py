@@ -207,6 +207,7 @@ class LevenbergMarquardt(SolverBase):
         cache_jacobian=True,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=0.75,
+        complementarity=None,
     ):
         if init_damping <= 0 or damping_decrease <= 0 or damping_increase <= 0:
             raise ValueError(
@@ -225,6 +226,7 @@ class LevenbergMarquardt(SolverBase):
             ad_solver=ad_solver,
             jacobian_mode=jacobian_mode,
             jacobian_chunk=jacobian_chunk,
+            complementarity=complementarity,
         )
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
@@ -282,8 +284,11 @@ class LevenbergMarquardt(SolverBase):
             jnp.asarray(self.init_damping, dtype=dtype), _damping_floor(dtype)
         )
         ridge = self._resolve_ridge(dtype) if self.penalized else None
+        homotopy = self._initial_homotopy(dtype)
         instances = dict(
-            metric=self.initial_metric, preconditioner=self.initial_preconditioner
+            metric=self.initial_metric,
+            preconditioner=self.initial_preconditioner,
+            homotopy=homotopy,
         )
         if not self.cache_jacobian:
             return LMState(damping, ridge=ridge, **instances)
@@ -309,6 +314,7 @@ class LevenbergMarquardt(SolverBase):
                 jnp.asarray(self.init_damping),
                 metric=self.initial_metric,
                 preconditioner=self.initial_preconditioner,
+                homotopy=self._initial_homotopy(),
             )
         if self.penalized:
             state = self._validate_supplied_ridge(
@@ -319,11 +325,17 @@ class LevenbergMarquardt(SolverBase):
                 "the caller-supplied state has a non-None ridge, but this "
                 "solver was constructed with ridge=None"
             )
+        init_homotopy = self._initial_homotopy()
+        if init_homotopy is not None and state.homotopy is None:
+            state = dataclasses.replace(state, homotopy=init_homotopy)
         return self._cold_state(self._resolved_state(state))
 
     def _initial_info(self, x, state, args, p):
-        residual, aux = self._residual_and_aux(x, args, p)
+        residual, aux = self._residual_and_aux(x, args, p, homotopy=state.homotopy)
         dtype = residual.dtype
+        homotopy = (
+            None if state.homotopy is None else jnp.asarray(state.homotopy, dtype=dtype)
+        )
         resid_loss = jnp.sum(residual**2)
         zero = jnp.zeros((), dtype=dtype)
         one = jnp.ones((), dtype=dtype)
@@ -360,6 +372,8 @@ class LevenbergMarquardt(SolverBase):
             aux=aux,
             stepsize=zero,
             num_linesearch_steps=jnp.asarray(0, dtype=jnp.int32),
+            homotopy=homotopy,
+            complementarity_changed=self._homotopy_active(homotopy),
             **ridge_fields,
         )
 
@@ -368,6 +382,8 @@ class LevenbergMarquardt(SolverBase):
             damping=jnp.asarray(state.damping, dtype=dtype),
             hyper=_cast_lm_hyper(state.hyper, dtype),
         )
+        if state.homotopy is not None:
+            updates["homotopy"] = jnp.asarray(state.homotopy, dtype=dtype)
         if self.penalized:
             updates["ridge"] = jnp.asarray(state.ridge, dtype=dtype)
             if state.solver_cache is not None:
@@ -381,7 +397,7 @@ class LevenbergMarquardt(SolverBase):
         """One Levenberg-Marquardt step: returns ``(x_new, state, info)``."""
         self._check_residual_args(args, p)
         theta, unravel = ravel_pytree(x)
-        residual_flat, residual_value, resid, Jt, jvp_fn, JT, aux = (
+        residual_flat, residual_value, resid, Jt, jvp_fn, JT, aux, base_mask = (
             self._linearize_step(theta, unravel, state, args, p)
         )
         dtype = resid.dtype
@@ -504,11 +520,33 @@ class LevenbergMarquardt(SolverBase):
             penalty_old=penalty_value_old if self.penalized else None,
         )
 
+        grad_norm = jnp.linalg.norm(grad)
+        (
+            loss,
+            resid_loss_new,
+            new_homotopy,
+            comp_changed,
+            homotopy_changed,
+        ) = self._post_step_complementarity(
+            theta_new,
+            unravel,
+            args,
+            p,
+            state,
+            improved,
+            loss,
+            resid_loss_new,
+            penalty_new,
+            ridge,
+            grad_norm,
+            base_mask,
+        )
+
         safe_alpha = jnp.where(improved, stepsize, one)
         damping_factor = jnp.where(
             improved,
             jnp.minimum(damping_increase, damping_decrease / safe_alpha),
-            damping_increase,
+            jnp.where(homotopy_changed, one, damping_increase),
         )
         new_damping = jnp.maximum(damping * damping_factor, damping_floor)
         used_geodesic = improved & ratio_accepted
@@ -523,18 +561,23 @@ class LevenbergMarquardt(SolverBase):
             else step_alpha * velocity_sub + 0.5 * (step_alpha**2) * u_a
         )
 
-        instances = dict(metric=state.metric, preconditioner=state.preconditioner)
+        instances = dict(
+            metric=state.metric,
+            preconditioner=state.preconditioner,
+            homotopy=new_homotopy,
+        )
         ridge_state = ridge if self.penalized else None
+        cache_valid = (~improved) & (~homotopy_changed)
         if self.cache_jacobian and self.linear_solver.materializes_jacobian:
             new_state = LMState(
                 new_damping,
                 ridge=ridge_state,
                 resid=resid,
                 Jt=Jt,
-                jacobian_valid=~improved,
+                jacobian_valid=cache_valid,
                 aux=aux,
                 hyper=state.hyper,
-                solver_cache=step_solver.make_cache(~improved),
+                solver_cache=step_solver.make_cache(cache_valid),
                 **instances,
             )
         else:
@@ -567,11 +610,13 @@ class LevenbergMarquardt(SolverBase):
                 damping_factor=damping_factor,
                 used_geodesic=used_geodesic,
                 acceleration_ratio=acceleration_ratio,
-                grad_norm=jnp.linalg.norm(grad),
+                grad_norm=grad_norm,
                 step_norm=jnp.linalg.norm(step_sub),
                 aux=aux,
                 stepsize=stepsize,
                 num_linesearch_steps=trials,
+                homotopy=new_homotopy,
+                complementarity_changed=comp_changed,
                 **ridge_info,
             ),
         )

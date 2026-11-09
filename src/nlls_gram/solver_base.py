@@ -33,6 +33,13 @@ from nlls_gram.multi_start import (
 )
 from nlls_gram.solve_loop import _solve_loop_jit, _solve_python_impl
 from nlls_gram.types import (
+    PDAS,
+    Complementarity,
+    Equality,
+    FischerBurmeister,
+    Inequality,
+    Minimum,
+    Residuals,
     SolverAction,
     SolverContext,
     SolverStatus,
@@ -308,6 +315,7 @@ class SolverBase:
         ad_solver,
         jacobian_mode,
         jacobian_chunk,
+        complementarity=None,
     ):
         if not isinstance(has_aux, bool):
             raise TypeError("has_aux must be a bool")
@@ -347,6 +355,16 @@ class SolverBase:
         self.ad_solver = ad_solver
         self.jacobian_mode = jacobian_mode
         self.jacobian_chunk = jacobian_chunk
+        self.complementarity = complementarity
+        cfg = PDAS() if complementarity is None else complementarity
+        self._resolved_complementarity = cfg
+        self._uses_homotopy_decay = (
+            isinstance(cfg, PDAS) and cfg.tau_init > 0 and cfg.tau_decay < 1.0
+        ) or (
+            isinstance(cfg, FischerBurmeister)
+            and cfg.mu_init > 0
+            and cfg.mu_decay < 1.0
+        )
         self._validate_configuration(linear_solver, ad_solver, penalized=penalized)
 
         krylov = isinstance(linear_solver, (CG, GramCG))
@@ -425,6 +443,25 @@ class SolverBase:
 
         self.cache_jacobian = cache_jacobian and linear_solver.materializes_jacobian
 
+    def _complementarity_static_key(self):
+        cfg = self.complementarity
+        if cfg is None:
+            return None
+        return (
+            type(cfg),
+            *(
+                _static_key_component(getattr(cfg, f.name))
+                for f in dataclasses.fields(cfg)
+            ),
+        )
+
+    def _initial_homotopy(self, dtype=None):
+        if isinstance(self.complementarity, PDAS):
+            return jnp.asarray(self.complementarity.tau_init, dtype=dtype)
+        if isinstance(self.complementarity, FischerBurmeister):
+            return jnp.asarray(self.complementarity.mu_init, dtype=dtype)
+        return None
+
     def _common_static_key(self):
         return (
             _static_key_component(self._raw_residual_fn),
@@ -440,6 +477,7 @@ class SolverBase:
             _config_static_key(self.ad_solver, baked=True),
             self.jacobian_mode,
             self.jacobian_chunk,
+            self._complementarity_static_key(),
         )
 
     def _check_registered_instance(self, instance, keyword):
@@ -551,19 +589,122 @@ class SolverBase:
             resid.dtype,
         ).T
 
-    def _dense_resid_jt_aux(self, residual_flat, theta):
-        if self.has_aux:
-            resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
-        else:
-            resid, jvp_fn = jax.linearize(residual_flat, theta)
-            aux = None
-        return resid, self._assemble_jt(jvp_fn, theta, resid), aux
+    def _dense_resid_jt_aux(self, eval_base, theta):
+        resid, jvp_fn, (aux, mask) = jax.linearize(eval_base, theta, has_aux=True)
+        return resid, self._assemble_jt(jvp_fn, theta, resid), aux, mask
 
-    def _residual_and_aux(self, x, args, p):
+    def _eval_residual_and_aux(
+        self, x, args, p, homotopy=None, frozen_mask=None, detach_mask=True
+    ):
         if self.has_aux:
             value, aux = self.residual_fn(x, args, p)
-            return jnp.ravel(value), aux
-        return jnp.ravel(self.residual_fn(x, args, p)), None
+        else:
+            value, aux = self.residual_fn(x, args, p), None
+        if isinstance(value, (Equality, Inequality)):
+            raise NotImplementedError(
+                "Equality and Inequality constraints are not yet supported"
+            )
+        if isinstance(value, Complementarity):
+            res_tree, comp = None, value
+        elif isinstance(value, Residuals):
+            if value.equality is not None or value.inequality is not None:
+                raise NotImplementedError(
+                    "Equality and Inequality constraints are not yet supported"
+                )
+            res_tree, comp = value.residual, value.complementarity
+        else:
+            res_tree, comp = value, None
+
+        r_eq = None if res_tree is None else ravel_pytree(res_tree)[0]
+        if comp is None:
+            return r_eq, aux, None
+
+        lhs = ravel_pytree(comp.lhs)[0]
+        rhs = ravel_pytree(comp.rhs)[0]
+        dtypes = [float, lhs.dtype, rhs.dtype]
+        if r_eq is not None:
+            dtypes.append(r_eq.dtype)
+        dtype = jnp.result_type(*dtypes)
+        if r_eq is not None:
+            r_eq = jnp.asarray(r_eq, dtype=dtype)
+        lhs = jnp.asarray(lhs, dtype=dtype)
+        rhs = jnp.asarray(rhs, dtype=dtype)
+        cfg = self._resolved_complementarity
+        c_scale = jnp.asarray(cfg.c_scale, dtype=dtype)
+        w_comp = jnp.asarray(cfg.w_comp, dtype=dtype)
+        a_tilde = lhs / c_scale
+        b_tilde = rhs
+
+        if isinstance(cfg, Minimum):
+            r_comp = w_comp * jnp.where(a_tilde <= b_tilde, a_tilde, b_tilde)
+            mask = None
+        elif isinstance(cfg, PDAS):
+            tau = (
+                jnp.asarray(cfg.tau_init, dtype=dtype)
+                if homotopy is None
+                else jnp.asarray(homotopy, dtype=dtype)
+            )
+            if frozen_mask is None:
+                diff = b_tilde - a_tilde
+                hard_mask = jax.lax.stop_gradient((a_tilde <= b_tilde).astype(dtype))
+                safe_tau = jnp.where(tau > 0, tau, jnp.ones_like(tau))
+                soft_mask = jax.nn.sigmoid(diff / safe_tau)
+                if detach_mask:
+                    soft_mask = jax.lax.stop_gradient(soft_mask)
+                mask = jnp.where(tau > 0, soft_mask, hard_mask)
+            else:
+                mask = jax.lax.stop_gradient(jnp.asarray(frozen_mask, dtype=dtype))
+            hard_branch = jnp.where(mask >= 0.5, a_tilde, b_tilde)
+            soft_branch = mask * a_tilde + (1.0 - mask) * b_tilde
+            r_comp = w_comp * jnp.where(tau > 0, soft_branch, hard_branch)
+        else:
+            mu = (
+                jnp.asarray(cfg.mu_init, dtype=dtype)
+                if homotopy is None
+                else jnp.asarray(homotopy, dtype=dtype)
+            )
+            eps_safe = (
+                jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
+                if cfg.eps_safe is None
+                else jnp.asarray(cfg.eps_safe, dtype=dtype)
+            )
+            q = 2.0 * jnp.square(mu) + eps_safe
+            scale = jax.lax.stop_gradient(
+                jnp.maximum(
+                    jnp.maximum(jnp.abs(a_tilde), jnp.abs(b_tilde)), jnp.sqrt(q)
+                )
+            )
+            safe_scale = jnp.where(scale > 0, scale, jnp.ones_like(scale))
+            a_hat = a_tilde / safe_scale
+            b_hat = b_tilde / safe_scale
+            q_hat = q / jnp.square(safe_scale)
+            s_hat = jnp.sqrt(jnp.square(a_hat) + jnp.square(b_hat) + q_hat)
+            apb_hat = a_hat + b_hat
+            pos = apb_hat > 0
+            safe_denom = jnp.where(pos, apb_hat + s_hat, jnp.ones_like(s_hat))
+            fb_hat = jnp.where(
+                pos,
+                (2.0 * a_hat * b_hat - q_hat) / safe_denom,
+                apb_hat - s_hat,
+            )
+            r_comp = w_comp * safe_scale * fb_hat
+            mask = None
+
+        resid = r_comp if r_eq is None else jnp.concatenate([r_eq, r_comp], axis=0)
+        return resid, aux, mask
+
+    def _residual_and_aux(
+        self, x, args, p, homotopy=None, frozen_mask=None, detach_mask=True
+    ):
+        resid, aux, _ = self._eval_residual_and_aux(
+            x,
+            args,
+            p,
+            homotopy=homotopy,
+            frozen_mask=frozen_mask,
+            detach_mask=detach_mask,
+        )
+        return resid, aux
 
     def _check_residual_args(self, args, p):
         # Silently dropping args/p a residual never sees would, in particular,
@@ -580,29 +721,19 @@ class SolverBase:
             )
 
     def _linearize_step(self, theta, unravel, state, args, p):
-        if self.has_aux:
+        homotopy = state.homotopy
 
-            def residual_flat(th):
-                value, aux = self.residual_fn(unravel(th), args, p)
-                return jnp.ravel(value), aux
-
-            def residual_value(th):
-                return residual_flat(th)[0]
-
-        else:
-
-            def residual_flat(th):
-                return jnp.ravel(self.residual_fn(unravel(th), args, p))
-
-            residual_value = residual_flat
+        def eval_base(th):
+            resid, aux, mask = self._eval_residual_and_aux(
+                unravel(th), args, p, homotopy=homotopy, frozen_mask=None
+            )
+            return resid, (aux, mask)
 
         jvp_fn = JT = Jt = None
         if not self.linear_solver.materializes_jacobian:
-            if self.has_aux:
-                resid, jvp_fn, aux = jax.linearize(residual_flat, theta, has_aux=True)
-            else:
-                resid, jvp_fn = jax.linearize(residual_flat, theta)
-                aux = None
+            resid, jvp_fn, (aux, base_mask) = jax.linearize(
+                eval_base, theta, has_aux=True
+            )
             transpose_fn = jax.linear_transpose(jvp_fn, theta)
 
             def JT(cotangent):
@@ -614,16 +745,142 @@ class SolverBase:
                     "cache_jacobian=True requires a state initialized with "
                     "cache_jacobian=True; call solver.init(x, args, p=p)"
                 )
-            resid, Jt, aux = jax.lax.cond(
-                state.jacobian_valid,
-                lambda _: (state.resid, state.Jt, state.aux),
-                lambda _: self._dense_resid_jt_aux(residual_flat, theta),
+            need_mask = jax.eval_shape(eval_base, theta)[1][1] is not None
+
+            def fresh_dense(_):
+                return self._dense_resid_jt_aux(eval_base, theta)
+
+            def cached_dense(_):
+                mask = (
+                    self._eval_residual_and_aux(
+                        unravel(theta), args, p, homotopy=homotopy, frozen_mask=None
+                    )[2]
+                    if need_mask
+                    else None
+                )
+                return state.resid, state.Jt, state.aux, mask
+
+            resid, Jt, aux, base_mask = jax.lax.cond(
+                ~state.jacobian_valid,
+                fresh_dense,
+                cached_dense,
                 operand=None,
             )
         else:
-            resid, Jt, aux = self._dense_resid_jt_aux(residual_flat, theta)
+            resid, Jt, aux, base_mask = self._dense_resid_jt_aux(eval_base, theta)
 
-        return residual_flat, residual_value, resid, Jt, jvp_fn, JT, aux
+        if self.has_aux:
+
+            def residual_flat(th):
+                return self._residual_and_aux(
+                    unravel(th), args, p, homotopy=homotopy, frozen_mask=base_mask
+                )
+
+            def residual_value(th):
+                return residual_flat(th)[0]
+
+        else:
+
+            def residual_flat(th):
+                return self._residual_and_aux(
+                    unravel(th), args, p, homotopy=homotopy, frozen_mask=base_mask
+                )[0]
+
+            residual_value = residual_flat
+
+        return residual_flat, residual_value, resid, Jt, jvp_fn, JT, aux, base_mask
+
+    def _homotopy_active(self, homotopy):
+        if homotopy is None or not self._uses_homotopy_decay:
+            return jnp.asarray(False, dtype=jnp.bool_)
+        return homotopy > jnp.zeros((), dtype=homotopy.dtype)
+
+    def _post_step_complementarity(
+        self,
+        theta_new,
+        unravel,
+        args,
+        p,
+        state,
+        improved,
+        loss,
+        resid_loss,
+        penalty_value,
+        ridge,
+        grad_norm,
+        base_mask,
+    ):
+        dtype = loss.dtype
+        zero = jnp.zeros((), dtype=dtype)
+        has_pdas = base_mask is not None
+        has_homotopy = state.homotopy is not None
+        if not has_pdas and not has_homotopy:
+            false_val = jnp.asarray(False, dtype=jnp.bool_)
+            return loss, resid_loss, None, false_val, false_val
+
+        if has_homotopy:
+            cfg = self._resolved_complementarity
+            if isinstance(cfg, PDAS):
+                decay, min_val = cfg.tau_decay, cfg.tau_min
+            else:
+                decay, min_val = cfg.mu_decay, cfg.mu_min
+            eta = jnp.asarray(state.homotopy, dtype=dtype)
+            if decay < 1.0:
+                eps_sqrt = jnp.sqrt(jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype))
+                subproblem_tol = jnp.maximum(1e-2 * eta, eps_sqrt)
+                subproblem_solved = (grad_norm <= subproblem_tol) | (
+                    jnp.sqrt(resid_loss) <= subproblem_tol
+                )
+                should_decay = (improved | subproblem_solved) & (eta > zero)
+                decayed = eta * jnp.asarray(decay, dtype=dtype)
+                floor = jnp.maximum(
+                    jnp.asarray(min_val, dtype=dtype),
+                    eps_sqrt
+                    if min_val == 0.0
+                    else jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype),
+                )
+                next_eta = jnp.where(decayed <= floor, zero, decayed)
+                new_homotopy = jnp.where(should_decay, next_eta, eta)
+                homotopy_changed = new_homotopy != eta
+            else:
+                new_homotopy = eta
+                homotopy_changed = jnp.asarray(False, dtype=jnp.bool_)
+        else:
+            new_homotopy = None
+            homotopy_changed = jnp.asarray(False, dtype=jnp.bool_)
+
+        need_refresh = improved | homotopy_changed
+
+        def refresh(_):
+            fresh_resid, _, fresh_mask = self._eval_residual_and_aux(
+                unravel(theta_new),
+                args,
+                p,
+                homotopy=new_homotopy,
+                frozen_mask=None,
+            )
+            fresh_resid_loss = jnp.sum(fresh_resid**2)
+            fresh_loss = (
+                fresh_resid_loss + ridge * penalty_value
+                if self.penalized
+                else fresh_resid_loss
+            )
+            mask_flipped = (
+                jnp.any((fresh_mask >= 0.5) != (base_mask >= 0.5))
+                if has_pdas
+                else jnp.asarray(False, dtype=jnp.bool_)
+            )
+            return fresh_loss, fresh_resid_loss, mask_flipped
+
+        def keep(_):
+            return loss, resid_loss, jnp.asarray(False, dtype=jnp.bool_)
+
+        loss, resid_loss, mask_flipped = jax.lax.cond(
+            need_refresh, refresh, keep, operand=None
+        )
+        homotopy_active = self._homotopy_active(new_homotopy)
+        comp_changed = homotopy_changed | mask_flipped | homotopy_active
+        return loss, resid_loss, new_homotopy, comp_changed, homotopy_changed
 
     def _block_sizes(self, theta_size):
         # With an explicit Metric, the metric block covers the leading
@@ -771,16 +1028,28 @@ class SolverBase:
             ratio_accepted,
         )
 
-    def _ad_linearization(self, x, args, p, p_dot):
+    def _ad_linearization(self, x, args, p, p_dot, homotopy=None):
         theta, unravel = ravel_pytree(x)
 
         def residual_from_theta(theta_value):
-            return self._residual_and_aux(unravel(theta_value), args, p)[0]
+            return self._residual_and_aux(
+                unravel(theta_value),
+                args,
+                p,
+                homotopy=homotopy,
+                detach_mask=False,
+            )[0]
 
         residual, theta_jvp = jax.linearize(residual_from_theta, theta)
 
         def residual_from_p(p_value):
-            return self._residual_and_aux(x, args, p_value)[0]
+            return self._residual_and_aux(
+                x,
+                args,
+                p_value,
+                homotopy=homotopy,
+                detach_mask=False,
+            )[0]
 
         residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
         return theta, unravel, residual, theta_jvp, residual_p_dot
@@ -958,8 +1227,20 @@ class SolverBase:
             )
 
     def _apply_action_state(self, state, previous):
+        changed = jnp.asarray(False)
+        if previous.homotopy is not None:
+            new_homotopy = jnp.asarray(state.homotopy, dtype=previous.homotopy.dtype)
+            homotopy_changed = ~jnp.array_equal(
+                new_homotopy, previous.homotopy, equal_nan=True
+            )
+            state = dataclasses.replace(state, homotopy=new_homotopy)
+            if state.jacobian_valid is not None:
+                state = dataclasses.replace(
+                    state, jacobian_valid=state.jacobian_valid & ~homotopy_changed
+                )
+            changed = changed | homotopy_changed
         if not self.penalized:
-            return state, jnp.asarray(False)
+            return state, changed
         # A ridge change leaves the Jacobian cache VALID (J does not depend on
         # ridge) but invalidates the ridge-keyed normal/QR caches and
         # suppresses the convergence check, whose diagnostics were computed at
@@ -967,8 +1248,8 @@ class SolverBase:
         # changing the while_loop carry aval.
         _validate_ridge_value(state.ridge, "state.ridge")
         new_ridge = jnp.asarray(state.ridge, dtype=previous.ridge.dtype)
-        changed = ~jnp.array_equal(new_ridge, previous.ridge, equal_nan=True)
-        return dataclasses.replace(state, ridge=new_ridge), changed
+        ridge_changed = ~jnp.array_equal(new_ridge, previous.ridge, equal_nan=True)
+        return dataclasses.replace(state, ridge=new_ridge), changed | ridge_changed
 
     def _invalidate_caches(self, state, action, touched, caches_stale):
         if touched and state.solver_cache is not None:
@@ -1203,40 +1484,64 @@ class SolverBase:
         # failed lane's callback may have left invalid metric/preconditioner/
         # ridge values behind, so the failed tangent program reads these.
         if self.penalized:
-            return (x, args, p, state.metric, state.preconditioner, state.ridge)
-        return (x, args, p, state.metric, state.preconditioner)
+            return (
+                x,
+                args,
+                p,
+                state.metric,
+                state.preconditioner,
+                state.homotopy,
+                state.ridge,
+            )
+        return (x, args, p, state.metric, state.preconditioner, state.homotopy)
 
     def _converged(self, info, atol, gtol, xtol):
+        homotopy_active = self._homotopy_active(info.homotopy)
+        stable = ~info.complementarity_changed
         if self.penalized:
             # gtol/xtol mean "done with the current fixed-ridge problem"; atol is
             # a CONJUNCTIVE filter on the TRUE residual, never sufficient alone.
-            gtol_met = (gtol > 0) & (info.grad_norm < gtol)
-            xtol_met = (xtol > 0) & info.accepted & (info.step_norm < xtol)
-            residual_ok = (atol <= 0) | (jnp.sqrt(info.resid_loss) <= atol)
+            gtol_met = stable & (gtol > 0) & (info.grad_norm < gtol)
+            xtol_met = stable & (xtol > 0) & info.accepted & (info.step_norm < xtol)
+            residual_ok = (~homotopy_active) & (
+                (atol <= 0) | (jnp.sqrt(info.resid_loss) <= atol)
+            )
             return (gtol_met | xtol_met) & residual_ok
-        atol_met = (atol > 0) & (jnp.sqrt(info.loss) < atol)
-        gtol_met = (gtol > 0) & (info.grad_norm < gtol)
-        xtol_met = (xtol > 0) & info.accepted & (info.step_norm < xtol)
+        atol_met = (~homotopy_active) & (atol > 0) & (jnp.sqrt(info.loss) < atol)
+        gtol_met = stable & (gtol > 0) & (info.grad_norm < gtol)
+        xtol_met = stable & (xtol > 0) & info.accepted & (info.step_norm < xtol)
         return atol_met | gtol_met | xtol_met
 
     def _ranking_objective(self, result, p, callback):
         # Without a callback, info.loss at step > 0 already reports the
         # objective at the retained iterate; a callback can replace x/args/
         # ridge after the last update, so recompute. Nonfinite masks to +inf.
-        if callback is None:
+        homotopy = result.state.homotopy
+        if callback is None and not self._uses_homotopy_decay:
             loss = result.info.loss
-        elif not self.penalized:
-            residual = self._residual_and_aux(result.x, result.args, p)[0]
-            loss = jnp.sum(residual**2)
         else:
-            residual = self._residual_and_aux(result.x, result.args, p)[0]
-            theta, _ = ravel_pytree(result.x)
-            n_m = self._block_sizes(theta.shape[0])[0]
-            resolved = self._resolved_state(result.state)
-            ctx = SolverContext(x=theta, state=resolved, args=result.args, p=p)
-            ridge = jnp.asarray(result.state.ridge, dtype=residual.dtype)
-            y_m = self._factor_apply_metric_block(theta[:n_m], ctx, residual.dtype)
-            loss = jnp.sum(residual**2) + ridge * jnp.sum(y_m**2)
+            target_homotopy = (
+                None
+                if homotopy is None
+                else jnp.where(
+                    self._homotopy_active(homotopy),
+                    jnp.zeros((), dtype=homotopy.dtype),
+                    homotopy,
+                )
+            )
+            residual = self._residual_and_aux(
+                result.x, result.args, p, homotopy=target_homotopy
+            )[0]
+            if not self.penalized:
+                loss = jnp.sum(residual**2)
+            else:
+                theta, _ = ravel_pytree(result.x)
+                n_m = self._block_sizes(theta.shape[0])[0]
+                resolved = self._resolved_state(result.state)
+                ctx = SolverContext(x=theta, state=resolved, args=result.args, p=p)
+                ridge = jnp.asarray(result.state.ridge, dtype=residual.dtype)
+                y_m = self._factor_apply_metric_block(theta[:n_m], ctx, residual.dtype)
+                loss = jnp.sum(residual**2) + ridge * jnp.sum(y_m**2)
         return jnp.where(
             jnp.isfinite(loss), loss, jnp.asarray(jnp.inf, dtype=loss.dtype)
         )
@@ -1428,7 +1733,17 @@ class SolverBase:
         if p is None:
             return jax.tree.map(_zero_tangent_leaf, x)
         state = self._resolved_state(jax.lax.stop_gradient(result.state))
-        initial_instances = jax.lax.stop_gradient(initial_ad_point[3:5])
+        initial_instances = jax.lax.stop_gradient(initial_ad_point[3:6])
+        final_homotopy = jax.lax.stop_gradient(result.state.homotopy)
+        homotopy = (
+            None
+            if final_homotopy is None
+            else jnp.where(
+                ad_success,
+                final_homotopy,
+                jnp.asarray(initial_instances[2], final_homotopy.dtype),
+            )
+        )
         state = dataclasses.replace(
             state,
             metric=(
@@ -1439,10 +1754,11 @@ class SolverBase:
             preconditioner=_where_tree(
                 ad_success, state.preconditioner, initial_instances[1]
             ),
+            homotopy=homotopy,
         )
         if self.penalized:
             final_ridge = jax.lax.stop_gradient(result.state.ridge)
-            initial_ridge = jax.lax.stop_gradient(initial_ad_point[5])
+            initial_ridge = jax.lax.stop_gradient(initial_ad_point[6])
             ridge = jnp.where(
                 ad_success, final_ridge, jnp.asarray(initial_ridge, final_ridge.dtype)
             )
@@ -1487,7 +1803,7 @@ class SolverBase:
 
     def _ad_x_tangent_unpenalized(self, x, args, p, p_dot, state, ad_success):
         theta, unravel, residual, theta_jvp, residual_p_dot = self._ad_linearization(
-            x, args, p, p_dot
+            x, args, p, p_dot, homotopy=state.homotopy
         )
         n, m = theta.shape[0], residual.shape[0]
         dtype = residual.dtype
@@ -1646,7 +1962,7 @@ class SolverBase:
         # x_dot = F_bar^{-1} y_dot -- no damping; the matrix is PD under the
         # identification condition because ridge > 0 by contract.
         theta, unravel, residual, theta_jvp, residual_p_dot = self._ad_linearization(
-            x, args, p, p_dot
+            x, args, p, p_dot, homotopy=state.homotopy
         )
         n_m, n_f = self._block_sizes(theta.shape[0])
         ctx = SolverContext(x=theta, state=state, args=args, p=p)
@@ -1682,7 +1998,7 @@ class SolverBase:
         # Matrix-free CG on the same whitened PD operator; matvec = J~'(J~ u) +
         # ridge [u_m; 0].
         theta, unravel, residual, theta_jvp, residual_p_dot = self._ad_linearization(
-            x, args, p, p_dot
+            x, args, p, p_dot, homotopy=state.homotopy
         )
         n_m, n_f = self._block_sizes(theta.shape[0])
         ctx = SolverContext(x=theta, state=state, args=args, p=p)

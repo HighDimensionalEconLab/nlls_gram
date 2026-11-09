@@ -48,9 +48,16 @@
 ::: nlls_gram.NewtonHyperparams
 ::: nlls_gram.register_pytree_dataclass
 
-## Residuals
+## Residuals and constraints
 
 ::: nlls_gram.vmap_rows
+::: nlls_gram.Residuals
+::: nlls_gram.Complementarity
+::: nlls_gram.PDAS
+::: nlls_gram.FischerBurmeister
+::: nlls_gram.Minimum
+::: nlls_gram.Equality
+::: nlls_gram.Inequality
 
 ## Multi-start
 

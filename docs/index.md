@@ -112,5 +112,6 @@ otherwise.
 - [Callbacks](callbacks.md) — the solve loop and its cookbook
 - [Implicit differentiation](implicit_ad.md) — the AD contract
 - [Row-wise residuals](vmap_rows.md) — `vmap_rows` for simulated-path residuals
+- [Complementarity](complementarity.md) — complementarity constraints (`PDAS`, `FischerBurmeister`, `Minimum`)
 - [Tuning](tuning_guide.md) — picking a solver and a schedule
 - [API](api.md)

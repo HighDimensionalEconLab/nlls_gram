@@ -20,13 +20,17 @@ import pytest
 from benchmarks.conftest import benchmark_batch_size, benchmark_direction_count
 from nlls_gram import (
     CG,
+    PDAS,
     QR,
     AnnealRidge,
     BlockEigenPreconditioner,
     Cholesky,
+    Complementarity,
+    FischerBurmeister,
     GramCG,
     IdentityPreconditioner,
     LevenbergMarquardt,
+    Minimum,
     Newton,
     RepeatedFactorMetric,
     SolverStatus,
@@ -464,4 +468,60 @@ def test_trajectory_vmap_rows_update(
             return out
 
         benchmark.group = f"vmap-rows-update-{n_firms}-{dtype.__name__}"
+        benchmark(run)
+
+
+@pytest.mark.parametrize("comp_name", ["pdas", "fb", "minimum"])
+def test_euler_complementarity_gram_solve(benchmark, device, dtype, comp_name):
+    n_grid, n_centers = 64, 256
+    tol = 1e-4 if dtype == jnp.float32 else 1e-8
+    with jax.default_device(device):
+        beta = jnp.asarray(0.95, dtype=dtype)
+        r_gross = jnp.asarray(1.05, dtype=dtype)
+        y = jnp.asarray(1.1, dtype=dtype)
+        w_grid = jnp.linspace(0.5, 2.5, n_grid, dtype=dtype)
+        centers = jnp.linspace(0.3, 2.7, n_centers, dtype=dtype)
+        phi = jnp.exp(
+            -0.5
+            * ((w_grid[:, None] - centers[None, :]) / jnp.asarray(0.15, dtype)) ** 2
+        ) / jnp.sqrt(jnp.asarray(n_centers, dtype))
+        phi = phi.at[:, :n_grid].add(jnp.eye(n_grid, dtype=dtype))
+        theta0 = jnp.zeros(n_centers, dtype=dtype)
+
+        def residual(theta):
+            a = phi @ theta
+            c1 = w_grid - a
+            c2 = r_gross * a + y
+            return Complementarity(lhs=a, rhs=1.0 / c1 - beta * r_gross / c2)
+
+        comp_cfg = {
+            "pdas": PDAS(),
+            "fb": FischerBurmeister(),
+            "minimum": Minimum(),
+        }[comp_name]
+        solver = LevenbergMarquardt(
+            residual,
+            linear_solver=Cholesky(form="gram"),
+            complementarity=comp_cfg,
+            cache_jacobian=False,
+            geodesic_acceleration=True,
+        )
+
+        @jax.jit
+        def run_solve(th):
+            return solver.solve(th, atol=tol, max_steps=40)
+
+        benchmark.extra_info["temp_mb"] = _temp_mb(run_solve.lower(theta0))
+        warm = run_solve(theta0)
+        jax.block_until_ready(warm)
+        assert int(warm.status) == int(SolverStatus.CONVERGED)
+        benchmark.extra_info["steps"] = int(warm.steps)
+        benchmark.extra_info["final_loss"] = float(warm.info.loss)
+
+        def run():
+            out = run_solve(theta0)
+            jax.block_until_ready(out)
+            return out
+
+        benchmark.group = f"euler-comp-gram-solve-{dtype.__name__}"
         benchmark(run)

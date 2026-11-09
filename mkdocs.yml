@@ -52,5 +52,6 @@ nav:
   - Multi-Start: multi_start.md
   - Implicit Differentiation: implicit_ad.md
   - Row-wise Residuals: vmap_rows.md
+  - Complementarity: complementarity.md
   - Tuning: tuning_guide.md
   - API: api.md

@@ -97,6 +97,7 @@ class Newton(SolverBase):
         ad_solver=None,
         has_aux=False,
         cache_jacobian=False,
+        complementarity=None,
     ):
         if damping is None:
             damping = (
@@ -151,6 +152,7 @@ class Newton(SolverBase):
             ad_solver=ad_solver,
             jacobian_mode=jacobian_mode,
             jacobian_chunk=jacobian_chunk,
+            complementarity=complementarity,
         )
         self.c1 = c1
         self.decrease_factor = decrease_factor
@@ -208,10 +210,12 @@ class Newton(SolverBase):
         )
         dtype = residual_shape.dtype
         ridge = self._resolve_ridge(dtype) if self.penalized else None
+        homotopy = self._initial_homotopy(dtype)
         instances = dict(
             ridge=ridge,
             metric=self.initial_metric,
             preconditioner=self.initial_preconditioner,
+            homotopy=homotopy,
         )
         if not self.cache_jacobian:
             return NewtonState(**instances)
@@ -241,6 +245,9 @@ class Newton(SolverBase):
                     "the caller-supplied state has a non-None ridge, but this "
                     "solver was constructed with ridge=None"
                 )
+            init_homotopy = self._initial_homotopy()
+            if init_homotopy is not None and state.homotopy is None:
+                state = dataclasses.replace(state, homotopy=init_homotopy)
             if self.cache_jacobian and state.jacobian_valid is None:
                 raise ValueError(
                     "cache_jacobian=True requires a NewtonState initialized with "
@@ -252,7 +259,7 @@ class Newton(SolverBase):
         return self._cast_state(resolved, x_dtype)
 
     def _initial_info(self, x, state, args, p):
-        residual, aux = self._residual_and_aux(x, args, p)
+        residual, aux = self._residual_and_aux(x, args, p, homotopy=state.homotopy)
         theta, _ = ravel_pytree(x)
         n_m, _ = self._block_sizes(theta.shape[0])
         self.linear_solver._validate_newton_shape(
@@ -261,6 +268,10 @@ class Newton(SolverBase):
             damped=self._damped,
         )
         dtype = residual.dtype
+        homotopy = (
+            None if state.homotopy is None else jnp.asarray(state.homotopy, dtype=dtype)
+        )
+        homotopy_active = self._homotopy_active(homotopy)
         zero = jnp.zeros((), dtype=dtype)
         infinity = jnp.asarray(jnp.inf, dtype=dtype)
         nan = jnp.asarray(jnp.nan, dtype=dtype)
@@ -291,7 +302,7 @@ class Newton(SolverBase):
         else:
             base_finite = theta_finite & resid_finite & jnp.isfinite(resid_loss)
             loss = jnp.where(base_finite, resid_loss, nan)
-            exact_root = base_finite & jnp.all(residual == 0)
+            exact_root = base_finite & (~homotopy_active) & jnp.all(residual == 0)
             step_status = jnp.where(
                 ~base_finite,
                 jnp.asarray(SolverStatus.NONFINITE, dtype=jnp.int32),
@@ -319,11 +330,15 @@ class Newton(SolverBase):
             used_geodesic=jnp.asarray(False, dtype=jnp.bool_),
             acceleration_ratio=zero,
             aux=aux,
+            homotopy=homotopy,
+            complementarity_changed=homotopy_active,
             **ridge_fields,
         )
 
     def _cast_state(self, state, dtype):
         updates = dict(hyper=_cast_newton_hyper(state.hyper, dtype))
+        if state.homotopy is not None:
+            updates["homotopy"] = jnp.asarray(state.homotopy, dtype=dtype)
         if self.penalized:
             updates["ridge"] = jnp.asarray(state.ridge, dtype=dtype)
             if state.solver_cache is not None:
@@ -349,7 +364,7 @@ class Newton(SolverBase):
             )
         theta, unravel = ravel_pytree(x)
         n_m, n_f = self._block_sizes(theta.shape[0])
-        residual_flat, residual_value, resid, Jt, jvp_fn, JT, aux = (
+        residual_flat, residual_value, resid, Jt, jvp_fn, JT, aux, base_mask = (
             self._linearize_step(theta, unravel, state, args, p)
         )
         self.linear_solver._validate_newton_shape(
@@ -386,7 +401,11 @@ class Newton(SolverBase):
                 & jnp.all(jnp.isfinite(resid))
                 & jnp.isfinite(raw_loss_old)
             )
-            exact_root = base_finite & jnp.all(resid == 0)
+            exact_root = (
+                base_finite
+                & (~self._homotopy_active(state.homotopy))
+                & jnp.all(resid == 0)
+            )
         loss_old = jnp.where(base_finite, raw_loss_old, nan)
 
         hyper = state.hyper if state.hyper is not None else self.hyperparams(dtype)
@@ -658,10 +677,44 @@ class Newton(SolverBase):
             operand=None,
         )
 
+        (
+            loss,
+            resid_loss,
+            new_homotopy,
+            comp_changed,
+            homotopy_changed,
+        ) = self._post_step_complementarity(
+            theta_new,
+            unravel,
+            args,
+            p,
+            state,
+            accepted,
+            loss,
+            resid_loss,
+            penalty_value,
+            ridge,
+            grad_norm,
+            base_mask,
+        )
+        step_status = jnp.where(
+            homotopy_changed
+            & jnp.isfinite(loss)
+            & (step_status != SolverStatus.LINEAR_SOLVE_FAILED),
+            jnp.asarray(SolverStatus.RUNNING, dtype=jnp.int32),
+            step_status,
+        )
+        cache_valid = cache_valid & (~homotopy_changed)
+        if solver_cache is not None:
+            solver_cache = dataclasses.replace(
+                solver_cache, valid=solver_cache.valid & (~homotopy_changed)
+            )
+
         instances = dict(
             ridge=ridge if self.penalized else None,
             metric=state.metric,
             preconditioner=state.preconditioner,
+            homotopy=new_homotopy,
         )
         if self.cache_jacobian:
             new_state = NewtonState(
@@ -705,22 +758,32 @@ class Newton(SolverBase):
                 used_geodesic=used_geodesic,
                 acceleration_ratio=acceleration_ratio,
                 aux=aux,
+                homotopy=new_homotopy,
+                complementarity_changed=comp_changed,
                 **ridge_info,
             ),
         )
 
     def _converged(self, info, atol, gtol, xtol):
+        homotopy_active = self._homotopy_active(info.homotopy)
+        stable = ~info.complementarity_changed
         step_ok = info.step_status == SolverStatus.RUNNING
         stationarity_eligible = (info.step_status != SolverStatus.NONFINITE) & (
             info.step_status != SolverStatus.LINEAR_SOLVE_FAILED
         )
-        gtol_met = stationarity_eligible & (gtol > 0) & (info.grad_norm < gtol)
-        xtol_met = step_ok & (xtol > 0) & info.accepted & (info.step_norm < xtol)
+        gtol_met = stable & stationarity_eligible & (gtol > 0) & (info.grad_norm < gtol)
+        xtol_met = (
+            stable & step_ok & (xtol > 0) & info.accepted & (info.step_norm < xtol)
+        )
         if self.penalized:
-            residual_ok = (atol <= 0) | (jnp.sqrt(info.resid_loss) <= atol)
+            residual_ok = (~homotopy_active) & (
+                (atol <= 0) | (jnp.sqrt(info.resid_loss) <= atol)
+            )
             return (gtol_met | xtol_met) & residual_ok
-        exact_root = info.step_status == SolverStatus.CONVERGED
-        atol_met = step_ok & (atol > 0) & (jnp.sqrt(info.loss) < atol)
+        exact_root = (~homotopy_active) & (info.step_status == SolverStatus.CONVERGED)
+        atol_met = (
+            (~homotopy_active) & step_ok & (atol > 0) & (jnp.sqrt(info.loss) < atol)
+        )
         return exact_root | atol_met | gtol_met | xtol_met
 
     def _step_failure_status(self, info):
