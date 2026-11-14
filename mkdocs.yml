@@ -1,5 +1,5 @@
 site_name: nlls_gram
-site_description: Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX
+site_description: Levenberg-Marquardt and Gauss-Newton nonlinear least-squares for JAX
 site_url: https://highdimensionaleconlab.github.io/nlls_gram/
 repo_url: https://github.com/HighDimensionalEconLab/nlls_gram
 repo_name: HighDimensionalEconLab/nlls_gram
@@ -44,14 +44,13 @@ extra_javascript:
 
 nav:
   - Home: index.md
-  - Ridge LM: ridge_lm.md
-  - Metric LM: metric_lm.md
+  - Tikhonov Regularization: ridge_lm.md
   - Newton: newton.md
-  - Metrics and Preconditioners: metrics.md
+  - Ridge Operators and Preconditioners: metrics.md
+  - Constraints: complementarity.md
   - Callbacks: callbacks.md
   - Multi-Start: multi_start.md
   - Implicit Differentiation: implicit_ad.md
   - Row-wise Residuals: vmap_rows.md
-  - Complementarity: complementarity.md
   - Tuning: tuning_guide.md
   - API: api.md

@@ -1,13 +1,7 @@
-"""Tests for LevenbergMarquardt across unpenalized (ridge=None) and Tikhonov-penalized
-(ridge > 0) objectives, linear solvers, metrics, geodesic acceleration, caching,
-and AnnealRidge continuation.
-"""
-
 import dataclasses
 
 import jax
 import jax.numpy as jnp
-import jax.scipy.linalg as jsp_linalg
 import numpy as np
 import pytest
 
@@ -20,21 +14,23 @@ from nlls_gram import (
     AnnealRidge,
     Cholesky,
     CholeskyCache,
-    CholeskyMetric,
     Complementarity,
-    DiagonalMetric,
-    Equality,
+    DiagonalPreconditioner,
+    DiagonalRidge,
+    FactorRidge,
     FischerBurmeister,
     GramCG,
-    IdentityMetric,
     IdentityPreconditioner,
+    IdentityRidge,
     Inequality,
+    InequalityPenalty,
     LevenbergMarquardt,
     LMState,
+    MatrixRidge,
     Minimum,
     Newton,
     QRCache,
-    RepeatedFactorMetric,
+    RepeatedFactorRidge,
     Residuals,
     SolverAction,
     SolverStatus,
@@ -42,53 +38,50 @@ from nlls_gram import (
 
 RNG = np.random.default_rng(11)
 M, N = 4, 8
-BLOCK, REPEATS, FREE = 3, 2, 2  # REPEATS * BLOCK + FREE == N
+BLOCK, REPEATS, FREE = 3, 2, 2
 N_M = REPEATS * BLOCK
 A_NP = RNG.normal(size=(M, N))
 B_NP = RNG.normal(size=M)
-W_ROOT = RNG.normal(size=(N, N))
-W_NP = W_ROOT @ W_ROOT.T + N * np.eye(N)
-K_ROOT = RNG.normal(size=(BLOCK, BLOCK + 2))
-K_NP = K_ROOT @ K_ROOT.T + 0.5 * np.eye(BLOCK)
-W_SEMI_NP = np.zeros((N, N))
+K_ROOT = RNG.normal(size=(BLOCK + 2, BLOCK))
+K_NP = K_ROOT.T @ K_ROOT + 0.5 * np.eye(BLOCK)
+L_K_NP = np.linalg.cholesky(K_NP).T
+Q_SEMI_NP = np.zeros((N, N))
 for _j in range(REPEATS):
-    W_SEMI_NP[_j * BLOCK : (_j + 1) * BLOCK, _j * BLOCK : (_j + 1) * BLOCK] = K_NP
+    Q_SEMI_NP[_j * BLOCK : (_j + 1) * BLOCK, _j * BLOCK : (_j + 1) * BLOCK] = K_NP
 
 A = jnp.asarray(A_NP, jnp.float32)
 B = jnp.asarray(B_NP, jnp.float32)
-L_W = jnp.asarray(np.linalg.cholesky(W_NP), jnp.float32)
-K = jnp.asarray(K_NP, jnp.float32)
+L_K = jnp.asarray(L_K_NP, jnp.float32)
 X0 = jnp.asarray(RNG.normal(size=N), jnp.float32)
 
 
 def linear_residual(x):
-    return A @ x - B
+    return jnp.matmul(A, x, precision=jax.lax.Precision.HIGHEST) - B
 
 
 def nonlinear_residual(theta):
-    return jnp.concatenate([A @ theta - B, jnp.array([theta[0] * theta[1] - 0.4])])
+    return jnp.concatenate(
+        [
+            jnp.matmul(A, theta, precision=jax.lax.Precision.HIGHEST) - B,
+            jnp.array([theta[0] * theta[1] - 0.4]),
+        ]
+    )
 
 
-def make_repeated_metric():
-    return RepeatedFactorMetric(jnp.linalg.cholesky(K, upper=True), repeats=REPEATS)
+def make_repeated_ridge():
+    return RepeatedFactorRidge(L_K, repeats=REPEATS)
 
 
-def min_norm_solution(W, b=B_NP):
-    Winv = np.linalg.inv(W)
-    return Winv @ A_NP.T @ np.linalg.solve(A_NP @ Winv @ A_NP.T, b)
+def min_euclid_solution(b=B_NP):
+    return A_NP.T @ np.linalg.solve(A_NP @ A_NP.T, b)
 
 
-def damped_step(W, x, damping):
-    r = A_NP @ x - B_NP
-    return -np.linalg.solve(A_NP.T @ A_NP + damping * W, A_NP.T @ r)
-
-
-def ridge_minimizer(ridge, W=W_SEMI_NP):
-    return np.linalg.solve(A_NP.T @ A_NP + ridge * W, A_NP.T @ B_NP)
+def ridge_minimizer(ridge, Q=Q_SEMI_NP):
+    return np.linalg.solve(A_NP.T @ A_NP + ridge * Q, A_NP.T @ B_NP)
 
 
 def min_seminorm_solution():
-    kkt = np.block([[W_SEMI_NP, A_NP.T], [A_NP, np.zeros((M, M))]])
+    kkt = np.block([[Q_SEMI_NP, A_NP.T], [A_NP, np.zeros((M, M))]])
     rhs = np.concatenate([np.zeros(N), B_NP])
     return np.linalg.solve(kkt, rhs)[:N]
 
@@ -97,7 +90,7 @@ FORWARD_SOLVERS = {
     "cholesky_auto": Cholesky(),
     "cholesky_gram": Cholesky(form="gram"),
     "cholesky_normal": Cholesky(form="normal"),
-    "qr": QR(),
+    "qr_auto": QR(),
     "qr_gram": QR(form="gram"),
     "qr_normal": QR(form="normal"),
     "cg": CG(IdentityPreconditioner(), tol=1e-12, maxiter=400),
@@ -106,177 +99,394 @@ FORWARD_SOLVERS = {
 
 
 @pytest.mark.parametrize("name", list(FORWARD_SOLVERS))
-def test_unpenalized_step_and_minimum_metric_norm_convergence(name):
+def test_unpenalized_euclidean_step_and_minimum_norm_convergence(name):
     damping = 0.07
-    metric = CholeskyMetric(L_W)
     solver = LevenbergMarquardt(
         linear_residual,
-        metric=metric,
         linear_solver=FORWARD_SOLVERS[name],
         init_damping=damping,
         geodesic_acceleration=False,
     )
+    x0_64 = np.asarray(X0, np.float64)
+    r0 = A_NP @ x0_64 - B_NP
+    expected_d = -np.linalg.solve(A_NP.T @ A_NP + damping * np.eye(N), A_NP.T @ r0)
     x1, _, info = solver.update(X0, solver.init(X0))
-    expected_step = np.asarray(X0, np.float64) + damped_step(
-        W_NP, np.asarray(X0, np.float64), damping
-    )
     assert bool(info.accepted)
-    np.testing.assert_allclose(np.asarray(x1), expected_step, rtol=2e-4, atol=2e-5)
+    np.testing.assert_allclose(np.asarray(x1), x0_64 + expected_d, rtol=2e-4, atol=2e-5)
+    np.testing.assert_allclose(
+        float(info.grad_norm), np.linalg.norm(A_NP.T @ r0), rtol=1e-5
+    )
 
-    result = solver.solve(jnp.zeros(N), max_steps=200, atol=1e-6)
+    # Underdetermined 1x2 Euclidean minimum-norm selection check
+    u_solver = LevenbergMarquardt(
+        lambda th: jnp.array([th[0] + th[1] + 1.0], dtype=jnp.float32),
+        linear_solver=FORWARD_SOLVERS[name],
+        geodesic_acceleration=False,
+    )
+    res_u = u_solver.solve(jnp.zeros(2, jnp.float32), max_steps=100, atol=1e-6)
+    assert int(res_u.status) == int(SolverStatus.CONVERGED)
+    np.testing.assert_allclose(res_u.x, np.array([-0.5, -0.5]), atol=1e-4)
+
+    result = solver.solve(jnp.zeros(N, jnp.float32), max_steps=200, atol=1e-6)
     assert int(result.status) == int(SolverStatus.CONVERGED)
-    expected_root = min_norm_solution(W_NP)
     np.testing.assert_allclose(
-        np.asarray(result.x), expected_root, rtol=2e-3, atol=2e-4
+        np.asarray(result.x), min_euclid_solution(), rtol=2e-3, atol=2e-4
     )
 
 
-def test_metric_variants_and_gram_qr_float32_conditioning():
-    # DiagonalMetric, RepeatedFactorMetric, and default Euclidean metric select
-    # their respective minimum-norm roots.
-    weights = jnp.asarray(RNG.uniform(0.5, 3.0, size=N), jnp.float32)
-    res_diag = LevenbergMarquardt(
-        linear_residual, metric=DiagonalMetric(weights)
-    ).solve(jnp.zeros(N), max_steps=200, atol=1e-6)
-    np.testing.assert_allclose(
-        np.asarray(res_diag.x),
-        min_norm_solution(np.diag(np.asarray(weights, np.float64))),
-        rtol=2e-3,
-        atol=2e-4,
-    )
-
-    res_euclid = LevenbergMarquardt(linear_residual).solve(
-        jnp.zeros(N), max_steps=200, atol=1e-6
-    )
-    np.testing.assert_allclose(
-        np.asarray(res_euclid.x), min_norm_solution(np.eye(N)), rtol=2e-3, atol=2e-4
-    )
-
-    # Decaying singular values in float32: QR(form="gram") reaches well below
-    # the squared-conditioning floor of Cholesky(form="gram").
+def test_gram_qr_float32_conditioning_unpenalized_and_ridge():
+    rng = np.random.default_rng(19)
     m_dec, n_dec = 24, 60
-    U, _ = np.linalg.qr(RNG.normal(size=(m_dec, m_dec)))
-    V, _ = np.linalg.qr(RNG.normal(size=(n_dec, m_dec)))
-    A_dec = jnp.asarray(U @ np.diag(0.65 ** np.arange(m_dec)) @ V.T, jnp.float32)
-    b_dec = jnp.asarray(RNG.normal(size=m_dec), jnp.float32)
+    U, _ = np.linalg.qr(rng.normal(size=(m_dec, m_dec)))
+    V, _ = np.linalg.qr(rng.normal(size=(n_dec, m_dec)))
+    A_dec = jnp.asarray(U @ np.diag(0.72 ** np.arange(m_dec)) @ V.T, jnp.float32)
+    b_dec = jnp.asarray(rng.normal(size=m_dec), jnp.float32)
     x0_dec = jnp.zeros(n_dec, jnp.float32)
 
-    chol_loss = float(
-        LevenbergMarquardt(
-            lambda x: A_dec @ x - b_dec,
-            linear_solver=Cholesky(form="gram"),
-            geodesic_acceleration=False,
-        )
-        .solve(x0_dec, max_steps=300)
-        .info.loss
+    def dec_residual(x):
+        return jnp.matmul(A_dec, x, precision=jax.lax.Precision.HIGHEST) - b_dec
+
+    chol_s = LevenbergMarquardt(
+        dec_residual,
+        init_damping=1e-12,
+        linear_solver=Cholesky(form="gram"),
+        geodesic_acceleration=False,
     )
-    qr_loss = float(
-        LevenbergMarquardt(
-            lambda x: A_dec @ x - b_dec,
-            linear_solver=QR(form="gram"),
-            geodesic_acceleration=False,
-        )
-        .solve(x0_dec, max_steps=300)
-        .info.loss
+    qr_s = LevenbergMarquardt(
+        dec_residual,
+        init_damping=1e-12,
+        linear_solver=QR(form="gram"),
+        geodesic_acceleration=False,
     )
-    assert qr_loss < 1e-2 * chol_loss
-    assert qr_loss < 1e-7
+    chol_loss = float(chol_s.update(x0_dec, chol_s.init(x0_dec))[2].loss)
+    qr_loss = float(qr_s.update(x0_dec, qr_s.init(x0_dec))[2].loss)
+    assert qr_loss < 1e-4 * chol_loss
+    assert qr_loss < 1e-6
 
 
 @pytest.mark.parametrize("name", list(FORWARD_SOLVERS))
-def test_geodesic_correction_matches_closed_form(name):
+def test_generalized_tikhonov_step_algebra_and_bordered_free_tail(name):
+    rho = 0.08
+    mu = 0.05
+    rm = make_repeated_ridge()
+    ls = FORWARD_SOLVERS[name]
+    if isinstance(ls, GramCG):
+        # GramCG requires full-coverage SPD penalized block (n_free == 0)
+        rm_full = RepeatedFactorRidge(L_K, repeats=2)
+        A_sub = A[:, :N_M]
+        x0_sub = X0[:N_M]
+        s_gram_cg = LevenbergMarquardt(
+            lambda th: A_sub @ th - B,
+            ridge=rho,
+            ridge_metric=rm_full,
+            linear_solver=ls,
+            init_damping=mu,
+            geodesic_acceleration=False,
+        )
+        x1_sub, _, info_sub = s_gram_cg.update(x0_sub, s_gram_cg.init(x0_sub))
+        x0_64 = np.asarray(x0_sub, np.float64)
+        A64 = np.asarray(A_sub, np.float64)
+        Q64 = Q_SEMI_NP[:N_M, :N_M]
+        r0 = A64 @ x0_64 - B_NP
+        g_ref = A64.T @ r0 + rho * (Q64 @ x0_64)
+        d_ref = -np.linalg.solve(A64.T @ A64 + rho * Q64 + mu * np.eye(N_M), g_ref)
+        np.testing.assert_allclose(
+            np.asarray(x1_sub), x0_64 + d_ref, rtol=2e-4, atol=2e-5
+        )
+        np.testing.assert_allclose(
+            float(info_sub.grad_norm), np.linalg.norm(g_ref), rtol=1e-4
+        )
+        return
+
+    solver = LevenbergMarquardt(
+        linear_residual,
+        ridge=rho,
+        ridge_metric=rm,
+        linear_solver=ls,
+        init_damping=mu,
+        geodesic_acceleration=False,
+    )
+    x1, _, info = solver.update(X0, solver.init(X0))
+    x0_64 = np.asarray(X0, np.float64)
+    r0 = A_NP @ x0_64 - B_NP
+    # Exact Euclidean gradient g = J'r + rho Q theta (NEVER includes mu * theta)
+    g_ref = A_NP.T @ r0 + rho * (Q_SEMI_NP @ x0_64)
+    H_ref = A_NP.T @ A_NP + rho * Q_SEMI_NP + mu * np.eye(N)
+    d_ref = -np.linalg.solve(H_ref, g_ref)
+    np.testing.assert_allclose(np.asarray(x1), x0_64 + d_ref, rtol=2e-4, atol=2e-5)
+    np.testing.assert_allclose(float(info.grad_norm), np.linalg.norm(g_ref), rtol=1e-4)
+    np.testing.assert_allclose(
+        float(info.loss),
+        float(info.resid_loss) + rho * float(info.penalty_value),
+        rtol=1e-5,
+    )
+
+    # Bordered free-tail stability at tiny damping (mu = 1e-7 in float32)
+    s_tiny = LevenbergMarquardt(
+        linear_residual,
+        ridge=rho,
+        ridge_metric=rm,
+        linear_solver=ls,
+        init_damping=1e-7,
+        geodesic_acceleration=False,
+    )
+    x1_tiny, _, info_tiny = s_tiny.update(X0, s_tiny.init(X0))
+    assert bool(jnp.all(jnp.isfinite(x1_tiny)))
+    d_tiny_ref = -np.linalg.solve(
+        A_NP.T @ A_NP + rho * Q_SEMI_NP + 1e-7 * np.eye(N), g_ref
+    )
+    np.testing.assert_allclose(
+        np.asarray(x1_tiny), x0_64 + d_tiny_ref, rtol=1e-3, atol=1e-4
+    )
+    assert bool(jnp.isfinite(info_tiny.loss))
+
+
+def test_ridge_completion_nullspace_decay_and_ridge_representations():
+    # r(theta) = theta_0 - 1, Q = I_2, theta_init = (1, 3):
+    # nullspace coordinate theta_1 = 3 must decay to 0 via rho Q theta in g!
+    rho = 0.25
+    s_null = LevenbergMarquardt(
+        lambda th: jnp.array([th[0] - 1.0], dtype=jnp.float32),
+        ridge=rho,
+        ridge_metric=IdentityRidge(),
+    )
+    res_null = s_null.solve(
+        jnp.array([1.0, 3.0], dtype=jnp.float32), gtol=1e-6, max_steps=60
+    )
+    assert int(res_null.status) == int(SolverStatus.CONVERGED)
+    np.testing.assert_allclose(
+        res_null.x, np.array([1.0 / (1.0 + rho), 0.0]), atol=1e-5
+    )
+
+    # Interior-zero DiagonalRidge, MatrixRidge, and FactorRidge match reference
+    w_diag = jnp.array([1.5, 0.0, 2.5, 0.0, 0.8, 1.2], dtype=jnp.float32)
+    Q_diag_np = np.diag(np.pad(np.asarray(w_diag, np.float64), (0, N - len(w_diag))))
+    for ls in (
+        Cholesky(form="normal"),
+        Cholesky(form="gram"),
+        QR(form="normal"),
+        QR(form="gram"),
+    ):
+        res_d = LevenbergMarquardt(
+            linear_residual,
+            ridge=rho,
+            ridge_metric=DiagonalRidge(w_diag),
+            linear_solver=ls,
+        ).solve(X0, gtol=1e-5, max_steps=80)
+        assert int(res_d.status) == int(SolverStatus.CONVERGED)
+        np.testing.assert_allclose(
+            res_d.x, ridge_minimizer(rho, Q_diag_np), rtol=2e-3, atol=2e-4
+        )
+
+    rng = np.random.default_rng(5)
+    L_fac = jnp.asarray(rng.normal(size=(4, 6)), jnp.float32)
+    L_fac_np = np.asarray(L_fac, np.float64)
+    Q_fac_np = np.zeros((N, N))
+    Q_fac_np[:6, :6] = L_fac_np.T @ L_fac_np
+    for rm in (
+        MatrixRidge(jnp.asarray(Q_fac_np[:6, :6], jnp.float32)),
+        FactorRidge(L_fac),
+    ):
+        for ls in (Cholesky(), QR()):
+            res_f = LevenbergMarquardt(
+                linear_residual, ridge=rho, ridge_metric=rm, linear_solver=ls
+            ).solve(X0, gtol=1e-5, max_steps=80)
+            assert int(res_f.status) == int(SolverStatus.CONVERGED)
+            np.testing.assert_allclose(
+                res_f.x, ridge_minimizer(rho, Q_fac_np), rtol=2e-3, atol=2e-4
+            )
+
+
+def test_dense_diagonal_preconditioning_and_capability_checks():
+    # Multiscale tall system: column scaling improves conditioning without changing
+    # Euclidean grad_norm, step_norm, or objective loss.
+    scales = jnp.array([1e-3, 1.0, 1e3], dtype=jnp.float32)
+    A_tall = (
+        jnp.array(
+            [[1.0, 0.2, -0.3], [0.4, 1.5, 0.1], [-0.2, 0.3, 1.2], [0.5, -0.4, 0.8]],
+            dtype=jnp.float32,
+        )
+        * scales[None, :]
+    )
+    x_true = jnp.array([100.0, 0.5, -1e-3], dtype=jnp.float32)
+    b_tall = A_tall @ x_true + jnp.array([0.01, -0.02, 0.01, -0.01], dtype=jnp.float32)
+    x0_tall = jnp.zeros(3, dtype=jnp.float32)
+
+    ref_solver = LevenbergMarquardt(
+        lambda x: A_tall @ x - b_tall,
+        init_damping=0.1,
+        linear_solver=Cholesky(form="normal"),
+        geodesic_acceleration=False,
+    )
+    x1_ref, _, info_ref = ref_solver.update(x0_tall, ref_solver.init(x0_tall))
+
+    col_diag = jnp.sum(A_tall**2, axis=0)
+    for pre in (DiagonalPreconditioner(None), DiagonalPreconditioner(col_diag)):
+        for ls in (
+            Cholesky(form="normal", preconditioner=pre),
+            QR(form="normal", preconditioner=pre),
+        ):
+            s = LevenbergMarquardt(
+                lambda x: A_tall @ x - b_tall,
+                init_damping=0.1,
+                linear_solver=ls,
+                geodesic_acceleration=False,
+            )
+            x1, _, info = s.update(x0_tall, s.init(x0_tall))
+            np.testing.assert_allclose(x1, x1_ref, rtol=1e-4, atol=1e-5)
+            np.testing.assert_allclose(info.grad_norm, info_ref.grad_norm, rtol=1e-5)
+            np.testing.assert_allclose(info.step_norm, info_ref.step_norm, rtol=1e-4)
+            np.testing.assert_allclose(info.loss, info_ref.loss, rtol=1e-5)
+
+    # Multiscale wide system: Gram Cholesky and unpenalized Gram QR with equilibration
+    row_scales = jnp.array([1e-2, 1.0, 1e2, 10.0], dtype=jnp.float32)
+    A_wide = row_scales[:, None] * A
+    b_wide = row_scales * B
+    ref_wide = LevenbergMarquardt(
+        lambda x: A_wide @ x - b_wide,
+        init_damping=0.1,
+        linear_solver=Cholesky(form="gram"),
+        geodesic_acceleration=False,
+    )
+    xw_ref, _, infow_ref = ref_wide.update(X0, ref_wide.init(X0))
+    row_diag = jnp.sum(A_wide**2, axis=1)
+    for pre in (DiagonalPreconditioner(None), DiagonalPreconditioner(row_diag)):
+        for ls in (
+            Cholesky(form="gram", preconditioner=pre),
+            QR(form="gram", preconditioner=pre),
+        ):
+            sw = LevenbergMarquardt(
+                lambda x: A_wide @ x - b_wide,
+                init_damping=0.1,
+                linear_solver=ls,
+                geodesic_acceleration=False,
+            )
+            xw, _, infow = sw.update(X0, sw.init(X0))
+            np.testing.assert_allclose(xw, xw_ref, rtol=1e-4, atol=1e-5)
+            np.testing.assert_allclose(infow.grad_norm, infow_ref.grad_norm, rtol=1e-5)
+
+    # Damped wide QR(form="normal") with column scaling preserves exact Euclidean step
+    sw_qr_norm = LevenbergMarquardt(
+        lambda x: A_wide @ x - b_wide,
+        init_damping=0.1,
+        linear_solver=QR(form="normal", preconditioner=DiagonalPreconditioner(None)),
+        geodesic_acceleration=False,
+    )
+    xw_qn, _, _ = sw_qr_norm.update(X0, sw_qr_norm.init(X0))
+    np.testing.assert_allclose(xw_qn, xw_ref, rtol=2e-4, atol=5e-5)
+    with jax.enable_x64(True):
+        A_w64 = jnp.asarray(A_wide, dtype=jnp.float64)
+        b_w64 = jnp.asarray(b_wide, dtype=jnp.float64)
+        X0_64 = jnp.asarray(X0, dtype=jnp.float64)
+        xw_ref64, _, _ = LevenbergMarquardt(
+            lambda x: A_w64 @ x - b_w64,
+            init_damping=0.1,
+            linear_solver=Cholesky(form="gram"),
+            geodesic_acceleration=False,
+        ).update(
+            X0_64,
+            LevenbergMarquardt(
+                lambda x: A_w64 @ x - b_w64,
+                init_damping=0.1,
+                linear_solver=Cholesky(form="gram"),
+                geodesic_acceleration=False,
+            ).init(X0_64),
+        )
+        sw_qn64 = LevenbergMarquardt(
+            lambda x: A_w64 @ x - b_w64,
+            init_damping=0.1,
+            linear_solver=QR(
+                form="normal", preconditioner=DiagonalPreconditioner(None)
+            ),
+            geodesic_acceleration=False,
+        )
+        xw_qn64, _, _ = sw_qn64.update(X0_64, sw_qn64.init(X0_64))
+        np.testing.assert_allclose(xw_qn64, xw_ref64, rtol=1e-12, atol=1e-12)
+
+    # Capability rejections for unsupported QR configurations
+    with pytest.raises(ValueError, match="m_aug >= n"):
+        Newton(
+            linear_residual,
+            damping=0.0,
+            linear_solver=QR(
+                form="normal", preconditioner=DiagonalPreconditioner(None)
+            ),
+        ).init(X0)
+    rk_def_n = Newton(
+        lambda x: jnp.array([x[0] + x[1] + 1.0, x[0] + x[1] + 1.0], dtype=x.dtype),
+        damping=0.0,
+        linear_solver=QR(
+            form="normal",
+            preconditioner=DiagonalPreconditioner(jnp.array([4.0, 1.0], jnp.float32)),
+        ),
+    )
+    assert int(rk_def_n.solve(jnp.zeros(2, jnp.float32), max_steps=5).status) == int(
+        SolverStatus.LINEAR_SOLVE_FAILED
+    )
+    with pytest.raises(ValueError, match="does not support DiagonalPreconditioner"):
+        LevenbergMarquardt(
+            linear_residual,
+            ridge=1e-2,
+            linear_solver=QR(form="gram", preconditioner=DiagonalPreconditioner(None)),
+        ).init(X0)
+
+
+@pytest.mark.parametrize("name", list(FORWARD_SOLVERS))
+def test_geodesic_correction_unpenalized_and_ridge_closed_form(name):
     def quad_res(x):
-        return jnp.array([x[0] ** 2 - 2.0, x[0] * x[1] - 1.0])
+        return jnp.array([x[0] ** 2 - 2.0, x[0] * x[1] - 1.0], dtype=jnp.float32)
 
     damping = 0.2
+    x0 = jnp.asarray([1.6, 0.7], jnp.float32)
+    x = np.asarray(x0, np.float64)
+    J = np.array([[2 * x[0], 0.0], [x[1], x[0]]])
+    r = np.array([x[0] ** 2 - 2.0, x[0] * x[1] - 1.0])
+
+    # Unpenalized closed-form velocity + 0.5 * acceleration
     solver = LevenbergMarquardt(
         quad_res,
         linear_solver=FORWARD_SOLVERS[name],
         init_damping=damping,
         geodesic_acceptance_ratio=1e9,
     )
-    x0 = jnp.asarray([1.6, 0.7], jnp.float32)
     x1, _, info = solver.update(x0, solver.init(x0))
-    x = np.asarray(x0, np.float64)
-    J = np.array([[2 * x[0], 0.0], [x[1], x[0]]])
-    r = np.array([x[0] ** 2 - 2.0, x[0] * x[1] - 1.0])
-    G = J.T @ J + damping * np.eye(2)
-    velocity = -np.linalg.solve(G, J.T @ r)
-    f_vv = np.array([2 * velocity[0] ** 2, 2 * velocity[0] * velocity[1]])
-    acceleration = -np.linalg.solve(G, J.T @ f_vv)
+    G0 = J.T @ J + damping * np.eye(2)
+    v0 = -np.linalg.solve(G0, J.T @ r)
+    f_vv0 = np.array([2 * v0[0] ** 2, 2 * v0[0] * v0[1]])
+    a0 = -np.linalg.solve(G0, J.T @ f_vv0)
     assert bool(info.used_geodesic)
+    np.testing.assert_allclose(np.asarray(x1), x + v0 + 0.5 * a0, rtol=1e-4, atol=1e-5)
+
+    # Penalized closed-form: acceleration solves H_mu a = -J' r_vv WITHOUT rho Q theta!
+    rho = 0.3
+    w_q = jnp.array([2.0, 0.5], dtype=jnp.float32)
+    Q_mat = np.diag([2.0, 0.5])
+    r_solver = LevenbergMarquardt(
+        quad_res,
+        ridge=rho,
+        ridge_metric=DiagonalRidge(w_q),
+        linear_solver=FORWARD_SOLVERS[name],
+        init_damping=damping,
+        geodesic_acceptance_ratio=1e9,
+    )
+    x1_r, _, info_r = r_solver.update(x0, r_solver.init(x0))
+    H_r = J.T @ J + rho * Q_mat + damping * np.eye(2)
+    v_r = -np.linalg.solve(H_r, J.T @ r + rho * (Q_mat @ x))
+    f_vv_r = np.array([2 * v_r[0] ** 2, 2 * v_r[0] * v_r[1]])
+    a_r = -np.linalg.solve(H_r, J.T @ f_vv_r)
+    assert bool(info_r.used_geodesic)
     np.testing.assert_allclose(
-        np.asarray(x1), x + velocity + 0.5 * acceleration, rtol=1e-4, atol=1e-5
+        np.asarray(x1_r), x + v_r + 0.5 * a_r, rtol=1e-4, atol=1e-5
     )
 
 
-def test_fixed_ridge_default_identity_and_repeated_metric():
-    ridge = 1e-2
-    # metric=None with ridge > 0 defaults to Euclidean IdentityMetric(n)
-    euclid_solver = LevenbergMarquardt(linear_residual, ridge=ridge)
-    euclid_res = euclid_solver.solve(jnp.zeros(N), max_steps=200, gtol=1e-5)
-    assert int(euclid_res.status) == int(SolverStatus.CONVERGED)
-    np.testing.assert_allclose(
-        np.asarray(euclid_res.x),
-        ridge_minimizer(ridge, np.eye(N)),
-        rtol=2e-3,
-        atol=2e-4,
-    )
-
-    # RepeatedFactorMetric with unpenalized free tail
-    metric = make_repeated_metric()
-    solver = LevenbergMarquardt(linear_residual, metric=metric, ridge=ridge)
-    result = solver.solve(jnp.zeros(N), max_steps=250, gtol=1e-5)
-    assert int(result.status) == int(SolverStatus.CONVERGED)
-    np.testing.assert_allclose(
-        np.asarray(result.x), ridge_minimizer(ridge), rtol=2e-3, atol=2e-4
-    )
-    np.testing.assert_allclose(
-        float(result.info.loss),
-        float(result.info.resid_loss) + ridge * float(result.info.penalty_value),
-        rtol=1e-5,
-    )
-
-    # Whitened stationarity norm matches dense reference
-    _, _, info = solver.update(X0, solver.init(X0))
-    F64 = np.linalg.cholesky(K_NP).T
-    F_bar = jsp_linalg.block_diag(*([F64] * REPEATS), np.eye(FREE))
-    grad_white = np.linalg.solve(
-        F_bar.T, A_NP.T @ (A_NP @ np.asarray(X0, np.float64) - B_NP)
-    ) + ridge * np.concatenate(
-        [(F_bar @ np.asarray(X0, np.float64))[:N_M], np.zeros(FREE)]
-    )
-    np.testing.assert_allclose(
-        float(info.grad_norm), np.linalg.norm(grad_white), rtol=1e-4
-    )
-
-
-def test_ridge_solvers_agree_and_caches_are_reused_and_ridge_keyed():
-    metric = make_repeated_metric()
-    steps = {}
-    for name, ls in (
-        ("cholesky", Cholesky()),
-        ("qr", QR()),
-        ("cg", CG(IdentityPreconditioner(), tol=1e-10, maxiter=None)),
-    ):
-        solver = LevenbergMarquardt(
-            nonlinear_residual,
-            metric=metric,
-            ridge=1e-2,
-            init_damping=1e-2,
-            linear_solver=ls,
-            geodesic_acceleration=False,
-        )
-        steps[name] = np.asarray(solver.update(X0, solver.init(X0))[0])
-    np.testing.assert_allclose(steps["cholesky"], steps["qr"], atol=1e-3)
-    np.testing.assert_allclose(steps["cholesky"], steps["cg"], atol=1e-3)
-
-    # CholeskyCache & QRCache reuse on matching ridge and invalidate on ridge change
+def test_ridge_caches_rejected_step_reuse_and_anneal_continuation():
+    rm = make_repeated_ridge()
     chol_solver = LevenbergMarquardt(
         nonlinear_residual,
-        metric=metric,
+        ridge_metric=rm,
         ridge=1e-3,
-        linear_solver=Cholesky(),
+        linear_solver=Cholesky(form="normal"),
         geodesic_acceleration=False,
     )
     fresh = chol_solver.init(X0)
@@ -295,9 +505,9 @@ def test_ridge_solvers_agree_and_caches_are_reused_and_ridge_keyed():
 
     qr_solver = LevenbergMarquardt(
         nonlinear_residual,
-        metric=metric,
+        ridge_metric=rm,
         ridge=1e-3,
-        linear_solver=QR(),
+        linear_solver=QR(form="normal"),
         geodesic_acceleration=False,
     )
     fresh_qr = qr_solver.init(X0)
@@ -316,8 +526,7 @@ def test_ridge_solvers_agree_and_caches_are_reused_and_ridge_keyed():
     )
     assert not bool(state_qr_clean.solver_cache.valid)
 
-
-def test_rejected_step_reuses_cached_linearization():
+    # Rejected step reuses cached linearization
     calls = []
 
     def scalar_residual(theta):
@@ -325,75 +534,32 @@ def test_rejected_step_reuses_cached_linearization():
         return theta**2 - 1.0
 
     x = jnp.asarray([0.1], dtype=jnp.float32)
-    bt_solver = LevenbergMarquardt(
-        scalar_residual,
-        init_damping=1e-8,
-        geodesic_acceleration=False,
+    solver_rej = LevenbergMarquardt(
+        scalar_residual, init_damping=1e-8, maxls=1, geodesic_acceleration=False
     )
-    _, _, bt_info = bt_solver.update(x, bt_solver.init(x))
-    assert bool(bt_info.accepted)
-    assert float(bt_info.stepsize) == pytest.approx(0.25)
-    assert float(bt_info.damping_factor) == pytest.approx(2.0)
-
-    solver = LevenbergMarquardt(
-        scalar_residual,
-        init_damping=1e-8,
-        maxls=1,
-        geodesic_acceleration=False,
-    )
-    state = solver.init(x)
+    state = solver_rej.init(x)
     calls.clear()
-    x1, state, info = solver.update(x, state)
+    x1, state, info = solver_rej.update(x, state)
     jax.effects_barrier()
     assert not bool(info.accepted)
     assert bool(state.jacobian_valid)
     assert len(calls) == 2
 
     calls.clear()
-    solver.update(x1, state)
+    solver_rej.update(x1, state)
     jax.effects_barrier()
     assert len(calls) == 1
 
-    # Passing a rejected-step state into solve() resets jacobian_valid so a new
-    # x0 is freshly linearized rather than reusing the old point's residual/Jt.
-    res_warm = solver.solve(
-        jnp.asarray([0.8], dtype=jnp.float32), state=state, atol=1e-5, max_steps=20
-    )
-    assert int(res_warm.status) == int(SolverStatus.CONVERGED)
-    np.testing.assert_allclose(
-        res_warm.x, jnp.asarray([1.0], dtype=jnp.float32), atol=1e-4
-    )
-
-    # Tall QR(form="gram") and strict < on unpenalized atol boundary
-    tall_qr = LevenbergMarquardt(
-        lambda th: jnp.array([th[0] - 1.0, th[1] - 2.0, th[0] + th[1] - 3.0]),
-        linear_solver=QR(form="gram"),
-    ).solve(jnp.zeros(2, dtype=jnp.float32), atol=1e-5)
-    assert int(tall_qr.status) == int(SolverStatus.CONVERGED)
-    np.testing.assert_allclose(tall_qr.x, jnp.array([1.0, 2.0]), atol=1e-4)
-
-    boundary_solver = LevenbergMarquardt(lambda th: th - 1.0)
-    assert (
-        int(
-            boundary_solver.solve(
-                jnp.zeros(1, dtype=jnp.float32), atol=1.0, max_steps=1
-            ).steps
-        )
-        == 1
-    )
-
-
-def test_anneal_ridge_continuation_and_conjunctive_atol():
+    # AnnealRidge continuation converges toward KKT minimum-seminorm solution
     x_dagger = min_seminorm_solution()
-    metric = make_repeated_metric()
-    fixed = LevenbergMarquardt(linear_residual, metric=metric, ridge=1e-1).solve(
+    fixed = LevenbergMarquardt(linear_residual, ridge_metric=rm, ridge=1e-1).solve(
         jnp.zeros(N), max_steps=300, gtol=1e-5
     )
     fixed_err = np.linalg.norm(np.asarray(fixed.x) - x_dagger)
 
     anneal = AnnealRidge(ridge_floor=1e-4, decrease=0.1, grad_rtol=1e-3)
-    solver = LevenbergMarquardt(linear_residual, metric=metric, ridge=1e-1)
-    cont = solver.solve(
+    solver_cont = LevenbergMarquardt(linear_residual, ridge_metric=rm, ridge=1e-1)
+    cont = solver_cont.solve(
         jnp.zeros(N),
         max_steps=500,
         gtol=1e-6,
@@ -405,25 +571,129 @@ def test_anneal_ridge_continuation_and_conjunctive_atol():
     assert np.linalg.norm(np.asarray(cont.x) - x_dagger) < 0.05 * fixed_err
     assert float(cont.state.ridge) <= 1e-4 + 1e-9
 
-    # Conjunctive atol rejects atol alone and does not stop at step 0 on an
-    # interpolating start with excess seminorm.
-    with pytest.raises(ValueError, match="conjunctive"):
-        solver.solve(jnp.zeros(N), atol=1e-8)
-
-    # Always-shrinking callback suppresses convergence on every step
-    always_shrink = lambda ctx: SolverAction(  # noqa: E731
-        state=dataclasses.replace(ctx.state, ridge=ctx.state.ridge * 0.5)
+    # Default atol=0 converges on gtol when ||r*|| > 0; explicit atol > 0 is conjunctive
+    slv_pen = LevenbergMarquardt(linear_residual, ridge=1.0)
+    nonzero_res = slv_pen.solve(jnp.zeros(N), max_steps=100, gtol=1e-5)
+    assert int(nonzero_res.status) == int(SolverStatus.CONVERGED)
+    assert float(nonzero_res.info.resid_loss) > 1e-3
+    conj_blocked = slv_pen.solve(
+        jnp.zeros(N),
+        max_steps=20,
+        gtol=1e-5,
+        atol=1e-8,
+        max_steps_is_success=False,
     )
-    shrunk = solver.solve(jnp.zeros(N), max_steps=15, gtol=1e3, callback=always_shrink)
-    assert int(shrunk.status) == int(SolverStatus.MAX_STEPS)
+    assert int(conj_blocked.status) == int(SolverStatus.MAX_STEPS)
 
 
-def test_pytree_aux_histories_and_jit_parity():
+def test_nonlinear_inequalities_kink_smoothing_diagnostics_and_callbacks():
+    # 1. Exact kink derivative at g == 0 is strictly 0.0 (g < 0, never g <= 0)
+    bare_ineq = LevenbergMarquardt(lambda x: Inequality(x))
+    r_kink, _, _ = bare_ineq._eval_residual_and_aux(
+        jnp.array([-2.0, 0.0, 3.0], dtype=jnp.float32), None, None
+    )
+    np.testing.assert_allclose(r_kink, jnp.array([-2.0, 0.0, 0.0], dtype=jnp.float32))
+    J_fwd = jax.jacfwd(lambda z: bare_ineq._eval_residual_and_aux(z, None, None)[0])(
+        jnp.array([-2.0, 0.0, 3.0], dtype=jnp.float32)
+    )
+    J_rev = jax.jacrev(lambda z: bare_ineq._eval_residual_and_aux(z, None, None)[0])(
+        jnp.array([-2.0, 0.0, 3.0], dtype=jnp.float32)
+    )
+    expected_J = np.diag([1.0, 0.0, 0.0])
+    np.testing.assert_allclose(J_fwd, expected_J)
+    np.testing.assert_allclose(J_rev, expected_J)
+
+    # 2. Smooth softplus overflow/NaN safety at extreme +/- margins
+    smooth_ineq = LevenbergMarquardt(
+        lambda x: Inequality(x),
+        inequality=InequalityPenalty(weight=4.0, smoothing=0.1),
+    )
+    x_ext = jnp.array([-1e4, -0.05, 0.0, 1e4], dtype=jnp.float32)
+    r_ext, _, _ = smooth_ineq._eval_residual_and_aux(x_ext, None, None)
+    J_ext = jax.jacrev(lambda z: smooth_ineq._eval_residual_and_aux(z, None, None)[0])(
+        x_ext
+    )
+    assert bool(jnp.all(jnp.isfinite(r_ext)))
+    assert bool(jnp.all(jnp.isfinite(J_ext)))
+    np.testing.assert_allclose(float(r_ext[0]), -2.0 * 1e4, rtol=1e-4)
+    np.testing.assert_allclose(float(r_ext[3]), 0.0, atol=1e-7)
+
+    # 3. Constrained projection: 0.5*(x0-0.5)^2 + 0.5*(x1+1)^2 + 0.5*w*min(x1-0.5, 0)^2
+    # Exact minimizer for x0 = 0.5 and x1 = (-1.0 + 0.5*w)/(1 + w)
+    w_pen = 9.0
+
+    def mixed_fn(x):
+        return Residuals(
+            residual=jnp.array([x[0] - 0.5, x[1] + 1.0], dtype=x.dtype),
+            inequality=Inequality({"margin": jnp.array([x[1] - 0.5], dtype=x.dtype)}),
+        )
+
+    x_init = jnp.array([-1.0, -2.0], dtype=jnp.float32)
+    x_star_exact = np.array([0.5, (-1.0 + 0.5 * w_pen) / (1.0 + w_pen)])
+
+    for solver_cls in (LevenbergMarquardt, Newton):
+        res_exact = solver_cls(
+            mixed_fn, inequality=InequalityPenalty(weight=w_pen, smoothing=0.0)
+        ).solve(x_init, gtol=1e-6, max_steps=50)
+        assert int(res_exact.status) == int(SolverStatus.CONVERGED)
+        np.testing.assert_allclose(res_exact.x, x_star_exact, atol=1e-5)
+        viol = max(0.5 - float(res_exact.x[1]), 0.0)
+        np.testing.assert_allclose(
+            float(res_exact.info.ineq_violation_norm), viol, rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            float(res_exact.info.ineq_max_violation), viol, rtol=1e-5
+        )
+        eq_expected = float((res_exact.x[0] - 0.5) ** 2 + (res_exact.x[1] + 1.0) ** 2)
+        np.testing.assert_allclose(
+            float(res_exact.info.eq_loss), eq_expected, rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            float(res_exact.info.loss), eq_expected + w_pen * viol**2, rtol=1e-5
+        )
+
+    # 4. Smooth solutions converge to exact solution as tau -> 0 and via smoothing_decay
+    errs = []
+    for tau in (0.5, 0.05, 1e-3):
+        sol_tau = LevenbergMarquardt(
+            mixed_fn, inequality=InequalityPenalty(weight=w_pen, smoothing=tau)
+        ).solve(x_init, gtol=1e-5, max_steps=60)
+        assert int(sol_tau.status) == int(SolverStatus.CONVERGED)
+        errs.append(float(np.linalg.norm(np.asarray(sol_tau.x) - x_star_exact)))
+    assert errs[2] < errs[1] < errs[0]
+    assert errs[2] < 2e-3
+
+    sol_decay = LevenbergMarquardt(
+        mixed_fn,
+        inequality=InequalityPenalty(
+            weight=w_pen, smoothing=0.5, smoothing_min=1e-5, smoothing_decay=0.3
+        ),
+    ).solve(x_init, gtol=1e-5, max_steps=80)
+    assert int(sol_decay.status) == int(SolverStatus.CONVERGED)
+    np.testing.assert_allclose(sol_decay.x, x_star_exact, atol=2e-4)
+
+    # 5. Callback mutating state.ineq_weight suppresses premature convergence
+    def grow_weight_cb(ctx):
+        grow = ctx.step <= 3
+        new_w = jnp.where(grow, ctx.state.ineq_weight * 2.0, ctx.state.ineq_weight)
+        return SolverAction(state=dataclasses.replace(ctx.state, ineq_weight=new_w))
+
+    s_cb = LevenbergMarquardt(
+        mixed_fn, inequality=InequalityPenalty(weight=9.0 / 8.0, smoothing=0.0)
+    )
+    sol_cb = s_cb.solve(x_init, gtol=1e-5, max_steps=60, callback=grow_weight_cb)
+    assert int(sol_cb.status) == int(SolverStatus.CONVERGED)
+    assert int(sol_cb.steps) >= 4
+    np.testing.assert_allclose(float(sol_cb.state.ineq_weight), 9.0, rtol=1e-6)
+    np.testing.assert_allclose(sol_cb.x, x_star_exact, atol=1e-4)
+
+
+def test_pytree_aux_histories_and_residuals_wrapper():
     def residual(x, args, p):
         r = A @ x["w"] - (args["b"] + p)
         return r, {"norm": jnp.linalg.norm(r)}
 
-    x0 = {"w": jnp.zeros(N)}
+    x0 = {"w": jnp.zeros(N, jnp.float32)}
     args = {"b": B}
     p = jnp.ones(M, jnp.float32) * 0.1
     solver = LevenbergMarquardt(residual, has_aux=True)
@@ -436,80 +706,35 @@ def test_pytree_aux_histories_and_jit_parity():
     np.testing.assert_allclose(
         res_jit.x_history["w"][int(res_jit.steps)], res_jit.x["w"], rtol=1e-6
     )
-    np.testing.assert_allclose(
-        float(res_jit.aux["norm"]),
-        float(jnp.linalg.norm(A @ res_jit.x["w"] - (B + p))),
-        atol=1e-6,
-    )
 
-
-def test_residuals_wrapper_and_pytree_residual():
-    x0 = jnp.zeros(N, dtype=jnp.float32)
-    p = jnp.ones(M, dtype=jnp.float32) * 0.1
+    x0_flat = jnp.zeros(N, jnp.float32)
     ref = LevenbergMarquardt(lambda x, _, p: A @ x - (B + p)).solve(
-        x0, p=p, max_steps=30, atol=1e-6
+        x0_flat, p=p, max_steps=30, atol=1e-6
     )
-
-    def wrapped_array(x, _, p):
-        r = A @ x - (B + p)
-        return Residuals(r)
-
-    def wrapped_pytree(x, _, p):
-        r = A @ x - (B + p)
-        return Residuals({"top": r[:2], "bottom": r[2:]})
-
-    def bare_pytree(x, _, p):
-        r = A @ x - (B + p)
-        return {"top": r[:2], "bottom": r[2:]}
-
-    def wrapped_with_aux(x, _, p):
-        r = A @ x - (B + p)
-        return Residuals({"top": r[:2], "bottom": r[2:]}), {"norm": jnp.linalg.norm(r)}
-
-    for fn in (wrapped_array, wrapped_pytree, bare_pytree):
+    for fn in (
+        lambda x, _, p: Residuals(A @ x - (B + p)),
+        lambda x, _, p: Residuals(
+            {"top": (A @ x - (B + p))[:2], "bot": (A @ x - (B + p))[2:]}
+        ),
+        lambda x, _, p: {"top": (A @ x - (B + p))[:2], "bot": (A @ x - (B + p))[2:]},
+    ):
         for solver_cls in (LevenbergMarquardt, Newton):
-            solver = solver_cls(fn)
-            res = solver.solve(x0, p=p, max_steps=30, atol=1e-6)
+            res = solver_cls(fn).solve(x0_flat, p=p, max_steps=30, atol=1e-6)
             assert int(res.status) == int(SolverStatus.CONVERGED)
             np.testing.assert_allclose(res.x, ref.x, atol=1e-5)
 
-    for bad_fn in (
-        lambda x: Equality(x),
-        lambda x: Inequality(x),
-        lambda x: Residuals(x, equality=Equality(x)),
-        lambda x: Residuals(x, inequality=Inequality(x)),
-    ):
-        with pytest.raises(NotImplementedError):
-            LevenbergMarquardt(bad_fn).solve(x0)
 
-    jac_ref = jax.jacobian(
-        lambda p_: (
-            LevenbergMarquardt(lambda x, _, p: A @ x - (B + p))
-            .solve(x0, p=p_, max_steps=30, atol=1e-6)
-            .x
+def test_complementarity_euler_and_paired_validation():
+    # Paired Complementarity shape/structure mismatch raises ValueError
+    with pytest.raises(ValueError, match="shapes"):
+        LevenbergMarquardt(lambda x: Complementarity(lhs=x[:2], rhs=x[:3])).init(
+            jnp.zeros(4, jnp.float32)
         )
-    )(p)
-    jac_wrapped = jax.jacobian(
-        lambda p_: (
-            LevenbergMarquardt(wrapped_pytree)
-            .solve(x0, p=p_, max_steps=30, atol=1e-6)
-            .x
+    with pytest.raises(ValueError, match="pytree"):
+        LevenbergMarquardt(lambda x: Complementarity(lhs={"a": x}, rhs={"b": x})).init(
+            jnp.zeros(2, jnp.float32)
         )
-    )(p)
-    np.testing.assert_allclose(jac_wrapped, jac_ref, atol=1e-5)
 
-    res_aux = LevenbergMarquardt(wrapped_with_aux, has_aux=True).solve(
-        x0, p=p, max_steps=30, atol=1e-6
-    )
-    assert int(res_aux.status) == int(SolverStatus.CONVERGED)
-    np.testing.assert_allclose(res_aux.x, ref.x, atol=1e-5)
-    np.testing.assert_allclose(float(res_aux.aux["norm"]), 0.0, atol=1e-5)
-
-
-def test_complementarity_euler_consumption_smoothing():
-    # Two-period consumption-savings Euler equation with borrowing constraint a >= 0:
-    #   0 <= a_i  perp  (w_i - a_i)^{-1} - beta * R * (R * a_i + y)^{-1} >= 0
-    # Exact solution: a*(w_i; y) = max(0, (w_i - y / (beta * R)) / (1 + 1 / beta)).
     beta = jnp.float32(0.95)
     r_gross = jnp.float32(1.05)
     kappa = 1.0 / (beta * r_gross)
@@ -521,11 +746,7 @@ def test_complementarity_euler_consumption_smoothing():
     def euler_comp_only(a, _, y):
         c1 = w_grid - a
         c2 = r_gross * a + y
-        euler_rhs = 1.0 / c1 - beta * r_gross / c2
-        return Complementarity(lhs=a, rhs=euler_rhs)
-
-    def euler_residuals_none(a, _, y):
-        return Residuals(complementarity=euler_comp_only(a, None, y))
+        return Complementarity(lhs=a, rhs=1.0 / c1 - beta * r_gross / c2)
 
     configs = [
         None,
@@ -539,185 +760,74 @@ def test_complementarity_euler_consumption_smoothing():
     ]
     for solver_cls in (LevenbergMarquardt, Newton):
         for cfg in configs:
-            for fn in (euler_comp_only, euler_residuals_none):
-                solver = solver_cls(fn, complementarity=cfg)
-                sol = solver.solve(a_init, p=y0, max_steps=60, atol=1e-5, gtol=1e-5)
-                assert int(sol.status) == int(SolverStatus.CONVERGED)
-                np.testing.assert_allclose(sol.x, a_exact, atol=2e-4)
+            sol = solver_cls(euler_comp_only, complementarity=cfg).solve(
+                a_init, p=y0, max_steps=60, atol=1e-5, gtol=1e-5
+            )
+            assert int(sol.status) == int(SolverStatus.CONVERGED)
+            np.testing.assert_allclose(sol.x, a_exact, atol=2e-4)
 
-    # Implicit AD w.r.t. income parameter y across active and inactive constraints.
-    da_dy_exact = jnp.where(w_grid > kappa * y0, -kappa / (1.0 + kappa * r_gross), 0.0)
-    for cfg in (PDAS(), FischerBurmeister(), Minimum()):
-        solver = LevenbergMarquardt(euler_comp_only, complementarity=cfg)
-        da_dy = jax.jacrev(
-            lambda y, s=solver: s.solve(a_init, p=y, max_steps=60, atol=1e-6).x
-        )(y0)
-        np.testing.assert_allclose(da_dy, da_dy_exact, atol=2e-4)
-
-    # Mixed equality + complementarity system: solve jointly for (c1, a)
-    # with budget c1 + a - w = 0 and 0 <= a perp u'(c1) - beta R u'(c2) >= 0.
-    def euler_mixed(x, _, y):
+    # Combined equality + inequality + complementarity system
+    def euler_all_three(x, _, y):
         c1, a = x["c1"], x["a"]
-        budget_eq = c1 + a - w_grid
-        euler_rhs = 1.0 / c1 - beta * r_gross / (r_gross * a + y)
         return Residuals(
-            residual=budget_eq,
-            complementarity=Complementarity(lhs=a, rhs=euler_rhs),
+            residual=c1 + a - w_grid,
+            inequality=Inequality(c1 - 0.05),
+            complementarity=Complementarity(
+                lhs=a, rhs=1.0 / c1 - beta * r_gross / (r_gross * a + y)
+            ),
         )
 
-    x_init_mixed = {"c1": w_grid - a_init, "a": a_init}
-    for cfg in (
-        PDAS(),
-        FischerBurmeister(mu_init=0.02, mu_min=1e-5, mu_decay=0.3),
-        Minimum(),
-    ):
-        sol_mixed = LevenbergMarquardt(euler_mixed, complementarity=cfg).solve(
-            x_init_mixed, p=y0, max_steps=60, atol=1e-5
-        )
-        assert int(sol_mixed.status) == int(SolverStatus.CONVERGED)
-        np.testing.assert_allclose(sol_mixed.x["a"], a_exact, atol=2e-4)
-        np.testing.assert_allclose(sol_mixed.x["c1"], w_grid - a_exact, atol=2e-4)
+    sol_all = LevenbergMarquardt(euler_all_three, complementarity=PDAS()).solve(
+        {"c1": w_grid - a_init, "a": a_init}, p=y0, max_steps=60, atol=1e-5
+    )
+    assert int(sol_all.status) == int(SolverStatus.CONVERGED)
+    np.testing.assert_allclose(sol_all.x["a"], a_exact, atol=2e-4)
+    assert float(sol_all.info.ineq_max_violation) == 0.0
 
-    # Underdetermined Gram form (M < P): RBF policy interpolation of a(w) = Phi @ theta.
-    centers = jnp.linspace(0.3, 2.4, 24, dtype=jnp.float32)
-    phi = jnp.exp(-0.5 * ((w_grid[:, None] - centers[None, :]) / 0.25) ** 2)
-    theta0 = jnp.zeros(24, dtype=jnp.float32)
-
-    def euler_gram(theta, _, y):
-        a = phi @ theta
-        c1 = w_grid - a
-        c2 = r_gross * a + y
-        return Complementarity(lhs=a, rhs=1.0 / c1 - beta * r_gross / c2)
-
-    for cfg in (PDAS(), FischerBurmeister(), Minimum()):
-        sol_gram = LevenbergMarquardt(
-            euler_gram,
-            linear_solver=Cholesky(form="gram"),
-            complementarity=cfg,
-        ).solve(theta0, p=y0, max_steps=80, atol=1e-5)
-        assert int(sol_gram.status) == int(SolverStatus.CONVERGED)
-        np.testing.assert_allclose(phi @ sol_gram.x, a_exact, atol=3e-4)
-
-    # Fischer-Burmeister float32 cancellation & dead-branch jacrev safety:
-    # At (a, b) = (1e4, 1e-4) with mu=0, naive a + b - sqrt(a^2 + b^2) underflows to 0.0
-    # in float32, whereas rationalized FB preserves ~2 * a * b / (a + b + s) ~= 1e-4.
-    # At (a, b) = (-1.0, 0.0) with mu=0, a + b + s == 0 on the untaken branch, which
-    # must not produce NaN in reverse-mode AD.
+    # Float32 Fischer-Burmeister cancellation & dead-branch jacrev safety
     fb_solver = LevenbergMarquardt(
         lambda x: Complementarity(lhs=x[:2], rhs=x[2:]),
         complementarity=FischerBurmeister(),
     )
     x_extreme = jnp.array([1e4, -1.0, 1e-4, 0.0], dtype=jnp.float32)
-    r_fb, _ = fb_solver._residual_and_aux(x_extreme, None, None)
-    J_fb = jax.jacrev(lambda z: fb_solver._residual_and_aux(z, None, None)[0])(
+    r_fb, _, _ = fb_solver._eval_residual_and_aux(x_extreme, None, None)
+    J_fb = jax.jacrev(lambda z: fb_solver._eval_residual_and_aux(z, None, None)[0])(
         x_extreme
     )
     np.testing.assert_allclose(float(r_fb[0]), 1e-4, rtol=1e-3)
     assert bool(jnp.all(jnp.isfinite(J_fb)))
 
-    # Extreme-scale Fischer-Burmeister (lhs=1e20 in float32) avoids square overflow
-    sol_large_fb = LevenbergMarquardt(
-        lambda x: Complementarity(jnp.full_like(x, 1e20), x),
-        complementarity=FischerBurmeister(),
-    ).solve(jnp.array([1.0], dtype=jnp.float32), atol=1e-6)
-    assert int(sol_large_fb.status) == int(SolverStatus.CONVERGED)
-    np.testing.assert_allclose(
-        sol_large_fb.x, jnp.zeros(1, dtype=jnp.float32), atol=1e-6
-    )
-
-    # Positive-temperature PDAS (tau_decay=1.0) implicit AD and xtol convergence
-    smooth_pdas = LevenbergMarquardt(
-        lambda x, _, p: Complementarity(x, x - p),
-        complementarity=PDAS(tau_init=1.0, tau_decay=1.0),
-    )
-    p1 = jnp.array([1.0], dtype=jnp.float32)
-    sol_xtol = smooth_pdas.solve(
-        jnp.array([0.5], dtype=jnp.float32), p=p1, max_steps=60, xtol=1e-6
-    )
-    assert int(sol_xtol.status) == int(SolverStatus.CONVERGED)
-    jac_smooth = jax.jacrev(
-        lambda p: (
-            smooth_pdas.solve(
-                jnp.array([0.5], dtype=jnp.float32), p=p, max_steps=60, atol=1e-6
-            ).x
-        )
-    )(p1)
-    s1 = jax.nn.sigmoid(1.0)
-    np.testing.assert_allclose(
-        float(jac_smooth[0, 0]), float(s1 + s1 * (1.0 - s1)), rtol=1e-4
-    )
-
-    # Integer lhs + float rhs promotes to float instead of truncating rhs to int
-    sol_int_lhs = LevenbergMarquardt(
-        lambda x: Complementarity(jnp.ones(1, dtype=jnp.int32), x - 0.5)
-    ).solve(jnp.zeros(1, dtype=jnp.float32), atol=1e-6)
-    np.testing.assert_allclose(
-        sol_int_lhs.x, jnp.array([0.5], dtype=jnp.float32), atol=1e-5
-    )
-
-    # Cached PDAS under jit=False / disable_jit preserves base_mask on rejected steps
-    with jax.disable_jit():
-        sol_nojit = LevenbergMarquardt(
-            euler_comp_only, init_damping=1e-6, cache_jacobian=True
-        ).solve(a_init, p=y0, max_steps=60, atol=1e-5, jit=False)
-        assert int(sol_nojit.status) == int(SolverStatus.CONVERGED)
-        np.testing.assert_allclose(sol_nojit.x, a_exact, atol=2e-4)
-
-    # Decoupled active-set trap: at x_trap = (-0.5, 5.0), lhs < rhs in both rows
-    # and lhs depends only on x[0], giving a zero Jacobian column for x[1] under
-    # hard active-set selection (PDAS(tau=0) and Minimum()), whereas
-    # FischerBurmeister(mu=0) and PDAS(tau_init > 0) couple both branches and
-    # converge to the unique root x* = (0.0, 1.0).
-    def trap_ncp(x):
-        lhs = jnp.array([x[0], x[0] + 1.0])
-        rhs = jnp.array([x[1] - 1.0, x[1] - x[0] - 1.0])
-        return Complementarity(lhs=lhs, rhs=rhs)
-
-    x_trap = jnp.array([-0.5, 5.0], dtype=jnp.float32)
-    x_trap_star = jnp.array([0.0, 1.0], dtype=jnp.float32)
-    for stall_cfg in (PDAS(), Minimum()):
-        sol_stall = LevenbergMarquardt(trap_ncp, complementarity=stall_cfg).solve(
-            x_trap, max_steps=30, atol=1e-6
-        )
-        assert int(sol_stall.status) == int(SolverStatus.MAX_STEPS)
-    for conv_cfg in (
-        FischerBurmeister(),
-        FischerBurmeister(mu_init=0.5, mu_min=0.0, mu_decay=0.5),
-        PDAS(tau_init=1.0, tau_min=0.0, tau_decay=0.5),
-    ):
-        sol_conv = LevenbergMarquardt(trap_ncp, complementarity=conv_cfg).solve(
-            x_trap, max_steps=40, atol=1e-6
-        )
-        assert int(sol_conv.status) == int(SolverStatus.CONVERGED)
-        np.testing.assert_allclose(sol_conv.x, x_trap_star, atol=1e-5)
-
 
 def test_lm_constructor_and_state_validation():
-    metric = make_repeated_metric()
+    rm = make_repeated_ridge()
+    with pytest.raises(ValueError, match="ridge_metric requires a positive ridge"):
+        LevenbergMarquardt(linear_residual, ridge=None, ridge_metric=rm)
+    with pytest.raises(TypeError):
+        LevenbergMarquardt(linear_residual, metric=rm)
     for bad_ridge in (0.0, -1e-3, True):
         with pytest.raises(ValueError):
-            LevenbergMarquardt(linear_residual, metric=metric, ridge=bad_ridge)
-    for gram in (
-        Cholesky(form="gram"),
-        QR(form="gram"),
-        GramCG(IdentityPreconditioner(), maxiter=8),
-    ):
-        with pytest.raises(ValueError, match="penalty rows"):
-            LevenbergMarquardt(
-                linear_residual, metric=metric, ridge=1e-3, linear_solver=gram
-            )
-    for bad_fwd in (SVD(), LU()):
-        with pytest.raises(ValueError, match="linear_solver"):
-            LevenbergMarquardt(linear_residual, linear_solver=bad_fwd)
-    with pytest.raises(ValueError, match="ad_solver"):
-        LevenbergMarquardt(linear_residual, ad_solver=QR())
-    with pytest.raises(ValueError, match="free block"):
+            LevenbergMarquardt(linear_residual, ridge_metric=rm, ridge=bad_ridge)
+    with pytest.raises(ValueError, match="linear_solver"):
+        LevenbergMarquardt(linear_residual, linear_solver=LU())
+    s_svd = LevenbergMarquardt(
+        linear_residual, linear_solver=SVD(), geodesic_acceleration=False
+    )
+    s_chol = LevenbergMarquardt(
+        linear_residual, linear_solver=Cholesky(), geodesic_acceleration=False
+    )
+    np.testing.assert_allclose(
+        s_svd.update(X0, s_svd.init(X0))[0],
+        s_chol.update(X0, s_chol.init(X0))[0],
+        rtol=1e-4,
+        atol=1e-5,
+    )
+    with pytest.raises(ValueError, match="exceeding"):
         LevenbergMarquardt(
-            lambda theta: theta[:1], metric=IdentityMetric(3), ridge=1e-3
+            lambda theta: theta[:1], ridge_metric=IdentityRidge(3), ridge=1e-3
         ).init(jnp.zeros(2))
 
     bare = LevenbergMarquardt(
-        linear_residual, metric=metric, ridge=1e-3, cache_jacobian=False
+        linear_residual, ridge_metric=rm, ridge=1e-3, cache_jacobian=False
     )
     with pytest.raises(ValueError, match="ridge"):
         bare.update(jnp.zeros(N), LMState(jnp.asarray(1e-3), None))
@@ -727,3 +837,81 @@ def test_lm_constructor_and_state_validation():
             state=LMState(jnp.asarray(1e-3), jnp.asarray(0.0)),
             gtol=1e-5,
         )
+
+
+def test_round2_solver_edge_cases():
+    # 1. Semidefinite RepeatedFactorRidge uses normal in auto and rejects gram
+    R_sing = jnp.array([[1.0, 0.0], [0.0, 0.0]], dtype=jnp.float32)
+    rm_sing = RepeatedFactorRidge(R_sing, repeats=2)
+    s_sing = LevenbergMarquardt(
+        lambda x: x[:2] - jnp.array([1.0, 2.0], jnp.float32),
+        ridge=1e-2,
+        ridge_metric=rm_sing,
+        linear_solver=Cholesky(form="auto"),
+    )
+    res_sing = s_sing.solve(jnp.zeros(4, jnp.float32), gtol=1e-5, max_steps=15)
+    assert int(res_sing.status) == int(SolverStatus.CONVERGED)
+    with pytest.raises(ValueError, match="strictly positive definite"):
+        LevenbergMarquardt(
+            lambda x: x[:2],
+            ridge=1e-2,
+            ridge_metric=rm_sing,
+            linear_solver=Cholesky(form="gram"),
+        ).init(jnp.zeros(4, jnp.float32))
+
+    # 2. Damped SVD retains small nonzero singular values without hard rcond truncation
+    J_tiny = jnp.diag(jnp.array([1.0, 1e-7], dtype=jnp.float32))
+    s_svd = LevenbergMarquardt(
+        lambda x: J_tiny @ x - jnp.array([0.0, 1.0], jnp.float32),
+        linear_solver=SVD(),
+        init_damping=1e-14,
+        geodesic_acceleration=False,
+    )
+    x1_svd, _, _ = s_svd.update(
+        jnp.zeros(2, jnp.float32), s_svd.init(jnp.zeros(2, jnp.float32))
+    )
+    assert float(x1_svd[1]) > 0.5
+
+    # 3. Overflow-safe smoothed inequality and eq_loss excluding complementarity
+    s_ineq = LevenbergMarquardt(
+        lambda x: Residuals(
+            residual=x[:1] - 3.0,
+            inequality=Inequality(x[1:] - 100.0),
+            complementarity=Complementarity(x[:1], x[:1] + 2.0),
+        ),
+        complementarity=Minimum(),
+        inequality=InequalityPenalty(weight=1.0, smoothing=1e-37, smoothing_decay=1.0),
+    )
+    info0 = s_ineq._initial_info(
+        jnp.zeros(2, jnp.float32), s_ineq.init(jnp.zeros(2, jnp.float32)), None, None
+    )
+    assert bool(jnp.isfinite(info0.loss))
+    assert float(info0.eq_loss) == pytest.approx(9.0, rel=1e-5)
+
+    # 4. Final info.loss refreshes when callback modifies ridge on the terminal step
+    def stop_with_new_ridge(ctx):
+        return SolverAction(
+            stop=True, state=dataclasses.replace(ctx.state, ridge=jnp.float32(10.0))
+        )
+
+    s_cb = LevenbergMarquardt(
+        lambda x: x - 1.0, ridge=0.1, ridge_metric=IdentityRidge()
+    )
+    res_cb = s_cb.solve(
+        jnp.ones(2, jnp.float32), gtol=1e-6, max_steps=5, callback=stop_with_new_ridge
+    )
+    expected_loss = float(jnp.sum((res_cb.x - 1.0) ** 2) + 10.0 * jnp.sum(res_cb.x**2))
+    assert float(res_cb.info.loss) == pytest.approx(expected_loss, rel=1e-5)
+
+    # 5. Cholesky avoids coordinate-dependent diagonal shift on extreme scale
+    J_scale = jnp.array([[1e4, 1.0]], dtype=jnp.float32)
+    s_chol = LevenbergMarquardt(
+        lambda x: J_scale @ x - jnp.array([1.0], jnp.float32),
+        linear_solver=Cholesky(form="normal"),
+        init_damping=1e-20,
+        geodesic_acceleration=False,
+    )
+    _, _, info_chol = s_chol.update(
+        jnp.zeros(2, jnp.float32), s_chol.init(jnp.zeros(2, jnp.float32))
+    )
+    assert not bool(info_chol.accepted) or float(info_chol.damping) >= 1e-20

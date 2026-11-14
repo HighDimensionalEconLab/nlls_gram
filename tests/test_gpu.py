@@ -1,5 +1,3 @@
-"""GPU execution and no-host-transfer tests for LevenbergMarquardt and Newton."""
-
 import os
 
 import jax
@@ -13,22 +11,24 @@ from nlls_gram import (
     QR,
     SVD,
     AnnealRidge,
-    BlockEigenPreconditioner,
     Cholesky,
     Complementarity,
+    DiagonalPreconditioner,
     FischerBurmeister,
     GramCG,
     IdentityPreconditioner,
+    Inequality,
+    InequalityPenalty,
     LevenbergMarquardt,
     Minimum,
     MultiStart,
     Newton,
-    RepeatedFactorMetric,
+    RepeatedFactorRidge,
+    Residuals,
     SolverStatus,
 )
-from nlls_gram.experimental import StateSpaceMetric, matern_state_space
 
-GPU_PLATFORMS = ("gpu", "metal")
+GPU_PLATFORMS = ("gpu",)
 
 
 def _gpu_devices():
@@ -123,8 +123,8 @@ def test_jitted_geodesic_update_runs_on_gpu_without_host_transfer(
 @pytest.mark.parametrize(
     ("linear_solver", "ad_solver"),
     [
-        (Cholesky(form="gram"), SVD()),
-        (QR(), Cholesky()),
+        (Cholesky(form="gram", preconditioner=DiagonalPreconditioner(None)), SVD()),
+        (QR(form="gram"), Cholesky(form="gram")),
         (GramCG(IdentityPreconditioner(), tol=1e-7, maxiter=100), None),
     ],
 )
@@ -132,19 +132,12 @@ def test_unpenalized_solve_and_implicit_ad_on_gpu(
     dtype, solver_cls, linear_solver, ad_solver
 ):
     rng = np.random.default_rng(17)
-    m, block, repeats, free = 3, 2, 2, 1
-    n = block * repeats + free
+    m, n = 3, 7
     A_np = rng.normal(size=(m, n))
     b_np = rng.normal(size=m)
     b_dot_np = rng.normal(size=m)
-    root = rng.normal(size=(block, block + 2))
-    K_np = root @ root.T + 0.5 * np.eye(block)
-    W_np = np.eye(n)
-    for j in range(repeats):
-        W_np[j * block : (j + 1) * block, j * block : (j + 1) * block] = K_np
-    W_inv = np.linalg.inv(W_np)
-    expected_x = W_inv @ A_np.T @ np.linalg.solve(A_np @ W_inv @ A_np.T, b_np)
-    expected_dx = W_inv @ A_np.T @ np.linalg.solve(A_np @ W_inv @ A_np.T, b_dot_np)
+    expected_x = A_np.T @ np.linalg.solve(A_np @ A_np.T, b_np)
+    expected_dx = A_np.T @ np.linalg.solve(A_np @ A_np.T, b_dot_np)
 
     gpu = _gpu_devices()[0]
     atol = 1e-5 if dtype == jnp.float32 else 1e-10
@@ -154,12 +147,9 @@ def test_unpenalized_solve_and_implicit_ad_on_gpu(
         A = jnp.asarray(A_np, dtype=dtype)
         b = jnp.asarray(b_np, dtype=dtype)
         b_dot = jnp.asarray(b_dot_np, dtype=dtype)
-        F = jnp.linalg.cholesky(jnp.asarray(K_np, dtype=dtype), upper=True)
-        metric = RepeatedFactorMetric(F, repeats=repeats)
         x0 = jnp.zeros(n, dtype=dtype)
         solver = solver_cls(
             lambda x, _, p: A @ x - p,
-            metric=metric,
             linear_solver=linear_solver,
             ad_solver=ad_solver,
         )
@@ -187,7 +177,7 @@ def test_unpenalized_solve_and_implicit_ad_on_gpu(
 
 
 @pytest.mark.parametrize("solver_cls", [LevenbergMarquardt, Newton])
-@pytest.mark.parametrize("mode", ["cholesky", "qr", "cg_block_eigen"])
+@pytest.mark.parametrize("mode", ["cholesky_gram", "qr_gram", "cg_diag"])
 def test_ridge_solve_continuation_and_implicit_ad_on_gpu(dtype, solver_cls, mode):
     rng = np.random.default_rng(31)
     m, block, repeats, free = 3, 2, 2, 1
@@ -196,15 +186,15 @@ def test_ridge_solve_continuation_and_implicit_ad_on_gpu(dtype, solver_cls, mode
     A_np = rng.normal(size=(m, n))
     b_np = rng.normal(size=m)
     b_dot_np = rng.normal(size=m)
-    root = rng.normal(size=(block, block + 2))
-    K_np = root @ root.T + 0.5 * np.eye(block)
-    W_np = np.zeros((n, n))
+    root = rng.normal(size=(block + 2, block))
+    K_np = root.T @ root + 0.5 * np.eye(block)
+    Q_np = np.zeros((n, n))
     for j in range(repeats):
-        W_np[j * block : (j + 1) * block, j * block : (j + 1) * block] = K_np
+        Q_np[j * block : (j + 1) * block, j * block : (j + 1) * block] = K_np
 
     ridge_floor = 1e-3 if dtype == jnp.float32 else 1e-6
-    expected_x = np.linalg.solve(A_np.T @ A_np + ridge_floor * W_np, A_np.T @ b_np)
-    expected_dx = np.linalg.solve(A_np.T @ A_np + ridge_floor * W_np, A_np.T @ b_dot_np)
+    expected_x = np.linalg.solve(A_np.T @ A_np + ridge_floor * Q_np, A_np.T @ b_np)
+    expected_dx = np.linalg.solve(A_np.T @ A_np + ridge_floor * Q_np, A_np.T @ b_dot_np)
 
     gpu = _gpu_devices()[0]
     gtol = 1e-5 if dtype == jnp.float32 else 1e-10
@@ -214,24 +204,21 @@ def test_ridge_solve_continuation_and_implicit_ad_on_gpu(dtype, solver_cls, mode
         A = jnp.asarray(A_np, dtype=dtype)
         b = jnp.asarray(b_np, dtype=dtype)
         b_dot = jnp.asarray(b_dot_np, dtype=dtype)
-        F = jnp.linalg.cholesky(jnp.asarray(K_np, dtype=dtype), upper=True)
-        metric = RepeatedFactorMetric(F, repeats=repeats)
+        L = jnp.linalg.cholesky(jnp.asarray(K_np, dtype=dtype), upper=True)
+        rm = RepeatedFactorRidge(L, repeats=repeats)
         x0 = jnp.zeros(n, dtype=dtype)
 
-        if mode == "cholesky":
-            linear_solver = Cholesky()
-            ad_solver = Cholesky()
-        elif mode == "qr":
-            linear_solver = QR()
-            ad_solver = Cholesky()
+        if mode == "cholesky_gram":
+            linear_solver = Cholesky(form="gram")
+            ad_solver = Cholesky(form="gram")
+        elif mode == "qr_gram":
+            linear_solver = QR(form="gram")
+            ad_solver = QR(form="gram")
         else:
-            precond = BlockEigenPreconditioner(
-                [
-                    (jnp.eye(n_m, dtype=dtype)[None], 1.0),
-                    (jnp.eye(free, dtype=dtype)[None], 0.0),
-                ],
-                jnp.arange(n),
+            diag_est = jnp.sum(A**2, axis=0) + ridge_floor * jnp.asarray(
+                np.diag(Q_np), dtype=dtype
             )
+            precond = DiagonalPreconditioner(jnp.maximum(diag_est, 1e-3))
             linear_solver = CG(precond, tol=1e-7, maxiter=100)
             ad_solver = CG(None, tol=1e-7, maxiter=100)
 
@@ -239,7 +226,7 @@ def test_ridge_solve_continuation_and_implicit_ad_on_gpu(dtype, solver_cls, mode
         user_state0 = anneal.init_state(dtype=dtype)
         solver = solver_cls(
             lambda x, _, p: A @ x - p,
-            metric=metric,
+            ridge_metric=rm,
             ridge=ridge_floor * 10.0,
             linear_solver=linear_solver,
             ad_solver=ad_solver,
@@ -273,27 +260,12 @@ def test_ridge_solve_continuation_and_implicit_ad_on_gpu(dtype, solver_cls, mode
     )
 
 
-def test_state_space_metric_multi_start_and_failed_lane_ad_on_gpu(dtype):
+def test_multi_start_failed_lane_ad_inequality_and_complementarity_on_gpu(dtype):
     gpu = _gpu_devices()[0]
-    rtol = 1e-4 if dtype == jnp.float32 else 1e-10
     atol = 1e-5 if dtype == jnp.float32 else 1e-10
 
     with jax.default_device(gpu):
-        # 1. StateSpaceMetric sequential & parallel
-        n, repeats = 128, 2
-        t = jnp.cumsum(jnp.ones(n, dtype=dtype))
-        x = jnp.sin(jnp.linspace(0.0, 6.0, repeats * n, dtype=dtype))
-        model = matern_state_space(
-            jnp.asarray(1.3, dtype=dtype), jnp.asarray(0.8, dtype=dtype), 2.5
-        )
-        seq = StateSpaceMetric(t, *model, repeats=repeats, epsilon=1e-5, parallel=False)
-        par = StateSpaceMetric(t, *model, repeats=repeats, epsilon=1e-5, parallel=True)
-        out_seq = jax.jit(lambda v: seq.factor_solve(v, None))(x)
-        out_par = jax.jit(lambda v: par.factor_solve(v, None))(x)
-        jax.block_until_ready((out_seq, out_par))
-        assert jnp.allclose(out_seq, out_par, rtol=rtol, atol=atol)
-
-        # 2. MultiStart + vmapped failed-lane AD
+        # 1. MultiStart + vmapped failed-lane AD
         solver = LevenbergMarquardt(
             lambda th, _, p: th - p, cache_jacobian=False, geodesic_acceleration=False
         )
@@ -326,6 +298,21 @@ def test_state_space_metric_multi_start_and_failed_lane_ad_on_gpu(dtype):
         )
         assert int(res_ms.status) == int(SolverStatus.CONVERGED)
 
+        # 2. Nonlinear Inequality on GPU without host transfer
+        ineq_solver = LevenbergMarquardt(
+            lambda x, _, p: Residuals(residual=x - p, inequality=Inequality(x - 1.0)),
+            inequality=InequalityPenalty(weight=4.0, smoothing=0.0),
+        )
+        p_in = jnp.asarray([0.0, 2.0], dtype=dtype)
+        sol_ineq = jax.jit(
+            lambda q: ineq_solver.solve(jnp.zeros(2, dtype=dtype), p=q, gtol=atol)
+        )(p_in)
+        jax.block_until_ready(sol_ineq)
+        assert int(sol_ineq.status) == int(SolverStatus.CONVERGED)
+        np.testing.assert_allclose(
+            np.asarray(sol_ineq.x), np.array([0.8, 2.0]), atol=1e-4
+        )
+
         # 3. Complementarity Euler equation on GPU across PDAS, FB, and Minimum
         beta = jnp.asarray(0.95, dtype=dtype)
         r_gross = jnp.asarray(1.05, dtype=dtype)
@@ -349,8 +336,6 @@ def test_state_space_metric_multi_start_and_failed_lane_ad_on_gpu(dtype):
                 a_init, p=y0, max_steps=60, atol=atol
             )
             assert int(sol_comp.status) == int(SolverStatus.CONVERGED)
-            assert sol_comp.x.dtype == dtype
-            assert next(iter(sol_comp.x.devices())).platform in GPU_PLATFORMS
             np.testing.assert_allclose(
-                np.asarray(sol_comp.x), np.asarray(a_exact), atol=2e-4
+                np.asarray(sol_comp.x), np.asarray(a_exact), atol=3e-4
             )

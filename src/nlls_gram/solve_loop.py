@@ -1,28 +1,10 @@
-"""The solve loop: the jitted ``lax.while_loop`` driver, its Python mirror,
-and the ``save_steps`` history buffers.
-
-Both drivers consume an informal solver protocol -- ``update``,
-``_apply_action``, ``_converged``, ``_step_failure_status``,
-``_residual_and_aux``, ``_initial_info``, ``_cast_state``, ``has_aux`` --
-implemented by ``SolverBase``.
-"""
-
 import jax
 import jax.numpy as jnp
 
 from nlls_gram.types import CallbackContext, SolveResult, SolverStatus
 
 
-# save_steps bookkeeping shared by the jitted and Python solve loops: row `step` of
-# x_history and args_history takes the kept post-action iterate and args; info.aux was
-# evaluated at the pre-step x, so it lands one row earlier, and _finalize_history fills
-# the last aux row from the final-solution evaluation. history_len is concrete (static
-# under jit), so the buffers live entirely inside the loop implementations — no
-# host-side allocation and no copy of a jit-input buffer before the in-place row
-# updates. eval_shape gets the aux buffer shapes without paying for a residual
-# evaluation.
 def _history_buffer(tree, history_len):
-    # Row 0 holds the initial value; tree.map over a None tree returns None.
     return jax.tree.map(
         lambda leaf: (
             jnp.zeros((history_len, *jnp.shape(leaf)), jnp.result_type(leaf))
@@ -98,9 +80,6 @@ def _solve_loop_impl(
     history = _init_history(solver, x, args, p, history_len)
     max_steps = jnp.asarray(max_steps, dtype=jnp.int32)
     info = solver._initial_info(x, state, args, p)
-    # Recast the state's scalars (damping, hyperparameters, and any
-    # solver-specific carried scalars) and the tolerances to the residual
-    # dtype so the while_loop carry matches what update() returns.
     atol = jnp.asarray(atol, dtype=info.loss.dtype)
     gtol = jnp.asarray(gtol, dtype=info.loss.dtype)
     xtol = jnp.asarray(xtol, dtype=info.loss.dtype)
@@ -121,11 +100,11 @@ def _solve_loop_impl(
     )
 
     def cond(carry):
-        _, _, _, _, _, _, step, _, stop = carry
+        _, _, _, _, _, _, step, _, stop, _ = carry
         return (~stop) & (step < max_steps)
 
     def body(carry):
-        x, state, args, user_state, history, _, step, _, _ = carry
+        x, state, args, user_state, history, _, step, _, _, _ = carry
         x_old, state_old = x, state
         x, state, info = solver.update(x, state, args, p)
         step = step + jnp.asarray(1, dtype=jnp.int32)
@@ -167,8 +146,6 @@ def _solve_loop_impl(
             if action.status is None
             else jnp.asarray(action.status, dtype=jnp.int32)
         )
-        # info describes the pre-action (x, args); if the action changed them,
-        # the tolerances and any pre-action step failure wait for a fresh update.
         raw_converged = solver._converged(info, atol, gtol, xtol)
         converged = raw_converged & ~problem_changed
         step_failed = (
@@ -199,17 +176,53 @@ def _solve_loop_impl(
                 ),
             ),
         )
-        return x, state, args, user_state, history, info, step, status, stop
+        return (
+            x,
+            state,
+            args,
+            user_state,
+            history,
+            info,
+            step,
+            status,
+            stop,
+            problem_changed,
+        )
 
     carry = jax.lax.while_loop(
         cond,
         body,
-        (x, state, args, user_state, history, info, step, status, stop),
+        (
+            x,
+            state,
+            args,
+            user_state,
+            history,
+            info,
+            step,
+            status,
+            stop,
+            jnp.asarray(False, dtype=jnp.bool_),
+        ),
     )
-    x, state, args, user_state, history, info, step, status, _ = carry
+    x, state, args, user_state, history, info, step, status, _, last_changed = carry
+    if callback is not None:
+        info = jax.lax.cond(
+            last_changed,
+            lambda _: solver._refresh_final_info(info, x, state, args, p),
+            lambda _: info,
+            operand=None,
+        )
     final_aux = None
     if solver.has_aux:
-        final_aux = solver._residual_and_aux(x, args, p)[1]
+        final_aux = solver._residual_and_aux(
+            x,
+            args,
+            p,
+            homotopy=state.homotopy,
+            ineq_weight=state.ineq_weight,
+            ineq_smoothing=state.ineq_smoothing,
+        )[1]
     x_history, aux_history, args_history = _finalize_history(history, step, final_aux)
     return result_cls(
         x,
@@ -256,6 +269,7 @@ def _solve_python_impl(
     initial_state = state
     status = status_cls.RUNNING
     steps = 0
+    last_changed = False
     if not bool(jnp.isfinite(info.loss)):
         status = status_cls.NONFINITE
     elif bool(solver._converged(info, atol, gtol, xtol)):
@@ -289,6 +303,7 @@ def _solve_python_impl(
         action, x, state, args, user_state, problem_changed = solver._apply_action(
             action, x, state, args, user_state
         )
+        last_changed = bool(problem_changed)
         retry_changed = solver._action_rescued(
             action, state, state_old, problem_changed
         )
@@ -303,10 +318,8 @@ def _solve_python_impl(
                 else int(action.status)
             )
             break
-        # info describes the pre-action (x, args); if the action changed
-        # them, the tolerances and any pre-action step failure wait for a fresh update.
         raw_converged = bool(solver._converged(info, atol, gtol, xtol))
-        if raw_converged and not bool(problem_changed):
+        if raw_converged and not last_changed:
             status = status_cls.CONVERGED
             break
         if (
@@ -321,9 +334,18 @@ def _solve_python_impl(
 
     if status == status_cls.RUNNING:
         status = status_cls.MAX_STEPS
+    if callback is not None and last_changed:
+        info = solver._refresh_final_info(info, x, state, args, p)
     final_aux = None
     if solver.has_aux:
-        final_aux = solver._residual_and_aux(x, args, p)[1]
+        final_aux = solver._residual_and_aux(
+            x,
+            args,
+            p,
+            homotopy=state.homotopy,
+            ineq_weight=state.ineq_weight,
+            ineq_smoothing=state.ineq_smoothing,
+        )[1]
     x_history, aux_history, args_history = _finalize_history(history, steps, final_aux)
     return result_cls(
         x,

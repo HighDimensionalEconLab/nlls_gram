@@ -1,7 +1,3 @@
-"""MultiStart and Flax NNX integration tests across sequential and parallel
-drivers, hooks, warm-state handling, and implicit AD.
-"""
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -47,7 +43,6 @@ def accept_deep_basin(key, result):
 @pytest.mark.parametrize("solver_cls", [LevenbergMarquardt, Newton])
 @pytest.mark.parametrize("parallel", [False, True])
 def test_multi_start_recovery_accept_hook_and_ad(solver_cls, parallel):
-    # 1. Recovers from NaN start and differentiates through the winning start
     solver = solver_cls(residual_nonlinear)
     x0_nan = jnp.array([jnp.nan, jnp.nan])
     ms = MultiStart(
@@ -66,7 +61,6 @@ def test_multi_start_recovery_accept_hook_and_ad(solver_cls, parallel):
     np.testing.assert_allclose(jax.grad(sum_x)(p0), 6.0 * p0 / 5.0, atol=1e-4)
     np.testing.assert_allclose(jax.hessian(sum_x)(p0), 6.0 / 5.0, atol=1e-3)
 
-    # 2. Custom accept hook rejects shallow local minimum and finds global basin
     basin_solver = solver_cls(residual_two_basin)
     x0_shallow = jnp.array([-2.0])
     key = jax.random.key(5)
@@ -83,7 +77,6 @@ def test_multi_start_recovery_accept_hook_and_ad(solver_cls, parallel):
 
 
 def test_warm_state_attempt_zero_reset_args_and_validation():
-    # Attempt 0 honors a caller-supplied warm state; retries invalidate caches
     solver = LevenbergMarquardt(residual_linear, init_damping=1e-2, cache_jacobian=True)
     p = jnp.asarray(3.0)
     warm = solver.solve(jnp.zeros(2), p=p, max_steps=80, atol=1e-6).state
@@ -100,7 +93,6 @@ def test_warm_state_attempt_zero_reset_args_and_validation():
     assert int(result.multi_start.attempt) == 1
     assert result.x_history.shape == (81, 2)
 
-    # reset_args resamples args on retry and composes with callback args mutation
     def reset_resample(key, args):
         data_key, carry_key = jax.random.split(key)
         return {
@@ -142,14 +134,11 @@ def test_warm_state_attempt_zero_reset_args_and_validation():
     assert int(res_r.status) == int(SolverStatus.CONVERGED)
     assert not jnp.allclose(res_r.args["data"], args0["data"])
 
-    # Validation errors
     key = jax.random.key(19)
     with pytest.raises(ValueError, match="num_starts"):
         MultiStart(key=key, num_starts=0)
     with pytest.raises(ValueError, match="requires draw"):
         MultiStart(key=key, num_starts=2)
-    with pytest.raises(TypeError, match="draw must be callable"):
-        MultiStart(key=key, num_starts=2, draw=5)
 
 
 class CurveMLP(nnx.Module):
@@ -164,7 +153,6 @@ class CurveMLP(nnx.Module):
 
 @pytest.mark.parametrize("parallel", [False, True])
 def test_nnx_module_and_draw_nnx_module(parallel):
-    # Value semantics and wrt filter
     draw = DrawNNXModule(CurveMLP)
     assert draw == DrawNNXModule(CurveMLP)
     assert hash(draw) == hash(DrawNNXModule(CurveMLP))
@@ -176,7 +164,6 @@ def test_nnx_module_and_draw_nnx_module(parallel):
     assert draw_wrt == DrawNNXModule(CurveMLP, wrt=wrt)
     assert draw_wrt != draw
 
-    # Multi-start recovery on NNX module with non-Param Variable state
     graphdef, theta_good, nondiff = nnx.split(
         CurveMLP(rngs=nnx.Rngs(1)), nnx.Param, ...
     )

@@ -6,7 +6,7 @@
 ::: nlls_gram.Newton
 ::: nlls_gram.AnnealRidge
 
-## Linear solvers
+## Linear solvers and caches
 
 ::: nlls_gram.Cholesky
 ::: nlls_gram.QR
@@ -14,24 +14,23 @@
 ::: nlls_gram.GramCG
 ::: nlls_gram.LU
 ::: nlls_gram.SVD
+::: nlls_gram.CholeskyCache
+::: nlls_gram.QRCache
 
-## Metrics
+## Ridge operators
 
-::: nlls_gram.Metric
-::: nlls_gram.IdentityMetric
-::: nlls_gram.CholeskyMetric
-::: nlls_gram.DiagonalMetric
-::: nlls_gram.RepeatedFactorMetric
+::: nlls_gram.RidgeMetric
+::: nlls_gram.IdentityRidge
+::: nlls_gram.DiagonalRidge
+::: nlls_gram.MatrixRidge
+::: nlls_gram.FactorRidge
+::: nlls_gram.RepeatedFactorRidge
 
 ## Preconditioners
 
 ::: nlls_gram.Preconditioner
 ::: nlls_gram.IdentityPreconditioner
-::: nlls_gram.BlockEigenPreconditioner
-::: nlls_gram.NystromPreconditioner
-::: nlls_gram.ShermanMorrisonPreconditioner
-::: nlls_gram.WoodburyPreconditioner
-::: nlls_gram.PaddedPreconditioner
+::: nlls_gram.DiagonalPreconditioner
 
 ## State and results
 
@@ -52,12 +51,12 @@
 
 ::: nlls_gram.vmap_rows
 ::: nlls_gram.Residuals
+::: nlls_gram.Inequality
+::: nlls_gram.InequalityPenalty
 ::: nlls_gram.Complementarity
 ::: nlls_gram.PDAS
 ::: nlls_gram.FischerBurmeister
 ::: nlls_gram.Minimum
-::: nlls_gram.Equality
-::: nlls_gram.Inequality
 
 ## Multi-start
 

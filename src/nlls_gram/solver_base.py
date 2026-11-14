@@ -1,27 +1,23 @@
-"""``SolverBase`` -- shared solver protocol, linearization, whitening, geodesic
-correction, outer loop driver, and implicit differentiation for
-:class:`~nlls_gram.LevenbergMarquardt` and :class:`~nlls_gram.Newton`.
-"""
-
 import dataclasses
 import functools
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-import jax.scipy.linalg as jsp_linalg
-import jax.scipy.sparse.linalg as jsp_sparse_linalg
 import numpy as np
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram.linear_solvers import (
     CG,
     LU,
+    QR,
     SVD,
     Cholesky,
     GramCG,
+    Subproblem,
     _config_static_key,
 )
-from nlls_gram.metrics import Metric
+from nlls_gram.metrics import IdentityRidge, RidgeMetric
 from nlls_gram.multi_start import (
     MultiStart,
     _accept_converged,
@@ -31,13 +27,17 @@ from nlls_gram.multi_start import (
     _multi_start_python_impl,
     _multi_start_sequential_jit,
 )
+from nlls_gram.preconditioners import (
+    DiagonalPreconditioner,
+    Preconditioner,
+)
 from nlls_gram.solve_loop import _solve_loop_jit, _solve_python_impl
 from nlls_gram.types import (
     PDAS,
     Complementarity,
-    Equality,
     FischerBurmeister,
     Inequality,
+    InequalityPenalty,
     Minimum,
     Residuals,
     SolverAction,
@@ -52,16 +52,18 @@ from nlls_gram.utilities import (
     _where_tree,
     _zero_tangent_leaf,
     canonicalize_residual,
-    mm,
 )
 
 
-# The residual evaluation that sizes the initial state runs outside the jitted
-# loop; keying it on the solver's value means a repeated solve with an equal
-# configuration retraces nothing.
+class _ADKrylovHyper(NamedTuple):
+    iterative_tol: jax.Array
+    iterative_atol: jax.Array
+    iterative_maxiter: int | None
+
+
 @functools.partial(jax.jit, static_argnums=0)
 def _init_residual_and_aux(solver, x, args, p):
-    return solver._residual_and_aux(x, args, p)
+    return solver._eval_residual_and_aux(x, args, p)
 
 
 def _armijo_backtracking(
@@ -74,10 +76,9 @@ def _armijo_backtracking(
     active,
     *,
     a=None,
-    y_m=None,
-    u_m=None,
-    u_a_m=None,
     ridge=None,
+    ridge_metric=None,
+    ctx=None,
     resid_loss_old=None,
     penalty_old=None,
 ):
@@ -123,10 +124,9 @@ def _armijo_backtracking(
         cand_resid = residual_value(cand_theta)
         cand_resid_loss = jnp.sum(cand_resid**2)
         if penalized:
-            step_u_m = (
-                alpha * u_m if u_a_m is None else alpha * u_m + 0.5 * (alpha**2) * u_a_m
+            cand_penalty = jnp.asarray(
+                ridge_metric.quad_form(cand_theta, ctx), dtype=dtype
             )
-            cand_penalty = jnp.sum((y_m + step_u_m) ** 2)
             cand_loss = cand_resid_loss + ridge * cand_penalty
         else:
             cand_penalty = zero
@@ -211,42 +211,6 @@ def _armijo_backtracking(
     )
 
 
-@jax.custom_jvp
-def _svd_pinv(Bt):
-    # Moore-Penrose pseudoinverse X = (Bt^T)^+ of shape (n, m), with the same
-    # rank cutoff max(n, m) * eps * sigma_max as the forward SVD solver.
-    U, sigma, Vt = jnp.linalg.svd(Bt.T, full_matrices=False)
-    cutoff = max(Bt.shape) * jnp.finfo(Bt.dtype).eps * sigma[0]
-    mask = sigma > cutoff
-    safe_sigma = jnp.where(mask, sigma, jnp.ones_like(sigma))
-    inverted = jnp.where(mask, 1.0 / safe_sigma, jnp.zeros_like(sigma))
-    return mm(Vt.T * inverted, U.T)
-
-
-@_svd_pinv.defjvp
-def _svd_pinv_jvp(primals, tangents):
-    (Bt,) = primals
-    (dBt,) = tangents
-    X = _svd_pinv(Bt)
-    # Golub-Pereyra (1973) pseudoinverse derivative for B = Bt^T, dB = dBt^T:
-    #   dX = -X dB X + X X^T dB^T (I_m - B X) + (I_n - X B) dB^T X^T X
-    # Grouped through min(n, m) x min(n, m) products so no large projector is
-    # formed and no 1 / (sigma_i^2 - sigma_j^2) SVD-vector gaps ever appear.
-    if Bt.shape[0] >= Bt.shape[1]:
-        term1 = -mm(X, mm(dBt.T, X))
-        XXt_dBt = mm(X, mm(X.T, dBt))
-        term2 = XXt_dBt - mm(XXt_dBt, mm(Bt.T, X))
-        dBt_XtX = mm(dBt, mm(X.T, X))
-        term3 = dBt_XtX - mm(X, mm(Bt.T, dBt_XtX))
-    else:
-        term1 = -mm(mm(X, dBt.T), X)
-        XXt_dBt = mm(mm(X, X.T), dBt)
-        term2 = XXt_dBt - mm(mm(XXt_dBt, Bt.T), X)
-        dBt_XtX = mm(mm(dBt, X.T), X)
-        term3 = dBt_XtX - mm(mm(X, Bt.T), dBt_XtX)
-    return X, term1 + term2 + term3
-
-
 def _validate_ridge_value(value, name="ridge"):
     if isinstance(value, bool):
         raise ValueError(
@@ -268,13 +232,27 @@ def _validate_ridge_value(value, name="ridge"):
         )
 
 
+def _validate_inequality_config(cfg):
+    if cfg is None:
+        return
+    if not isinstance(cfg, InequalityPenalty):
+        raise TypeError(
+            f"inequality must be an InequalityPenalty or None, got {type(cfg).__name__}"
+        )
+    w = jnp.asarray(cfg.weight)
+    if not isinstance(cfg.weight, jax.core.Tracer):
+        w_np = np.asarray(w)
+        if not np.all(np.isfinite(w_np)) or np.any(w_np < 0.0):
+            raise ValueError("InequalityPenalty.weight must be finite and nonnegative")
+    if cfg.smoothing < 0.0 or cfg.smoothing_min < 0.0:
+        raise ValueError(
+            "InequalityPenalty smoothing and smoothing_min must be nonnegative"
+        )
+    if not (0.0 < cfg.smoothing_decay <= 1.0):
+        raise ValueError("InequalityPenalty.smoothing_decay must lie in (0, 1]")
+
+
 class SolverBase:
-    # Value-based identity: the jitted solve loop marks the solver itself
-    # static, so equal-config solvers built around the same residual share the
-    # compiled loop across instances. Subclasses set _static_key/_static_hash
-    # in __init__ from their constructor arguments; metric/preconditioner
-    # instances key by pytree STRUCTURE (their arrays are threaded through
-    # the carried state, so equal-config fresh instances share one compile).
     def __eq__(self, other):
         if self is other:
             return True
@@ -285,19 +263,14 @@ class SolverBase:
     def __hash__(self):
         return self._static_hash
 
-    # Sealed at the end of each subclass __init__: the configuration keys
-    # the compiled solve loop, so mutate-by-assignment would keep the stale
-    # key and silently reuse another configuration's compilation.
     def __setattr__(self, name, value):
         if getattr(self, "_sealed", False):
             raise AttributeError(
-                f"{type(self).__name__} is frozen after construction: its "
-                "configuration keys the compiled solve loop. Build a new "
-                "solver instead of assigning attributes"
+                f"{type(self).__name__} is frozen after construction; build a "
+                "new solver instead of assigning attributes"
             )
         object.__setattr__(self, name, value)
 
-    _has_metric = False
     penalized = False
     _forward_role_attr = "supports_forward"
 
@@ -305,50 +278,49 @@ class SolverBase:
         self,
         residual_fn,
         *,
-        linear_solver,
-        metric,
         ridge,
+        ridge_metric,
+        linear_solver,
+        ad_solver,
+        jacobian_mode,
+        jacobian_chunk,
         has_aux,
         cache_jacobian,
         geodesic_acceleration,
         geodesic_acceptance_ratio,
-        ad_solver,
-        jacobian_mode,
-        jacobian_chunk,
         complementarity=None,
+        inequality=None,
     ):
-        if not isinstance(has_aux, bool):
-            raise TypeError("has_aux must be a bool")
-        if not isinstance(cache_jacobian, bool):
-            raise TypeError("cache_jacobian must be a bool")
-        if not isinstance(geodesic_acceleration, bool):
-            raise TypeError("geodesic_acceleration must be a bool")
-        if (
-            isinstance(geodesic_acceptance_ratio, bool)
-            or not np.isfinite(float(geodesic_acceptance_ratio))
-            or float(geodesic_acceptance_ratio) < 0.0
-        ):
-            raise ValueError("geodesic_acceptance_ratio must be nonnegative")
-
-        if metric is not None:
-            if not isinstance(metric, Metric):
-                raise TypeError(
-                    f"metric must be a Metric instance, got {type(metric).__name__}"
-                )
-            self._check_registered_instance(metric, "metric")
-
         penalized = ridge is not None
+        if not penalized and ridge_metric is not None:
+            raise ValueError(
+                "ridge_metric requires a positive ridge; outer steps use "
+                "Euclidean geometry and do not accept a step metric"
+            )
         if penalized:
             _validate_ridge_value(ridge, "ridge")
+            if ridge_metric is None:
+                resolved_rm = IdentityRidge()
+            else:
+                if not isinstance(ridge_metric, RidgeMetric):
+                    raise TypeError(
+                        "ridge_metric must be a RidgeMetric instance, got "
+                        f"{type(ridge_metric).__name__}"
+                    )
+                self._check_registered_instance(ridge_metric, "ridge_metric")
+                resolved_rm = ridge_metric
+        else:
+            resolved_rm = None
+
+        _validate_inequality_config(inequality)
 
         self._raw_residual_fn = residual_fn
         self.residual_fn, self.residual_arity = canonicalize_residual(residual_fn)
         self.has_aux = has_aux
         self.linear_solver = linear_solver
-        self.initial_metric = metric
-        self._has_metric = metric is not None
         self.penalized = penalized
         self.initial_ridge = ridge
+        self.initial_ridge_metric = resolved_rm
         self.cache_jacobian = cache_jacobian
         self.geodesic_acceleration = geodesic_acceleration
         self.geodesic_acceptance_ratio = geodesic_acceptance_ratio
@@ -356,15 +328,27 @@ class SolverBase:
         self.jacobian_mode = jacobian_mode
         self.jacobian_chunk = jacobian_chunk
         self.complementarity = complementarity
-        cfg = PDAS() if complementarity is None else complementarity
-        self._resolved_complementarity = cfg
+        self.inequality = inequality
+
+        comp_cfg = PDAS() if complementarity is None else complementarity
+        self._resolved_complementarity = comp_cfg
         self._uses_homotopy_decay = (
-            isinstance(cfg, PDAS) and cfg.tau_init > 0 and cfg.tau_decay < 1.0
+            isinstance(comp_cfg, PDAS)
+            and comp_cfg.tau_init > 0
+            and comp_cfg.tau_decay < 1.0
         ) or (
-            isinstance(cfg, FischerBurmeister)
-            and cfg.mu_init > 0
-            and cfg.mu_decay < 1.0
+            isinstance(comp_cfg, FischerBurmeister)
+            and comp_cfg.mu_init > 0
+            and comp_cfg.mu_decay < 1.0
         )
+        ineq_cfg = InequalityPenalty() if inequality is None else inequality
+        self._resolved_inequality = ineq_cfg
+        self._uses_ineq_decay = (
+            inequality is not None
+            and ineq_cfg.smoothing > 0.0
+            and ineq_cfg.smoothing_decay < 1.0
+        )
+
         self._validate_configuration(linear_solver, ad_solver, penalized=penalized)
 
         krylov = isinstance(linear_solver, (CG, GramCG))
@@ -372,8 +356,21 @@ class SolverBase:
             if linear_solver.preconditioner is None:
                 raise ValueError(
                     "the forward linear_solver requires a preconditioner; "
-                    "IdentityPreconditioner() is the explicit opt-out "
-                    "(preconditioner=None is legal only in the ad_solver role)"
+                    "pass IdentityPreconditioner() for unpreconditioned Krylov "
+                    "(preconditioner=None is legal only in ad_solver)"
+                )
+            if not isinstance(linear_solver.preconditioner, Preconditioner):
+                raise TypeError(
+                    "linear_solver.preconditioner must be a Preconditioner instance"
+                )
+            if (
+                isinstance(linear_solver.preconditioner, DiagonalPreconditioner)
+                and linear_solver.preconditioner.diagonal is None
+            ):
+                raise ValueError(
+                    "DiagonalPreconditioner(diagonal=None) automatic equilibration "
+                    "requires a dense solver (Cholesky or QR); pass an explicit "
+                    "positive diagonal array for CG or GramCG"
                 )
             self._check_registered_instance(
                 linear_solver.preconditioner, "linear_solver.preconditioner"
@@ -383,7 +380,12 @@ class SolverBase:
             self.iterative_atol = linear_solver.atol
             self.iterative_maxiter = linear_solver.maxiter
         else:
-            self.initial_preconditioner = None
+            dense_precond = getattr(linear_solver, "preconditioner", None)
+            if dense_precond is not None:
+                self._check_registered_instance(
+                    dense_precond, "linear_solver.preconditioner"
+                )
+            self.initial_preconditioner = dense_precond
             self.iterative_tol = 0.0
             self.iterative_atol = 0.0
             self.iterative_maxiter = 8
@@ -392,7 +394,6 @@ class SolverBase:
             self.ad_solver_tol = ad_solver.tol
             self.ad_solver_atol = ad_solver.atol
             self.ad_solver_maxiter = ad_solver.maxiter
-            self.ad_solver_penalty = getattr(ad_solver, "penalty", None)
             if ad_solver.preconditioner is None:
                 self.ad_solver_preconditioner = None
                 if self.initial_preconditioner is None:
@@ -408,16 +409,27 @@ class SolverBase:
                 elif self.initial_preconditioner.requires_positive_damping:
                     raise ValueError(
                         "ad_solver preconditioner=None inherits the forward "
-                        "preconditioner, but this one divides by the live "
-                        "damping and cannot serve the undamped AD system"
+                        "preconditioner, which requires positive damping and "
+                        "cannot serve the undamped AD system"
                     )
                 else:
                     self._ad_preconditioner_source = "carried"
             else:
+                if not isinstance(ad_solver.preconditioner, Preconditioner):
+                    raise TypeError(
+                        "ad_solver.preconditioner must be a Preconditioner instance"
+                    )
+                if (
+                    isinstance(ad_solver.preconditioner, DiagonalPreconditioner)
+                    and ad_solver.preconditioner.diagonal is None
+                ):
+                    raise ValueError(
+                        "DiagonalPreconditioner(diagonal=None) requires Cholesky or QR"
+                    )
                 if ad_solver.preconditioner.requires_positive_damping:
                     raise ValueError(
-                        "this preconditioner divides by the live damping and "
-                        "cannot serve in ad_solver (the AD system is undamped)"
+                        "ad_solver.preconditioner requires positive damping and "
+                        "cannot serve the undamped AD system"
                     )
                 self._check_registered_instance(
                     ad_solver.preconditioner, "ad_solver.preconditioner"
@@ -425,26 +437,37 @@ class SolverBase:
                 self.ad_solver_preconditioner = ad_solver.preconditioner
                 self._ad_preconditioner_source = "explicit"
         else:
-            self.ad_solver_tol = None
-            self.ad_solver_atol = 0.0
-            self.ad_solver_maxiter = None
-            self.ad_solver_penalty = (
-                getattr(linear_solver, "penalty", None)
-                if (ad_solver is None and krylov)
-                else None
+            self.ad_solver_tol = (
+                linear_solver.tol if (ad_solver is None and krylov) else None
             )
-            self.ad_solver_preconditioner = None
-            inherit = (
-                ad_solver is None
-                and krylov
-                and not linear_solver.preconditioner.requires_positive_damping
+            self.ad_solver_atol = (
+                linear_solver.atol if (ad_solver is None and krylov) else 0.0
             )
-            self._ad_preconditioner_source = "carried" if inherit else "none"
+            self.ad_solver_maxiter = (
+                linear_solver.maxiter if (ad_solver is None and krylov) else None
+            )
+            ad_precond = getattr(ad_solver, "preconditioner", None)
+            if ad_precond is not None:
+                if ad_precond.requires_positive_damping:
+                    raise ValueError(
+                        "ad_solver.preconditioner requires positive damping and "
+                        "cannot serve the undamped AD system"
+                    )
+                self._check_registered_instance(ad_precond, "ad_solver.preconditioner")
+                self.ad_solver_preconditioner = ad_precond
+                self._ad_preconditioner_source = "explicit"
+            else:
+                self.ad_solver_preconditioner = None
+                inherit = (
+                    ad_solver is None
+                    and self.initial_preconditioner is not None
+                    and not self.initial_preconditioner.requires_positive_damping
+                )
+                self._ad_preconditioner_source = "carried" if inherit else "none"
 
         self.cache_jacobian = cache_jacobian and linear_solver.materializes_jacobian
 
-    def _complementarity_static_key(self):
-        cfg = self.complementarity
+    def _dataclass_static_key(self, cfg):
         if cfg is None:
             return None
         return (
@@ -462,6 +485,14 @@ class SolverBase:
             return jnp.asarray(self.complementarity.mu_init, dtype=dtype)
         return None
 
+    def _initial_ineq_state(self, dtype=None):
+        if self.inequality is None:
+            return None, None
+        return (
+            jnp.asarray(self.inequality.weight, dtype=dtype),
+            jnp.asarray(self.inequality.smoothing, dtype=dtype),
+        )
+
     def _common_static_key(self):
         return (
             _static_key_component(self._raw_residual_fn),
@@ -470,14 +501,15 @@ class SolverBase:
             self.penalized,
             _config_static_key(self.linear_solver, baked=False),
             None
-            if not self._has_metric
-            else jax.tree_util.tree_structure(self.initial_metric),
+            if not self.penalized
+            else jax.tree_util.tree_structure(self.initial_ridge_metric),
             self.cache_jacobian,
             self.geodesic_acceleration,
             _config_static_key(self.ad_solver, baked=True),
             self.jacobian_mode,
             self.jacobian_chunk,
-            self._complementarity_static_key(),
+            self._dataclass_static_key(self.complementarity),
+            self._dataclass_static_key(self.inequality),
         )
 
     def _check_registered_instance(self, instance, keyword):
@@ -489,49 +521,31 @@ class SolverBase:
                 "flattens as a leaf); register the class with "
                 "nlls_gram.register_pytree_dataclass"
             )
-        # A nested unregistered object (e.g. PaddedPreconditioner over an
-        # unregistered base) flattens as an opaque leaf and would fail deep
-        # inside jit instead of here.
         for leaf in jax.tree_util.tree_leaves(instance):
             if not isinstance(
                 leaf, (jax.Array, np.ndarray, np.generic, int, float, complex, bool)
             ):
                 raise TypeError(
                     f"{keyword} contains a non-array leaf of type "
-                    f"{type(leaf).__name__}; register nested "
-                    "metric/preconditioner classes with "
+                    f"{type(leaf).__name__}; register nested classes with "
                     "nlls_gram.register_pytree_dataclass"
                 )
 
     def _validate_configuration(self, linear_solver, ad_solver, penalized):
-        """Reject a config in a role it cannot fill, at construction.
-
-        Without this an unsupported combination resolves to a DIFFERENT
-        algorithm -- ``ad_solver=QR()`` quietly running dense Cholesky, or the
-        ridge objective handing its penalized subproblem to a dual form that
-        never sees the penalty rows.
-        """
-        role = [(linear_solver, "linear_solver", self._forward_role_attr)]
+        roles = [(linear_solver, "linear_solver", self._forward_role_attr)]
         if ad_solver is not None:
-            role.append((ad_solver, "ad_solver", "supports_ad"))
-        for config, keyword, attribute in role:
+            roles.append((ad_solver, "ad_solver", "supports_ad"))
+        for config, keyword, attribute in roles:
             if not getattr(config, attribute):
                 raise ValueError(
                     f"{config!r} cannot serve as {keyword}: it does not "
-                    f"implement that role"
+                    "implement that role"
                 )
             if penalized and not config.supports_penalty:
-                raise ValueError(
-                    f"{config!r} cannot serve as {keyword} for the ridge "
-                    "objective: its operator never sees the penalty rows"
-                )
+                raise ValueError(f"{config!r} cannot serve as {keyword} when ridge > 0")
         if self.jacobian_mode not in ("auto", "fwd", "rev"):
             raise ValueError(f"unknown jacobian_mode: {self.jacobian_mode}")
-        if self.jacobian_chunk is not None and (
-            isinstance(self.jacobian_chunk, bool)
-            or not isinstance(self.jacobian_chunk, int)
-            or self.jacobian_chunk <= 0
-        ):
+        if self.jacobian_chunk is not None and self.jacobian_chunk <= 0:
             raise ValueError("jacobian_chunk must be a positive int or None")
 
     def _resolve_ridge(self, dtype, ridge=None):
@@ -544,9 +558,6 @@ class SolverBase:
         return jnp.asarray(source, dtype=dtype)
 
     def _cold_state(self, state):
-        # Drawn multi-start lanes must not reuse caches built at another
-        # (x, args); damping, ridge, hyper, and the carried instances stay
-        # inherited from the caller's initial state.
         updates = {}
         if state.jacobian_valid is not None:
             updates["jacobian_valid"] = jnp.zeros_like(state.jacobian_valid)
@@ -555,17 +566,11 @@ class SolverBase:
         return dataclasses.replace(state, **updates) if updates else state
 
     def _resolve_jacobian_mode(self, m, n):
-        # "auto" vmaps the identity basis of the SMALL side: n forward-mode
-        # columns when the system is tall or square (n <= m), m reverse-mode
-        # rows only when strictly fat.
         if self.jacobian_mode != "auto":
             return self.jacobian_mode
         return "fwd" if n <= m else "rev"
 
     def _assemble_jt(self, jvp_fn, theta, resid):
-        # The basis goes through the linearization in one batch, or in chunks
-        # of jacobian_chunk so the batched pass's live intermediates scale
-        # with the chunk instead of with m or n.
         def over_basis(fn, size, dtype):
             if self.jacobian_chunk is None or self.jacobian_chunk >= size:
                 return jax.vmap(fn)(jnp.eye(size, dtype=dtype))
@@ -590,125 +595,225 @@ class SolverBase:
         ).T
 
     def _dense_resid_jt_aux(self, eval_base, theta):
-        resid, jvp_fn, (aux, mask) = jax.linearize(eval_base, theta, has_aux=True)
-        return resid, self._assemble_jt(jvp_fn, theta, resid), aux, mask
+        resid, jvp_fn, (aux, meta) = jax.linearize(eval_base, theta, has_aux=True)
+        return resid, self._assemble_jt(jvp_fn, theta, resid), aux, meta
 
     def _eval_residual_and_aux(
-        self, x, args, p, homotopy=None, frozen_mask=None, detach_mask=True
+        self,
+        x,
+        args,
+        p,
+        homotopy=None,
+        ineq_weight=None,
+        ineq_smoothing=None,
+        frozen_mask=None,
+        detach_mask=True,
     ):
         if self.has_aux:
             value, aux = self.residual_fn(x, args, p)
         else:
             value, aux = self.residual_fn(x, args, p), None
-        if isinstance(value, (Equality, Inequality)):
-            raise NotImplementedError(
-                "Equality and Inequality constraints are not yet supported"
-            )
-        if isinstance(value, Complementarity):
-            res_tree, comp = None, value
+
+        if isinstance(value, Inequality):
+            res_tree, ineq_tree, comp = None, value.value, None
+        elif isinstance(value, Complementarity):
+            res_tree, ineq_tree, comp = None, None, value
         elif isinstance(value, Residuals):
-            if value.equality is not None or value.inequality is not None:
-                raise NotImplementedError(
-                    "Equality and Inequality constraints are not yet supported"
+            res_tree = value.residual
+            ineq_raw = value.inequality
+            ineq_tree = ineq_raw.value if isinstance(ineq_raw, Inequality) else ineq_raw
+            comp = value.complementarity
+            if comp is not None and not isinstance(comp, Complementarity):
+                raise TypeError(
+                    "Residuals.complementarity must be a Complementarity(lhs, rhs) "
+                    "instance"
                 )
-            res_tree, comp = value.residual, value.complementarity
+            if res_tree is None and ineq_tree is None and comp is None:
+                raise ValueError(
+                    "Residuals must provide at least one of residual, inequality, "
+                    "or complementarity"
+                )
         else:
-            res_tree, comp = value, None
+            res_tree, ineq_tree, comp = value, None, None
 
         r_eq = None if res_tree is None else ravel_pytree(res_tree)[0]
-        if comp is None:
-            return r_eq, aux, None
+        if ineq_tree is None and comp is None:
+            return r_eq, aux, (None, None)
 
-        lhs = ravel_pytree(comp.lhs)[0]
-        rhs = ravel_pytree(comp.rhs)[0]
-        dtypes = [float, lhs.dtype, rhs.dtype]
+        dtypes = [float]
         if r_eq is not None:
             dtypes.append(r_eq.dtype)
+        if comp is not None:
+            lhs_leaves, lhs_def = jax.tree_util.tree_flatten(comp.lhs)
+            rhs_leaves, rhs_def = jax.tree_util.tree_flatten(comp.rhs)
+            if lhs_def != rhs_def or [jnp.shape(a) for a in lhs_leaves] != [
+                jnp.shape(b) for b in rhs_leaves
+            ]:
+                raise ValueError(
+                    "Complementarity lhs and rhs must have matching pytree "
+                    "structure and shapes"
+                )
+            lhs = ravel_pytree(comp.lhs)[0]
+            rhs = ravel_pytree(comp.rhs)[0]
+            dtypes.extend([lhs.dtype, rhs.dtype])
+        else:
+            lhs = rhs = None
+        if ineq_tree is not None:
+            g_raw = ravel_pytree(ineq_tree)[0]
+            dtypes.append(g_raw.dtype)
+        else:
+            g_raw = None
+
         dtype = jnp.result_type(*dtypes)
+        blocks = []
         if r_eq is not None:
             r_eq = jnp.asarray(r_eq, dtype=dtype)
-        lhs = jnp.asarray(lhs, dtype=dtype)
-        rhs = jnp.asarray(rhs, dtype=dtype)
-        cfg = self._resolved_complementarity
-        c_scale = jnp.asarray(cfg.c_scale, dtype=dtype)
-        w_comp = jnp.asarray(cfg.w_comp, dtype=dtype)
-        a_tilde = lhs / c_scale
-        b_tilde = rhs
+            blocks.append(r_eq)
 
-        if isinstance(cfg, Minimum):
-            r_comp = w_comp * jnp.where(a_tilde <= b_tilde, a_tilde, b_tilde)
-            mask = None
-        elif isinstance(cfg, PDAS):
-            tau = (
-                jnp.asarray(cfg.tau_init, dtype=dtype)
-                if homotopy is None
-                else jnp.asarray(homotopy, dtype=dtype)
-            )
-            if frozen_mask is None:
-                diff = b_tilde - a_tilde
-                hard_mask = jax.lax.stop_gradient((a_tilde <= b_tilde).astype(dtype))
-                safe_tau = jnp.where(tau > 0, tau, jnp.ones_like(tau))
-                soft_mask = jax.nn.sigmoid(diff / safe_tau)
-                if detach_mask:
-                    soft_mask = jax.lax.stop_gradient(soft_mask)
-                mask = jnp.where(tau > 0, soft_mask, hard_mask)
-            else:
-                mask = jax.lax.stop_gradient(jnp.asarray(frozen_mask, dtype=dtype))
-            hard_branch = jnp.where(mask >= 0.5, a_tilde, b_tilde)
-            soft_branch = mask * a_tilde + (1.0 - mask) * b_tilde
-            r_comp = w_comp * jnp.where(tau > 0, soft_branch, hard_branch)
-        else:
-            mu = (
-                jnp.asarray(cfg.mu_init, dtype=dtype)
-                if homotopy is None
-                else jnp.asarray(homotopy, dtype=dtype)
-            )
-            eps_safe = (
-                jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
-                if cfg.eps_safe is None
-                else jnp.asarray(cfg.eps_safe, dtype=dtype)
-            )
-            q = 2.0 * jnp.square(mu) + eps_safe
-            scale = jax.lax.stop_gradient(
-                jnp.maximum(
-                    jnp.maximum(jnp.abs(a_tilde), jnp.abs(b_tilde)), jnp.sqrt(q)
+        mask = None
+        if comp is not None:
+            lhs = jnp.asarray(lhs, dtype=dtype)
+            rhs = jnp.asarray(rhs, dtype=dtype)
+            cfg = self._resolved_complementarity
+            c_scale = jnp.asarray(cfg.c_scale, dtype=dtype)
+            w_comp = jnp.asarray(cfg.w_comp, dtype=dtype)
+            a_tilde = lhs / c_scale
+            b_tilde = rhs
+
+            if isinstance(cfg, Minimum):
+                r_comp = w_comp * jnp.where(a_tilde <= b_tilde, a_tilde, b_tilde)
+            elif isinstance(cfg, PDAS):
+                tau = (
+                    jnp.asarray(cfg.tau_init, dtype=dtype)
+                    if homotopy is None
+                    else jnp.asarray(homotopy, dtype=dtype)
                 )
-            )
-            safe_scale = jnp.where(scale > 0, scale, jnp.ones_like(scale))
-            a_hat = a_tilde / safe_scale
-            b_hat = b_tilde / safe_scale
-            q_hat = q / jnp.square(safe_scale)
-            s_hat = jnp.sqrt(jnp.square(a_hat) + jnp.square(b_hat) + q_hat)
-            apb_hat = a_hat + b_hat
-            pos = apb_hat > 0
-            safe_denom = jnp.where(pos, apb_hat + s_hat, jnp.ones_like(s_hat))
-            fb_hat = jnp.where(
-                pos,
-                (2.0 * a_hat * b_hat - q_hat) / safe_denom,
-                apb_hat - s_hat,
-            )
-            r_comp = w_comp * safe_scale * fb_hat
-            mask = None
+                if frozen_mask is None:
+                    diff = b_tilde - a_tilde
+                    hard_mask = jax.lax.stop_gradient(
+                        (a_tilde <= b_tilde).astype(dtype)
+                    )
+                    safe_tau = jnp.where(tau > 0, tau, jnp.ones_like(tau))
+                    soft_mask = jax.nn.sigmoid(diff / safe_tau)
+                    if detach_mask:
+                        soft_mask = jax.lax.stop_gradient(soft_mask)
+                    mask = jnp.where(tau > 0, soft_mask, hard_mask)
+                else:
+                    mask = jax.lax.stop_gradient(jnp.asarray(frozen_mask, dtype=dtype))
+                hard_branch = jnp.where(mask >= 0.5, a_tilde, b_tilde)
+                soft_branch = mask * a_tilde + (1.0 - mask) * b_tilde
+                r_comp = w_comp * jnp.where(tau > 0, soft_branch, hard_branch)
+            else:
+                mu = (
+                    jnp.asarray(cfg.mu_init, dtype=dtype)
+                    if homotopy is None
+                    else jnp.asarray(homotopy, dtype=dtype)
+                )
+                eps_safe = (
+                    jnp.asarray(jnp.finfo(dtype).tiny, dtype=dtype)
+                    if cfg.eps_safe is None
+                    else jnp.asarray(cfg.eps_safe, dtype=dtype)
+                )
+                q = 2.0 * jnp.square(mu) + eps_safe
+                scale = jax.lax.stop_gradient(
+                    jnp.maximum(
+                        jnp.maximum(jnp.abs(a_tilde), jnp.abs(b_tilde)), jnp.sqrt(q)
+                    )
+                )
+                safe_scale = jnp.where(scale > 0, scale, jnp.ones_like(scale))
+                a_hat = a_tilde / safe_scale
+                b_hat = b_tilde / safe_scale
+                q_hat = q / jnp.square(safe_scale)
+                s_hat = jnp.sqrt(jnp.square(a_hat) + jnp.square(b_hat) + q_hat)
+                apb_hat = a_hat + b_hat
+                pos = apb_hat > 0
+                safe_denom = jnp.where(pos, apb_hat + s_hat, jnp.ones_like(s_hat))
+                fb_hat = jnp.where(
+                    pos,
+                    (2.0 * a_hat * b_hat - q_hat) / safe_denom,
+                    apb_hat - s_hat,
+                )
+                r_comp = w_comp * safe_scale * fb_hat
+            blocks.append(r_comp)
 
-        resid = r_comp if r_eq is None else jnp.concatenate([r_eq, r_comp], axis=0)
-        return resid, aux, mask
+        ineq_metrics = None
+        if g_raw is not None:
+            g = jnp.asarray(g_raw, dtype=dtype)
+            zero = jnp.zeros((), dtype=dtype)
+            eq_loss = jnp.sum(r_eq**2) if r_eq is not None else zero
+            viol = jnp.maximum(-g, jnp.zeros_like(g))
+            viol_norm = jnp.linalg.norm(viol)
+            max_viol = jnp.max(viol, initial=zero)
+            ineq_metrics = (
+                jax.lax.stop_gradient(eq_loss),
+                jax.lax.stop_gradient(viol_norm),
+                jax.lax.stop_gradient(max_viol),
+            )
+
+            icfg = self._resolved_inequality
+            w = (
+                jnp.asarray(icfg.weight, dtype=dtype)
+                if ineq_weight is None
+                else jnp.asarray(ineq_weight, dtype=dtype)
+            )
+            if w.ndim > 0 and w.shape != g.shape:
+                raise ValueError(
+                    f"InequalityPenalty weight shape {w.shape} does not match "
+                    f"inequality margin shape {g.shape}"
+                )
+            tau_i = (
+                jnp.asarray(icfg.smoothing, dtype=dtype)
+                if ineq_smoothing is None
+                else jnp.asarray(ineq_smoothing, dtype=dtype)
+            )
+            neg = g < 0
+            psi_exact = jnp.where(neg, g, jnp.zeros_like(g))
+            tau_pos = tau_i > 0
+            safe_tau_i = jnp.where(tau_pos, tau_i, jnp.ones_like(tau_i))
+            g_neg = jnp.where(tau_pos & neg, g, jnp.zeros_like(g))
+            g_pos = jnp.where(tau_pos & (~neg), g, jnp.zeros_like(g))
+            psi_smooth = jnp.where(
+                neg,
+                g_neg - safe_tau_i * jax.nn.softplus(g_neg / safe_tau_i),
+                -safe_tau_i * jax.nn.softplus(-g_pos / safe_tau_i),
+            )
+            psi = jnp.where(tau_pos, psi_smooth, psi_exact)
+
+            w_pos = w > 0
+            sqrt_w = jnp.where(
+                w_pos,
+                jnp.sqrt(jnp.where(w_pos, w, jnp.ones_like(w))),
+                jnp.zeros_like(w),
+            )
+            blocks.append(sqrt_w * psi)
+
+        resid = blocks[0] if len(blocks) == 1 else jnp.concatenate(blocks, axis=0)
+        return resid, aux, (mask, ineq_metrics)
 
     def _residual_and_aux(
-        self, x, args, p, homotopy=None, frozen_mask=None, detach_mask=True
+        self,
+        x,
+        args,
+        p,
+        homotopy=None,
+        ineq_weight=None,
+        ineq_smoothing=None,
+        frozen_mask=None,
+        detach_mask=True,
     ):
         resid, aux, _ = self._eval_residual_and_aux(
             x,
             args,
             p,
             homotopy=homotopy,
+            ineq_weight=ineq_weight,
+            ineq_smoothing=ineq_smoothing,
             frozen_mask=frozen_mask,
             detach_mask=detach_mask,
         )
         return resid, aux
 
     def _check_residual_args(self, args, p):
-        # Silently dropping args/p a residual never sees would, in particular,
-        # make the implicit derivative with respect to p a silent zero.
         if args is not None and self.residual_arity < 2:
             raise ValueError(
                 "args was passed but residual_fn takes only (x); "
@@ -722,16 +827,24 @@ class SolverBase:
 
     def _linearize_step(self, theta, unravel, state, args, p):
         homotopy = state.homotopy
+        ineq_weight = state.ineq_weight
+        ineq_smoothing = state.ineq_smoothing
 
         def eval_base(th):
-            resid, aux, mask = self._eval_residual_and_aux(
-                unravel(th), args, p, homotopy=homotopy, frozen_mask=None
+            resid, aux, meta = self._eval_residual_and_aux(
+                unravel(th),
+                args,
+                p,
+                homotopy=homotopy,
+                ineq_weight=ineq_weight,
+                ineq_smoothing=ineq_smoothing,
+                frozen_mask=None,
             )
-            return resid, (aux, mask)
+            return resid, (aux, meta)
 
         jvp_fn = JT = Jt = None
         if not self.linear_solver.materializes_jacobian:
-            resid, jvp_fn, (aux, base_mask) = jax.linearize(
+            resid, jvp_fn, (aux, base_meta) = jax.linearize(
                 eval_base, theta, has_aux=True
             )
             transpose_fn = jax.linear_transpose(jvp_fn, theta)
@@ -745,35 +858,49 @@ class SolverBase:
                     "cache_jacobian=True requires a state initialized with "
                     "cache_jacobian=True; call solver.init(x, args, p=p)"
                 )
-            need_mask = jax.eval_shape(eval_base, theta)[1][1] is not None
+            meta_shapes = jax.eval_shape(eval_base, theta)[1][1]
+            need_meta = meta_shapes[0] is not None or meta_shapes[1] is not None
 
             def fresh_dense(_):
                 return self._dense_resid_jt_aux(eval_base, theta)
 
             def cached_dense(_):
-                mask = (
+                meta = (
                     self._eval_residual_and_aux(
-                        unravel(theta), args, p, homotopy=homotopy, frozen_mask=None
+                        unravel(theta),
+                        args,
+                        p,
+                        homotopy=homotopy,
+                        ineq_weight=ineq_weight,
+                        ineq_smoothing=ineq_smoothing,
+                        frozen_mask=None,
                     )[2]
-                    if need_mask
-                    else None
+                    if need_meta
+                    else (None, None)
                 )
-                return state.resid, state.Jt, state.aux, mask
+                return state.resid, state.Jt, state.aux, meta
 
-            resid, Jt, aux, base_mask = jax.lax.cond(
+            resid, Jt, aux, base_meta = jax.lax.cond(
                 ~state.jacobian_valid,
                 fresh_dense,
                 cached_dense,
                 operand=None,
             )
         else:
-            resid, Jt, aux, base_mask = self._dense_resid_jt_aux(eval_base, theta)
+            resid, Jt, aux, base_meta = self._dense_resid_jt_aux(eval_base, theta)
 
+        base_mask, base_ineq = base_meta
         if self.has_aux:
 
             def residual_flat(th):
                 return self._residual_and_aux(
-                    unravel(th), args, p, homotopy=homotopy, frozen_mask=base_mask
+                    unravel(th),
+                    args,
+                    p,
+                    homotopy=homotopy,
+                    ineq_weight=ineq_weight,
+                    ineq_smoothing=ineq_smoothing,
+                    frozen_mask=base_mask,
                 )
 
             def residual_value(th):
@@ -783,19 +910,66 @@ class SolverBase:
 
             def residual_flat(th):
                 return self._residual_and_aux(
-                    unravel(th), args, p, homotopy=homotopy, frozen_mask=base_mask
+                    unravel(th),
+                    args,
+                    p,
+                    homotopy=homotopy,
+                    ineq_weight=ineq_weight,
+                    ineq_smoothing=ineq_smoothing,
+                    frozen_mask=base_mask,
                 )[0]
 
             residual_value = residual_flat
 
-        return residual_flat, residual_value, resid, Jt, jvp_fn, JT, aux, base_mask
+        return (
+            residual_flat,
+            residual_value,
+            resid,
+            Jt,
+            jvp_fn,
+            JT,
+            aux,
+            base_mask,
+            base_ineq,
+        )
 
     def _homotopy_active(self, homotopy):
         if homotopy is None or not self._uses_homotopy_decay:
             return jnp.asarray(False, dtype=jnp.bool_)
-        return homotopy > jnp.zeros((), dtype=homotopy.dtype)
+        floor = jnp.asarray(
+            self._resolved_complementarity.tau_min
+            if isinstance(self._resolved_complementarity, PDAS)
+            else self._resolved_complementarity.mu_min,
+            dtype=homotopy.dtype,
+        )
+        return homotopy > floor
 
-    def _post_step_complementarity(
+    def _ineq_smoothing_active(self, ineq_smoothing):
+        if ineq_smoothing is None or not self._uses_ineq_decay:
+            return jnp.asarray(False, dtype=jnp.bool_)
+        floor = jnp.asarray(
+            self._resolved_inequality.smoothing_min, dtype=ineq_smoothing.dtype
+        )
+        return ineq_smoothing > floor
+
+    def _decay_scalar(self, val, decay, min_val, improved, subproblem_solved, dtype):
+        zero = jnp.zeros((), dtype=dtype)
+        eps = jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype)
+        eps_sqrt = jnp.sqrt(eps)
+        floor = jnp.maximum(
+            jnp.asarray(min_val, dtype=dtype),
+            eps_sqrt if min_val == 0.0 else eps,
+        )
+        should_decay = (improved | subproblem_solved) & (
+            val > jnp.asarray(min_val, dtype=dtype)
+        )
+        decayed = val * jnp.asarray(decay, dtype=dtype)
+        target = jnp.asarray(min_val, dtype=dtype) if min_val > 0.0 else zero
+        next_val = jnp.where(decayed <= floor, target, decayed)
+        new_val = jnp.where(should_decay, next_val, val)
+        return new_val, new_val != val
+
+    def _post_step_constraints(
         self,
         theta_new,
         unravel,
@@ -809,15 +983,28 @@ class SolverBase:
         ridge,
         grad_norm,
         base_mask,
+        base_ineq,
     ):
         dtype = loss.dtype
-        zero = jnp.zeros((), dtype=dtype)
         has_pdas = base_mask is not None
         has_homotopy = state.homotopy is not None
-        if not has_pdas and not has_homotopy:
-            false_val = jnp.asarray(False, dtype=jnp.bool_)
-            return loss, resid_loss, None, false_val, false_val
+        has_ineq = base_ineq is not None
+        has_ineq_state = state.ineq_smoothing is not None
+        false_val = jnp.asarray(False, dtype=jnp.bool_)
 
+        if not has_pdas and not has_homotopy and not has_ineq and not has_ineq_state:
+            return (
+                loss,
+                resid_loss,
+                None,
+                None,
+                false_val,
+                None,
+                false_val,
+                None,
+            )
+
+        eps_sqrt = jnp.sqrt(jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype))
         if has_homotopy:
             cfg = self._resolved_complementarity
             if isinstance(cfg, PDAS):
@@ -826,148 +1013,135 @@ class SolverBase:
                 decay, min_val = cfg.mu_decay, cfg.mu_min
             eta = jnp.asarray(state.homotopy, dtype=dtype)
             if decay < 1.0:
-                eps_sqrt = jnp.sqrt(jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype))
-                subproblem_tol = jnp.maximum(1e-2 * eta, eps_sqrt)
-                subproblem_solved = (grad_norm <= subproblem_tol) | (
-                    jnp.sqrt(resid_loss) <= subproblem_tol
+                tol = jnp.maximum(1e-2 * eta, eps_sqrt)
+                solved = (grad_norm <= tol) | (jnp.sqrt(resid_loss) <= tol)
+                new_homotopy, homotopy_changed = self._decay_scalar(
+                    eta, decay, min_val, improved, solved, dtype
                 )
-                should_decay = (improved | subproblem_solved) & (eta > zero)
-                decayed = eta * jnp.asarray(decay, dtype=dtype)
-                floor = jnp.maximum(
-                    jnp.asarray(min_val, dtype=dtype),
-                    eps_sqrt
-                    if min_val == 0.0
-                    else jnp.asarray(jnp.finfo(dtype).eps, dtype=dtype),
-                )
-                next_eta = jnp.where(decayed <= floor, zero, decayed)
-                new_homotopy = jnp.where(should_decay, next_eta, eta)
-                homotopy_changed = new_homotopy != eta
             else:
-                new_homotopy = eta
-                homotopy_changed = jnp.asarray(False, dtype=jnp.bool_)
+                new_homotopy, homotopy_changed = eta, false_val
         else:
-            new_homotopy = None
-            homotopy_changed = jnp.asarray(False, dtype=jnp.bool_)
+            new_homotopy, homotopy_changed = None, false_val
 
-        need_refresh = improved | homotopy_changed
+        if has_ineq_state:
+            icfg = self._resolved_inequality
+            tau_i = jnp.asarray(state.ineq_smoothing, dtype=dtype)
+            if icfg.smoothing_decay < 1.0:
+                tol_i = jnp.maximum(1e-2 * tau_i, eps_sqrt)
+                solved_i = grad_norm <= tol_i
+                new_ineq_smoothing, ineq_smoothing_changed = self._decay_scalar(
+                    tau_i,
+                    icfg.smoothing_decay,
+                    icfg.smoothing_min,
+                    improved,
+                    solved_i,
+                    dtype,
+                )
+            else:
+                new_ineq_smoothing, ineq_smoothing_changed = tau_i, false_val
+        else:
+            new_ineq_smoothing, ineq_smoothing_changed = None, false_val
 
-        def refresh(_):
-            fresh_resid, _, fresh_mask = self._eval_residual_and_aux(
-                unravel(theta_new),
-                args,
-                p,
-                homotopy=new_homotopy,
-                frozen_mask=None,
+        schedule_changed = homotopy_changed | ineq_smoothing_changed
+        need_refresh = improved | schedule_changed
+
+        if has_pdas or has_homotopy or has_ineq:
+
+            def refresh(_):
+                fresh_resid, _, (fresh_mask, fresh_ineq) = self._eval_residual_and_aux(
+                    unravel(theta_new),
+                    args,
+                    p,
+                    homotopy=new_homotopy,
+                    ineq_weight=state.ineq_weight,
+                    ineq_smoothing=new_ineq_smoothing,
+                    frozen_mask=None,
+                )
+                fresh_resid_loss = jnp.sum(fresh_resid**2)
+                fresh_loss = (
+                    fresh_resid_loss + ridge * penalty_value
+                    if self.penalized
+                    else fresh_resid_loss
+                )
+                mask_flipped = (
+                    jnp.any((fresh_mask >= 0.5) != (base_mask >= 0.5))
+                    if has_pdas
+                    else false_val
+                )
+                return fresh_loss, fresh_resid_loss, mask_flipped, fresh_ineq
+
+            def keep(_):
+                return loss, resid_loss, false_val, base_ineq
+
+            loss, resid_loss, mask_flipped, out_ineq = jax.lax.cond(
+                need_refresh, refresh, keep, operand=None
             )
-            fresh_resid_loss = jnp.sum(fresh_resid**2)
-            fresh_loss = (
-                fresh_resid_loss + ridge * penalty_value
-                if self.penalized
-                else fresh_resid_loss
-            )
-            mask_flipped = (
-                jnp.any((fresh_mask >= 0.5) != (base_mask >= 0.5))
-                if has_pdas
-                else jnp.asarray(False, dtype=jnp.bool_)
-            )
-            return fresh_loss, fresh_resid_loss, mask_flipped
+        else:
+            mask_flipped = false_val
+            out_ineq = None
 
-        def keep(_):
-            return loss, resid_loss, jnp.asarray(False, dtype=jnp.bool_)
-
-        loss, resid_loss, mask_flipped = jax.lax.cond(
-            need_refresh, refresh, keep, operand=None
+        comp_changed = (
+            homotopy_changed | mask_flipped | self._homotopy_active(new_homotopy)
         )
-        homotopy_active = self._homotopy_active(new_homotopy)
-        comp_changed = homotopy_changed | mask_flipped | homotopy_active
-        return loss, resid_loss, new_homotopy, comp_changed, homotopy_changed
-
-    def _block_sizes(self, theta_size):
-        # With an explicit Metric, the metric block covers the leading
-        # metric.size coordinates and the rest is free. Without an explicit
-        # Metric, unpenalized mode puts all coordinates in the free block
-        # (n_m = 0), while ridge mode penalizes all coordinates under the
-        # Euclidean identity metric (n_m = theta_size, n_f = 0).
-        if not self._has_metric:
-            return (theta_size, 0) if self.penalized else (0, theta_size)
-        n_f = theta_size - self.initial_metric.size
-        if n_f < 0:
-            raise ValueError(
-                f"the metric covers {self.initial_metric.size} leading "
-                f"coordinates but x flattens to only {theta_size}; the free "
-                "block is len(x) - metric.size and must be nonnegative"
-            )
-        return self.initial_metric.size, n_f
+        ineq_changed = (
+            ineq_smoothing_changed | self._ineq_smoothing_active(new_ineq_smoothing)
+            if has_ineq
+            else None
+        )
+        return (
+            loss,
+            resid_loss,
+            new_homotopy,
+            new_ineq_smoothing,
+            comp_changed,
+            ineq_changed,
+            schedule_changed,
+            out_ineq,
+        )
 
     def _resolved_state(self, state):
-        # A hand-built pre-seeding state reads through the constructor
-        # instances; states from init/solve carry their own. The resolved
-        # view is ephemeral (ctx only) -- update passes the input fields
-        # through, so a user's own while_loop carry keeps its structure.
-        metric = self.initial_metric if state.metric is None else state.metric
+        if not self.penalized and state.ridge_metric is not None:
+            raise ValueError(
+                "state.ridge_metric requires ridge > 0; outer steps use "
+                "Euclidean geometry"
+            )
+        rm = (
+            self.initial_ridge_metric
+            if (self.penalized and state.ridge_metric is None)
+            else state.ridge_metric
+        )
         precond = (
             self.initial_preconditioner
             if state.preconditioner is None
             else state.preconditioner
         )
-        if metric is state.metric and precond is state.preconditioner:
+        if rm is state.ridge_metric and precond is state.preconditioner:
             return state
-        return dataclasses.replace(state, metric=metric, preconditioner=precond)
+        return dataclasses.replace(state, ridge_metric=rm, preconditioner=precond)
 
-    def _factor_apply_metric_block(self, v_m, ctx, dtype):
-        metric = ctx.state.metric
-        if metric is None:
-            return jnp.asarray(v_m, dtype=dtype)
-        return jnp.asarray(metric.factor_apply(v_m, ctx), dtype=dtype)
+    def _solver_space_and_form(self, solver_cfg, m, n, ridge_metric, *, damped):
+        if isinstance(solver_cfg, (Cholesky, QR)):
+            form = solver_cfg.resolve_form(
+                m, n, self.penalized, ridge_metric, damped=damped
+            )
+            space = "residual" if form == "gram" else "parameter"
+            return space, form
+        if isinstance(solver_cfg, GramCG):
+            return "residual", "gram"
+        if isinstance(solver_cfg, CG):
+            return "parameter", "normal"
+        if isinstance(solver_cfg, LU):
+            return "parameter", "lu"
+        return "parameter", "svd"
 
-    # The solver-internal extension F_bar = blockdiag(F, sqrt(free_scale) I):
-    # the CARRIED metric's factor op on the metric block, a scalar on the
-    # free block. Applied to vectors or leading-axis-batched matrices; F_bar
-    # itself is never materialized. When metric is None (Euclidean identity),
-    # F_bar = I and the ops return v directly.
-    def _scaled_free(self, v, metric):
-        return v / jnp.sqrt(jnp.asarray(metric.free_scale, v.dtype))
-
-    def _extended_solve(self, v, ctx):
-        metric = ctx.state.metric
-        if metric is None:
-            return v
-        n_m = metric.size
-        if n_m == 0:
-            return self._scaled_free(v, metric)
-        if v.shape[0] == n_m:
-            return metric.factor_solve(v, ctx)
-        return jnp.concatenate(
-            [metric.factor_solve(v[:n_m], ctx), self._scaled_free(v[n_m:], metric)],
-            axis=0,
-        )
-
-    def _extended_solve_transpose(self, v, ctx):
-        metric = ctx.state.metric
-        if metric is None:
-            return v
-        n_m = metric.size
-        if n_m == 0:
-            return self._scaled_free(v, metric)
-        if v.shape[0] == n_m:
-            return metric.factor_solve_transpose(v, ctx)
-        return jnp.concatenate(
-            [
-                metric.factor_solve_transpose(v[:n_m], ctx),
-                self._scaled_free(v[n_m:], metric),
-            ],
-            axis=0,
-        )
-
-    def _base_objective(self, resid, theta, n_m, n_f, state, ctx):
+    def _base_objective(self, resid, theta, state, ctx):
         dtype = resid.dtype
         resid_loss_old = jnp.sum(resid**2)
         if not self.penalized:
             return (
                 jnp.zeros((), dtype=dtype),
-                jnp.zeros(n_m, dtype=dtype),
                 None,
-                jnp.zeros_like(theta, dtype=dtype),
+                jnp.zeros_like(theta),
                 resid_loss_old,
                 resid_loss_old,
             )
@@ -976,17 +1150,14 @@ class SolverBase:
                 "the state has no ridge; create it with init(x, args, p=p)"
             )
         ridge = jnp.asarray(state.ridge, dtype=dtype)
-        y_m = self._factor_apply_metric_block(theta[:n_m], ctx, dtype)
-        penalty_value_old = jnp.sum(y_m**2)
-        penalty_gradient = (
-            y_m if n_f == 0 else jnp.concatenate([y_m, jnp.zeros(n_f, dtype=dtype)])
-        )
+        rm = ctx.state.ridge_metric
+        penalty_grad = jnp.asarray(rm.matvec(theta, ctx), dtype=dtype)
+        penalty_value_old = jnp.asarray(rm.quad_form(theta, ctx), dtype=dtype)
         loss_old = resid_loss_old + ridge * penalty_value_old
         return (
             ridge,
-            y_m,
             penalty_value_old,
-            penalty_gradient,
+            penalty_grad,
             resid_loss_old,
             loss_old,
         )
@@ -996,63 +1167,48 @@ class SolverBase:
         residual_flat,
         theta,
         velocity,
-        velocity_sub,
-        correction_fn,
-        ctx,
+        solve_residual_rhs,
         geodesic_acceptance_ratio,
         dtype,
     ):
-        def first_jvp(th):
-            return jax.jvp(residual_flat, (th,), (velocity,), has_aux=self.has_aux)[1]
+        v_detached = jax.lax.stop_gradient(velocity)
 
-        f_vv = jax.jvp(first_jvp, (theta,), (velocity,))[1]
-        acceleration_sub = correction_fn(f_vv)
-        acceleration = jnp.asarray(
-            self._extended_solve(acceleration_sub, ctx), dtype=dtype
-        )
+        def first_jvp(th):
+            return jax.jvp(residual_flat, (th,), (v_detached,), has_aux=self.has_aux)[1]
+
+        r_vv = jax.jvp(first_jvp, (theta,), (v_detached,))[1]
+        acceleration = jnp.asarray(solve_residual_rhs(r_vv), dtype=dtype)
         zero = jnp.zeros((), dtype=dtype)
         acceleration_ratio = (
             2.0
-            * jnp.linalg.norm(acceleration_sub)
-            / (jnp.linalg.norm(velocity_sub) + jnp.finfo(dtype).eps)
+            * jnp.linalg.norm(acceleration)
+            / (jnp.linalg.norm(velocity) + jnp.finfo(dtype).eps)
         )
         ratio_accepted = (
             (geodesic_acceptance_ratio > zero)
             & (acceleration_ratio > zero)
             & (acceleration_ratio <= geodesic_acceptance_ratio)
         )
-        return (
-            acceleration_sub,
-            acceleration,
-            acceleration_ratio,
-            ratio_accepted,
-        )
+        return acceleration, acceleration_ratio, ratio_accepted
 
-    def _ad_linearization(self, x, args, p, p_dot, homotopy=None):
+    def _ad_linearization(
+        self, x, args, p, homotopy=None, ineq_weight=None, ineq_smoothing=None
+    ):
         theta, unravel = ravel_pytree(x)
 
-        def residual_from_theta(theta_value):
+        def eval_for_ad(theta_value, p_value):
             return self._residual_and_aux(
                 unravel(theta_value),
                 args,
-                p,
-                homotopy=homotopy,
-                detach_mask=False,
-            )[0]
-
-        residual, theta_jvp = jax.linearize(residual_from_theta, theta)
-
-        def residual_from_p(p_value):
-            return self._residual_and_aux(
-                x,
-                args,
                 p_value,
                 homotopy=homotopy,
+                ineq_weight=ineq_weight,
+                ineq_smoothing=ineq_smoothing,
                 detach_mask=False,
-            )[0]
+            )
 
-        residual_p_dot = jax.jvp(residual_from_p, (p,), (p_dot,))[1]
-        return theta, unravel, residual, theta_jvp, residual_p_dot
+        (residual, _), lin_fn = jax.linearize(eval_for_ad, theta, p)
+        return theta, unravel, residual, lin_fn
 
     def _ad_cg_tol(self, dtype):
         if self.ad_solver_tol is not None:
@@ -1061,8 +1217,6 @@ class SolverBase:
         return jnp.asarray(default_tol, dtype=dtype)
 
     def _ad_preconditioner(self, state):
-        # "carried": the forward instance at the solution, callback refreshes
-        # included; "explicit": the ad_solver's own baked instance.
         if self._ad_preconditioner_source == "carried":
             return state.preconditioner
         if self._ad_preconditioner_source == "explicit":
@@ -1077,11 +1231,6 @@ class SolverBase:
         )
 
     def _check_instance_structure(self, new, previous, name):
-        # Trace-time guard mirroring the hyper contract: a replaced instance
-        # must be the same registered type with matching static fields and
-        # leaf avals -- weak type included, since a weak/strong scalar swap
-        # passes the while-loop carry's physical checks but retraces the body
-        # under different promotion rules.
         def spec(tree):
             leaves, treedef = jax.tree_util.tree_flatten(tree)
             return treedef, [
@@ -1106,13 +1255,9 @@ class SolverBase:
         if action is None:
             action = SolverAction()
         action_state = action.state
-        # The step's diagnostics and every cache describe the pre-action
-        # problem, so they are stale iff the action actually changed the
-        # values -- a traced comparison, so a jit-style callback that returns
-        # the field every step with unchanged values changes nothing.
         xargs_changed = jnp.asarray(False)
         state_changed = jnp.asarray(False)
-        metric_changed = jnp.asarray(False)
+        rm_changed = jnp.asarray(False)
         if action.x is not None:
             xargs_changed = xargs_changed | _tree_changed(action.x, x)
             x = action.x
@@ -1123,12 +1268,9 @@ class SolverBase:
                 raise ValueError(
                     "cache_jacobian=True but the callback action returned a "
                     "state without the Jacobian cache; use "
-                    "dataclasses.replace(ctx.state, ...) to preserve the "
-                    "cache fields"
+                    "dataclasses.replace(ctx.state, ...) to preserve cache fields"
                 )
             self._check_action_state(state)
-            # Trace-time guard so the hyper contract fails identically with
-            # and without jit (jit would reject the carry mismatch anyway).
             previous_hyper = previous.hyper
             if previous_hyper is not None:
                 if state.hyper is None or (
@@ -1138,9 +1280,7 @@ class SolverBase:
                     raise ValueError(
                         "the callback action changed the structure or dtypes of "
                         "state.hyper; reset values with "
-                        "dataclasses.replace(ctx.state.hyper, ...) using arrays of "
-                        "the same dtype — a knob constructed as None cannot be "
-                        "enabled mid-solve"
+                        "dataclasses.replace(ctx.state.hyper, ...)"
                     )
                 for prev_leaf, new_leaf in zip(
                     jax.tree_util.tree_leaves(previous_hyper),
@@ -1157,9 +1297,7 @@ class SolverBase:
                         raise ValueError(
                             "the callback action changed the structure or dtypes of "
                             "state.hyper; reset values with "
-                            "dataclasses.replace(ctx.state.hyper, ...) using arrays of "
-                            "the same dtype — a knob constructed as None cannot be "
-                            "enabled mid-solve"
+                            "dataclasses.replace(ctx.state.hyper, ...)"
                         )
                 state = dataclasses.replace(
                     state,
@@ -1171,21 +1309,17 @@ class SolverBase:
                         state.hyper,
                     ),
                 )
-            if self._has_metric:
-                self._check_instance_structure(state.metric, previous.metric, "metric")
-                # A changed metric moves the ridge objective (suppressing this
-                # step's convergence test) but only re-whitens the unpenalized
-                # solver's; both stale the whitening-dependent solver caches,
-                # neither the Jacobian cache -- J = dr/dx does not see the
-                # metric. Preconditioner changes are deliberately not compared:
-                # staleness only moves the CG iteration path.
-                metric_changed = _tree_changed(state.metric, previous.metric)
+            if self.penalized:
+                self._check_instance_structure(
+                    state.ridge_metric, previous.ridge_metric, "ridge_metric"
+                )
+                rm_changed = _tree_changed(state.ridge_metric, previous.ridge_metric)
             self._check_instance_structure(
                 state.preconditioner, previous.preconditioner, "preconditioner"
             )
             state, state_changed = self._apply_action_state(state, previous)
             if self.penalized:
-                state_changed = state_changed | metric_changed
+                state_changed = state_changed | rm_changed
         if action.args is not None:
             xargs_changed = xargs_changed | _tree_changed(action.args, args)
             args = action.args
@@ -1193,8 +1327,6 @@ class SolverBase:
             user_state = action.user_state
         problem_changed = xargs_changed | state_changed
         if action.x is not None or action.args is not None:
-            # The Jacobian cache describes the pre-action (x, args) and is
-            # stale once either moves.
             if state.jacobian_valid is not None:
                 state = dataclasses.replace(
                     state, jacobian_valid=state.jacobian_valid & ~xargs_changed
@@ -1202,22 +1334,20 @@ class SolverBase:
         touched = (
             action.x is not None or action.args is not None or action_state is not None
         )
-        state = self._invalidate_caches(
-            state, action, touched, problem_changed | metric_changed
-        )
+        state = self._invalidate_caches(state, touched, problem_changed | rm_changed)
         return action, x, state, args, user_state, problem_changed
 
     def _action_rescued(self, action, state, previous, problem_changed):
         if action is None or action.state is None:
             return problem_changed
-        metric_changed = (
-            _tree_changed(state.metric, previous.metric)
-            if self._has_metric
+        rm_changed = (
+            _tree_changed(state.ridge_metric, previous.ridge_metric)
+            if self.penalized
             else jnp.asarray(False)
         )
         hyper_changed = _tree_changed(state.hyper, previous.hyper)
         precond_changed = _tree_changed(state.preconditioner, previous.preconditioner)
-        return problem_changed | metric_changed | hyper_changed | precond_changed
+        return problem_changed | rm_changed | hyper_changed | precond_changed
 
     def _check_action_state(self, state):
         if self.penalized and state.ridge is None:
@@ -1225,33 +1355,53 @@ class SolverBase:
                 "the callback action returned a state without ridge; "
                 "use dataclasses.replace(ctx.state, ...) to preserve it"
             )
+        if not self.penalized and state.ridge_metric is not None:
+            raise ValueError(
+                "the callback action set state.ridge_metric on an unpenalized solver"
+            )
 
     def _apply_action_state(self, state, previous):
         changed = jnp.asarray(False)
+        resid_transform_changed = jnp.asarray(False)
         if previous.homotopy is not None:
             new_homotopy = jnp.asarray(state.homotopy, dtype=previous.homotopy.dtype)
             homotopy_changed = ~jnp.array_equal(
                 new_homotopy, previous.homotopy, equal_nan=True
             )
             state = dataclasses.replace(state, homotopy=new_homotopy)
-            if state.jacobian_valid is not None:
-                state = dataclasses.replace(
-                    state, jacobian_valid=state.jacobian_valid & ~homotopy_changed
+            resid_transform_changed = resid_transform_changed | homotopy_changed
+        if previous.ineq_weight is not None:
+            new_iw = jnp.asarray(state.ineq_weight, dtype=previous.ineq_weight.dtype)
+            if new_iw.shape != previous.ineq_weight.shape:
+                raise ValueError(
+                    "the callback action changed the shape of state.ineq_weight"
                 )
-            changed = changed | homotopy_changed
+            iw_changed = ~jnp.array_equal(new_iw, previous.ineq_weight, equal_nan=True)
+            state = dataclasses.replace(state, ineq_weight=new_iw)
+            resid_transform_changed = resid_transform_changed | iw_changed
+        if previous.ineq_smoothing is not None:
+            new_is = jnp.asarray(
+                state.ineq_smoothing, dtype=previous.ineq_smoothing.dtype
+            )
+            is_changed = ~jnp.array_equal(
+                new_is, previous.ineq_smoothing, equal_nan=True
+            )
+            state = dataclasses.replace(state, ineq_smoothing=new_is)
+            resid_transform_changed = resid_transform_changed | is_changed
+        if state.jacobian_valid is not None:
+            state = dataclasses.replace(
+                state,
+                jacobian_valid=state.jacobian_valid & ~resid_transform_changed,
+            )
+        changed = changed | resid_transform_changed
         if not self.penalized:
             return state, changed
-        # A ridge change leaves the Jacobian cache VALID (J does not depend on
-        # ridge) but invalidates the ridge-keyed normal/QR caches and
-        # suppresses the convergence check, whose diagnostics were computed at
-        # the old ridge. The recast keeps a weak-typed callback float from
-        # changing the while_loop carry aval.
         _validate_ridge_value(state.ridge, "state.ridge")
         new_ridge = jnp.asarray(state.ridge, dtype=previous.ridge.dtype)
         ridge_changed = ~jnp.array_equal(new_ridge, previous.ridge, equal_nan=True)
         return dataclasses.replace(state, ridge=new_ridge), changed | ridge_changed
 
-    def _invalidate_caches(self, state, action, touched, caches_stale):
+    def _invalidate_caches(self, state, touched, caches_stale):
         if touched and state.solver_cache is not None:
             cache = state.solver_cache
             state = dataclasses.replace(
@@ -1280,65 +1430,8 @@ class SolverBase:
         multi_start=None,
         jit=True,
     ):
-        """Run repeated solver updates until a stopping rule fires.
-
-        Parameters are ``update``'s plus loop controls. ``max_steps`` is always
-        enforced; ``max_steps_is_success=True`` (the default) treats
-        :attr:`SolverStatus.MAX_STEPS` as usable for implicit AD and for the
-        default multi-start acceptance, while keeping the status for
-        diagnostics.
-
-        ``atol``/``gtol``/``xtol`` bound the residual norm, the stationarity
-        residual ``info.grad_norm``, and an accepted step's ``info.step_norm``;
-        ``0`` disables a check and every firing rule reports
-        :attr:`SolverStatus.CONVERGED`. When ``ridge=None``, the three rules combine
-        disjunctively (``atol | gtol | xtol``); when ``ridge`` is active,
-        ``atol`` acts as a conjunctive filter on ``gtol | xtol``.
-
-        ``callback`` receives a :class:`CallbackContext` after each step and may
-        return a :class:`SolverAction` to stop or to override ``x``/``state``/
-        ``args``/``user_state``; ``p`` is passed through but cannot be
-        replaced. A callback that installs an invalid ``x`` or ``args`` must
-        also stop with a failed status.
-
-        ``save_steps=True`` records the iterate history on the result:
-        ``x_history`` stacks ``x0`` and every kept post-step iterate along a
-        ``(max_steps + 1)`` leading axis (rows beyond ``steps`` are zero
-        padding), plus the row-aligned ``args_history`` and, with ``has_aux``,
-        ``aux_history``. The buffers are differentiation-inert and make the
-        jitted loop retrace when ``max_steps`` changes.
-
-        ``multi_start`` (a :class:`MultiStart`) retries or parallelizes over
-        fresh initial conditions and returns the single best result, with
-        diagnostics on ``result.multi_start``.
-
-        Implicit AD uses ``CONVERGED``, and ``MAX_STEPS`` when
-        ``max_steps_is_success=True``; every failed status receives zero
-        tangents for ``result.x`` and ``result.aux``, with the failed lane's
-        linear tangent program evaluated at differentiation-inert copies of the
-        original ``(x0, args, p)``.
-
-        ONLY ``result.x``, ``result.aux``, and ``result.p`` carry tangents.
-        Everything else -- ``info`` (including ``info.loss``), ``state``,
-        ``steps``, the histories, and the multi-start diagnostics -- is
-        differentiation-inert and gets EXACT ZERO, since damping, step norms,
-        and iteration counts are artifacts of the path rather than properties
-        of the root. Differentiating a loss therefore means recomputing it
-        from ``result.x``, not reading ``result.info.loss``::
-
-            jax.grad(lambda p: objective(solver.solve(x0, p=p).x, p))(p)
-        """
+        """Run solver updates until a stopping rule fires and support AD in ``p``."""
         self._check_residual_args(args, p)
-        if max_steps <= 0:
-            raise ValueError("max_steps must be positive")
-        # Tolerances are traced data inside the loop, so vmapped/traced values
-        # skip the concrete-only sign validation.
-        if not isinstance(atol, jax.core.Tracer) and atol < 0:
-            raise ValueError("atol must be nonnegative")
-        if not isinstance(gtol, jax.core.Tracer) and gtol < 0:
-            raise ValueError("gtol must be nonnegative")
-        if not isinstance(xtol, jax.core.Tracer) and xtol < 0:
-            raise ValueError("xtol must be nonnegative")
         self._validate_tolerances(atol, gtol, xtol)
         callback = _hashable_hook(callback)
         state = self._solve_state(x0, args, p, state)
@@ -1453,9 +1546,6 @@ class SolverBase:
     def _validate_tolerances(self, atol, gtol, xtol):
         if not self.penalized:
             return
-        # atol is a CONJUNCTIVE filter on the true residual, never a stopping
-        # rule alone: a residual-only test would stop at any interpolating
-        # iterate, before the seminorm is minimized.
         concrete = [not isinstance(t, jax.core.Tracer) for t in (atol, gtol, xtol)]
         if (
             concrete[0]
@@ -1464,10 +1554,8 @@ class SolverBase:
             and (concrete[2] and xtol == 0)
         ):
             raise ValueError(
-                "atol > 0 requires a positive gtol or xtol: atol is a "
-                "conjunctive filter on the TRUE residual, never a stopping "
-                "rule by itself. Calibrate gtol from a pilot run as roughly "
-                "1e-3 * ridge * info.penalty_grad_norm"
+                "ridge > 0 requires a positive gtol or xtol to test stationarity "
+                "of the penalized objective; atol alone cannot detect a ridge minimizer"
             )
 
     def _validate_supplied_ridge(self, state, dtype):
@@ -1480,44 +1568,110 @@ class SolverBase:
         return dataclasses.replace(state, ridge=jnp.asarray(state.ridge, dtype=dtype))
 
     def _initial_ad_point(self, x, state, args, p):
-        # The pre-loop instances (and ridge when penalized) ride along: a
-        # failed lane's callback may have left invalid metric/preconditioner/
-        # ridge values behind, so the failed tangent program reads these.
+        resolved = self._resolved_state(state)
+        base = (
+            x,
+            args,
+            p,
+            resolved.ridge_metric,
+            resolved.preconditioner,
+            resolved.homotopy,
+            resolved.ineq_weight,
+            resolved.ineq_smoothing,
+        )
         if self.penalized:
-            return (
-                x,
-                args,
-                p,
-                state.metric,
-                state.preconditioner,
-                state.homotopy,
-                state.ridge,
-            )
-        return (x, args, p, state.metric, state.preconditioner, state.homotopy)
+            return (*base, resolved.ridge)
+        return base
+
+    def _constraints_stable(self, info):
+        comp_stable = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if info.complementarity_changed is None
+            else ~info.complementarity_changed
+        )
+        ineq_stable = (
+            jnp.asarray(True, dtype=jnp.bool_)
+            if info.inequality_changed is None
+            else ~info.inequality_changed
+        )
+        return comp_stable & ineq_stable
 
     def _converged(self, info, atol, gtol, xtol):
         homotopy_active = self._homotopy_active(info.homotopy)
-        stable = ~info.complementarity_changed
+        ineq_decay_active = (
+            jnp.asarray(False, dtype=jnp.bool_)
+            if info.inequality_changed is None
+            else info.inequality_changed
+        )
+        ready = (
+            self._constraints_stable(info) & (~homotopy_active) & (~ineq_decay_active)
+        )
+        gtol_met = ready & (gtol > 0) & (info.grad_norm < gtol)
+        xtol_met = ready & (xtol > 0) & info.accepted & (info.step_norm < xtol)
         if self.penalized:
-            # gtol/xtol mean "done with the current fixed-ridge problem"; atol is
-            # a CONJUNCTIVE filter on the TRUE residual, never sufficient alone.
-            gtol_met = stable & (gtol > 0) & (info.grad_norm < gtol)
-            xtol_met = stable & (xtol > 0) & info.accepted & (info.step_norm < xtol)
-            residual_ok = (~homotopy_active) & (
-                (atol <= 0) | (jnp.sqrt(info.resid_loss) <= atol)
-            )
+            residual_ok = (atol <= 0) | (jnp.sqrt(info.resid_loss) <= atol)
             return (gtol_met | xtol_met) & residual_ok
-        atol_met = (~homotopy_active) & (atol > 0) & (jnp.sqrt(info.loss) < atol)
-        gtol_met = stable & (gtol > 0) & (info.grad_norm < gtol)
-        xtol_met = stable & (xtol > 0) & info.accepted & (info.step_norm < xtol)
+        atol_met = ready & (atol > 0) & (jnp.sqrt(info.loss) < atol)
         return atol_met | gtol_met | xtol_met
 
+    def _refresh_final_info(self, info, x, state, args, p):
+        residual, aux, (_, ineq_metrics) = self._eval_residual_and_aux(
+            x,
+            args,
+            p,
+            homotopy=state.homotopy,
+            ineq_weight=state.ineq_weight,
+            ineq_smoothing=state.ineq_smoothing,
+        )
+        dtype = info.loss.dtype
+        resid_loss = jnp.asarray(jnp.sum(residual**2), dtype=dtype)
+        updates = {"aux": aux}
+        if state.homotopy is not None:
+            updates["homotopy"] = jnp.asarray(state.homotopy, dtype=dtype)
+        if self.penalized:
+            theta, _ = ravel_pytree(x)
+            resolved = self._resolved_state(state)
+            ridge = jnp.asarray(state.ridge, dtype=dtype)
+            ctx = SolverContext(
+                x=theta,
+                state=resolved,
+                args=args,
+                p=p,
+                ridge=ridge,
+                damping=jnp.zeros((), dtype=dtype),
+            )
+            penalty_grad = jnp.asarray(
+                resolved.ridge_metric.matvec(theta, ctx), dtype=dtype
+            )
+            penalty_value = jnp.asarray(
+                resolved.ridge_metric.quad_form(theta, ctx), dtype=dtype
+            )
+            updates["ridge"] = ridge
+            updates["resid_loss"] = resid_loss
+            updates["penalty_value"] = penalty_value
+            updates["penalty_grad_norm"] = jnp.asarray(
+                jnp.linalg.norm(penalty_grad), dtype=dtype
+            )
+            updates["loss"] = jnp.asarray(
+                resid_loss + ridge * penalty_value, dtype=dtype
+            )
+        else:
+            updates["loss"] = resid_loss
+        if ineq_metrics is not None:
+            eq_loss, viol_norm, max_viol = ineq_metrics
+            updates["eq_loss"] = jnp.asarray(eq_loss, dtype=dtype)
+            updates["ineq_violation_norm"] = jnp.asarray(viol_norm, dtype=dtype)
+            updates["ineq_max_violation"] = jnp.asarray(max_viol, dtype=dtype)
+        return dataclasses.replace(info, **updates)
+
     def _ranking_objective(self, result, p, callback):
-        # Without a callback, info.loss at step > 0 already reports the
-        # objective at the retained iterate; a callback can replace x/args/
-        # ridge after the last update, so recompute. Nonfinite masks to +inf.
         homotopy = result.state.homotopy
-        if callback is None and not self._uses_homotopy_decay:
+        ineq_smoothing = result.state.ineq_smoothing
+        if (
+            callback is None
+            and not self._uses_homotopy_decay
+            and not self._uses_ineq_decay
+        ):
             loss = result.info.loss
         else:
             target_homotopy = (
@@ -1525,23 +1679,46 @@ class SolverBase:
                 if homotopy is None
                 else jnp.where(
                     self._homotopy_active(homotopy),
-                    jnp.zeros((), dtype=homotopy.dtype),
+                    jnp.asarray(
+                        self._resolved_complementarity.tau_min
+                        if isinstance(self._resolved_complementarity, PDAS)
+                        else self._resolved_complementarity.mu_min,
+                        dtype=homotopy.dtype,
+                    ),
                     homotopy,
                 )
             )
+            target_ineq_smoothing = (
+                None
+                if ineq_smoothing is None
+                else jnp.where(
+                    self._ineq_smoothing_active(ineq_smoothing),
+                    jnp.asarray(
+                        self._resolved_inequality.smoothing_min,
+                        dtype=ineq_smoothing.dtype,
+                    ),
+                    ineq_smoothing,
+                )
+            )
             residual = self._residual_and_aux(
-                result.x, result.args, p, homotopy=target_homotopy
+                result.x,
+                result.args,
+                p,
+                homotopy=target_homotopy,
+                ineq_weight=result.state.ineq_weight,
+                ineq_smoothing=target_ineq_smoothing,
             )[0]
             if not self.penalized:
                 loss = jnp.sum(residual**2)
             else:
                 theta, _ = ravel_pytree(result.x)
-                n_m = self._block_sizes(theta.shape[0])[0]
                 resolved = self._resolved_state(result.state)
                 ctx = SolverContext(x=theta, state=resolved, args=result.args, p=p)
                 ridge = jnp.asarray(result.state.ridge, dtype=residual.dtype)
-                y_m = self._factor_apply_metric_block(theta[:n_m], ctx, residual.dtype)
-                loss = jnp.sum(residual**2) + ridge * jnp.sum(y_m**2)
+                pen = jnp.asarray(
+                    resolved.ridge_metric.quad_form(theta, ctx), dtype=residual.dtype
+                )
+                loss = jnp.sum(residual**2) + ridge * pen
         return jnp.where(
             jnp.isfinite(loss), loss, jnp.asarray(jnp.inf, dtype=loss.dtype)
         )
@@ -1660,10 +1837,9 @@ class SolverBase:
         )
 
     def _ad_result_tangent(self, result, p_dot, initial_ad_point, max_steps_is_success):
-        # A successful tangent relinearizes at the returned solution. A failed
-        # tangent uses the differentiation-inert original initial point, so the
-        # linear tangent program stays finite under vmap. Everything except x,
-        # p, and aux is bookkeeping with zero tangents.
+        zero_result = jax.tree.map(_zero_tangent_leaf, result)
+        if result.p is None:
+            return dataclasses.replace(zero_result, p=p_dot)
         initial_x, initial_args, initial_p = jax.tree.map(
             jax.lax.stop_gradient, initial_ad_point[:3]
         )
@@ -1674,394 +1850,225 @@ class SolverBase:
         ad_args = _where_tree(ad_success, result.args, initial_args)
         ad_p = _where_tree(ad_success, result.p, initial_p)
         ad_p_dot = _mask_tangent_tree(ad_success, p_dot)
-        zero_result = jax.tree.map(_zero_tangent_leaf, result)
-        x_dot = self._ad_x_tangent(
-            ad_x, ad_args, ad_p, ad_p_dot, result, ad_success, initial_ad_point
+        x_dot, aux_dot = self._ad_x_tangent(
+            ad_x,
+            ad_args,
+            ad_p,
+            ad_p_dot,
+            result,
+            ad_success,
+            initial_ad_point,
+            zero_result.aux,
         )
-        x_dot = _where_tree(ad_success, x_dot, zero_result.x)
-        aux_dot = zero_result.aux
-        if self.has_aux and ad_p is not None:
-            # aux depends on p directly and through the solution x*(p).
-            def aux_at_solution(x_value, p_value):
-                return self.residual_fn(x_value, ad_args, p_value)[1]
-
-            aux_dot = jax.jvp(aux_at_solution, (ad_x, ad_p), (x_dot, ad_p_dot))[1]
-            aux_dot = _where_tree(ad_success, aux_dot, zero_result.aux)
         return dataclasses.replace(zero_result, x=x_dot, p=p_dot, aux=aux_dot)
 
-    def _resolved_ad_solver(self, m=None, n=None):
-        if self.penalized:
-            if self.ad_solver is None:
-                return "normal_cg" if isinstance(self.linear_solver, CG) else "cholesky"
-            return "cholesky" if isinstance(self.ad_solver, Cholesky) else "normal_cg"
+    def _resolved_ad_solver(self, m, n, ridge_metric):
         if self.ad_solver is not None:
-            if m is not None and n is not None:
-                if isinstance(self.ad_solver, LU) and n != m:
-                    raise ValueError(
-                        f"ad_solver=LU() requires a square system (m == n), "
-                        f"got m={m} and n={n}"
-                    )
-                if (
-                    isinstance(self.ad_solver, CG)
-                    and n > m
-                    and self.ad_solver.penalty is None
-                ):
-                    raise ValueError(
-                        f"ad_solver=CG(...) requires n <= m (or a positive penalty), "
-                        f"got m={m} and n={n}"
-                    )
-                if isinstance(self.ad_solver, GramCG) and m > n:
-                    raise ValueError(
-                        f"ad_solver=GramCG(...) requires m <= n, got m={m} and n={n}"
-                    )
+            self.ad_solver.validate_shape(
+                m,
+                n,
+                penalized=self.penalized,
+                ridge_metric=ridge_metric,
+                damped=False,
+                role="ad_solver",
+            )
             return self.ad_solver
-        if isinstance(self.linear_solver, CG) and (
-            m is None or n is None or n <= m or self.linear_solver.penalty is not None
-        ):
-            return self.linear_solver
-        if isinstance(self.linear_solver, GramCG) and (
-            m is None or n is None or m <= n
-        ):
-            return self.linear_solver
+        if not self.penalized:
+            if isinstance(self.linear_solver, CG) and (
+                n <= m or self.linear_solver.penalty is not None
+            ):
+                return self.linear_solver
+            if isinstance(self.linear_solver, GramCG) and m <= n:
+                return self.linear_solver
+            if isinstance(self.linear_solver, SVD):
+                return self.linear_solver
+            return LU() if (m == n and self.inequality is None) else SVD()
+
         if isinstance(self.linear_solver, SVD):
             return self.linear_solver
-        if m is not None and n is not None:
-            return LU() if m == n else SVD()
-        return SVD()
+        if isinstance(self.linear_solver, CG) and (
+            ridge_metric.n_free_for(n) <= m or self.linear_solver.penalty is not None
+        ):
+            return self.linear_solver
+        if (
+            isinstance(self.linear_solver, GramCG)
+            and ridge_metric.has_shifted_solve
+            and ridge_metric.n_free_for(n) == 0
+            and ridge_metric.penalized_is_spd
+        ):
+            return self.linear_solver
+        if ridge_metric.has_factor and (
+            (m + ridge_metric.factor_rows_for(n) < n)
+            or (not ridge_metric.penalized_is_spd and m < n)
+            or (not ridge_metric.penalized_is_spd and ridge_metric.n_free_for(n) > m)
+        ):
+            return SVD()
+        if isinstance(self.linear_solver, (QR, Cholesky)):
+            try:
+                self.linear_solver.validate_shape(
+                    m, n, penalized=True, ridge_metric=ridge_metric, damped=False
+                )
+            except ValueError:
+                pass
+            else:
+                return self.linear_solver
+        return Cholesky()
 
-    def _ad_x_tangent(self, x, args, p, p_dot, result, ad_success, initial_ad_point):
-        if p is None:
-            return jax.tree.map(_zero_tangent_leaf, x)
+    def _ad_x_tangent(
+        self, x, args, p, p_dot, result, ad_success, initial_ad_point, zero_aux
+    ):
         state = self._resolved_state(jax.lax.stop_gradient(result.state))
-        initial_instances = jax.lax.stop_gradient(initial_ad_point[3:6])
-        final_homotopy = jax.lax.stop_gradient(result.state.homotopy)
-        homotopy = (
-            None
-            if final_homotopy is None
-            else jnp.where(
-                ad_success,
-                final_homotopy,
-                jnp.asarray(initial_instances[2], final_homotopy.dtype),
+        (
+            init_rm,
+            init_precond,
+            init_homotopy,
+            init_iw,
+            init_is,
+        ) = jax.lax.stop_gradient(initial_ad_point[3:8])
+
+        def _select_opt(final_v, init_v):
+            if final_v is None:
+                return None
+            return jnp.where(
+                ad_success, final_v, jnp.asarray(init_v, dtype=final_v.dtype)
             )
-        )
+
+        homotopy = _select_opt(state.homotopy, init_homotopy)
+        ineq_weight = _select_opt(state.ineq_weight, init_iw)
+        ineq_smoothing = _select_opt(state.ineq_smoothing, init_is)
         state = dataclasses.replace(
             state,
-            metric=(
-                _where_tree(ad_success, state.metric, initial_instances[0])
-                if self._has_metric
-                else state.metric
+            ridge_metric=(
+                _where_tree(ad_success, state.ridge_metric, init_rm)
+                if self.penalized
+                else None
             ),
-            preconditioner=_where_tree(
-                ad_success, state.preconditioner, initial_instances[1]
-            ),
+            preconditioner=_where_tree(ad_success, state.preconditioner, init_precond),
             homotopy=homotopy,
-        )
-        if self.penalized:
-            final_ridge = jax.lax.stop_gradient(result.state.ridge)
-            initial_ridge = jax.lax.stop_gradient(initial_ad_point[6])
-            ridge = jnp.where(
-                ad_success, final_ridge, jnp.asarray(initial_ridge, final_ridge.dtype)
-            )
-            if self._resolved_ad_solver() == "cholesky":
-                return self._ad_tangent_ridge_cholesky(
-                    x, args, p, p_dot, ridge, state, ad_success
-                )
-            return self._ad_tangent_ridge_normal_cg(
-                x, args, p, p_dot, ridge, state, ad_success
-            )
-        return self._ad_x_tangent_unpenalized(x, args, p, p_dot, state, ad_success)
-
-    def _ad_whiten(self, v, ctx, dtype):
-        # S = F_bar^{-1} is not self-adjoint, and a matrix-free factor may
-        # be opaque to JAX's transpose machinery, so declare its transpose
-        # explicitly: the identity matvec exposes nothing to AD and every rule
-        # routes through the declared solves.
-        if ctx.state.metric is None:
-            return jnp.asarray(v, dtype=dtype)
-        return jax.lax.custom_linear_solve(
-            lambda u: u,
-            jnp.asarray(v, dtype=dtype),
-            lambda _, b: jnp.asarray(self._extended_solve(b, ctx), dtype=dtype),
-            transpose_solve=lambda _, b: jnp.asarray(
-                self._extended_solve_transpose(b, ctx), dtype=dtype
-            ),
+            ineq_weight=ineq_weight,
+            ineq_smoothing=ineq_smoothing,
         )
 
-    def _ad_whiten_transpose(self, v, ctx, dtype):
-        if ctx.state.metric is None:
-            return jnp.asarray(v, dtype=dtype)
-        return jax.lax.custom_linear_solve(
-            lambda u: u,
-            jnp.asarray(v, dtype=dtype),
-            lambda _, b: jnp.asarray(
-                self._extended_solve_transpose(b, ctx), dtype=dtype
-            ),
-            transpose_solve=lambda _, b: jnp.asarray(
-                self._extended_solve(b, ctx), dtype=dtype
-            ),
+        theta, unravel, residual, lin_fn = self._ad_linearization(
+            x,
+            args,
+            p,
+            homotopy=homotopy,
+            ineq_weight=ineq_weight,
+            ineq_smoothing=ineq_smoothing,
         )
+        zero_theta = jnp.zeros_like(theta)
+        zero_p = jax.tree.map(_zero_tangent_leaf, p)
 
-    def _ad_x_tangent_unpenalized(self, x, args, p, p_dot, state, ad_success):
-        theta, unravel, residual, theta_jvp, residual_p_dot = self._ad_linearization(
-            x, args, p, p_dot, homotopy=state.homotopy
-        )
+        def theta_jvp(v):
+            return lin_fn(v, zero_p)[0]
+
+        residual_p_dot, aux_p_dot = lin_fn(zero_theta, p_dot)
         n, m = theta.shape[0], residual.shape[0]
         dtype = residual.dtype
-        resolved = self._resolved_ad_solver(m, n)
-        ctx = SolverContext(x=theta, state=state, args=args, p=p)
-        if isinstance(resolved, LU):
-            Jt = self._assemble_jt(theta_jvp, theta, residual)
-            return unravel(self._ad_tangent_lu(Jt, residual_p_dot, ad_success))
-
-        self._block_sizes(n)
-
-        def whiten(v):
-            return self._ad_whiten(v, ctx, dtype)
-
-        def whiten_transpose(v):
-            return self._ad_whiten_transpose(v, ctx, dtype)
-
-        if isinstance(resolved, (CG, GramCG)):
-            u = self._ad_tangent_krylov(
-                resolved,
-                theta,
-                theta_jvp,
-                residual_p_dot,
-                whiten,
-                whiten_transpose,
-                ctx,
+        zero = jnp.zeros((), dtype=dtype)
+        if self.penalized:
+            final_ridge = jax.lax.stop_gradient(result.state.ridge)
+            init_ridge = jax.lax.stop_gradient(initial_ad_point[8])
+            ridge = jnp.where(
                 ad_success,
+                jnp.asarray(final_ridge, dtype=dtype),
+                jnp.asarray(init_ridge, dtype=dtype),
             )
+            state = dataclasses.replace(state, ridge=ridge)
         else:
-            # B' = F_bar^{-T} J', shape (n, m).
-            Bt = whiten_transpose(self._assemble_jt(theta_jvp, theta, residual))
-            u = (
-                self._ad_tangent_svd(Bt, residual_p_dot)
-                if isinstance(resolved, SVD)
-                else self._ad_tangent_dense(
-                    Bt, residual_p_dot, ad_success, form=resolved.form
-                )
-            )
-        theta_dot = whiten(u)
-        return unravel(theta_dot)
+            ridge = zero
 
-    def _ad_tangent_dense(self, Bt, residual_p_dot, ad_success=True, form="auto"):
-        # Undamped Gauss-Newton tangent: u = -B^+ (dr/dp) p_dot through the
-        # requested or smaller normal/gram system. Requires full rank; a rank-
-        # deficient B needs SVD(), which selects the minimum-norm tangent.
-        n, m = Bt.shape
-        if form == "gram" and m > n:
-            raise ValueError(
-                f"ad_solver=Cholesky(form='gram') requires m <= n, got m={m} and n={n}"
-            )
-        if form == "normal" and n > m:
-            raise ValueError(
-                "ad_solver=Cholesky(form='normal') requires n <= m, "
-                f"got m={m} and n={n}"
-            )
-        use_gram = form == "gram" or (form == "auto" and n > m)
-        if use_gram:
-            gram = mm(Bt.T, Bt)
-            gram = jnp.where(ad_success, gram, jnp.eye(m, dtype=Bt.dtype))
-            factor = jsp_linalg.cho_factor(gram)
-            return -mm(Bt, jsp_linalg.cho_solve(factor, residual_p_dot))
-        normal = mm(Bt, Bt.T)
-        normal = jnp.where(ad_success, normal, jnp.eye(n, dtype=Bt.dtype))
-        factor = jsp_linalg.cho_factor(normal)
-        return -jsp_linalg.cho_solve(factor, mm(Bt, residual_p_dot))
-
-    def _ad_tangent_lu(self, Bt, residual_p_dot, ad_success=True):
-        # Square B: u = -B^{-1} (dr/dp) p_dot, factored directly.
-        n = Bt.shape[0]
-        B = jnp.where(ad_success, Bt.T, jnp.eye(n, dtype=Bt.dtype))
-        return -jnp.linalg.solve(B, residual_p_dot)
-
-    def _ad_tangent_svd(self, Bt, residual_p_dot):
-        # Spectral filter: u = -B^+ (dr/dp) p_dot, the minimum-metric-norm
-        # tangent.
-        return -mm(_svd_pinv(Bt), residual_p_dot)
-
-    def _ad_tangent_krylov(
-        self,
-        config,
-        theta,
-        theta_jvp,
-        residual_p_dot,
-        whiten,
-        whiten_transpose,
-        ctx,
-        ad_success=True,
-    ):
-        dtype = residual_p_dot.dtype
-        transpose_fn = jax.linear_transpose(theta_jvp, theta)
-        zero_damping = jnp.zeros((), dtype=dtype)
-
-        def JT(cotangent):
-            return transpose_fn(cotangent)[0]
-
-        def B(u):
-            return theta_jvp(whiten(u))
-
-        def Bt(w):
-            return whiten_transpose(JT(w))
-
-        apply_M = None
-        ad_preconditioner = self._ad_preconditioner(ctx.state)
-        if ad_preconditioner is not None:
-
-            def apply_M(v):
-                return jnp.where(
-                    ad_success, ad_preconditioner.apply(v, zero_damping, ctx), v
-                )
-
-        def cg(matvec, rhs, preconditioner=apply_M):
-            solution, _ = jsp_sparse_linalg.cg(
-                matvec,
-                rhs,
-                tol=self._ad_cg_tol(dtype),
-                atol=jnp.asarray(self.ad_solver_atol, dtype=dtype),
-                maxiter=self.ad_solver_maxiter,
-                M=preconditioner,
-            )
-            return solution
-
-        if isinstance(config, GramCG):
-
-            def dual_matvec(y):
-                return jnp.where(ad_success, B(Bt(y)), y)
-
-            y = jax.lax.custom_linear_solve(
-                dual_matvec,
-                residual_p_dot,
-                lambda _, c: cg(dual_matvec, c),
-                symmetric=True,
-            )
-            return -Bt(y)
-
-        penalty = self.ad_solver_penalty
-
-        def normal_matvec(u):
-            value = Bt(B(u))
-            if penalty is not None:
-                value = value + jnp.asarray(penalty, dtype=dtype) * u
-            return jnp.where(ad_success, value, u)
-
-        rhs = -Bt(residual_p_dot)
-        return jax.lax.custom_linear_solve(
-            normal_matvec,
-            rhs,
-            lambda _, c: cg(normal_matvec, c),
-            symmetric=True,
+        resolved = self._resolved_ad_solver(m, n, state.ridge_metric)
+        space, form = self._solver_space_and_form(
+            resolved, m, n, state.ridge_metric, damped=False
+        )
+        ctx = SolverContext(
+            x=theta,
+            state=state,
+            args=args,
+            p=p,
+            ridge=ridge if self.penalized else None,
+            damping=zero,
+            space=space,
+            role="ad",
+            form=form,
         )
 
-    def _ad_tangent_ridge_cholesky(
-        self, x, args, p, p_dot, ridge, state, ad_success=True
-    ):
-        # The GN implicit rule posed on the whitened variable y = F_bar x:
-        # (J~'J~ + ridge E) y_dot = -J~'(dr/dp) p_dot, then
-        # x_dot = F_bar^{-1} y_dot -- no damping; the matrix is PD under the
-        # identification condition because ridge > 0 by contract.
-        theta, unravel, residual, theta_jvp, residual_p_dot = self._ad_linearization(
-            x, args, p, p_dot, homotopy=state.homotopy
-        )
-        n_m, n_f = self._block_sizes(theta.shape[0])
-        ctx = SolverContext(x=theta, state=state, args=args, p=p)
-        Jt = self._assemble_jt(theta_jvp, theta, residual)
-        ridge_typed = jnp.asarray(ridge, dtype=residual.dtype)
-        Jt_sub = jnp.asarray(
-            self._extended_solve_transpose(Jt, ctx), dtype=residual.dtype
-        )
-        if n_f == 0 and Jt_sub.shape[0] > Jt_sub.shape[1]:
-            m = Jt_sub.shape[1]
-            diag = jnp.arange(m)
-            dual_matrix = mm(Jt_sub.T, Jt_sub).at[diag, diag].add(ridge_typed)
-            dual_matrix = jnp.where(
-                ad_success, dual_matrix, jnp.eye(m, dtype=residual.dtype)
-            )
-            factor = jsp_linalg.cho_factor(dual_matrix)
-            y_dot = -mm(Jt_sub, jsp_linalg.cho_solve(factor, residual_p_dot))
+        Jt = jvp_fn = JT = None
+        if resolved.materializes_jacobian:
+            Jt = self._assemble_jt(theta_jvp, theta, residual)
         else:
-            n = theta.shape[0]
-            diag = jnp.arange(n_m)
-            normal_matrix = mm(Jt_sub, Jt_sub.T).at[diag, diag].add(ridge_typed)
-            normal_matrix = jnp.where(
-                ad_success, normal_matrix, jnp.eye(n, dtype=residual.dtype)
-            )
-            factor = jsp_linalg.cho_factor(normal_matrix)
-            y_dot = jsp_linalg.cho_solve(factor, -mm(Jt_sub, residual_p_dot))
-        theta_dot = self._ad_whiten(y_dot, ctx, residual.dtype)
-        return unravel(theta_dot)
+            jvp_fn = theta_jvp
+            transpose_fn = jax.linear_transpose(theta_jvp, theta)
 
-    def _ad_tangent_ridge_normal_cg(
-        self, x, args, p, p_dot, ridge, state, ad_success=True
-    ):
-        # Matrix-free CG on the same whitened PD operator; matvec = J~'(J~ u) +
-        # ridge [u_m; 0].
-        theta, unravel, residual, theta_jvp, residual_p_dot = self._ad_linearization(
-            x, args, p, p_dot, homotopy=state.homotopy
+            def JT(cotangent):
+                return transpose_fn(cotangent)[0]
+
+        penalty_grad = (
+            jnp.asarray(state.ridge_metric.matvec(theta, ctx), dtype=dtype)
+            if self.penalized
+            else zero_theta
         )
-        n_m, n_f = self._block_sizes(theta.shape[0])
-        ctx = SolverContext(x=theta, state=state, args=args, p=p)
-        theta_transpose = jax.linear_transpose(theta_jvp, theta)
-
-        def JT(cotangent):
-            return theta_transpose(cotangent)[0]
-
-        ridge_typed = jnp.asarray(ridge, dtype=residual.dtype)
-
-        def normal_matvec(u):
-            gauss_newton = jnp.asarray(
-                self._extended_solve_transpose(
-                    JT(
-                        theta_jvp(
-                            jnp.asarray(self._extended_solve(u, ctx), residual.dtype)
-                        )
-                    ),
-                    ctx,
-                ),
-                dtype=residual.dtype,
+        ad_hyper = (
+            _ADKrylovHyper(
+                iterative_tol=self._ad_cg_tol(dtype),
+                iterative_atol=jnp.asarray(self.ad_solver_atol, dtype=dtype),
+                iterative_maxiter=self.ad_solver_maxiter,
             )
-            metric_shift = (
-                u
-                if n_f == 0
-                else jnp.concatenate([u[:n_m], jnp.zeros(n_f, dtype=residual.dtype)])
-            )
-            value = gauss_newton + ridge_typed * metric_shift
-            return jnp.where(ad_success, value, u)
-
-        cg_tol = self._ad_cg_tol(residual.dtype)
-        cg_atol = jnp.asarray(self.ad_solver_atol, dtype=residual.dtype)
-        ad_preconditioner = self._ad_preconditioner(state)
-        if ad_preconditioner is None:
-            apply_M = None
-        else:
-            zero_damping = jnp.zeros((), dtype=residual.dtype)
-
-            def apply_M(v):
-                return jnp.where(
-                    ad_success, ad_preconditioner.apply(v, zero_damping, ctx), v
-                )
-
-        def solve(matvec, rhs_value):
-            solution, _ = jsp_sparse_linalg.cg(
-                matvec,
-                rhs_value,
-                tol=cg_tol,
-                atol=cg_atol,
-                maxiter=self.ad_solver_maxiter,
-                M=apply_M,
-            )
-            return solution
-
-        rhs = -self._ad_whiten_transpose(JT(residual_p_dot), ctx, residual.dtype)
-        y_dot = jax.lax.custom_linear_solve(
-            normal_matvec,
-            rhs,
-            solve,
-            symmetric=True,
+            if isinstance(resolved, (CG, GramCG))
+            else None
         )
-        theta_dot = self._ad_whiten(y_dot, ctx, residual.dtype)
-        return unravel(theta_dot)
+        ad_precond = (
+            self._ad_preconditioner(state)
+            if (
+                isinstance(resolved, (CG, GramCG))
+                or getattr(resolved, "preconditioner", None) is not None
+            )
+            else None
+        )
+        prepared = resolved.prepare(
+            Subproblem(
+                resid=residual,
+                theta=theta,
+                Jt=Jt,
+                jvp_fn=jvp_fn,
+                JT=JT,
+                ridge=ridge,
+                damping=zero,
+                ridge_metric=state.ridge_metric,
+                penalty_grad=penalty_grad,
+                cache=None,
+                cache_enabled=False,
+                hyper=ad_hyper,
+                ctx=ctx,
+                penalized=self.penalized,
+                undamped=True,
+                active=ad_success,
+                preconditioner=ad_precond,
+            )
+        )
+        valid_scale = jnp.where(
+            (~ad_success) | prepared.solve_ok,
+            jnp.ones((), dtype=dtype),
+            jnp.asarray(jnp.nan, dtype=dtype),
+        )
+        raw_x_dot_vec = valid_scale * prepared.solve_residual_rhs(residual_p_dot)
+        x_dot_vec = jnp.where(ad_success, raw_x_dot_vec, zero_theta)
+        x_dot = unravel(x_dot_vec)
+        if not self.has_aux:
+            return x_dot, zero_aux
+        aux_x_dot = lin_fn(x_dot_vec, zero_p)[1]
+        aux_dot = jax.tree.map(
+            lambda a, b: (
+                None
+                if a is None
+                else (a if getattr(a, "dtype", None) == jax.dtypes.float0 else a + b)
+            ),
+            aux_x_dot,
+            aux_p_dot,
+        )
+        return x_dot, _mask_tangent_tree(ad_success, aux_dot)
 
 
 __all__ = ["MultiStart", "SolverBase"]

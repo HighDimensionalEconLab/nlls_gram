@@ -1,8 +1,3 @@
-"""Dtype purity (float32 default, float64 under JAX_ENABLE_X64=1, and float32
-problems under enabled x64 without promotion) and HIGHEST matmul precision
-guards for LevenbergMarquardt and Newton.
-"""
-
 import os
 import subprocess
 import sys
@@ -19,18 +14,21 @@ from nlls_gram import (
     SVD,
     AnnealRidge,
     Cholesky,
-    CholeskyMetric,
     Complementarity,
-    DiagonalMetric,
+    DiagonalPreconditioner,
+    DiagonalRidge,
+    FactorRidge,
     FischerBurmeister,
     GramCG,
     IdentityPreconditioner,
+    Inequality,
+    InequalityPenalty,
     LevenbergMarquardt,
     LMState,
     Minimum,
     MultiStart,
     Newton,
-    RepeatedFactorMetric,
+    RepeatedFactorRidge,
     SolverAction,
     SolverStatus,
 )
@@ -42,10 +40,6 @@ B_NP = RNG.normal(size=M)
 A = jnp.asarray(A_NP, jnp.float32)
 B = jnp.asarray(B_NP, jnp.float32)
 X0 = jnp.zeros(N, jnp.float32)
-
-
-def fat_residual(x, args, p):
-    return A @ x - p
 
 
 @pytest.mark.parametrize("solver_cls", [LevenbergMarquardt, Newton])
@@ -77,7 +71,6 @@ def test_float32_purity_and_highest_matmul_precision(solver_cls, ls):
     (cotangent,) = jax.vjp(run, p0)[1](jnp.ones_like(x0))
     assert tangent.dtype == jnp.float32 and cotangent.dtype == jnp.float32
 
-    # Every solver-owned dot_general is pinned to Precision.HIGHEST
     stack = [jax.make_jaxpr(run)(p0).jaxpr]
     dots = []
     while stack:
@@ -106,30 +99,30 @@ def test_float32_purity_and_highest_matmul_precision(solver_cls, ls):
 
 def _run_x64_checks():
     assert jax.config.jax_enable_x64
-    # 1. Three-way step agreement (Cholesky, QR, CG) to 1e-9 in float64
+    # 1. Five-way step agreement (Cholesky, QR, CG) to 1e-9 in float64
     m, block, repeats, free = 5, 4, 2, 2
     p_dim = repeats * block + free
     A64 = jnp.asarray(RNG.normal(size=(m, p_dim)), jnp.float64)
     b64 = jnp.asarray(RNG.normal(size=m), jnp.float64)
-    root = RNG.normal(size=(block, block + 2))
-    K_np = root @ root.T + 0.5 * np.eye(block)
+    root = RNG.normal(size=(block + 2, block))
+    K_np = root.T @ root + 0.5 * np.eye(block)
     K64 = jnp.asarray(K_np, jnp.float64)
     x0_64 = jnp.asarray(RNG.normal(size=p_dim), jnp.float64)
-    metric64 = RepeatedFactorMetric(
-        jnp.linalg.cholesky(K64, upper=True), repeats=repeats
-    )
+    rm64 = RepeatedFactorRidge(jnp.linalg.cholesky(K64, upper=True), repeats=repeats)
 
     steps = {}
     for name, ls in (
-        ("cholesky", Cholesky()),
-        ("qr", QR()),
+        ("chol_normal", Cholesky(form="normal")),
+        ("chol_gram", Cholesky(form="gram")),
+        ("qr_normal", QR(form="normal")),
+        ("qr_gram", QR(form="gram")),
         ("cg", CG(IdentityPreconditioner(), tol=1e-14, maxiter=None)),
     ):
         s = LevenbergMarquardt(
             lambda th: A64 @ th - b64,
-            metric=metric64,
+            ridge_metric=rm64,
             ridge=1e-8,
-            init_damping=1e-6,
+            init_damping=1e-12,
             linear_solver=ls,
             geodesic_acceleration=False,
         )
@@ -137,8 +130,14 @@ def _run_x64_checks():
         assert x1.dtype == jnp.float64 and state1.ridge.dtype == jnp.float64
         assert info1.loss.dtype == jnp.float64
         steps[name] = np.asarray(x1)
-    np.testing.assert_allclose(steps["cholesky"], steps["qr"], atol=1e-9)
-    np.testing.assert_allclose(steps["cholesky"], steps["cg"], atol=1e-8)
+    for high_acc in ("chol_gram", "qr_gram"):
+        np.testing.assert_allclose(
+            steps["qr_normal"], steps[high_acc], rtol=1e-13, atol=1e-13
+        )
+    for normal_eq in ("chol_normal", "cg"):
+        np.testing.assert_allclose(
+            steps["qr_normal"], steps[normal_eq], rtol=1e-6, atol=5e-7
+        )
 
     # 2. AnnealRidge continuation matches minimum-seminorm KKT solution to 1e-6
     M0 = np.zeros((p_dim, p_dim))
@@ -151,14 +150,13 @@ def _run_x64_checks():
     anneal = AnnealRidge(ridge_floor=1e-8, decrease=0.1)
     ridge_res = LevenbergMarquardt(
         lambda th: A64 @ th - b64,
-        metric=metric64,
+        ridge_metric=rm64,
         ridge=1e-4,
-        linear_solver=QR(),
+        linear_solver=QR(form="gram"),
     ).solve(
         jnp.zeros(p_dim, jnp.float64),
         max_steps=400,
         gtol=1e-14,
-        atol=1e-8,
         callback=anneal,
         user_state=anneal.init_state(jnp.float64),
     )
@@ -233,15 +231,22 @@ def _run_x64_checks():
 
     for solver_cls in (LevenbergMarquardt, Newton):
         for kwargs in [
-            dict(linear_solver=Cholesky()),
-            dict(linear_solver=QR()),
+            dict(linear_solver=Cholesky(preconditioner=DiagonalPreconditioner(None))),
+            dict(
+                linear_solver=QR(
+                    form="gram", preconditioner=DiagonalPreconditioner(None)
+                )
+            ),
             dict(
                 linear_solver=GramCG(IdentityPreconditioner(), maxiter=8),
                 ad_solver=SVD(),
             ),
-            dict(metric=DiagonalMetric(jnp.ones(N, jnp.float32) * 2.0)),
             dict(
-                metric=CholeskyMetric(jnp.eye(N, dtype=jnp.float32)),
+                ridge_metric=DiagonalRidge(jnp.ones(N, jnp.float32) * 2.0),
+                ridge=1e-3,
+            ),
+            dict(
+                ridge_metric=FactorRidge(jnp.eye(N, dtype=jnp.float32)),
                 ridge=1e-3,
             ),
         ]:
@@ -296,7 +301,18 @@ def _run_x64_checks():
         assert res_ms.multi_start.loss.dtype == jnp.float32
         assert res_ms.status.dtype == jnp.int32
 
-    # 7. Complementarity in float64 and float32 non-promotion
+    # 7. Inequality and Complementarity in float64 and float32 non-promotion
+    s_ineq32 = LevenbergMarquardt(
+        lambda x, _, p: Inequality(x - p),
+        inequality=InequalityPenalty(weight=2.0, smoothing=0.1, smoothing_decay=0.5),
+    )
+    jpr_ineq32 = jax.make_jaxpr(
+        lambda p: (
+            s_ineq32.solve(jnp.zeros(3, jnp.float32), p=p, max_steps=6, gtol=1e-5).x
+        )
+    )(jnp.ones(3, jnp.float32))
+    assert not promotions(str(jpr_ineq32))
+
     w64 = jnp.linspace(0.6, 2.0, 6, dtype=jnp.float64)
     beta64, r64, y64 = jnp.float64(0.95), jnp.float64(1.05), jnp.float64(1.1)
     kappa64 = 1.0 / (beta64 * r64)

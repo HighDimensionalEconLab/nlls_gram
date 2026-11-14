@@ -1,15 +1,3 @@
-"""Undamped (or residual-coupled) Newton / Gauss-Newton with Armijo backtracking
-for nonlinear least squares over a JAX pytree ``x``, supporting both unpenalized
-geometry-selected interpolation (``ridge=None``) and Tikhonov-penalized ridge
-optimization (``ridge > 0``).
-
-At each outer step, computes the minimum-metric-norm Gauss-Newton direction
-(or penalized ridge Gauss-Newton direction) once, optionally adds the
-second-order geodesic correction along a parabolic trial curve, and searches
-with a residual-only Armijo backtracking loop against the half-objective merit
-function using the actual directional derivative ``s = g'u``.
-"""
-
 import dataclasses
 
 import jax
@@ -20,7 +8,6 @@ from nlls_gram.linear_solvers import (
     CG,
     LU,
     Cholesky,
-    GramCG,
     Subproblem,
 )
 from nlls_gram.solver_base import (
@@ -36,42 +23,12 @@ from nlls_gram.types import (
     SolverStatus,
     _cast_newton_hyper,
 )
-from nlls_gram.utilities import mm
 
 __all__ = ["Newton"]
 
 
 class Newton(SolverBase):
-    """Newton / Gauss-Newton with Armijo backtracking over a JAX pytree ``x``.
-
-    Supports two root-selection regimes controlled by ``ridge``:
-
-    - **Unpenalized (``ridge=None``, default)**: minimizes ``||r(x, args, p)||^2``
-      with optional :class:`~nlls_gram.Metric` ``W = F'F`` selecting
-      minimum-``W``-norm Gauss-Newton directions ``u = -B^+ r`` in whitened
-      coordinates ``u = F_bar d`` (``B = J F_bar^{-1}``). Supports
-      :class:`~nlls_gram.Cholesky` (default), :class:`~nlls_gram.QR`,
-      :class:`~nlls_gram.SVD`, :class:`~nlls_gram.LU` (square systems),
-      :class:`~nlls_gram.CG`, and :class:`~nlls_gram.GramCG`.
-    - **Penalized ridge (``ridge > 0``)**: minimizes the Tikhonov objective
-      ``||r(x, args, p)||^2 + ridge * ||x_m||_W^2`` (defaulting ``metric`` to
-      the Euclidean identity over all coordinates when ``metric=None``), with
-      ``ridge`` carried in :attr:`NewtonState.ridge` for continuation schedules
-      (:class:`~nlls_gram.AnnealRidge`). Supports :class:`~nlls_gram.Cholesky`,
-      :class:`~nlls_gram.QR`, and :class:`~nlls_gram.CG`.
-
-    Line-search defaults: ``c1=1e-4``, ``decrease_factor=0.5``, ``maxls=30``,
-    ``max_stepsize=1.0``, and ``linesearch_tol=0.0``. Every outer iteration
-    resets the initial trial step size to ``min(1.0, max_stepsize)``.
-
-    When ``damping > 0`` (default ``1e-3`` when ``ridge=None`` and ``0.0`` when
-    ``ridge`` is active or ``linear_solver=LU()``), applies stateless
-    parameter-scale-invariant residual-coupled step damping to the linear solve
-    at each outer step before Armijo backtracking:
-    ``max(min_damping, damping * (||B||_F^2 / m) * ||r||_2**damping_power)``
-    for dense solvers (or ``max(min_damping, damping * ||r||_2**damping_power)``
-    for matrix-free Krylov solvers).
-    """
+    """Euclidean-step Newton / Gauss-Newton solver with Armijo backtracking."""
 
     _forward_role_attr = "supports_newton"
 
@@ -79,8 +36,12 @@ class Newton(SolverBase):
         self,
         residual_fn,
         *,
-        metric=None,
         ridge=None,
+        ridge_metric=None,
+        linear_solver=Cholesky(),  # noqa: B008
+        ad_solver=None,
+        jacobian_mode="auto",
+        jacobian_chunk=None,
         c1=1e-4,
         decrease_factor=0.5,
         maxls=30,
@@ -89,70 +50,52 @@ class Newton(SolverBase):
         damping=None,
         damping_power=1.5,
         min_damping=1e-10,
-        geodesic_acceleration=True,
-        geodesic_acceptance_ratio=0.75,
-        linear_solver=Cholesky(),  # noqa: B008 -- frozen, immutable default
-        jacobian_mode="auto",
-        jacobian_chunk=None,
-        ad_solver=None,
         has_aux=False,
         cache_jacobian=False,
+        geodesic_acceleration=True,
+        geodesic_acceptance_ratio=0.75,
         complementarity=None,
+        inequality=None,
     ):
         if damping is None:
             damping = (
                 0.0 if (ridge is not None or isinstance(linear_solver, LU)) else 1e-3
             )
-        if not (0.0 < c1 < 1.0):
-            raise ValueError("c1 must satisfy 0 < c1 < 1")
-        if not (0.0 < decrease_factor < 1.0):
-            raise ValueError("decrease_factor must satisfy 0 < decrease_factor < 1")
-        if isinstance(maxls, bool) or not isinstance(maxls, int) or maxls <= 0:
-            raise ValueError("maxls must be a positive int")
-        if max_stepsize <= 0.0:
-            raise ValueError("max_stepsize must be positive")
-        if linesearch_tol < 0.0:
-            raise ValueError("linesearch_tol must be nonnegative")
-        if damping < 0.0:
-            raise ValueError("damping must be nonnegative")
-        if damping_power < 0.0:
-            raise ValueError("damping_power must be nonnegative")
-        if min_damping <= 0.0:
-            raise ValueError("min_damping must be positive")
         if damping > 0.0 and isinstance(linear_solver, LU):
             raise ValueError(
                 "linear_solver=LU() does not support damping > 0; pass damping=0.0 "
                 "or use Cholesky(), QR(), SVD(), CG(), or GramCG()"
             )
-        if isinstance(linear_solver, (CG, GramCG)):
-            if (
-                linear_solver.preconditioner is not None
-                and linear_solver.preconditioner.requires_positive_damping
-            ):
-                raise ValueError(
-                    "this preconditioner divides by the live damping and "
-                    "cannot serve in Newton (the Newton system is undamped)"
-                )
-            if getattr(linear_solver, "penalty", None) is not None:
-                raise ValueError(
-                    "CG(penalty=...) is not supported in Newton's forward "
-                    "linear_solver role: the forward step must remain undamped. "
-                    "Use penalty only in ad_solver=CG(...)"
-                )
+        precond = getattr(linear_solver, "preconditioner", None)
+        if (
+            damping == 0.0
+            and precond is not None
+            and getattr(precond, "requires_positive_damping", False)
+        ):
+            raise ValueError(
+                "linear_solver.preconditioner requires positive damping and "
+                "cannot serve an undamped Newton system"
+            )
+        if isinstance(linear_solver, CG) and linear_solver.penalty is not None:
+            raise ValueError(
+                "CG(penalty=...) is supported only in ad_solver=CG(...), not in "
+                "Newton's forward linear_solver role"
+            )
 
         self._init_common(
             residual_fn,
-            linear_solver=linear_solver,
-            metric=metric,
             ridge=ridge,
+            ridge_metric=ridge_metric,
+            linear_solver=linear_solver,
+            ad_solver=ad_solver,
+            jacobian_mode=jacobian_mode,
+            jacobian_chunk=jacobian_chunk,
             has_aux=has_aux,
             cache_jacobian=cache_jacobian,
             geodesic_acceleration=bool(geodesic_acceleration),
             geodesic_acceptance_ratio=geodesic_acceptance_ratio,
-            ad_solver=ad_solver,
-            jacobian_mode=jacobian_mode,
-            jacobian_chunk=jacobian_chunk,
             complementarity=complementarity,
+            inequality=inequality,
         )
         self.c1 = c1
         self.decrease_factor = decrease_factor
@@ -169,7 +112,7 @@ class Newton(SolverBase):
         self._sealed = True
 
     def hyperparams(self, dtype=None):
-        """``NewtonHyperparams`` built from the constructor values."""
+        """Return ``NewtonHyperparams`` built from constructor settings."""
         eff_dtype = jnp.result_type(float) if dtype is None else dtype
         iterative_tol = self.iterative_tol
         if iterative_tol is None:
@@ -195,27 +138,32 @@ class Newton(SolverBase):
         )
 
     def init(self, x0, args=None, *, p=None):
-        """Build the initial :class:`~nlls_gram.NewtonState` at ``x0``.
-
-        Uses ``jax.eval_shape`` to validate shapes and size optional Jacobian
-        cache buffers without paying an extra device residual evaluation.
-        """
+        """Build initial ``NewtonState`` at ``x0`` without evaluating the residual."""
         self._check_residual_args(args, p)
-        residual_shape, aux_shape = _init_residual_and_aux.eval_shape(self, x0, args, p)
+        residual_shape, aux_shape, _ = _init_residual_and_aux.eval_shape(
+            self, x0, args, p
+        )
         theta, _ = ravel_pytree(x0)
         m, n = residual_shape.size, theta.size
-        n_m, _ = self._block_sizes(n)
-        self.linear_solver._validate_newton_shape(
-            m + n_m if self.penalized else m, n, damped=self._damped
+        self.linear_solver.validate_shape(
+            m,
+            n,
+            penalized=self.penalized,
+            ridge_metric=self.initial_ridge_metric,
+            damped=self._damped,
+            role="linear_solver",
         )
         dtype = residual_shape.dtype
         ridge = self._resolve_ridge(dtype) if self.penalized else None
         homotopy = self._initial_homotopy(dtype)
+        ineq_weight, ineq_smoothing = self._initial_ineq_state(dtype)
         instances = dict(
             ridge=ridge,
-            metric=self.initial_metric,
+            ridge_metric=self.initial_ridge_metric,
             preconditioner=self.initial_preconditioner,
             homotopy=homotopy,
+            ineq_weight=ineq_weight,
+            ineq_smoothing=ineq_smoothing,
         )
         if not self.cache_jacobian:
             return NewtonState(**instances)
@@ -224,7 +172,9 @@ class Newton(SolverBase):
             Jt=jnp.zeros((n, m), dtype=dtype),
             jacobian_valid=jnp.asarray(False, dtype=jnp.bool_),
             aux=jax.tree.map(lambda s: jnp.zeros(s.shape, dtype=s.dtype), aux_shape),
-            solver_cache=self.linear_solver.new_cache(m, n, n_m, dtype, self.penalized),
+            solver_cache=self.linear_solver.new_cache(
+                m, n, self.initial_ridge_metric, dtype, self.penalized
+            ),
             **instances,
         )
 
@@ -248,6 +198,11 @@ class Newton(SolverBase):
             init_homotopy = self._initial_homotopy()
             if init_homotopy is not None and state.homotopy is None:
                 state = dataclasses.replace(state, homotopy=init_homotopy)
+            init_iw, init_is = self._initial_ineq_state()
+            if init_iw is not None and state.ineq_weight is None:
+                state = dataclasses.replace(state, ineq_weight=init_iw)
+            if init_is is not None and state.ineq_smoothing is None:
+                state = dataclasses.replace(state, ineq_smoothing=init_is)
             if self.cache_jacobian and state.jacobian_valid is None:
                 raise ValueError(
                     "cache_jacobian=True requires a NewtonState initialized with "
@@ -259,19 +214,35 @@ class Newton(SolverBase):
         return self._cast_state(resolved, x_dtype)
 
     def _initial_info(self, x, state, args, p):
-        residual, aux = self._residual_and_aux(x, args, p, homotopy=state.homotopy)
+        residual, aux, (_, ineq_metrics) = self._eval_residual_and_aux(
+            x,
+            args,
+            p,
+            homotopy=state.homotopy,
+            ineq_weight=state.ineq_weight,
+            ineq_smoothing=state.ineq_smoothing,
+        )
         theta, _ = ravel_pytree(x)
-        n_m, _ = self._block_sizes(theta.shape[0])
-        self.linear_solver._validate_newton_shape(
-            residual.shape[0] + n_m if self.penalized else residual.shape[0],
+        resolved = self._resolved_state(state)
+        self.linear_solver.validate_shape(
+            residual.shape[0],
             theta.shape[0],
+            penalized=self.penalized,
+            ridge_metric=resolved.ridge_metric,
             damped=self._damped,
+            role="linear_solver",
         )
         dtype = residual.dtype
         homotopy = (
             None if state.homotopy is None else jnp.asarray(state.homotopy, dtype=dtype)
         )
+        ineq_s = (
+            None
+            if state.ineq_smoothing is None
+            else jnp.asarray(state.ineq_smoothing, dtype=dtype)
+        )
         homotopy_active = self._homotopy_active(homotopy)
+        ineq_active = self._ineq_smoothing_active(ineq_s)
         zero = jnp.zeros((), dtype=dtype)
         infinity = jnp.asarray(jnp.inf, dtype=dtype)
         nan = jnp.asarray(jnp.nan, dtype=dtype)
@@ -280,10 +251,12 @@ class Newton(SolverBase):
         resid_finite = jnp.all(jnp.isfinite(residual))
         if self.penalized:
             ridge = jnp.asarray(state.ridge, dtype=dtype)
-            resolved = self._resolved_state(state)
-            ctx = SolverContext(x=theta, state=resolved, args=args, p=p)
-            y_m = self._factor_apply_metric_block(theta[:n_m], ctx, dtype)
-            penalty_value = jnp.sum(y_m**2)
+            ctx = SolverContext(
+                x=theta, state=resolved, args=args, p=p, ridge=ridge, damping=zero
+            )
+            penalty_value = jnp.asarray(
+                resolved.ridge_metric.quad_form(theta, ctx), dtype=dtype
+            )
             raw_loss = resid_loss + ridge * penalty_value
             base_finite = theta_finite & resid_finite & jnp.isfinite(raw_loss)
             loss = jnp.where(base_finite, raw_loss, nan)
@@ -302,7 +275,12 @@ class Newton(SolverBase):
         else:
             base_finite = theta_finite & resid_finite & jnp.isfinite(resid_loss)
             loss = jnp.where(base_finite, resid_loss, nan)
-            exact_root = base_finite & (~homotopy_active) & jnp.all(residual == 0)
+            exact_root = (
+                base_finite
+                & (~homotopy_active)
+                & (~ineq_active)
+                & jnp.all(residual == 0)
+            )
             step_status = jnp.where(
                 ~base_finite,
                 jnp.asarray(SolverStatus.NONFINITE, dtype=jnp.int32),
@@ -314,6 +292,18 @@ class Newton(SolverBase):
             )
             grad_norm = jnp.where(exact_root, zero, infinity)
             ridge_fields = {}
+
+        if ineq_metrics is not None:
+            eq_loss, viol_norm, max_viol = ineq_metrics
+            ineq_fields = dict(
+                eq_loss=jnp.where(base_finite, eq_loss, nan),
+                ineq_violation_norm=jnp.where(base_finite, viol_norm, nan),
+                ineq_max_violation=jnp.where(base_finite, max_viol, nan),
+                inequality_changed=ineq_active,
+            )
+        else:
+            ineq_fields = {}
+
         return NewtonInfo(
             loss=loss,
             loss_old=loss,
@@ -333,12 +323,17 @@ class Newton(SolverBase):
             homotopy=homotopy,
             complementarity_changed=homotopy_active,
             **ridge_fields,
+            **ineq_fields,
         )
 
     def _cast_state(self, state, dtype):
         updates = dict(hyper=_cast_newton_hyper(state.hyper, dtype))
         if state.homotopy is not None:
             updates["homotopy"] = jnp.asarray(state.homotopy, dtype=dtype)
+        if state.ineq_weight is not None:
+            updates["ineq_weight"] = jnp.asarray(state.ineq_weight, dtype=dtype)
+        if state.ineq_smoothing is not None:
+            updates["ineq_smoothing"] = jnp.asarray(state.ineq_smoothing, dtype=dtype)
         if self.penalized:
             updates["ridge"] = jnp.asarray(state.ridge, dtype=dtype)
             if state.solver_cache is not None:
@@ -349,7 +344,7 @@ class Newton(SolverBase):
         return dataclasses.replace(state, **updates)
 
     def update(self, x, state, args=None, p=None):
-        """One Newton + Armijo step: returns ``(x_new, state, info)``."""
+        """Execute one Newton + Armijo step and return ``(x_new, state, info)``."""
         self._check_residual_args(args, p)
         if not isinstance(state, NewtonState):
             raise TypeError(f"state must be a NewtonState; got {type(state).__name__}")
@@ -363,34 +358,92 @@ class Newton(SolverBase):
                 "solver.init(x0, args, p=p)"
             )
         theta, unravel = ravel_pytree(x)
-        n_m, n_f = self._block_sizes(theta.shape[0])
-        residual_flat, residual_value, resid, Jt, jvp_fn, JT, aux, base_mask = (
-            self._linearize_step(theta, unravel, state, args, p)
-        )
-        self.linear_solver._validate_newton_shape(
-            resid.shape[0] + n_m if self.penalized else resid.shape[0],
-            theta.shape[0],
+        (
+            residual_flat,
+            residual_value,
+            resid,
+            Jt,
+            jvp_fn,
+            JT,
+            aux,
+            base_mask,
+            base_ineq,
+        ) = self._linearize_step(theta, unravel, state, args, p)
+        m, n = resid.shape[0], theta.shape[0]
+        resolved_state = self._resolved_state(state)
+        self.linear_solver.validate_shape(
+            m,
+            n,
+            penalized=self.penalized,
+            ridge_metric=resolved_state.ridge_metric,
             damped=self._damped,
+            role="linear_solver",
         )
         dtype = resid.dtype
         zero = jnp.zeros((), dtype=dtype)
         nan = jnp.asarray(jnp.nan, dtype=dtype)
-        resolved_state = self._resolved_state(state)
-        ctx = SolverContext(x=theta, state=resolved_state, args=args, p=p)
+
+        hyper = state.hyper if state.hyper is not None else self.hyperparams(dtype)
+        resid_loss_raw = jnp.sum(resid**2)
+        has_traced_damping = state.hyper is not None or self._damped
+        if not has_traced_damping:
+            damping = zero
+        else:
+            damping_scale = jnp.asarray(hyper.damping, dtype=dtype)
+            damping_power = jnp.asarray(hyper.damping_power, dtype=dtype)
+            min_damping = jnp.asarray(hyper.min_damping, dtype=dtype)
+            r_norm = jnp.sqrt(resid_loss_raw)
+
+            def _compute_damping(_):
+                j_scale = (
+                    jnp.sum(Jt**2) / m if Jt is not None else jnp.ones((), dtype=dtype)
+                )
+                floor = min_damping
+                if isinstance(self.linear_solver, Cholesky):
+                    floor = jnp.maximum(floor, 4.0 * jnp.finfo(dtype).eps * j_scale)
+                return jnp.maximum(
+                    floor, damping_scale * j_scale * (r_norm**damping_power)
+                )
+
+            damping = jax.lax.cond(
+                damping_scale > zero,
+                _compute_damping,
+                lambda _: zero,
+                operand=None,
+            )
+
+        space, form = self._solver_space_and_form(
+            self.linear_solver,
+            m,
+            n,
+            resolved_state.ridge_metric,
+            damped=has_traced_damping,
+        )
+        ridge_val = jnp.asarray(state.ridge, dtype=dtype) if self.penalized else None
+        ctx = SolverContext(
+            x=theta,
+            state=resolved_state,
+            args=args,
+            p=p,
+            ridge=ridge_val,
+            damping=damping,
+            space=space,
+            role="forward",
+            form=form,
+        )
         (
             ridge,
-            y_m,
             penalty_value_old,
-            penalty_gradient,
+            penalty_grad,
             resid_loss_old,
             raw_loss_old,
-        ) = self._base_objective(resid, theta, n_m, n_f, state, ctx)
+        ) = self._base_objective(resid, theta, state, ctx)
         if self.penalized:
-            penalty_grad_norm = jnp.linalg.norm(penalty_gradient)
+            penalty_grad_norm = jnp.linalg.norm(penalty_grad)
             base_finite = (
                 jnp.all(jnp.isfinite(theta))
                 & jnp.all(jnp.isfinite(resid))
-                & jnp.all(jnp.isfinite(y_m))
+                & jnp.all(jnp.isfinite(penalty_grad))
                 & jnp.isfinite(raw_loss_old)
             )
             exact_root = jnp.asarray(False, dtype=jnp.bool_)
@@ -404,42 +457,10 @@ class Newton(SolverBase):
             exact_root = (
                 base_finite
                 & (~self._homotopy_active(state.homotopy))
+                & (~self._ineq_smoothing_active(state.ineq_smoothing))
                 & jnp.all(resid == 0)
             )
         loss_old = jnp.where(base_finite, raw_loss_old, nan)
-
-        hyper = state.hyper if state.hyper is not None else self.hyperparams(dtype)
-
-        def whiten(v):
-            return jnp.asarray(self._extended_solve(v, ctx), dtype=dtype)
-
-        def whiten_transpose(v):
-            return jnp.asarray(self._extended_solve_transpose(v, ctx), dtype=dtype)
-
-        if state.hyper is None and not self._damped:
-            damping = zero
-        else:
-            damping_scale = jnp.asarray(hyper.damping, dtype=dtype)
-            damping_power = jnp.asarray(hyper.damping_power, dtype=dtype)
-            min_damping = jnp.asarray(hyper.min_damping, dtype=dtype)
-            r_norm = jnp.sqrt(resid_loss_old)
-
-            def _compute_damping(_):
-                j_scale = (
-                    jnp.sum(whiten_transpose(Jt) ** 2) / resid.shape[0]
-                    if Jt is not None
-                    else jnp.ones((), dtype=dtype)
-                )
-                return jnp.maximum(
-                    min_damping, damping_scale * j_scale * (r_norm**damping_power)
-                )
-
-            damping = jax.lax.cond(
-                damping_scale > zero,
-                _compute_damping,
-                lambda _: zero,
-                operand=None,
-            )
 
         sub = Subproblem(
             resid=resid,
@@ -447,29 +468,27 @@ class Newton(SolverBase):
             Jt=Jt,
             jvp_fn=jvp_fn,
             JT=JT,
-            whiten=whiten,
-            whiten_transpose=whiten_transpose,
-            y_m=y_m,
-            penalty_gradient=penalty_gradient,
             ridge=ridge,
             damping=damping,
-            n_m=n_m,
-            n_f=n_f,
+            ridge_metric=resolved_state.ridge_metric,
+            penalty_grad=penalty_grad,
             cache=state.solver_cache,
             cache_enabled=self.cache_jacobian,
             hyper=hyper,
             ctx=ctx,
             penalized=self.penalized,
+            undamped=not has_traced_damping,
+            active=True,
+            preconditioner=resolved_state.preconditioner,
         )
 
         def _compute_step(_):
-            newton_step = self.linear_solver.prepare_newton(sub)
+            newton_step = self.linear_solver.prepare(sub)
             grad = newton_step.grad
-            u = newton_step.d
-            d = whiten(u)
+            d = jnp.asarray(newton_step.velocity(), dtype=dtype)
             grad_norm = jnp.linalg.norm(grad)
-            direction_norm = jnp.linalg.norm(u)
-            slope = mm(grad, u)
+            direction_norm = jnp.linalg.norm(d)
+            slope = jnp.sum(grad * d)
             solve_ok = (
                 newton_step.solve_ok
                 & jnp.all(jnp.isfinite(d))
@@ -483,7 +502,6 @@ class Newton(SolverBase):
                     hyper.geodesic_acceptance_ratio, dtype=dtype
                 )
                 (
-                    u_a_raw,
                     a_raw,
                     acceleration_ratio,
                     raw_ratio_accepted,
@@ -491,25 +509,16 @@ class Newton(SolverBase):
                     residual_flat,
                     theta,
                     d,
-                    u,
-                    newton_step.correction,
-                    ctx,
+                    newton_step.solve_residual_rhs,
                     geodesic_acceptance_ratio,
                     dtype,
                 )
                 ratio_accepted = (
-                    descent_ok
-                    & raw_ratio_accepted
-                    & jnp.all(jnp.isfinite(u_a_raw))
-                    & jnp.all(jnp.isfinite(a_raw))
+                    descent_ok & raw_ratio_accepted & jnp.all(jnp.isfinite(a_raw))
                 )
-                u_a = jnp.where(ratio_accepted, u_a_raw, jnp.zeros_like(u))
                 a = jnp.where(ratio_accepted, a_raw, jnp.zeros_like(d))
-                u_a_m = u_a[:n_m] if self.penalized else None
             else:
-                u_a = None
                 a = None
-                u_a_m = None
                 acceleration_ratio = zero
                 ratio_accepted = jnp.asarray(False, dtype=jnp.bool_)
 
@@ -534,20 +543,21 @@ class Newton(SolverBase):
                     hyper,
                     descent_ok,
                     a=a,
-                    y_m=y_m if self.penalized else None,
-                    u_m=u[:n_m] if self.penalized else None,
-                    u_a_m=u_a_m,
                     ridge=ridge if self.penalized else None,
+                    ridge_metric=resolved_state.ridge_metric
+                    if self.penalized
+                    else None,
+                    ctx=ctx,
                     resid_loss_old=resid_loss_old if self.penalized else None,
                     penalty_old=penalty_value_old if self.penalized else None,
                 )
                 if self.geodesic_acceleration:
-                    step_u_norm = jnp.linalg.norm(
-                        stepsize_ls * u + 0.5 * (stepsize_ls**2) * u_a
+                    step_d_norm = jnp.linalg.norm(
+                        stepsize_ls * d + 0.5 * (stepsize_ls**2) * a
                     )
                 else:
-                    step_u_norm = stepsize_ls * direction_norm
-                step_norm_ls = jnp.where(accepted_ls, step_u_norm, zero)
+                    step_d_norm = stepsize_ls * direction_norm
+                step_norm_ls = jnp.where(accepted_ls, step_d_norm, zero)
                 return (
                     theta_ls,
                     loss_ls,
@@ -681,9 +691,12 @@ class Newton(SolverBase):
             loss,
             resid_loss,
             new_homotopy,
+            new_ineq_smoothing,
             comp_changed,
-            homotopy_changed,
-        ) = self._post_step_complementarity(
+            ineq_changed,
+            schedule_changed,
+            out_ineq,
+        ) = self._post_step_constraints(
             theta_new,
             unravel,
             args,
@@ -696,25 +709,33 @@ class Newton(SolverBase):
             ridge,
             grad_norm,
             base_mask,
+            base_ineq,
         )
         step_status = jnp.where(
-            homotopy_changed
+            schedule_changed
             & jnp.isfinite(loss)
             & (step_status != SolverStatus.LINEAR_SOLVE_FAILED),
             jnp.asarray(SolverStatus.RUNNING, dtype=jnp.int32),
             step_status,
         )
-        cache_valid = cache_valid & (~homotopy_changed)
+        cache_valid = cache_valid & (~schedule_changed)
         if solver_cache is not None:
             solver_cache = dataclasses.replace(
-                solver_cache, valid=solver_cache.valid & (~homotopy_changed)
+                solver_cache, valid=solver_cache.valid & (~schedule_changed)
             )
 
+        ineq_weight_out = (
+            None
+            if state.ineq_weight is None
+            else jnp.asarray(state.ineq_weight, dtype=dtype)
+        )
         instances = dict(
             ridge=ridge if self.penalized else None,
-            metric=state.metric,
+            ridge_metric=state.ridge_metric,
             preconditioner=state.preconditioner,
             homotopy=new_homotopy,
+            ineq_weight=ineq_weight_out,
+            ineq_smoothing=new_ineq_smoothing,
         )
         if self.cache_jacobian:
             new_state = NewtonState(
@@ -739,6 +760,17 @@ class Newton(SolverBase):
         else:
             ridge_info = {}
 
+        if out_ineq is not None:
+            eq_loss, viol_norm, max_viol = out_ineq
+            ineq_info = dict(
+                eq_loss=jnp.where(base_finite, eq_loss, nan),
+                ineq_violation_norm=jnp.where(base_finite, viol_norm, nan),
+                ineq_max_violation=jnp.where(base_finite, max_viol, nan),
+                inequality_changed=ineq_changed,
+            )
+        else:
+            ineq_info = {}
+
         return (
             unravel(theta_new),
             new_state,
@@ -761,29 +793,36 @@ class Newton(SolverBase):
                 homotopy=new_homotopy,
                 complementarity_changed=comp_changed,
                 **ridge_info,
+                **ineq_info,
             ),
         )
 
     def _converged(self, info, atol, gtol, xtol):
         homotopy_active = self._homotopy_active(info.homotopy)
-        stable = ~info.complementarity_changed
+        ineq_decay_active = (
+            jnp.asarray(False, dtype=jnp.bool_)
+            if info.inequality_changed is None
+            else info.inequality_changed
+        )
+        ready = (
+            self._constraints_stable(info) & (~homotopy_active) & (~ineq_decay_active)
+        )
         step_ok = info.step_status == SolverStatus.RUNNING
         stationarity_eligible = (info.step_status != SolverStatus.NONFINITE) & (
             info.step_status != SolverStatus.LINEAR_SOLVE_FAILED
         )
-        gtol_met = stable & stationarity_eligible & (gtol > 0) & (info.grad_norm < gtol)
+        gtol_met = ready & stationarity_eligible & (gtol > 0) & (info.grad_norm < gtol)
         xtol_met = (
-            stable & step_ok & (xtol > 0) & info.accepted & (info.step_norm < xtol)
+            ready & step_ok & (xtol > 0) & info.accepted & (info.step_norm < xtol)
         )
         if self.penalized:
-            residual_ok = (~homotopy_active) & (
-                (atol <= 0) | (jnp.sqrt(info.resid_loss) <= atol)
-            )
-            return (gtol_met | xtol_met) & residual_ok
-        exact_root = (~homotopy_active) & (info.step_status == SolverStatus.CONVERGED)
-        atol_met = (
-            (~homotopy_active) & step_ok & (atol > 0) & (jnp.sqrt(info.loss) < atol)
+            return gtol_met | xtol_met
+        exact_root = (
+            (~homotopy_active)
+            & (~ineq_decay_active)
+            & (info.step_status == SolverStatus.CONVERGED)
         )
+        atol_met = ready & step_ok & (atol > 0) & (jnp.sqrt(info.loss) < atol)
         return exact_root | atol_met | gtol_met | xtol_met
 
     def _step_failure_status(self, info):

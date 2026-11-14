@@ -1,7 +1,3 @@
-"""Compilation-cache and carried-instance state guards for LevenbergMarquardt
-and Newton.
-"""
-
 import dataclasses
 
 import jax
@@ -13,16 +9,16 @@ from nlls_gram import (
     CG,
     QR,
     AnnealRidge,
-    BlockEigenPreconditioner,
     Cholesky,
-    CholeskyMetric,
-    DiagonalMetric,
+    DiagonalPreconditioner,
+    DiagonalRidge,
+    FactorRidge,
     GramCG,
-    IdentityMetric,
+    IdentityRidge,
     LevenbergMarquardt,
     Newton,
     Preconditioner,
-    RepeatedFactorMetric,
+    RepeatedFactorRidge,
     SolverAction,
     SolverStatus,
     register_pytree_dataclass,
@@ -74,9 +70,6 @@ def test_equal_solvers_and_traced_loop_controls_share_one_compilation(solver_cls
     solver.solve(jnp.zeros(N), p=make_p(3.0), max_steps=20, atol=1e-6, xtol=1e-9)
     assert compilations() == 1
 
-    # Numeric constructor hyperparameters travel in state/hyper and share the
-    # compiled loop across fresh solver instances (including leafless ad_solver
-    # preconditioners).
     if solver_cls is LevenbergMarquardt:
         solver_cls(
             residual,
@@ -99,38 +92,33 @@ def test_equal_solvers_and_traced_loop_controls_share_one_compilation(solver_cls
         ).solve(jnp.zeros(N), p=make_p(1.5), **SOLVE)
     assert compilations() == 1
 
-    # Frozen after construction
     with pytest.raises(AttributeError, match="frozen after construction"):
         solver.geodesic_acceleration = False
 
 
-def test_metrics_preconditioners_and_callbacks_compile_once_and_use_live_values():
-    # Two same-structure, different-valued metrics share one compiled loop and
-    # use each metric's own factor values.
+def test_ridge_metrics_preconditioners_and_callbacks_compile_once_and_use_live_values():
     def solve_with(scale):
         return LevenbergMarquardt(
             residual,
-            metric=DiagonalMetric(
+            ridge=0.1,
+            ridge_metric=DiagonalRidge(
                 jnp.asarray([100.0, 1.0, 1.0, 1.0, 100.0], jnp.float32) ** scale
             ),
-        ).solve(jnp.zeros(N), p=make_p(), max_steps=60, atol=1e-6)
+        ).solve(jnp.zeros(N), p=make_p(), max_steps=60, gtol=1e-6)
 
     heavy_ends = solve_with(1.0)
     heavy_middle = solve_with(-1.0)
     assert compilations() == 1
     assert not np.allclose(heavy_ends.x, heavy_middle.x, atol=1e-4)
 
-    # Fresh BlockEigenPreconditioner and AnnealRidge callback share one compile
     for jitted in JITTED:
         jitted._clear_cache()
     for scale in (1.0, 2.0):
-        precond = BlockEigenPreconditioner(
-            [(scale * jnp.eye(N, dtype=jnp.float32)[None], 1.0)], jnp.arange(N)
-        )
+        precond = DiagonalPreconditioner(scale * jnp.ones(N, dtype=jnp.float32))
         anneal = AnnealRidge(ridge_floor=1e-8)
         LevenbergMarquardt(
             residual,
-            metric=CholeskyMetric(scale * jnp.eye(N, dtype=jnp.float32)),
+            ridge_metric=FactorRidge(scale * jnp.eye(N, dtype=jnp.float32)),
             ridge=1e-3,
             linear_solver=CG(precond, tol=1e-8, maxiter=16),
         ).solve(
@@ -143,32 +131,30 @@ def test_metrics_preconditioners_and_callbacks_compile_once_and_use_live_values(
         )
     assert compilations() == 1
 
-    # Changing a static setting compiles a distinct program
     LevenbergMarquardt(residual, linear_solver=QR()).solve(
         jnp.zeros(N), p=make_p(), **SOLVE
     )
     assert compilations() == 2
 
 
-def test_carried_metric_swap_semantics_invalidation_and_implicit_ad():
-    root = RNG.normal(size=(2, 4))
-    K = jnp.asarray(root @ root.T + 0.5 * np.eye(2), jnp.float32)
+def test_carried_ridge_metric_swap_semantics_invalidation_and_implicit_ad():
+    root = RNG.normal(size=(4, 2))
+    K = jnp.asarray(root.T @ root + 0.5 * np.eye(2), jnp.float32)
     b_vec = jnp.ones(M, jnp.float32)
 
-    def make_metric(scale=1.0):
-        return RepeatedFactorMetric(
+    def make_rm(scale=1.0):
+        return RepeatedFactorRidge(
             scale * jnp.linalg.cholesky(K, upper=True), repeats=2
         )
 
     def swap_every_step(ctx):
         scale = 1.0 + 0.01 * ctx.step.astype(jnp.float32)
         return SolverAction(
-            state=dataclasses.replace(ctx.state, metric=make_metric(scale))
+            state=dataclasses.replace(ctx.state, ridge_metric=make_rm(scale))
         )
 
-    # Ridge objective: metric swap changes the objective and suppresses convergence
     ridge_solver = LevenbergMarquardt(
-        lambda x: A @ x - b_vec, metric=make_metric(), ridge=1e-3
+        lambda x: A @ x - b_vec, ridge_metric=make_rm(), ridge=1e-2
     )
     assert int(
         ridge_solver.solve(
@@ -176,63 +162,56 @@ def test_carried_metric_swap_semantics_invalidation_and_implicit_ad():
         ).status
     ) == int(SolverStatus.MAX_STEPS)
 
-    # Unpenalized objective: metric swap re-whitens geometry without blocking
-    unpen_solver = LevenbergMarquardt(lambda x: A @ x - b_vec, metric=make_metric())
-    assert int(
-        unpen_solver.solve(
-            jnp.zeros(N), max_steps=15, gtol=1e3, callback=swap_every_step
-        ).status
-    ) == int(SolverStatus.CONVERGED)
-
-    # Wrong structure or weak-type scalar swap raises naming state.metric
-    x0 = jnp.zeros(N)
+    x0 = jnp.zeros(N, jnp.float32)
     state = ridge_solver.init(x0)
-    with pytest.raises(ValueError, match="state.metric"):
+    with pytest.raises(ValueError, match="state.ridge_metric"):
         ridge_solver._apply_action(
-            SolverAction(state=dataclasses.replace(state, metric=IdentityMetric(4))),
+            SolverAction(
+                state=dataclasses.replace(state, ridge_metric=IdentityRidge(4))
+            ),
             x0,
             state,
             None,
             None,
         )
-    leaves, treedef = jax.tree_util.tree_flatten(state.metric)
+    leaves, treedef = jax.tree_util.tree_flatten(state.ridge_metric)
     doctored = jax.tree_util.tree_unflatten(
-        treedef, [1.0 if jnp.ndim(leaf) == 0 else leaf for leaf in leaves]
+        treedef, [jnp.ones((1, 1), dtype=jnp.float32) for _ in leaves]
     )
-    with pytest.raises(ValueError, match="state.metric"):
+    with pytest.raises(ValueError, match="state.ridge_metric"):
         ridge_solver._apply_action(
-            SolverAction(state=dataclasses.replace(state, metric=doctored)),
+            SolverAction(state=dataclasses.replace(state, ridge_metric=doctored)),
             x0,
             state,
             None,
             None,
         )
 
-    # Implicit AD uses the carried metric at the solution after a mid-solve swap
+    # Implicit AD uses the carried ridge_metric at the solution after a mid-solve swap
+    rho = 0.2
     w_init = jnp.asarray(RNG.uniform(0.5, 2.0, size=N), jnp.float32)
     w_swap = jnp.asarray(RNG.uniform(4.0, 9.0, size=N), jnp.float32)
 
     def swap_at_2(ctx):
         fresh = jax.lax.cond(
             ctx.step == 2,
-            lambda: DiagonalMetric(w_swap),
-            lambda: ctx.state.metric,
+            lambda: DiagonalRidge(w_swap),
+            lambda: ctx.state.ridge_metric,
         )
-        return SolverAction(state=dataclasses.replace(ctx.state, metric=fresh))
+        return SolverAction(state=dataclasses.replace(ctx.state, ridge_metric=fresh))
 
     ad_solver = LevenbergMarquardt(
-        lambda x, _, p: A @ x - p, metric=DiagonalMetric(w_init)
+        lambda x, _, p: A @ x - p, ridge=rho, ridge_metric=DiagonalRidge(w_init)
     )
     tangent = jax.jacfwd(
         lambda pv: (
             ad_solver.solve(
-                jnp.zeros(N), p=pv, max_steps=60, atol=1e-6, callback=swap_at_2
+                jnp.zeros(N), p=pv, max_steps=60, gtol=1e-6, callback=swap_at_2
             ).x
         )
     )(b_vec)
-    W_inv = jnp.diag(1.0 / w_swap)
-    analytic = W_inv @ A.T @ jnp.linalg.inv(A @ W_inv @ A.T)
-    np.testing.assert_allclose(tangent, analytic, rtol=2e-4, atol=2e-5)
+    analytic = jnp.linalg.solve(A.T @ A + rho * jnp.diag(w_swap), A.T)
+    np.testing.assert_allclose(tangent, analytic, rtol=5e-4, atol=5e-5)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)

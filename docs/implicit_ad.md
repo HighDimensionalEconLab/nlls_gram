@@ -1,104 +1,35 @@
-# Implicit differentiation
+# Implicit Differentiation
 
-`solve(...).x` carries a custom JVP rule with respect to `p`, so gradients do
-**not** unroll the LM iterations. They differentiate the converged root
-through the implicit function theorem, at a cost independent of `max_steps`.
+`solve(...).x` carries a custom JVP rule with respect to `p`, differentiating the converged solution via the implicit function theorem at a cost independent of `max_steps`. Reverse-mode `jax.grad`, `jax.vjp`, `jax.jacrev`, and `jax.vmap` work automatically by JAX transposition of the linear tangent rule.
 
-## The rule
+## Mathematical rule
 
-For a root \(r(x, a, p) = 0\) with \(J = r_x\) and \(K = r_p\), differentiating
-gives \(J\,\dot x = -K\,\dot p\). That is underdetermined at an interpolating
-root, and the metric picks the solution: with \(W = F^\top F\) and
-\(B = JF^{-1}\),
+Let \(r(x, a, p) \in \mathbb{R}^m\) denote the complete optimization residual at the converged iterate \(x^*\) (evaluated at the frozen final ridge, inequality, and complementarity parameters), with \(J = D_x r(x^*, a, p)\) and \(K = D_p r(x^*, a, p)\).
 
-$$
-\dot x = -F^{-1}B^{+}K\dot p ,
-$$
+- **Unpenalized (`ridge=None`)**: solves the undamped Gauss-Newton tangent equation
+  $$
+  \dot{x} = -J^+ K \dot{p} ,
+  $$
+  returning the Euclidean minimum-norm tangent on underdetermined interpolating manifolds and the linearized least-squares tangent on overdetermined systems.
+- **Tikhonov-penalized (`ridge` \(\rho > 0\))**: solves the undamped regularized Gauss-Newton stationarity system
+  $$
+  \left(J^\top J + \rho Q\right) \dot{x} = -J^\top K \dot{p} ,
+  $$
+  returning the Euclidean minimum-norm augmented least-squares tangent when `ad_solver=SVD()` and \(\ker(J) \cap \ker(L) \ne \{0\}\).
 
-the **minimum-\(W\)-norm** tangent — the same local selection rule the forward
-step uses in both `LevenbergMarquardt` and `Newton` (reducing to the
-minimum-Euclidean-norm tangent \(\dot x = -J^+ K \dot p\) when `metric=None`).
+On nonzero-residual least-squares problems (\(r(x^*) \ne 0\)), this rule uses the Gauss-Newton sensitivity equation, omitting the second-order curvature terms \(\sum_i r_i \nabla^2_{xx} r_i\) and \((D_p J^\top) r\). It is exact whenever \(r(x^*) = 0\), or when \(r\) is affine in \(x\) with \(D_p J = 0\), and first-order accurate in \(\|r(x^*)\|_2\) otherwise.
 
-When the root is locally unique (for example, a full-rank square system with
-\(r(x^*, a, p) = 0\)), this selected tangent equals the exact sensitivity of the
-solver's returned root \(x^*(p)\). On an underdetermined problem whose Jacobian
-row space rotates with \(p\), the selected tangent \(\dot x = -F^{-1} B^+ K \dot p\)
-is the minimum-norm tangent to the solution manifold \(r(x, a, p) = 0\) at
-\(x^*\), which differs in general from the path derivative of a fixed
-initialization's trajectory by the rotation of \(\text{range}(J^\top)\). When
-`ridge` is active in `LevenbergMarquardt` or `Newton`, the ridge makes the
-system positive definite and the rule solves the Gauss-Newton linearized
-stationarity system \((\tilde J^\top\tilde J + \lambda E)\dot y = -\tilde J^\top K\dot p\).
-Note that on nonzero-residual least-squares or positive-ridge problems, both
-solvers differentiate the Gauss-Newton linearization (omitting the second-order
-residual-Hessian term \(\sum_i r_i \nabla^2_{xx} r_i\)), which becomes exact as
-\(\|r(x^*)\|_2 \to 0\).
+## Selecting `ad_solver`
 
-Reverse mode comes from JAX transposing that linear tangent program, so `grad`,
-`vjp`, `hessian`, and `vmap` all work without a separate implementation.
+Any linear solver valid at \(\mu = 0\) for the problem formulation (`Cholesky`, `QR`, `CG`, `GramCG`, `LU`, or `SVD`) can serve as `ad_solver`. When `ad_solver=None` (the default):
 
-## Choosing an `ad_solver`
+- With `ridge=None`: uses `GramCG` or `CG` when the forward solver is a compatible Krylov method (`m <= n` for `GramCG`, `n <= m` for `CG`), `LU()` when \(m = n\) without inequalities, and `SVD()` otherwise.
+- With `ridge > 0`: uses `CG` or `GramCG` when the forward solver is a compatible Krylov method, `SVD()` when the forward solver is `SVD` or when the augmented operator lacks guaranteed full rank on a wide system, `QR` or `Cholesky` (preserving `form` and `preconditioner`) when the forward solver is valid at \(\mu = 0\), and `Cholesky()` otherwise.
 
-`None`, the default, matches the forward family where that operator is
-invertible and otherwise picks by shape: `LU()` for a square system, `SVD()`
-for a rectangular one. Both err like \(\text{cond}(B)\varepsilon\); the normal
-and dual factorizations err like \(\text{cond}(B)^2\varepsilon\), so the
-default is also the accurate choice. Override it when you know more than the
-shape does — see
-[Metric LM](metric_lm.md#rank-deficiency-and-implicit-ad) for the table of
-which rule is valid where. The short version:
+## Frozen conditioning and failed solves
 
-- `LU()` for a square system; it is already the default, and it raises rather
-  than guessing if the system turns out rectangular;
-- `SVD()` whenever the undamped system is singular by construction — padded
-  zero residuals are the common case, and again the default;
-- `GramCG(precond)` for \(m \le n\) and `CG(precond)` for \(n \le m\) when the
-  forward solve is matrix-free and you want the tangent to stay so;
-- `Cholesky()` to trade tangent accuracy for speed on a rectangular system
-  whose small side is known to have full rank.
+Carried `ridge`, `ridge_metric`, `preconditioner`, `homotopy`, `ineq_weight`, and `ineq_smoothing` values are treated as differentiation-inert inputs under `jax.lax.stop_gradient`.
 
-A Krylov rule used outside its valid shape raises rather than returning a
-quietly wrong tangent.
+Implicit AD differentiates results with `SolverStatus.CONVERGED`, plus `SolverStatus.MAX_STEPS` when `max_steps_is_success=True` (the default). All failure statuses return exact zero tangents for `result.x` and `result.aux`. Under `jax.vmap`, failed lanes evaluate the masked linear tangent program at stop-gradient copies of the initial `(x0, args, p)` so VJP transposition stays finite across every batch lane.
 
-## Frozen instances
-
-Under differentiation the **carried** metric and preconditioner instances —
-the geometry the solve actually converged under, callback refreshes included
-— are frozen inputs to the implicit system: their leaves ride along as inert
-conditioning data under `stop_gradient`, and the state-dependence of a
-callback-refreshed instance is not differentiated. An iterate-tracking
-metric that wants the tangent taken at the exact solution geometry refreshes
-on every accepted step, which makes the carried instance current at
-convergence.
-
-## Failed solves
-
-Implicit AD uses `CONVERGED`, and also `MAX_STEPS` when
-`max_steps_is_success=True` (the default). Every other status returns **exact
-zero tangents** for `result.x` and `result.aux`. To keep automatic VJP
-transposition finite under `vmap`, a failed lane's linear tangent program is
-evaluated at differentiation-inert copies of the original `(x0, args, p)`, so
-those initial values must be valid for JVP evaluation of the residual. The
-primal failed result is never replaced.
-
-`x0` gets exactly zero tangent by contract: the returned root is a property of
-the problem, not of where the search started.
-
-## Aux outputs
-
-With `has_aux=True`, `result.aux` is evaluated at the returned `(x, args, p)`
-and is differentiable with respect to `p` both directly and through
-\(x^*(p)\).
-
-```python
-def residual(x, args, p):
-    value = model_residual(x, args, p)
-    return value, {"fit": summary(x, p)}
-
-
-solver = LevenbergMarquardt(residual, has_aux=True)
-grad = jax.grad(lambda p: solver.solve(x0, args, p=p, atol=1e-8).aux["fit"])(p)
-```
-
-`args`, `user_state`, the histories, and the multi-start diagnostics are all
-differentiation-inert.
+With `has_aux=True`, `(residual, aux)` is jointly linearized once at `(result.x, result.args, p)` so derivatives flow into `aux` both directly through `p` and indirectly through \(x^*(p)\) without redundant forward evaluations. Under `jax.jacfwd`, `jax.jacrev`, `jax.linearize` + `jax.vmap`, and `jax.vjp` + `jax.vmap`, the primal solve, joint residual linearization, Jacobian assembly, and dense AD matrix factorization execute once and are reused across all batched tangent or cotangent right-hand sides.

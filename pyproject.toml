@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nlls-gram"
-version = "3.1.0"
-description = "Metric-aware Levenberg-Marquardt nonlinear least-squares for JAX"
+version = "4.0.0"
+description = "Levenberg-Marquardt and Gauss-Newton nonlinear least-squares for JAX"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -14,7 +14,7 @@ authors = [{ name = "Jesse Perla", email = "jesseperla@gmail.com" }]
 keywords = [
     "levenberg-marquardt",
     "nonlinear-least-squares",
-    "metric",
+    "tikhonov",
     "jax",
     "optimization",
 ]
@@ -26,7 +26,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 dependencies = [
-    "jax>=0.11.2",
+    "jax>=0.12.0.1",
+    "jaxlib>=0.12.0.1",
 ]
 
 [project.urls]
@@ -53,7 +54,7 @@ benchmark = [
     "pytest-benchmark>=5.3.0",
 ]
 dev = [
-    "flax>=0.12.10",
+    "flax>=0.12.12",
     "pytest>=9.1.1",
     "ruff>=0.17.1",
 ]
@@ -62,6 +63,5 @@ docs = [
     "mkdocstrings[python]>=1.0.7",
 ]
 gpu = [
-    "jax[cuda13]>=0.11.2 ; sys_platform == 'linux'",
-    "metaljax>=0.11.9 ; platform_machine == 'arm64' and sys_platform == 'darwin'",
+    "jax[cuda13]>=0.12.0.1 ; sys_platform == 'linux'",
 ]

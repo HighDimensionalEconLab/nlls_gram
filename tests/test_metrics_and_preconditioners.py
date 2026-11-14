@@ -1,5 +1,3 @@
-"""Tests for Metric and Preconditioner classes, callback refresh, and StateSpace."""
-
 import dataclasses
 
 import jax
@@ -8,239 +6,292 @@ import jax.scipy.linalg as jsp_linalg
 import numpy as np
 import pytest
 
+import nlls_gram
 from nlls_gram import (
     CG,
-    BlockEigenPreconditioner,
+    QR,
+    SVD,
+    Cholesky,
+    DiagonalPreconditioner,
+    DiagonalRidge,
+    FactorRidge,
     GramCG,
-    IdentityMetric,
     IdentityPreconditioner,
+    IdentityRidge,
     LevenbergMarquardt,
-    LMState,
+    MatrixRidge,
     Newton,
-    NystromPreconditioner,
-    PaddedPreconditioner,
-    RepeatedFactorMetric,
-    ShermanMorrisonPreconditioner,
+    Preconditioner,
+    RepeatedFactorRidge,
+    RidgeMetric,
     SolverContext,
     SolverStatus,
-    WoodburyPreconditioner,
     register_pytree_dataclass,
 )
-from nlls_gram.experimental import StateSpaceMetric, matern_state_space
 
-REPEATS = 3
-BLOCK = 4
-N_M = REPEATS * BLOCK
 CTX = SolverContext()
 
 
-def make_factor(key, size):
-    root = jax.random.normal(key, (size, size + 2))
-    K = root @ root.T + 0.5 * jnp.eye(size)
-    return jnp.linalg.cholesky(K, upper=True), K
+@dataclasses.dataclass(frozen=True, eq=False)
+class MatvecOnlyRidge(RidgeMetric):
+    weights: jax.Array
+
+    def matvec(self, v, ctx):
+        w = jnp.asarray(self.weights, dtype=v.dtype)
+        shape = (w.shape[0],) + (1,) * (v.ndim - 1)
+        return v * w.reshape(shape)
 
 
-def test_metrics_contract_and_live_context():
-    F, K = make_factor(jax.random.key(0), BLOCK)
-    metric = RepeatedFactorMetric(F, repeats=REPEATS)
-    assert metric.size == N_M
-    F_bar = jsp_linalg.block_diag(*([F] * REPEATS))
-    W = jsp_linalg.block_diag(*([K] * REPEATS))
-    v = jax.random.normal(jax.random.key(1), (N_M,))
-    matrix = jax.random.normal(jax.random.key(2), (N_M, 3))
+register_pytree_dataclass(MatvecOnlyRidge, data_fields=("weights",))
 
-    applied = metric.factor_apply(v, CTX)
-    np.testing.assert_allclose(applied, F_bar @ v, rtol=1e-5, atol=1e-6)
+
+def test_removed_legacy_exports_absent():
+    removed = (
+        "Metric",
+        "IdentityMetric",
+        "DiagonalMetric",
+        "CholeskyMetric",
+        "RepeatedFactorMetric",
+        "StateSpaceMetric",
+        "BlockEigenPreconditioner",
+        "NystromPreconditioner",
+        "ShermanMorrisonPreconditioner",
+        "WoodburyPreconditioner",
+        "PaddedPreconditioner",
+        "Equality",
+    )
+    for name in removed:
+        assert not hasattr(nlls_gram, name), f"{name} must not be exported"
+
+
+def test_ridge_operators_quadratic_forms_and_matrix_vs_factor_distinction():
+    rng = np.random.default_rng(7)
+    n = 8
+    v = jnp.asarray(rng.normal(size=n), jnp.float32)
+    mat = jnp.asarray(rng.normal(size=(n, 3)), jnp.float32)
+
+    # IdentityRidge full and leading slice
+    id_full = IdentityRidge()
+    id_part = IdentityRidge(5)
+    np.testing.assert_allclose(id_full.matvec(v, CTX), v)
+    np.testing.assert_allclose(id_full.quad_form(v, CTX), jnp.sum(v**2), rtol=1e-6)
     np.testing.assert_allclose(
-        metric.factor_apply(matrix, CTX), F_bar @ matrix, rtol=1e-5, atol=1e-6
+        id_part.matvec(v, CTX), jnp.concatenate([v[:5], jnp.zeros(3, v.dtype)])
     )
     np.testing.assert_allclose(
-        metric.factor_solve(applied, CTX), v, rtol=2e-4, atol=1e-5
+        id_part.quad_form(v, CTX), jnp.sum(v[:5] ** 2), rtol=1e-6
+    )
+    with pytest.raises(ValueError, match="exceeding"):
+        id_part.matvec(jnp.zeros(4, jnp.float32), CTX)
+
+    # DiagonalRidge with interior and trailing zeros + free tail
+    w = jnp.array([2.0, 0.0, 3.5, 0.0, 1.5, 0.0], dtype=jnp.float32)
+    diag_r = DiagonalRidge(w)
+    assert diag_r.n_free_for(n) == n - 3
+    p_idx, f_idx = diag_r.partition_indices(n)
+    np.testing.assert_array_equal(np.asarray(p_idx), np.array([0, 2, 4]))
+    np.testing.assert_array_equal(np.asarray(f_idx), np.array([1, 3, 5, 6, 7]))
+    w_pad = np.pad(np.asarray(w, np.float64), (0, n - len(w)))
+    np.testing.assert_allclose(
+        diag_r.matvec(v, CTX), w_pad * np.asarray(v, np.float64), rtol=1e-6
     )
     np.testing.assert_allclose(
-        metric.factor_solve_transpose(matrix, CTX),
-        np.linalg.solve(np.asarray(F_bar, np.float64).T, np.asarray(matrix)),
-        rtol=2e-4,
-        atol=1e-5,
+        diag_r.quad_form(v, CTX),
+        np.sum(w_pad * np.asarray(v, np.float64) ** 2),
+        rtol=1e-6,
+    )
+    with pytest.raises(ValueError, match="nonnegative"):
+        DiagonalRidge(jnp.array([1.0, -0.1]))
+
+    # MatrixRidge(Q) vs FactorRidge(L): Q and L with Q = L'L are NOT interchangeable
+    L_rect_np = rng.normal(size=(3, 5))
+    Q_psd_np = L_rect_np.T @ L_rect_np
+    mat_r = MatrixRidge(jnp.asarray(Q_psd_np, jnp.float32))
+    fac_r = FactorRidge(jnp.asarray(L_rect_np, jnp.float32))
+    assert not mat_r.penalized_is_spd
+    assert not fac_r.penalized_is_spd
+    np.testing.assert_allclose(
+        mat_r.matvec(v, CTX), fac_r.matvec(v, CTX), rtol=1e-5, atol=1e-6
     )
     np.testing.assert_allclose(
-        float(metric.norm(v, CTX)) ** 2, float(v @ (W @ v)), rtol=1e-4
+        mat_r.quad_form(v, CTX), fac_r.quad_form(v, CTX), rtol=1e-5, atol=1e-6
     )
 
-    # IdentityMetric is plain Euclidean
-    ident = IdentityMetric(6)
-    v6 = jax.random.normal(jax.random.key(3), (6,))
-    np.testing.assert_array_equal(ident.factor_apply(v6, CTX), v6)
-    np.testing.assert_allclose(float(ident.norm(v6, CTX)), float(jnp.linalg.norm(v6)))
+    # MatrixRidge(M) gives Q = M, whereas FactorRidge(M) gives Q = M'M = M^2
+    M_spd = jnp.array([[2.0, 0.5], [0.5, 3.0]], dtype=jnp.float32)
+    v2 = jnp.array([1.0, -2.0], dtype=jnp.float32)
+    np.testing.assert_allclose(
+        MatrixRidge(M_spd).matvec(v2, CTX), M_spd @ v2, rtol=1e-6
+    )
+    np.testing.assert_allclose(
+        FactorRidge(M_spd).matvec(v2, CTX), (M_spd.T @ M_spd) @ v2, rtol=1e-6
+    )
+    assert not np.allclose(
+        MatrixRidge(M_spd).matvec(v2, CTX), FactorRidge(M_spd).matvec(v2, CTX)
+    )
 
-    # Validation
-    with pytest.raises(ValueError, match="square"):
-        RepeatedFactorMetric(jnp.ones((2, 3)))
-    with pytest.raises(ValueError, match="repeats"):
-        RepeatedFactorMetric(jnp.eye(2), repeats=0)
+    # MatrixRidge rejects asymmetric and indefinite matrices
+    with pytest.raises(ValueError, match="symmetric"):
+        MatrixRidge(jnp.array([[1.0, 2.0], [0.0, 1.0]], dtype=jnp.float32))
+    with pytest.raises(ValueError, match="positive semidefinite"):
+        MatrixRidge(jnp.array([[1.0, 0.0], [0.0, -0.1]], dtype=jnp.float32))
 
-    # Live SolverContext reaches factor ops
-    seen = []
+    # RepeatedFactorRidge packed multi-RHS GEMMs + unpenalized free tail
+    L_blk = jnp.asarray(rng.normal(size=(4, 3)), jnp.float32)
+    rep_r = RepeatedFactorRidge(L_blk, repeats=2)
+    assert rep_r.size == 6
+    assert rep_r.n_free_for(n) == 2
+    L_bar = jsp_linalg.block_diag(L_blk, L_blk)
+    K_bar = jsp_linalg.block_diag(L_blk.T @ L_blk, L_blk.T @ L_blk, jnp.zeros((2, 2)))
+    np.testing.assert_allclose(
+        rep_r.factor_apply(mat, CTX), L_bar @ mat[:6], rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        rep_r.matvec(mat, CTX), K_bar @ mat, rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        rep_r.quad_form(v, CTX), v @ (K_bar @ v), rtol=1e-5, atol=1e-6
+    )
 
-    class Probe(IdentityMetric):
-        def factor_apply(self, vec, ctx):
-            seen.append(ctx.x is not None and ctx.state is not None)
+
+def test_matvec_only_ridge_metric_on_cg_and_solver_capability_checks():
+    rng = np.random.default_rng(13)
+    m, n = 5, 6
+    A = jnp.asarray(rng.normal(size=(m, n)), jnp.float32)
+    b = jnp.asarray(rng.normal(size=m), jnp.float32)
+    w = jnp.asarray(rng.uniform(0.5, 2.5, size=n), jnp.float32)
+    rho = 0.05
+    mv_ridge = MatvecOnlyRidge(w)
+
+    cg_solver = LevenbergMarquardt(
+        lambda x: A @ x - b,
+        ridge=rho,
+        ridge_metric=mv_ridge,
+        linear_solver=CG(IdentityPreconditioner(), tol=1e-10, maxiter=128),
+        ad_solver=CG(IdentityPreconditioner(), tol=1e-10, maxiter=128),
+    )
+    res = cg_solver.solve(jnp.zeros(n, jnp.float32), gtol=1e-6, max_steps=50)
+    assert int(res.status) == int(SolverStatus.CONVERGED)
+    expected = np.linalg.solve(
+        np.asarray(A, np.float64).T @ np.asarray(A, np.float64)
+        + rho * np.diag(np.asarray(w, np.float64)),
+        np.asarray(A, np.float64).T @ np.asarray(b, np.float64),
+    )
+    np.testing.assert_allclose(res.x, expected, rtol=1e-4, atol=1e-4)
+
+    # QR, Cholesky, GramCG, and SVD reject matvec-only ridge metrics
+    for bad_ls in (Cholesky(), QR(), GramCG(IdentityPreconditioner())):
+        with pytest.raises(ValueError):
+            LevenbergMarquardt(
+                lambda x: A @ x - b,
+                ridge=rho,
+                ridge_metric=mv_ridge,
+                linear_solver=bad_ls,
+            ).init(jnp.zeros(n, jnp.float32))
+    with pytest.raises(ValueError, match="factor"):
+        Newton(
+            lambda x: A @ x - b,
+            ridge=rho,
+            ridge_metric=mv_ridge,
+            linear_solver=SVD(),
+        ).init(jnp.zeros(n, jnp.float32))
+
+
+def test_diagonal_preconditioner_and_live_solver_context():
+    with pytest.raises(ValueError, match="strictly positive"):
+        DiagonalPreconditioner(jnp.array([1.0, 0.0]))
+    with pytest.raises(ValueError, match="dense solver"):
+        DiagonalPreconditioner(None).apply(jnp.ones(3), jnp.float32(0.1), CTX)
+
+    d = jnp.array([2.0, 5.0, 10.0], dtype=jnp.float32)
+    dp = DiagonalPreconditioner(d)
+    v = jnp.array([4.0, 11.0, 21.0], dtype=jnp.float32)
+    np.testing.assert_allclose(dp.apply(v, jnp.float32(0.5), CTX), v / (d + 0.5))
+
+    seen_ridge = []
+    seen_pre = []
+
+    @dataclasses.dataclass(frozen=True, eq=False)
+    class ProbeRidge(RidgeMetric):
+        def matvec(self, vec, ctx):
+            seen_ridge.append(
+                (ctx.x is not None, ctx.ridge is not None, ctx.role, ctx.space)
+            )
             return vec
 
-        factor_solve = factor_apply
-        factor_solve_transpose = factor_apply
+    @dataclasses.dataclass(frozen=True, eq=False)
+    class ProbePre(Preconditioner):
+        scale: jax.Array
 
-    register_pytree_dataclass(Probe, data_fields=("free_scale",), meta_fields=("size",))
-    A = jnp.ones((2, 4), jnp.float32)
-    s = LevenbergMarquardt(lambda th: A @ th - 1.0, metric=Probe(3), ridge=1e-3)
-    s.update(jnp.zeros(4), s.init(jnp.zeros(4)))
-    assert seen and all(seen)
+        def apply(self, vec, damping, ctx):
+            seen_pre.append(
+                (
+                    ctx.x is not None,
+                    ctx.ridge is not None,
+                    ctx.damping is not None,
+                    ctx.space,
+                    ctx.role,
+                    ctx.form,
+                )
+            )
+            return vec / (self.scale + damping)
 
+    register_pytree_dataclass(ProbeRidge, data_fields=())
+    register_pytree_dataclass(ProbePre, data_fields=("scale",))
 
-def test_state_space_metric_sequential_and_parallel_agree():
-    n, repeats = 64, 2
-    t = jnp.cumsum(jnp.ones(n, dtype=jnp.float32))
-    x = jnp.sin(jnp.linspace(0.0, 6.0, repeats * n, dtype=jnp.float32))
-    model = matern_state_space(jnp.float32(1.3), jnp.float32(0.8), 2.5)
-    seq = StateSpaceMetric(t, *model, repeats=repeats, epsilon=1e-5, parallel=False)
-    par = StateSpaceMetric(t, *model, repeats=repeats, epsilon=1e-5, parallel=True)
-    np.testing.assert_allclose(
-        seq.factor_solve(x, None), par.factor_solve(x, None), rtol=1e-4, atol=1e-5
+    A = jnp.array([[1.0, 0.5, 0.0], [0.0, 2.0, 1.0]], dtype=jnp.float32)
+    b = jnp.array([1.0, -1.0], dtype=jnp.float32)
+    s = LevenbergMarquardt(
+        lambda th, _, p: A @ th - p,
+        ridge=1e-2,
+        ridge_metric=ProbeRidge(),
+        linear_solver=CG(ProbePre(jnp.ones(3, jnp.float32)), tol=1e-8, maxiter=16),
+    )
+    x0 = jnp.zeros(3, jnp.float32)
+    s.update(x0, s.init(x0, p=b), p=b)
+    assert seen_ridge and all(ok_x and ok_r for ok_x, ok_r, _, _ in seen_ridge)
+    assert seen_pre and all(
+        ok_x and ok_r and ok_d and space == "parameter" and role == "forward"
+        for ok_x, ok_r, ok_d, space, role, _ in seen_pre
+    )
+
+    # Callback swap of preconditioner takes effect on subsequent step
+    s_bad = LevenbergMarquardt(
+        lambda th: A @ th - b,
+        linear_solver=CG(DiagonalPreconditioner(jnp.full(3, 1e4)), tol=0.0, maxiter=2),
+    )
+    diag_exact = jnp.diag(A.T @ A)
+    s_good = LevenbergMarquardt(
+        lambda th: A @ th - b,
+        linear_solver=CG(DiagonalPreconditioner(diag_exact), tol=0.0, maxiter=2),
+    )
+    swapped = dataclasses.replace(
+        s_bad.init(x0), preconditioner=DiagonalPreconditioner(diag_exact)
     )
     np.testing.assert_allclose(
-        seq.factor_apply(x, None), par.factor_apply(x, None), rtol=1e-4, atol=1e-5
-    )
-
-
-def test_block_eigen_and_dual_preconditioners():
-    # 1. BlockEigenPreconditioner matches dense shifted inverse at damping=0 and >0
-    keys = jax.random.split(jax.random.key(0), 3)
-
-    def spd_blocks(key, groups, size):
-        root = jax.random.normal(key, (groups, size, size))
-        return jnp.einsum("gik,gjk->gij", root, root) + 0.5 * jnp.eye(size)
-
-    fam_a = spd_blocks(keys[0], 2, 3)
-    fam_free = spd_blocks(keys[1], 1, 2)
-    perm = jnp.asarray(np.random.default_rng(0).permutation(8))
-    precond = BlockEigenPreconditioner([(fam_a, 1.0), (fam_free, 0.0)], perm)
-    dense = jsp_linalg.block_diag(fam_a[0], fam_a[1], fam_free[0])
-    ridge_mask = jnp.concatenate([jnp.ones(6), jnp.zeros(2)])
-    ridge = 0.05
-    ctx = SolverContext(
-        state=LMState(damping=jnp.asarray(1e-3), ridge=jnp.asarray(ridge))
-    )
-    v = jax.random.normal(keys[2], (8,))
-    sel = jnp.eye(8)[perm]
-    for damping in (0.0, 0.37):
-        shifted = dense + jnp.diag(ridge_mask * ridge + damping)
-        expected = jnp.linalg.solve(sel.T @ shifted @ sel, v)
-        np.testing.assert_allclose(
-            precond.apply(v, jnp.asarray(damping), ctx),
-            expected,
-            rtol=2e-4,
-            atol=2e-5,
-        )
-
-    # 2. Callback refresh of BlockEigenPreconditioner drives next step and AD inherits
-    p_dim, m_resid = 10, 14
-    n_m, n_f = 8, 2
-    F, _ = make_factor(jax.random.key(2), 4)
-    metric = RepeatedFactorMetric(F, repeats=2)
-    A = jax.random.normal(jax.random.key(3), (m_resid, p_dim)) / jnp.sqrt(p_dim)
-    target = jax.random.normal(jax.random.key(4), (m_resid,))
-    F_bar = jsp_linalg.block_diag(F, F, jnp.eye(n_f))
-    J_w = jnp.linalg.solve(F_bar.T, A.T).T
-    G = J_w.T @ J_w
-    exact_p = BlockEigenPreconditioner(
-        [(G[:n_m, :n_m][None], 1.0), (G[n_m:, n_m:][None], 0.0)], jnp.arange(p_dim)
-    )
-    scrambled_p = BlockEigenPreconditioner(
-        [(100.0 * jnp.eye(n_m)[None], 1.0), (100.0 * jnp.eye(n_f)[None], 0.0)],
-        jnp.arange(p_dim),
-    )
-
-    def res_fn(x, _, p):
-        return A @ x - p * target
-
-    s_scram = LevenbergMarquardt(
-        res_fn,
-        metric=metric,
-        ridge=1e-3,
-        linear_solver=CG(scrambled_p, tol=0.0, maxiter=3),
-    )
-    s_exact = LevenbergMarquardt(
-        res_fn, metric=metric, ridge=1e-3, linear_solver=CG(exact_p, tol=0.0, maxiter=3)
-    )
-    x0 = jnp.zeros(p_dim)
-    p0 = jnp.float32(1.0)
-    swapped_state = dataclasses.replace(s_scram.init(x0, p=p0), preconditioner=exact_p)
-    np.testing.assert_allclose(
-        s_scram.update(x0, swapped_state, p=p0)[0],
-        s_exact.update(x0, s_exact.init(x0, p=p0), p=p0)[0],
+        s_bad.update(x0, swapped)[0],
+        s_good.update(x0, s_good.init(x0))[0],
         rtol=1e-6,
         atol=1e-7,
     )
 
-    # 3. Dual preconditioners (Identity, ShermanMorrison, Woodbury, Nystrom, Padded)
-    rng = np.random.default_rng(5)
-    m = 4
-    A_dual = jnp.asarray(rng.normal(size=(m, 7)), jnp.float32)
-    b_dual = jnp.asarray(rng.normal(size=m), jnp.float32)
-    dual_mat = A_dual @ A_dual.T + 0.5 * jnp.eye(m, dtype=jnp.float32)
-    u = jnp.asarray(rng.normal(size=m), jnp.float32)
-    U = jnp.asarray(rng.normal(size=(m, 2)), jnp.float32)
-    w = jnp.asarray([0.4, 0.7], jnp.float32)
-    dual_solve = lambda vec: jnp.linalg.solve(dual_mat, vec)  # noqa: E731
-    dual_mv = lambda mat: dual_mat @ mat  # noqa: E731
-
-    for pre in (
-        IdentityPreconditioner(),
-        ShermanMorrisonPreconditioner(dual_solve, u, jnp.float32(0.3)),
-        WoodburyPreconditioner(dual_solve, U, w),
-        NystromPreconditioner(
-            dual_mv, n=m, rank=2, key=jax.random.key(0), dtype=jnp.float32
-        ),
-        PaddedPreconditioner(IdentityPreconditioner(), n_real=m - 1),
-    ):
-        vec = jnp.asarray(rng.normal(size=m), jnp.float32)
-        out = pre.apply(vec, jnp.float32(0.1), CTX)
-        assert out.dtype == jnp.float32 and float(jnp.dot(vec, out)) > 0.0
-
-    # GramCG with WoodburyPreconditioner converges on Newton
-    n_sol = Newton(
-        lambda x: A_dual @ x - b_dual,
-        linear_solver=GramCG(
-            WoodburyPreconditioner(dual_solve, U, w), tol=1e-7, maxiter=64
-        ),
-    ).solve(jnp.zeros(7, jnp.float32), atol=1e-5)
-    assert int(n_sol.status) == int(SolverStatus.CONVERGED)
-
-    # NystromPreconditioner avoids catastrophic cancellation on ill-conditioned
-    # float32 operators and stays finite at zero damping even when rho == 0.
-    diag_ill = jnp.array([1e8, 1.0, 1.0, 1.0], dtype=jnp.float32)
-    nys_ill = NystromPreconditioner(
-        lambda mat: diag_ill[:, None] * mat,
-        n=4,
-        rank=2,
-        key=jax.random.key(7),
-        dtype=jnp.float32,
+    # MatrixRidge preserves small positive eigenvalues, AD wrt Q, and traced NaNs
+    Q_wide_scale = jnp.diag(jnp.array([1e10, 1.0], dtype=jnp.float32))
+    mr_scale = MatrixRidge(Q_wide_scale)
+    v_unit = jnp.array([0.0, 1.0], dtype=jnp.float32)
+    assert float(mr_scale.quad_form(v_unit, CTX)) == pytest.approx(1.0)
+    assert float(jnp.sum(mr_scale.factor_apply(v_unit, CTX) ** 2)) == pytest.approx(1.0)
+    grad_q = jax.grad(
+        lambda q: MatrixRidge(q).quad_form(jnp.array([2.0, 3.0], jnp.float32), CTX)
+    )(jnp.eye(2, dtype=jnp.float32))
+    np.testing.assert_allclose(
+        grad_q, jnp.array([[4.0, 6.0], [6.0, 9.0]], dtype=jnp.float32), rtol=1e-5
     )
-    v_perp = jnp.array([0.0, 1.0, -1.0, 0.5], dtype=jnp.float32)
-    out_ill = nys_ill.apply(v_perp, jnp.float32(0.0), CTX)
-    assert jnp.all(jnp.isfinite(out_ill))
-    assert float(jnp.linalg.norm(out_ill)) > 0.1
-
-    diag_rank1 = jnp.array([10.0, 0.0, 0.0], dtype=jnp.float32)
-    nys_full = NystromPreconditioner(
-        lambda mat: diag_rank1[:, None] * mat,
-        n=3,
-        rank=3,
-        key=jax.random.key(9),
-        dtype=jnp.float32,
-    )
-    assert jnp.all(
-        jnp.isfinite(
-            nys_full.apply(jnp.ones(3, dtype=jnp.float32), jnp.float32(0.0), CTX)
-        )
-    )
+    bad_q_val = jax.jit(
+        lambda q: MatrixRidge(q).quad_form(jnp.ones(2, jnp.float32), CTX)
+    )(jnp.diag(jnp.array([1.0, -1.0], dtype=jnp.float32)))
+    assert bool(jnp.isnan(bad_q_val))
+    bad_d_val = jax.jit(
+        lambda d: DiagonalPreconditioner(d).apply(jnp.ones(2, jnp.float32), 0.1, CTX)
+    )(jnp.array([1.0, -2.0], dtype=jnp.float32))
+    assert bool(jnp.all(jnp.isnan(bad_d_val)))

@@ -1,9 +1,3 @@
-"""Levenberg-Marquardt nonlinear least-squares solver for JAX, supporting both
-unpenalized geometry-selected interpolation (``ridge=None``) and
-Tikhonov-penalized ridge optimization (``ridge > 0``), plus the
-:class:`AnnealRidge` continuation callback.
-"""
-
 import dataclasses
 from dataclasses import dataclass
 
@@ -32,7 +26,6 @@ from nlls_gram.types import (
     _cast_lm_hyper,
     _damping_floor,
 )
-from nlls_gram.utilities import mm
 
 __all__ = [
     "AnnealRidge",
@@ -44,56 +37,7 @@ __all__ = [
 
 @dataclass(frozen=True)
 class AnnealRidge:
-    """Ridge-continuation ``solve`` callback: multiply ``state.ridge`` by
-    ``decrease`` whenever the current level has yielded what it can, never
-    below ``ridge_floor``.
-
-    Works identically with :class:`LevenbergMarquardt` and
-    :class:`~nlls_gram.Newton` when constructed with a positive ``ridge``.
-
-    A level has yielded what it can when it is
-
-    - **stationary**: ``info.grad_norm`` fell below ``grad_rtol`` relative to
-      its reference value at the current ridge level (the level's first
-      observed gradient), or
-    - **stalled** (opt-in, ``stall_rtol > 0``): an ACCEPTED step improved
-      the gradient by less than a factor ``stall_rtol``. The escape hatch
-      for a frozen anneal: the per-level references COMPOUND -- with closely
-      spaced levels each new reference is already small, the effective
-      demand approaches ``grad_rtol ** levels`` times the initial gradient,
-      and the anneal can freeze below the problem's noise floor while steps
-      keep being accepted with negligible progress. Enable with
-      ``stall_rtol ~ 0.99`` when that happens.
-
-    ``ridge_floor`` is REQUIRED and strictly positive (``ridge = 0`` is out
-    of the solver's contract). Usage::
-
-        anneal = AnnealRidge(ridge_floor=1e-10)
-        result = solver.solve(x0, callback=anneal,
-                              user_state=anneal.init_state(),
-                              gtol=1e-8, atol=1e-8)
-
-    A wrapping callback calls the instance, inspects
-    ``action.state.ridge < ctx.state.ridge`` for a level advance, and returns a
-    ``dataclasses.replace`` of the action -- e.g. gating an expensive
-    preconditioner rebuild on the advance with ``jax.lax.cond`` so the
-    eigendecomposition is paid only when it fires::
-
-        def driver_callback(ctx):
-            action = anneal(ctx)
-            advanced = action.state.ridge < ctx.state.ridge
-            precond = jax.lax.cond(
-                advanced,
-                lambda: BlockEigenPreconditioner(families(ctx.x), PERM),
-                lambda: ctx.state.preconditioner,
-            )
-            return dataclasses.replace(
-                action,
-                state=dataclasses.replace(
-                    action.state, preconditioner=precond
-                ),
-            )
-    """
+    """Ridge-continuation callback reducing ``state.ridge`` down to ``ridge_floor``."""
 
     ridge_floor: float
     decrease: float = 0.1
@@ -110,9 +54,7 @@ class AnnealRidge:
             raise ValueError("stall_rtol must lie in [0, 1)")
 
     def init_state(self, dtype=None):
-        """The initial ``user_state``: both trackers at ``+inf``. ``dtype``
-        defaults to the JAX default float; pass the problem dtype explicitly
-        for a float32 program under enabled x64."""
+        """Return initial ``user_state`` trackers at ``+inf``."""
         infinity = jnp.asarray(
             jnp.inf, dtype=jnp.result_type(float) if dtype is None else dtype
         )
@@ -125,9 +67,6 @@ class AnnealRidge:
         grad_norm = jnp.asarray(ctx.info.grad_norm, dtype=dtype)
         reference = jnp.asarray(ctx.user_state["reference"], dtype=dtype)
         previous = jnp.asarray(ctx.user_state["previous"], dtype=dtype)
-        # +inf marks "no observation at this level yet": the first step after a
-        # ridge decrease (or the initial step) sets the reference and can never
-        # read as stalled.
         reference = jnp.where(jnp.isfinite(reference), reference, grad_norm)
         stationary = grad_norm <= jnp.asarray(self.grad_rtol, dtype) * reference
         if self.stall_rtol > 0:
@@ -162,35 +101,18 @@ class AnnealRidge:
 
 
 class LevenbergMarquardt(SolverBase):
-    """Levenberg-Marquardt nonlinear least-squares solver over a JAX pytree
-    ``x``.
-
-    Supports two root-selection regimes controlled by ``ridge``:
-
-    - **Unpenalized (``ridge=None``, default)**: minimizes ``||r(x, args, p)||^2``
-      with optional :class:`~nlls_gram.Metric` ``W = F'F`` shaping the
-      trust-region geometry so the small-damping Gauss-Newton limit selects
-      minimum-``W``-norm corrections. Stopping rules ``atol``, ``gtol``, and
-      ``xtol`` combine disjunctively (``atol | gtol | xtol``).
-    - **Penalized ridge (``ridge > 0``)**: minimizes the Tikhonov objective
-      ``||r(x, args, p)||^2 + ridge * ||x_m||_W^2`` (defaulting ``metric`` to
-      the Euclidean identity over all coordinates when ``metric=None``), with
-      ``ridge`` carried in :attr:`LMState.ridge` for continuation schedules
-      (:class:`AnnealRidge`). ``atol`` acts as a conjunctive filter on
-      ``gtol | xtol``.
-
-    ``linear_solver`` accepts :class:`~nlls_gram.Cholesky` (default),
-    :class:`~nlls_gram.QR`, :class:`~nlls_gram.CG`, or
-    :class:`~nlls_gram.GramCG` (unpenalized only). ``ad_solver`` configures the
-    implicit-AD tangent system (``None`` inherits the forward family).
-    """
+    """Euclidean-step Levenberg-Marquardt solver for NLLS and generalized Tikhonov."""
 
     def __init__(
         self,
         residual_fn,
         *,
-        metric=None,
         ridge=None,
+        ridge_metric=None,
+        linear_solver=Cholesky(),  # noqa: B008
+        ad_solver=None,
+        jacobian_mode="auto",
+        jacobian_chunk=None,
         init_damping=1e-3,
         damping_decrease=0.5,
         damping_increase=4.0,
@@ -199,34 +121,27 @@ class LevenbergMarquardt(SolverBase):
         maxls=20,
         max_stepsize=1.0,
         linesearch_tol=0.0,
-        linear_solver=Cholesky(),  # noqa: B008 -- frozen, immutable default
-        jacobian_mode="auto",
-        jacobian_chunk=None,
-        ad_solver=None,
         has_aux=False,
         cache_jacobian=True,
         geodesic_acceleration=True,
         geodesic_acceptance_ratio=0.75,
         complementarity=None,
+        inequality=None,
     ):
-        if init_damping <= 0 or damping_decrease <= 0 or damping_increase <= 0:
-            raise ValueError(
-                "init_damping, damping_decrease, and damping_increase must be positive"
-            )
-
         self._init_common(
             residual_fn,
-            linear_solver=linear_solver,
-            metric=metric,
             ridge=ridge,
+            ridge_metric=ridge_metric,
+            linear_solver=linear_solver,
+            ad_solver=ad_solver,
+            jacobian_mode=jacobian_mode,
+            jacobian_chunk=jacobian_chunk,
             has_aux=has_aux,
             cache_jacobian=cache_jacobian,
             geodesic_acceleration=geodesic_acceleration,
             geodesic_acceptance_ratio=geodesic_acceptance_ratio,
-            ad_solver=ad_solver,
-            jacobian_mode=jacobian_mode,
-            jacobian_chunk=jacobian_chunk,
             complementarity=complementarity,
+            inequality=inequality,
         )
         self.init_damping = init_damping
         self.damping_decrease = damping_decrease
@@ -242,7 +157,7 @@ class LevenbergMarquardt(SolverBase):
         self._sealed = True
 
     def hyperparams(self, dtype=None):
-        """``LMHyperparams`` built from the constructor values."""
+        """Return ``LMHyperparams`` built from constructor settings."""
         iterative_tol = self.iterative_tol
         if iterative_tol is None:
             if dtype is None:
@@ -266,53 +181,57 @@ class LevenbergMarquardt(SolverBase):
         )
 
     def init(self, x0, args=None, *, p=None):
-        """Build the initial :class:`LMState` at ``x0``.
-
-        Uses ``jax.eval_shape`` to type ``damping`` and ``ridge`` and size the
-        Jacobian and linear-solver cache buffers when ``cache_jacobian=True``
-        on a dense linear solver without paying a device residual evaluation.
-        ``hyper`` stays ``None`` so manual ``update`` loops carry no extra
-        buffers; ``solve`` populates it.
-        """
+        """Build initial ``LMState`` at ``x0`` without evaluating the residual."""
         self._check_residual_args(args, p)
-        residual_shape, aux_shape = _init_residual_and_aux.eval_shape(self, x0, args, p)
+        residual_shape, aux_shape, _ = _init_residual_and_aux.eval_shape(
+            self, x0, args, p
+        )
         theta, _ = ravel_pytree(x0)
-        p_dim = theta.size
-        n_m, _ = self._block_sizes(p_dim)
+        m, n = residual_shape.size, theta.size
+        self.linear_solver.validate_shape(
+            m,
+            n,
+            penalized=self.penalized,
+            ridge_metric=self.initial_ridge_metric,
+            damped=True,
+            role="linear_solver",
+        )
         dtype = residual_shape.dtype
         damping = jnp.maximum(
             jnp.asarray(self.init_damping, dtype=dtype), _damping_floor(dtype)
         )
         ridge = self._resolve_ridge(dtype) if self.penalized else None
         homotopy = self._initial_homotopy(dtype)
+        ineq_weight, ineq_smoothing = self._initial_ineq_state(dtype)
         instances = dict(
-            metric=self.initial_metric,
+            ridge_metric=self.initial_ridge_metric,
             preconditioner=self.initial_preconditioner,
             homotopy=homotopy,
+            ineq_weight=ineq_weight,
+            ineq_smoothing=ineq_smoothing,
         )
         if not self.cache_jacobian:
             return LMState(damping, ridge=ridge, **instances)
-        m = residual_shape.size
         return LMState(
             damping,
             ridge,
             resid=jnp.zeros(residual_shape.shape, dtype=dtype),
-            Jt=jnp.zeros((p_dim, m), dtype=dtype),
+            Jt=jnp.zeros((n, m), dtype=dtype),
             jacobian_valid=jnp.asarray(False, dtype=jnp.bool_),
             aux=jax.tree.map(lambda s: jnp.zeros(s.shape, dtype=s.dtype), aux_shape),
             solver_cache=self.linear_solver.new_cache(
-                m, p_dim, n_m, dtype, self.penalized
+                m, n, self.initial_ridge_metric, dtype, self.penalized
             ),
             **instances,
         )
 
     def _solve_state(self, x0, args, p, state):
         if state is None:
-            if self.cache_jacobian or self.penalized:
+            if self.cache_jacobian or self.penalized or self.inequality is not None:
                 return self.init(x0, args, p=p)
             return LMState(
                 jnp.asarray(self.init_damping),
-                metric=self.initial_metric,
+                ridge_metric=None,
                 preconditioner=self.initial_preconditioner,
                 homotopy=self._initial_homotopy(),
             )
@@ -328,10 +247,32 @@ class LevenbergMarquardt(SolverBase):
         init_homotopy = self._initial_homotopy()
         if init_homotopy is not None and state.homotopy is None:
             state = dataclasses.replace(state, homotopy=init_homotopy)
+        init_iw, init_is = self._initial_ineq_state()
+        if init_iw is not None and state.ineq_weight is None:
+            state = dataclasses.replace(state, ineq_weight=init_iw)
+        if init_is is not None and state.ineq_smoothing is None:
+            state = dataclasses.replace(state, ineq_smoothing=init_is)
         return self._cold_state(self._resolved_state(state))
 
     def _initial_info(self, x, state, args, p):
-        residual, aux = self._residual_and_aux(x, args, p, homotopy=state.homotopy)
+        residual, aux, (_, ineq_metrics) = self._eval_residual_and_aux(
+            x,
+            args,
+            p,
+            homotopy=state.homotopy,
+            ineq_weight=state.ineq_weight,
+            ineq_smoothing=state.ineq_smoothing,
+        )
+        theta, _ = ravel_pytree(x)
+        resolved = self._resolved_state(state)
+        self.linear_solver.validate_shape(
+            residual.shape[0],
+            theta.shape[0],
+            penalized=self.penalized,
+            ridge_metric=resolved.ridge_metric,
+            damped=True,
+            role="linear_solver",
+        )
         dtype = residual.dtype
         homotopy = (
             None if state.homotopy is None else jnp.asarray(state.homotopy, dtype=dtype)
@@ -341,13 +282,13 @@ class LevenbergMarquardt(SolverBase):
         one = jnp.ones((), dtype=dtype)
         infinity = jnp.asarray(jnp.inf, dtype=dtype)
         if self.penalized:
-            theta, _ = ravel_pytree(x)
             ridge = jnp.asarray(state.ridge, dtype=dtype)
-            n_m = self._block_sizes(theta.shape[0])[0]
-            resolved = self._resolved_state(state)
-            ctx = SolverContext(x=theta, state=resolved, args=args, p=p)
-            y_m = self._factor_apply_metric_block(theta[:n_m], ctx, dtype)
-            penalty_value = jnp.sum(y_m**2)
+            ctx = SolverContext(
+                x=theta, state=resolved, args=args, p=p, ridge=ridge, damping=zero
+            )
+            penalty_value = jnp.asarray(
+                resolved.ridge_metric.quad_form(theta, ctx), dtype=dtype
+            )
             loss = resid_loss + ridge * penalty_value
             ridge_fields = dict(
                 ridge=ridge,
@@ -358,6 +299,23 @@ class LevenbergMarquardt(SolverBase):
         else:
             loss = resid_loss
             ridge_fields = {}
+
+        if ineq_metrics is not None:
+            eq_loss, viol_norm, max_viol = ineq_metrics
+            ineq_s = (
+                None
+                if state.ineq_smoothing is None
+                else jnp.asarray(state.ineq_smoothing, dtype=dtype)
+            )
+            ineq_fields = dict(
+                eq_loss=eq_loss,
+                ineq_violation_norm=viol_norm,
+                ineq_max_violation=max_viol,
+                inequality_changed=self._ineq_smoothing_active(ineq_s),
+            )
+        else:
+            ineq_fields = {}
+
         return LMInfo(
             loss=loss,
             loss_old=loss,
@@ -375,6 +333,7 @@ class LevenbergMarquardt(SolverBase):
             homotopy=homotopy,
             complementarity_changed=self._homotopy_active(homotopy),
             **ridge_fields,
+            **ineq_fields,
         )
 
     def _cast_state(self, state, dtype):
@@ -384,6 +343,10 @@ class LevenbergMarquardt(SolverBase):
         )
         if state.homotopy is not None:
             updates["homotopy"] = jnp.asarray(state.homotopy, dtype=dtype)
+        if state.ineq_weight is not None:
+            updates["ineq_weight"] = jnp.asarray(state.ineq_weight, dtype=dtype)
+        if state.ineq_smoothing is not None:
+            updates["ineq_smoothing"] = jnp.asarray(state.ineq_smoothing, dtype=dtype)
         if self.penalized:
             updates["ridge"] = jnp.asarray(state.ridge, dtype=dtype)
             if state.solver_cache is not None:
@@ -394,30 +357,64 @@ class LevenbergMarquardt(SolverBase):
         return dataclasses.replace(state, **updates)
 
     def update(self, x, state, args=None, p=None):
-        """One Levenberg-Marquardt step: returns ``(x_new, state, info)``."""
+        """Execute one Levenberg-Marquardt step and return ``(x_new, state, info)``."""
         self._check_residual_args(args, p)
         theta, unravel = ravel_pytree(x)
-        residual_flat, residual_value, resid, Jt, jvp_fn, JT, aux, base_mask = (
-            self._linearize_step(theta, unravel, state, args, p)
-        )
+        (
+            residual_flat,
+            residual_value,
+            resid,
+            Jt,
+            jvp_fn,
+            JT,
+            aux,
+            base_mask,
+            base_ineq,
+        ) = self._linearize_step(theta, unravel, state, args, p)
         dtype = resid.dtype
+        m, n = resid.shape[0], theta.shape[0]
+        resolved_state = self._resolved_state(state)
+        self.linear_solver.validate_shape(
+            m,
+            n,
+            penalized=self.penalized,
+            ridge_metric=resolved_state.ridge_metric,
+            damped=True,
+            role="linear_solver",
+        )
+
         hyper = state.hyper if state.hyper is not None else self.hyperparams(dtype)
         damping_decrease = jnp.asarray(hyper.damping_decrease, dtype=dtype)
         damping_increase = jnp.asarray(hyper.damping_increase, dtype=dtype)
         damping_floor = _damping_floor(dtype)
         damping = jnp.maximum(jnp.asarray(state.damping, dtype=dtype), damping_floor)
 
-        n_m, n_f = self._block_sizes(theta.shape[0])
-        resolved_state = self._resolved_state(state)
-        ctx = SolverContext(x=theta, state=resolved_state, args=args, p=p)
+        space, form = self._solver_space_and_form(
+            self.linear_solver, m, n, resolved_state.ridge_metric, damped=True
+        )
+        ridge_val = (
+            jnp.asarray(state.ridge, dtype=dtype)
+            if (self.penalized and state.ridge is not None)
+            else None
+        )
+        ctx = SolverContext(
+            x=theta,
+            state=resolved_state,
+            args=args,
+            p=p,
+            ridge=ridge_val,
+            damping=damping,
+            space=space,
+            role="forward",
+            form=form,
+        )
         (
             ridge,
-            y_m,
             penalty_value_old,
-            penalty_gradient,
+            penalty_grad,
             resid_loss_old,
             loss_old,
-        ) = self._base_objective(resid, theta, n_m, n_f, state, ctx)
+        ) = self._base_objective(resid, theta, state, ctx)
 
         step_solver = self.linear_solver.prepare(
             Subproblem(
@@ -426,30 +423,29 @@ class LevenbergMarquardt(SolverBase):
                 Jt=Jt,
                 jvp_fn=jvp_fn,
                 JT=JT,
-                whiten=lambda v: self._extended_solve(v, ctx),
-                whiten_transpose=lambda v: self._extended_solve_transpose(v, ctx),
-                y_m=y_m,
-                penalty_gradient=penalty_gradient,
                 ridge=ridge,
                 damping=damping,
-                n_m=n_m,
-                n_f=n_f,
+                ridge_metric=resolved_state.ridge_metric,
+                penalty_grad=penalty_grad,
                 cache=state.solver_cache,
                 cache_enabled=self.cache_jacobian,
                 hyper=hyper,
                 ctx=ctx,
                 penalized=self.penalized,
+                undamped=False,
+                always_damped=True,
+                active=True,
+                preconditioner=resolved_state.preconditioner,
             )
         )
         grad = step_solver.grad
-        velocity_sub = step_solver.velocity()
-        velocity = jnp.asarray(self._extended_solve(velocity_sub, ctx), dtype=dtype)
+        velocity = jnp.asarray(step_solver.velocity(), dtype=dtype)
         zero = jnp.zeros((), dtype=dtype)
         one = jnp.ones((), dtype=dtype)
-        slope = mm(grad, velocity_sub)
+        slope = jnp.sum(grad * velocity)
         descent_ok = (
-            jnp.isfinite(loss_old)
-            & jnp.all(jnp.isfinite(velocity_sub))
+            step_solver.solve_ok
+            & jnp.isfinite(loss_old)
             & jnp.all(jnp.isfinite(velocity))
             & jnp.isfinite(slope)
             & (slope < zero)
@@ -460,7 +456,6 @@ class LevenbergMarquardt(SolverBase):
                 hyper.geodesic_acceptance_ratio, dtype=dtype
             )
             (
-                acceleration_sub,
                 acceleration,
                 acceleration_ratio,
                 raw_ratio_accepted,
@@ -468,27 +463,16 @@ class LevenbergMarquardt(SolverBase):
                 residual_flat,
                 theta,
                 velocity,
-                velocity_sub,
-                step_solver.correction,
-                ctx,
+                step_solver.solve_residual_rhs,
                 geodesic_acceptance_ratio,
                 dtype,
             )
             ratio_accepted = (
-                descent_ok
-                & raw_ratio_accepted
-                & jnp.all(jnp.isfinite(acceleration_sub))
-                & jnp.all(jnp.isfinite(acceleration))
-            )
-            u_a = jnp.where(
-                ratio_accepted, acceleration_sub, jnp.zeros_like(velocity_sub)
+                descent_ok & raw_ratio_accepted & jnp.all(jnp.isfinite(acceleration))
             )
             a = jnp.where(ratio_accepted, acceleration, jnp.zeros_like(velocity))
-            u_a_m = u_a[:n_m] if self.penalized else None
         else:
-            u_a = None
             a = None
-            u_a_m = None
             acceleration_ratio = zero
             ratio_accepted = jnp.asarray(False, dtype=jnp.bool_)
 
@@ -512,10 +496,9 @@ class LevenbergMarquardt(SolverBase):
             hyper,
             descent_ok,
             a=a,
-            y_m=y_m if self.penalized else None,
-            u_m=velocity_sub[:n_m] if self.penalized else None,
-            u_a_m=u_a_m,
             ridge=ridge if self.penalized else None,
+            ridge_metric=resolved_state.ridge_metric if self.penalized else None,
+            ctx=ctx,
             resid_loss_old=resid_loss_old if self.penalized else None,
             penalty_old=penalty_value_old if self.penalized else None,
         )
@@ -525,9 +508,12 @@ class LevenbergMarquardt(SolverBase):
             loss,
             resid_loss_new,
             new_homotopy,
+            new_ineq_smoothing,
             comp_changed,
-            homotopy_changed,
-        ) = self._post_step_complementarity(
+            ineq_changed,
+            schedule_changed,
+            out_ineq,
+        ) = self._post_step_constraints(
             theta_new,
             unravel,
             args,
@@ -540,13 +526,14 @@ class LevenbergMarquardt(SolverBase):
             ridge,
             grad_norm,
             base_mask,
+            base_ineq,
         )
 
         safe_alpha = jnp.where(improved, stepsize, one)
         damping_factor = jnp.where(
             improved,
             jnp.minimum(damping_increase, damping_decrease / safe_alpha),
-            jnp.where(homotopy_changed, one, damping_increase),
+            jnp.where(schedule_changed, one, damping_increase),
         )
         new_damping = jnp.maximum(damping * damping_factor, damping_floor)
         used_geodesic = improved & ratio_accepted
@@ -555,19 +542,26 @@ class LevenbergMarquardt(SolverBase):
             stepsize,
             jnp.where(trial_stepsize > zero, trial_stepsize, one),
         )
-        step_sub = (
-            step_alpha * velocity_sub
-            if u_a is None
-            else step_alpha * velocity_sub + 0.5 * (step_alpha**2) * u_a
+        step_vec = (
+            step_alpha * velocity
+            if a is None
+            else step_alpha * velocity + 0.5 * (step_alpha**2) * a
         )
 
+        ineq_weight_out = (
+            None
+            if state.ineq_weight is None
+            else jnp.asarray(state.ineq_weight, dtype=dtype)
+        )
         instances = dict(
-            metric=state.metric,
+            ridge_metric=state.ridge_metric,
             preconditioner=state.preconditioner,
             homotopy=new_homotopy,
+            ineq_weight=ineq_weight_out,
+            ineq_smoothing=new_ineq_smoothing,
         )
         ridge_state = ridge if self.penalized else None
-        cache_valid = (~improved) & (~homotopy_changed)
+        cache_valid = (~improved) & (~schedule_changed) & step_solver.solve_ok
         if self.cache_jacobian and self.linear_solver.materializes_jacobian:
             new_state = LMState(
                 new_damping,
@@ -593,10 +587,21 @@ class LevenbergMarquardt(SolverBase):
                 ridge=ridge,
                 resid_loss=resid_loss_new,
                 penalty_value=penalty_new,
-                penalty_grad_norm=jnp.linalg.norm(penalty_gradient),
+                penalty_grad_norm=jnp.linalg.norm(penalty_grad),
             )
         else:
             ridge_info = {}
+
+        if out_ineq is not None:
+            eq_loss, viol_norm, max_viol = out_ineq
+            ineq_info = dict(
+                eq_loss=eq_loss,
+                ineq_violation_norm=viol_norm,
+                ineq_max_violation=max_viol,
+                inequality_changed=ineq_changed,
+            )
+        else:
+            ineq_info = {}
 
         return (
             unravel(theta_new),
@@ -611,12 +616,13 @@ class LevenbergMarquardt(SolverBase):
                 used_geodesic=used_geodesic,
                 acceleration_ratio=acceleration_ratio,
                 grad_norm=grad_norm,
-                step_norm=jnp.linalg.norm(step_sub),
+                step_norm=jnp.linalg.norm(step_vec),
                 aux=aux,
                 stepsize=stepsize,
                 num_linesearch_steps=trials,
                 homotopy=new_homotopy,
                 complementarity_changed=comp_changed,
                 **ridge_info,
+                **ineq_info,
             ),
         )

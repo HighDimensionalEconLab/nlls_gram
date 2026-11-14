@@ -1,40 +1,28 @@
 # nlls_gram
 
-Levenberg-Marquardt nonlinear least squares for JAX, built for
-**underdetermined interpolation**: problems whose residual has many more
-parameters than equations, so a zero-residual root is not unique and *which*
-root you get is part of the contract.
+`nlls_gram` solves nonlinear equations, nonlinear least-squares problems, and generalized Tikhonov interpolation problems over JAX pytrees using Euclidean outer step geometry.
 
-Two solvers share one `init`/`update`/`solve` protocol, one linear-solver
-menu, and one implicit-AD contract. Both accept `ridge=None` (unpenalized
-nonlinear least squares) or `ridge=<positive scalar>` (Tikhonov-penalized
-ridge objective):
+Two solvers share one `init`/`update`/`solve` protocol, one linear-solver menu, and one implicit differentiation rule:
 
-| | `LevenbergMarquardt(..., ridge=...)` | `LevenbergMarquardt` | `Newton(..., ridge=...)` | `Newton` |
-|---|---|---|---|---|
-| minimizes | \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) | \(\|r(x)\|^2\) | \(\|r(x)\|^2 + \lambda\,\|x_m\|_W^2\) | \(\|r(x)\|^2\) |
-| globalization | trust-region damping + Armijo backtracking | trust-region damping + Armijo backtracking | Armijo backtracking line search | Armijo backtracking line search |
-| step direction | damped ridge minimum-\(W\)-norm | damped minimum-\(W\)-norm | ridge minimum-\(W\)-norm | minimum-\(W\)-norm \(-\bar F^{-1}(J \bar F^{-1})^+ r\) |
-| use when | the interpolant is the deliverable | rank-deficient or curved paths need trust-region damping | RKHS / kernel ridge problems where full steps dominate | well-conditioned systems or with residual-coupled `damping > 0` + `geodesic_acceleration=True` |
+| Solver | `ridge=None` | `ridge=<positive scalar>` | Globalization |
+|---|---|---|---|
+| `LevenbergMarquardt` | \(\frac{1}{2}\|r(\theta)\|_2^2\) | \(\frac{1}{2}\|r(\theta)\|_2^2 + \frac{\rho}{2}\theta^\top Q \theta\) | Euclidean trust-region damping \(\mu I_n\) + Armijo backtracking |
+| `Newton` | \(\frac{1}{2}\|r(\theta)\|_2^2\) | \(\frac{1}{2}\|r(\theta)\|_2^2 + \frac{\rho}{2}\theta^\top Q \theta\) | Optional residual-coupled scalar damping + Armijo backtracking |
+
+`info.loss` consistently reports \(2 F_\rho(\theta) = \|r(\theta)\|_2^2 + \rho\,\theta^\top Q \theta\).
 
 ## Install
 
 ```bash
-uv add nlls-gram      # or: pip install nlls-gram
+uv add nlls-gram
 ```
-
-JAX is the only dependency.
 
 ## Residual interface
 
-`residual_fn` takes `(x)`, `(x, args)`, or `(x, args, p)` — always in that
-order — and returns a residual pytree, or `(residual, aux)` with
-`has_aux=True`. `x` is any JAX pytree.
+`residual_fn` accepts `(x)`, `(x, args)`, or `(x, args, p)` and returns a residual pytree, a `Residuals` / `Inequality` / `Complementarity` container, or `(residual, aux)` when `has_aux=True`.
 
-- `args` is **solver-inert** auxiliary data: sampled batches, module
-  graphdefs, anything the solver should thread through untouched.
-- `p` is everything you may want a **total derivative of the solution** with
-  respect to. `solve(...).x` carries a custom implicit AD rule in `p`.
+- `args` carries solver-inert auxiliary data.
+- `p` carries external parameters with respect to which `solve(...).x` is implicitly differentiable.
 
 ```python
 import jax.numpy as jnp
@@ -49,69 +37,48 @@ solver = LevenbergMarquardt(residual)
 result = solver.solve(
     jnp.zeros(8), {"design": design}, p={"target": y}, max_steps=200, atol=1e-8
 )
-result.x, result.status, result.steps
 ```
 
-## Minimum-norm interpolation
+## Generalized Tikhonov interpolation
+
+When `ridge` is positive, `ridge_metric` specifies a positive semidefinite quadratic operator \(Q = L^\top L\) in the objective while keeping trust-region damping strictly Euclidean (\(\mu \|d\|_2^2\)). Passing `ridge_metric=None` uses the Euclidean identity \(Q = I_n\). Supplying a non-`None` `ridge_metric` when `ridge=None` raises `ValueError`.
 
 ```python
 import jax.numpy as jnp
-from nlls_gram import AnnealRidge, LevenbergMarquardt, RepeatedFactorMetric
+from nlls_gram import AnnealRidge, LevenbergMarquardt, RepeatedFactorRidge
 
-# W = blockdiag(K, K) for a kernel Gram matrix K: the RKHS seminorm over two
-# coefficient blocks. The constructor takes the FACTOR.
-metric = RepeatedFactorMetric(jnp.linalg.cholesky(K, upper=True), repeats=2)
-
-solver = LevenbergMarquardt(collocation_residual, metric=metric, ridge=1e-4)
-
-# Anneal the ridge toward the interpolating limit on stationarity.
-anneal = AnnealRidge(ridge_floor=1e-10)
-result = solver.solve(
-    x0, callback=anneal, user_state=anneal.init_state(), gtol=1e-8, atol=1e-8
+ridge_metric = RepeatedFactorRidge(jnp.linalg.cholesky(K, upper=True), repeats=2)
+solver = LevenbergMarquardt(
+    collocation_residual,
+    ridge=1e-4,
+    ridge_metric=ridge_metric,
 )
+anneal = AnnealRidge(ridge_floor=1e-10)
+result = solver.solve(x0, callback=anneal, user_state=anneal.init_state(), gtol=1e-8)
 ```
-
-The metric covers the leading `metric.size` coordinates; anything past that is
-a **free block**, unpenalized by the ridge solver. Calibrate `gtol` as roughly
-`1e-3 * ridge * sqrt(q(x*))`, using the reported
-`info.penalty_grad_norm = sqrt(penalty_value)`.
 
 ## Linear solvers
 
-The same typed configs serve both solvers (`LevenbergMarquardt` and `Newton`),
-in both the forward and the implicit-AD role (`QR()` is forward-only). A knob
-that exists for only one method is a field on that method, so it cannot be
-passed with another.
+Numerical preconditioners live on `linear_solver` and `ad_solver`, never on the outer solver constructor.
 
-| config | system | dimension | when |
+| Config | Space | Form | Notes |
 |---|---|---|---|
-| `Cholesky()` | dense, auto gram/normal | \(\min(m, n)\) | the default |
-| `QR()` | damping-row QR, auto gram/normal | \(\min(m, n)\) | forward-only; tiny damping or ridge; rank-safe when damped (`LM` or `damping > 0`); float32 |
-| `CG(precond)` | matrix-free normal | \(n\) | \(n \lesssim m\), no dense \(J\) |
-| `GramCG(precond)` | matrix-free dual | \(m\) | \(m \ll n\), no dense \(J\) |
-| `LU()` | dense solve of \(J\) or \(B\) | \(n\) | `Newton` forward and `ad_solver` for square systems |
-| `SVD()` | pseudoinverse | — | `Newton` forward and `ad_solver` for rank-deficient systems |
+| `Cholesky(form="auto", preconditioner=None)` | dense | `gram` or `normal` | Default dense solver with optional `DiagonalPreconditioner` |
+| `QR(form="auto", preconditioner=None)` | dense | `gram` or `normal` | Avoids squaring \(\operatorname{cond}(J)\) in both forward and implicit AD |
+| `CG(preconditioner, ...)` | parameter (\(n\)) | matrix-free normal | Supports matvec-only `RidgeMetric` |
+| `GramCG(preconditioner, ...)` | residual (\(m\)) | matrix-free Gram | Unpenalized wide systems (\(m \ll n\)) |
+| `LU()` | parameter (\(n\)) | square \(J\) | Undamped square systems (\(m = n\), `ridge=None`) |
+| `SVD(rcond=None)` | parameter (\(n\)) | pseudoinverse | Rank-aware augmented or unpenalized least squares |
 
-For \(\lambda > 0\) the gram and normal forms compute the *same* step (the
-push-through identity), so the choice is about cost, not semantics. A
-`preconditioner` is required for the Krylov configs —
-`IdentityPreconditioner()` is the explicit opt-out.
+## Documentation guide
 
-When `ridge=None`, `ad_solver=None` (the default) matches the forward family
-where its undamped operator is invertible, and otherwise picks by shape: `LU()`
-when \(m = n\), `SVD()` when not. When `ridge > 0`, `ad_solver=None` uses
-matrix-free normal `CG` when the forward solver is `CG` and dense `Cholesky`
-otherwise.
-
-## Where to go next
-
-- [Ridge LM](ridge_lm.md) — the objective, whitening, ridge continuation, stopping
-- [Metric LM](metric_lm.md) — the damping geometry and its minimum-norm limit
-- [Newton](newton.md) — undamped minimum-norm Newton / Gauss-Newton with Armijo backtracking
-- [Metrics and preconditioners](metrics.md) — the two hook types
-- [Callbacks](callbacks.md) — the solve loop and its cookbook
-- [Implicit differentiation](implicit_ad.md) — the AD contract
-- [Row-wise residuals](vmap_rows.md) — `vmap_rows` for simulated-path residuals
-- [Complementarity](complementarity.md) — complementarity constraints (`PDAS`, `FischerBurmeister`, `Minimum`)
-- [Tuning](tuning_guide.md) — picking a solver and a schedule
+- [Tikhonov Regularization](ridge_lm.md)
+- [Newton](newton.md)
+- [Ridge Operators and Preconditioners](metrics.md)
+- [Constraints](complementarity.md)
+- [Callbacks](callbacks.md)
+- [Multi-Start](multi_start.md)
+- [Implicit Differentiation](implicit_ad.md)
+- [Row-wise Residuals](vmap_rows.md)
+- [Tuning](tuning_guide.md)
 - [API](api.md)

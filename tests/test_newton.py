@@ -1,8 +1,3 @@
-"""Tests for Newton + Armijo backtracking across unpenalized (ridge=None) and
-Tikhonov-penalized (ridge > 0) objectives, linear solvers, rank-deficient
-regularization, geodesic acceleration, and line-search edge cases.
-"""
-
 import dataclasses
 
 import jax
@@ -18,12 +13,16 @@ from nlls_gram import (
     AnnealRidge,
     CallbackContext,
     Cholesky,
-    CholeskyMetric,
+    DiagonalPreconditioner,
+    FactorRidge,
     GramCG,
     IdentityPreconditioner,
+    Inequality,
+    InequalityPenalty,
     LevenbergMarquardt,
     Newton,
     Preconditioner,
+    RepeatedFactorRidge,
     SolverAction,
     SolveResult,
     SolverStatus,
@@ -49,8 +48,10 @@ register_pytree_dataclass(
     [
         Cholesky(),
         Cholesky(form="gram"),
+        Cholesky(form="gram", preconditioner=DiagonalPreconditioner(None)),
         QR(),
         QR(form="gram"),
+        QR(form="gram", preconditioner=DiagonalPreconditioner(None)),
         SVD(),
         GramCG(IdentityPreconditioner(), tol=1e-12, maxiter=64),
     ],
@@ -76,8 +77,57 @@ def test_wide_linear_interpolation_one_step(linear_solver):
 @pytest.mark.parametrize(
     "linear_solver",
     [
+        Cholesky(form="normal"),
+        Cholesky(form="gram"),
+        QR(form="normal"),
+        QR(form="gram"),
+        SVD(),
+        CG(IdentityPreconditioner(), tol=1e-12, maxiter=128),
+    ],
+)
+def test_undamped_newton_ridge_bordered_free_tail_one_step(linear_solver):
+    # At damping == 0.0 with RepeatedFactorRidge + free tail (n_f > 0), bordered
+    # elimination solves H_0 d = -(J'r + rho Q x0) in one step with zero division by mu.
+    rng = np.random.default_rng(42)
+    m, block, repeats, free = 5, 3, 2, 2
+    n = block * repeats + free
+    A_np = rng.normal(size=(m, n))
+    b_np = rng.normal(size=m)
+    x0_np = rng.normal(size=n)
+    root = rng.normal(size=(block + 1, block))
+    K_np = root.T @ root + 0.5 * np.eye(block)
+    L_np = np.linalg.cholesky(K_np).T
+    Q_np = np.zeros((n, n))
+    for j in range(repeats):
+        Q_np[j * block : (j + 1) * block, j * block : (j + 1) * block] = K_np
+
+    rho = 0.15
+    expected_x = np.linalg.solve(A_np.T @ A_np + rho * Q_np, A_np.T @ b_np)
+
+    A = jnp.asarray(A_np, jnp.float32)
+    b = jnp.asarray(b_np, jnp.float32)
+    x0 = jnp.asarray(x0_np, jnp.float32)
+    rm = RepeatedFactorRidge(jnp.asarray(L_np, jnp.float32), repeats=repeats)
+    solver = Newton(
+        lambda x: A @ x - b,
+        ridge=rho,
+        ridge_metric=rm,
+        damping=0.0,
+        linear_solver=linear_solver,
+        geodesic_acceleration=False,
+    )
+    x1, _, info = solver.update(x0, solver.init(x0))
+    assert bool(info.accepted)
+    np.testing.assert_allclose(np.asarray(x1), expected_x, rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "linear_solver",
+    [
         Cholesky(),
+        Cholesky(form="normal", preconditioner=DiagonalPreconditioner(None)),
         QR(),
+        QR(form="normal", preconditioner=DiagonalPreconditioner(None)),
         SVD(),
         CG(IdentityPreconditioner(), tol=1e-12, maxiter=64),
     ],
@@ -127,7 +177,6 @@ def test_square_nonlinear_problem(linear_solver):
 
 
 def test_armijo_backtracking_oracle_nonfinite_trials_and_jaxpr():
-    # 1. arctan(x) from x0=3 matches scalar backtracking oracle
     x0 = jnp.array([3.0], dtype=jnp.float32)
     c1, beta = 1e-4, 0.5
     solver = Newton(
@@ -154,8 +203,6 @@ def test_armijo_backtracking_oracle_nonfinite_trials_and_jaxpr():
     np.testing.assert_allclose(info.stepsize, alpha, rtol=1e-5)
     np.testing.assert_allclose(x1[0], 3.0 + alpha * d0, rtol=1e-5)
 
-    # 2. log(x) from x=10 rejects 4 NaN trials and accepts on trial 5 (0.8**4)
-    # and vmaps cleanly alongside a single-trial lane (x=1.5).
     log_solver = Newton(
         jnp.log,
         c1=1e-4,
@@ -170,7 +217,6 @@ def test_armijo_backtracking_oracle_nonfinite_trials_and_jaxpr():
     np.testing.assert_array_equal(info_vmap.num_linesearch_steps, np.array([1, 5]))
     np.testing.assert_allclose(info_vmap.stepsize, np.array([1.0, 0.8**4]), rtol=1e-5)
 
-    # 3. exp(x) - 1 from x=-10 exhausts maxls=10 -> LINE_SEARCH_FAILED
     exp_solver = Newton(
         lambda x: jnp.exp(x) - 1.0,
         maxls=10,
@@ -182,7 +228,6 @@ def test_armijo_backtracking_oracle_nonfinite_trials_and_jaxpr():
     )
     assert int(res_fail.status) == int(SolverStatus.LINE_SEARCH_FAILED)
 
-    # 4. Inner while_loop body contains no factorizations or linear solves
     jaxpr = jax.make_jaxpr(lambda x, s: log_solver.update(x, s))(xs[0], state)
     while_eqns = []
 
@@ -213,14 +258,11 @@ def test_armijo_backtracking_oracle_nonfinite_trials_and_jaxpr():
 
 
 def test_failure_statuses_exact_root_and_rank_deficient_svd():
-    # Nonfinite base point -> NONFINITE
     nan_x0 = jnp.array([jnp.nan], dtype=jnp.float32)
     assert int(Newton(lambda x: x - 1.0).solve(nan_x0).status) == int(
         SolverStatus.NONFINITE
     )
 
-    # Undamped singular Cholesky / QR -> LINEAR_SOLVE_FAILED, while default
-    # damped Newton and SVD succeed.
     def dup_res(x):
         return jnp.array([x[0] + x[1] - 2.0, x[0] + x[1] - 2.0], dtype=jnp.float32)
 
@@ -236,7 +278,36 @@ def test_failure_statuses_exact_root_and_rank_deficient_svd():
     assert int(res_svd.status) == int(SolverStatus.CONVERGED)
     np.testing.assert_allclose(res_svd.x, jnp.array([1.0, 1.0]), atol=1e-5)
 
-    # Zero gradient at non-root -> NON_DESCENT unless gtol > 0
+    # Semidefinite ridge with shared nullspace at damping=0:
+    # Cholesky/QR fail cleanly while SVD selects the minimum-norm step.
+    L_rank1 = jnp.array([[1.0, 1.0]], dtype=jnp.float32)
+    for ls in (Cholesky(form="normal"), QR(form="normal")):
+        st_sing = (
+            Newton(
+                dup_res,
+                ridge=0.5,
+                ridge_metric=FactorRidge(L_rank1),
+                damping=0.0,
+                linear_solver=ls,
+            )
+            .solve(x0)
+            .status
+        )
+        assert int(st_sing) == int(SolverStatus.LINEAR_SOLVE_FAILED)
+
+    res_svd_semi = Newton(
+        dup_res,
+        ridge=0.5,
+        ridge_metric=FactorRidge(L_rank1),
+        damping=0.0,
+        linear_solver=SVD(),
+    ).solve(jnp.array([2.0, -2.0], dtype=jnp.float32), gtol=1e-5, max_steps=10)
+    assert int(res_svd_semi.status) == int(SolverStatus.CONVERGED)
+    # Along [1, 1] minimizer is [0.8, 0.8]; nullspace [1, -1] stays at x0 projection.
+    np.testing.assert_allclose(
+        res_svd_semi.x[0] + res_svd_semi.x[1], 8.0 / 5.0, atol=1e-5
+    )
+
     zero_grad = Newton(lambda x: x**2 + 1.0, linear_solver=SVD())
     assert int(zero_grad.solve(jnp.array([0.0]), gtol=0.0).status) == int(
         SolverStatus.NON_DESCENT
@@ -245,7 +316,6 @@ def test_failure_statuses_exact_root_and_rank_deficient_svd():
         SolverStatus.CONVERGED
     )
 
-    # Exact root at x0 bypasses singular Cholesky factorization at step 0
     res_root = Newton(lambda x: x**2, damping=0.0, linear_solver=Cholesky()).solve(
         jnp.zeros(3, dtype=jnp.float32)
     )
@@ -318,12 +388,13 @@ def test_newton_ridge_matches_lm_ridge_and_supports_anneal_ridge(linear_solver):
     A = jax.random.normal(k1, (m, n), dtype=jnp.float32)
     b = jax.random.normal(k2, (m,), dtype=jnp.float32)
     M_raw = jax.random.normal(k3, (n_m, n_m), dtype=jnp.float32)
-    L = jnp.linalg.cholesky(M_raw @ M_raw.T + jnp.eye(n_m, dtype=jnp.float32))
-    metric = CholeskyMetric(L)
+    L = jnp.linalg.cholesky(
+        M_raw @ M_raw.T + jnp.eye(n_m, dtype=jnp.float32), upper=True
+    )
+    rm = FactorRidge(L)
     ridge = 1e-1
     x0 = jnp.zeros(n, dtype=jnp.float32)
 
-    # Default metric=None with ridge > 0 uses Euclidean identity penalty
     euclid_n = Newton(lambda x: A @ x - b, ridge=ridge, linear_solver=linear_solver)
     res_euclid = euclid_n.solve(x0, gtol=1e-5, max_steps=20)
     assert int(res_euclid.status) == int(SolverStatus.CONVERGED)
@@ -338,26 +409,25 @@ def test_newton_ridge_matches_lm_ridge_and_supports_anneal_ridge(linear_solver):
     p0 = jnp.asarray(0.5, dtype=jnp.float32)
     rn = Newton(
         residual_fn,
-        metric=metric,
+        ridge_metric=rm,
         ridge=ridge,
         linear_solver=linear_solver,
         geodesic_acceleration=True,
     )
     rlm = LevenbergMarquardt(
-        residual_fn, metric=metric, ridge=ridge, linear_solver=linear_solver
+        residual_fn, ridge_metric=rm, ridge=ridge, linear_solver=linear_solver
     )
     x1, state1, _ = rn.update(x0, rn.init(x0, None, p=p0), None, p=p0)
     _, _, step1_info = rn.update(x1, state1, None, p=p0)
     assert bool(step1_info.used_geodesic)
-    res_rn = rn.solve(x0, None, p=p0, gtol=1e-5, atol=1.0, max_steps=30)
-    res_rlm = rlm.solve(x0, None, p=p0, gtol=1e-5, atol=1.0, max_steps=50)
+    res_rn = rn.solve(x0, None, p=p0, gtol=1e-5, max_steps=30)
+    res_rlm = rlm.solve(x0, None, p=p0, gtol=1e-5, max_steps=50)
     assert int(res_rn.status) == int(SolverStatus.CONVERGED)
     np.testing.assert_allclose(res_rn.x, res_rlm.x, rtol=1e-4, atol=1e-4)
 
-    # AnnealRidge rescues NON_DESCENT when stationary at an intermediate ridge
     anneal = AnnealRidge(ridge_floor=1e-4, decrease=0.1, grad_rtol=1e-1)
     res_anneal = Newton(
-        lambda x: A @ x - b, metric=metric, ridge=1e-1, linear_solver=linear_solver
+        lambda x: A @ x - b, ridge_metric=rm, ridge=1e-1, linear_solver=linear_solver
     ).solve(
         x0,
         callback=anneal,
@@ -369,7 +439,7 @@ def test_newton_ridge_matches_lm_ridge_and_supports_anneal_ridge(linear_solver):
     np.testing.assert_allclose(res_anneal.state.ridge, 1e-4, rtol=1e-5)
 
 
-def test_newton_callbacks_cache_retry_and_validation():
+def test_newton_callbacks_inequality_and_validation():
     def residual_fn(x, target):
         return jnp.exp(x) - target, {"norm_x": jnp.linalg.norm(x)}
 
@@ -378,7 +448,6 @@ def test_newton_callbacks_cache_retry_and_validation():
     solver = Newton(residual_fn, maxls=3, cache_jacobian=True, has_aux=True)
 
     def rescue_cb(ctx: CallbackContext):
-        assert isinstance(ctx, CallbackContext)
         rescue = ctx.info.step_status == SolverStatus.LINE_SEARCH_FAILED
         new_maxls = jnp.where(rescue, jnp.int32(60), ctx.state.hyper.maxls)
         new_hyper = dataclasses.replace(ctx.state.hyper, maxls=new_maxls)
@@ -400,10 +469,17 @@ def test_newton_callbacks_cache_retry_and_validation():
     assert int(res.status) == int(SolverStatus.CONVERGED)
     np.testing.assert_allclose(res.x, jnp.zeros_like(x0), atol=1e-5)
 
-    # Validation errors
+    # Newton bare Inequality solve
+    ineq_n = Newton(
+        lambda x: Inequality(x - jnp.array([2.0, -1.0], dtype=x.dtype)),
+        inequality=InequalityPenalty(weight=1.0, smoothing=0.0),
+    ).solve(jnp.array([0.5, 0.5], dtype=jnp.float32), atol=1e-6, max_steps=10)
+    assert int(ineq_n.status) == int(SolverStatus.CONVERGED)
+    np.testing.assert_allclose(ineq_n.x, jnp.array([2.0, 0.5]), atol=1e-5)
+
     wide_res = lambda x: x[:2] + x[2:4]  # noqa: E731
     tall_res = lambda x: jnp.concatenate([x, x + 1.0])  # noqa: E731
-    with pytest.raises(ValueError, match="requires n <= m"):
+    with pytest.raises(ValueError, match="full column support"):
         Newton(wide_res, damping=0.0, linear_solver=Cholesky(form="normal")).init(
             jnp.ones(4)
         )
@@ -411,13 +487,26 @@ def test_newton_callbacks_cache_retry_and_validation():
         Newton(tall_res, damping=0.0, linear_solver=Cholesky(form="gram")).init(
             jnp.ones(2)
         )
-    with pytest.raises(ValueError, match="requires a square system"):
-        Newton(wide_res, linear_solver=LU()).init(jnp.ones(4))
-    with pytest.raises(ValueError, match="divides by the live damping"):
-        Newton(tall_res, linear_solver=CG(_DampingDividingPreconditioner()))
-    with pytest.raises(ValueError, match="does not support damping > 0"):
+    with pytest.raises(ValueError, match="square"):
+        Newton(wide_res, damping=0.0, linear_solver=LU()).init(jnp.ones(4))
+    with pytest.raises(ValueError, match="positive damping"):
+        Newton(
+            tall_res, damping=0.0, linear_solver=CG(_DampingDividingPreconditioner())
+        )
+    with pytest.raises(ValueError, match="damping"):
         Newton(lambda x: x, damping=0.1, linear_solver=LU())
     with pytest.raises(TypeError, match="NewtonState"):
         Newton(wide_res).solve(
             jnp.ones(4), state=LevenbergMarquardt(wide_res).init(jnp.ones(4))
         )
+
+    # Newton with semidefinite RepeatedFactorRidge in auto resolves normal
+    R_sing = jnp.array([[1.0, 0.0], [0.0, 0.0]], dtype=jnp.float32)
+    res_semi = Newton(
+        lambda x: x[:2] - jnp.array([1.0, -1.0], jnp.float32),
+        ridge=1e-2,
+        ridge_metric=RepeatedFactorRidge(R_sing, repeats=1),
+        damping=1e-3,
+        linear_solver=QR(form="auto"),
+    ).solve(jnp.zeros(2, jnp.float32), gtol=1e-5, max_steps=15)
+    assert int(res_semi.status) == int(SolverStatus.CONVERGED)

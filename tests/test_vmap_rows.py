@@ -1,15 +1,11 @@
-"""``vmap_rows`` against ``jax.vmap`` on a simulated-path residual: the same
-values, Jacobian, tangents, and second directional derivative; the same
-solver steps; and composition with ``jit`` and an outer ``vmap``.
-"""
-
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram import (
-    IdentityMetric,
+    IdentityRidge,
     LevenbergMarquardt,
     SolverStatus,
     vmap_rows,
@@ -74,7 +70,6 @@ def problem(seed=0, T=T):
         0.05 * jax.random.normal(keys[7], (Q, N)),
         jnp.arange(T),
     )
-    # Row targets consistent with the zero policy, so an exact root exists.
     x0, shocks, next_shocks, _ = args
     rho = 0.9
     xs = jax.lax.scan(lambda x, s: ((rho * x + s),) * 2, x0, shocks)[1]
@@ -84,8 +79,6 @@ def problem(seed=0, T=T):
 
 
 def assemble(residual, theta, args, p):
-    # The solver's reverse-mode assembly: m unit cotangents through the
-    # transposed linearization.
     flat, unravel = ravel_pytree(theta)
 
     def residual_flat(th):
@@ -110,7 +103,6 @@ def test_matches_vmap_to_second_order():
 
 
 def test_matches_vmap_in_forward_assembly():
-    # Tall system: the solver assembles J from n unit tangents instead.
     theta, args, p = problem(T=200)
     flat, unravel = ravel_pytree(theta)
 
@@ -127,17 +119,23 @@ def test_matches_vmap_in_forward_assembly():
     )
 
 
-def test_solver_takes_the_same_steps():
+def test_solver_takes_the_same_steps_and_composes_with_checkpoint():
     theta, args, p = problem()
+    ckpt_rows = make_residual(vmap_rows(jax.checkpoint(euler_row), in_axes=IN_AXES))
     results = []
-    for residual in (native, rows):
+    for residual in (native, rows, ckpt_rows):
         solver = LevenbergMarquardt(residual, geodesic_acceleration=True)
         results.append(solver.solve(theta, args, p=p, max_steps=100, atol=1e-4))
-    reference, candidate = results
+    reference, candidate, ckpt_candidate = results
     assert candidate.status == SolverStatus.CONVERGED
+    assert ckpt_candidate.status == SolverStatus.CONVERGED
     assert int(candidate.steps) == int(reference.steps)
+    assert int(ckpt_candidate.steps) == int(reference.steps)
     np.testing.assert_allclose(
         ravel_pytree(candidate.x)[0], ravel_pytree(reference.x)[0], rtol=1e-3
+    )
+    np.testing.assert_allclose(
+        ravel_pytree(ckpt_candidate.x)[0], ravel_pytree(reference.x)[0], rtol=1e-3
     )
 
 
@@ -158,11 +156,10 @@ def test_composes_with_jit_and_outer_vmap():
 
 
 def test_jacobian_chunk_matches_one_batch():
-    # The cached Jacobian after one step is the assembled matrix itself.
     theta, args, p = problem()
     for kwargs in (
         {},
-        {"metric": IdentityMetric(ravel_pytree(theta)[0].size), "ridge": 1e-4},
+        {"ridge_metric": IdentityRidge(ravel_pytree(theta)[0].size), "ridge": 1e-4},
     ):
         jacobians = []
         for chunk in (None, 4):
@@ -209,3 +206,45 @@ def test_chunk_size_and_default_in_axes():
     J_vmap = jax.jit(jax.jacrev(residual_vmap))(theta)
     for a, b in zip(jax.tree.leaves(J_vmap), jax.tree.leaves(J_default), strict=True):
         np.testing.assert_allclose(b, a, rtol=tol, atol=tol * float(jnp.abs(a).max()))
+
+
+def test_one_arg_signature_nonfloating_aux_transpose_and_multishape_jit():
+    grid = jnp.linspace(0.5, 2.0, 5, dtype=jnp.float32)
+
+    @vmap_rows(in_axes=(None,))
+    def bad_static(_x):
+        return jnp.float32(0.0)
+
+    with pytest.raises(ValueError, match="at least one"):
+        bad_static(grid)
+
+    def one_arg_row(g, x):
+        return g * x[0] + x[1] - 1.0
+
+    wrapped_1arg = vmap_rows(in_axes=(0, None))(one_arg_row)
+    res_1arg = LevenbergMarquardt(lambda x: wrapped_1arg(grid, x)).solve(
+        jnp.zeros(2, jnp.float32), atol=1e-5, max_steps=15
+    )
+    assert int(res_1arg.status) == int(SolverStatus.CONVERGED)
+
+    @vmap_rows(in_axes=(0, None))
+    def row_with_meta(g, x):
+        r = jnp.sin(g * x[0]) - x[1]
+        return r, {"idx": jnp.int32(3), "pos": r > 0}
+
+    x0 = jnp.array([0.4, 0.1], dtype=jnp.float32)
+    (r_val, meta_val), lin_fn = jax.linearize(lambda x: row_with_meta(grid, x), x0)
+    assert meta_val["idx"].dtype == jnp.int32 and meta_val["pos"].dtype == jnp.bool_
+    dr, dmeta = lin_fn(jnp.ones_like(x0))
+    assert dmeta["idx"].dtype == jax.dtypes.float0
+    (xt,) = jax.linear_transpose(lambda v: lin_fn(v)[0], x0)(jnp.ones_like(r_val))
+    J_rev = jax.jacrev(lambda x: row_with_meta(grid, x)[0])(x0)
+    np.testing.assert_allclose(xt, jnp.sum(J_rev, axis=0), rtol=1e-5, atol=1e-6)
+
+    @jax.jit
+    def multi_shape_jac(g, x):
+        return jax.jacrev(lambda th: wrapped_1arg(g, th))(x)
+
+    j5 = multi_shape_jac(grid, x0)
+    j9 = multi_shape_jac(jnp.linspace(0.5, 2.0, 9, dtype=jnp.float32), x0)
+    assert j5.shape == (5, 2) and j9.shape == (9, 2)

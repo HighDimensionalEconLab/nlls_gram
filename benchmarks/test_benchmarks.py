@@ -1,18 +1,3 @@
-"""End-to-end performance and memory benchmarks for nlls-gram.
-
-Covers the four workload families where runtime and temporary memory footprint
-regressions matter in practice:
-1. Wide nonlinear RBF interpolation (m=256, n=2048) across LM and Newton
-   (Cholesky, QR, GramCG, and geodesic acceleration).
-2. Wide nonlinear RBF solve + implicit reverse-mode differentiation (grad and
-   vmapped grad).
-3. Tall overdetermined nonlinear least squares (m=512, n=64).
-4. Multi-block Matérn kernel ridge continuation (AnnealRidge) + implicit grad
-   (n=483, m=480) across Cholesky, QR, and BlockEigen-preconditioned CG.
-5. Simulated-trajectory Euler residual step under jax.vmap vs vmap_rows (and
-   jacobian_chunk), recording compiled temporary memory (temp_mb).
-"""
-
 import jax
 import jax.numpy as jnp
 import pytest
@@ -23,16 +8,16 @@ from nlls_gram import (
     PDAS,
     QR,
     AnnealRidge,
-    BlockEigenPreconditioner,
     Cholesky,
     Complementarity,
+    DiagonalPreconditioner,
     FischerBurmeister,
     GramCG,
     IdentityPreconditioner,
     LevenbergMarquardt,
     Minimum,
     Newton,
-    RepeatedFactorMetric,
+    RepeatedFactorRidge,
     SolverStatus,
     vmap_rows,
 )
@@ -265,7 +250,7 @@ def test_tall_nonlinear_least_squares_solve(benchmark, device, dtype, solver_nam
     [
         "lm_cholesky",
         "lm_qr",
-        "lm_cg_block_eigen",
+        "lm_cg_diag",
         "newton_cholesky",
         "newton_qr",
     ],
@@ -277,7 +262,6 @@ def test_ridge_continuation_solve_and_grad(benchmark, device, dtype, solver_name
     eps = 1e-2 if dtype == jnp.float32 else 1e-4
     ridge_floor = 1e-2 if dtype == jnp.float32 else 1e-5
     gtol = 1e-3 if dtype == jnp.float32 else 5e-5
-    atol = 1e-1 if dtype == jnp.float32 else 1e-2
 
     with jax.default_device(device):
         t = jnp.linspace(0.0, 20.0, n_grid, dtype=dtype)
@@ -286,7 +270,7 @@ def test_ridge_continuation_solve_and_grad(benchmark, device, dtype, solver_name
         K = (1.0 + scaled + scaled**2 / 3.0) * jnp.exp(-scaled)
         shifted = K + jnp.asarray(eps, dtype=dtype) * jnp.eye(n_grid, dtype=dtype)
         F = jnp.linalg.cholesky(shifted, upper=True)
-        metric = RepeatedFactorMetric(F, repeats=repeats)
+        rm = RepeatedFactorRidge(F, repeats=repeats)
 
         k1, k2, k3 = jax.random.split(jax.random.key(5), 3)
         A = (
@@ -314,17 +298,14 @@ def test_ridge_continuation_solve_and_grad(benchmark, device, dtype, solver_name
             linear_solver = QR()
             ad_solver = Cholesky()
         else:
-            F_inv = jnp.linalg.inv(F)
-            A_m = A[:, :n_m].reshape(m_resid, repeats, n_grid)
-            A_w = jnp.einsum("mrg,gh->mrh", A_m, F_inv)
-            gram_blocks = jnp.einsum("mrg,mrh->rgh", A_w, A_w)
-            free_block = (
-                A[:, n_m:].T @ A[:, n_m:] + 1e-2 * jnp.eye(free_size, dtype=dtype)
-            )[None]
-            precond = BlockEigenPreconditioner(
-                [(gram_blocks, 1.0), (free_block, 0.0)],
-                jnp.arange(p_dim, dtype=jnp.int32),
+            q_diag = jnp.concatenate(
+                [
+                    jnp.tile(jnp.diag(shifted), repeats),
+                    jnp.zeros(free_size, dtype=dtype),
+                ]
             )
+            diag_est = jnp.sum(A**2, axis=0) + ridge_floor * q_diag
+            precond = DiagonalPreconditioner(jnp.maximum(diag_est, 1e-4))
             linear_solver = CG(precond, tol=gtol * 0.01, maxiter=128)
             ad_solver = CG(precond, tol=gtol * 0.01, maxiter=128)
 
@@ -334,7 +315,7 @@ def test_ridge_continuation_solve_and_grad(benchmark, device, dtype, solver_name
         lm_kw = {"init_damping": 1e-6} if solver_cls is LevenbergMarquardt else {}
         solver = solver_cls(
             residual,
-            metric=metric,
+            ridge_metric=rm,
             ridge=ridge_floor * 100.0,
             linear_solver=linear_solver,
             ad_solver=ad_solver,
@@ -349,7 +330,6 @@ def test_ridge_continuation_solve_and_grad(benchmark, device, dtype, solver_name
                 p=param,
                 max_steps=40,
                 gtol=gtol,
-                atol=atol,
                 callback=anneal,
                 user_state=user_state0,
             )
@@ -360,7 +340,6 @@ def test_ridge_continuation_solve_and_grad(benchmark, device, dtype, solver_name
             p=p0,
             max_steps=40,
             gtol=gtol,
-            atol=atol,
             callback=anneal,
             user_state=user_state0,
         )

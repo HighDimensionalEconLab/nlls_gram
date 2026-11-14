@@ -1,27 +1,11 @@
-"""Solver-agnostic helpers: pytree selection/masking, jit static-key hashing,
-residual-signature canonicalization, and the pinned-precision matrix product.
-
-No solver or metric code lives here -- only plumbing both
-``LevenbergMarquardt`` and ``Newton`` share.
-"""
-
 import dataclasses
 import inspect
 
 import jax
 import jax.numpy as jnp
 
-# XLA:GPU serves float32 dot_general from TF32 tensor cores by default: a
-# 10-bit mantissa, so ~1e-3 relative error. Forming a Gram or normal matrix
-# already squares the condition number, and doing that at TF32 spends about
-# three decimal digits before the factorization starts -- enough to move a
-# converged step and to put an implicit tangent visibly off. Every product
-# inside the package goes through `mm` (or passes `precision=HIGHEST` to
-# einsum) so a float32 solve answers the same on GPU as on CPU, where the
-# setting is a no-op. Callers should also set
-# `jax.config.update("jax_default_matmul_precision", "highest")` near the top
-# of a script: that covers matmuls in their own residual functions, which the
-# package cannot reach from here.
+# Pin internal matmuls to full IEEE precision so float32 GPU runs do not drop
+# to TF32 tensor-core mantissa width when forming Gram or normal products.
 HIGHEST = jax.lax.Precision.HIGHEST
 
 
@@ -30,24 +14,11 @@ def mm(a, b):
 
 
 def register_pytree_dataclass(cls, *, data_fields, meta_fields=()):
-    """Register a frozen dataclass as a pytree whose unflatten bypasses
-    ``__init__``/``__post_init__``.
+    """Register a frozen dataclass as a JAX pytree.
 
-    ``data_fields`` become traced leaves (subtrees, if a field holds a
-    container); ``meta_fields`` become static structure and must hold
-    hashable values. Unflatten rebuilds the instance with ``object.__new__``
-    plus ``object.__setattr__``, so constructors are free to compute derived
-    leaves and validate eagerly -- reconstruction inside jit, ``vmap``, or a
-    loop carry restores the stored fields verbatim without re-running any of
-    it. Static values are type-tagged, so treedefs compare and hash by value
-    with jit's strict-type semantics (``1``, ``1.0``, and ``True`` stay
-    distinct). Every dataclass field must appear in exactly one of the two
-    lists. Returns ``cls``.
-
-    Every concrete :class:`~nlls_gram.Metric` and
-    :class:`~nlls_gram.Preconditioner` class must be registered this way
-    (subclassing a registered base does not register the subclass); the
-    solvers reject unregistered instances at construction.
+    ``data_fields`` become traced children and ``meta_fields`` become static
+    hashable structure. Unflatten bypasses ``__init__`` and ``__post_init__``.
+    Every dataclass field must appear in either ``data_fields`` or ``meta_fields``.
     """
     data_fields = tuple(data_fields)
     meta_fields = tuple(meta_fields)
@@ -56,13 +27,10 @@ def register_pytree_dataclass(cls, *, data_fields, meta_fields=()):
     if len(data_fields) + len(meta_fields) != len(listed) or listed != declared:
         raise ValueError(
             f"register_pytree_dataclass({cls.__name__}): data_fields + "
-            f"meta_fields must cover every dataclass field exactly once; "
-            f"declared {sorted(declared)}, listed {sorted(listed)}"
+            f"meta_fields must cover every dataclass field exactly once"
         )
 
     def static_aux(instance):
-        # The typed tag makes equality/hash strict-typed; the raw value rides
-        # alongside so unflatten can restore it verbatim.
         return tuple(
             (_typed_key(value), value)
             for value in (getattr(instance, name) for name in meta_fields)
@@ -97,10 +65,6 @@ def _tree_changed(new, old):
         return jnp.asarray(True)
     changed = jnp.asarray(False)
     for new_leaf, old_leaf in zip(new_leaves, old_leaves, strict=True):
-        # The same tracer/array object is the same value: a callback that
-        # passes a subtree through dataclasses.replace untouched costs no
-        # comparison ops. equal_nan: an unchanged NaN sentinel is not a
-        # change.
         if new_leaf is old_leaf:
             continue
         changed = changed | ~jnp.array_equal(new_leaf, old_leaf, equal_nan=True)
@@ -117,7 +81,6 @@ def _zero_tangent_leaf(leaf):
 
 
 def _broadcast_leading_condition(condition, leaf):
-    """Broadcast a scalar or leading-batch condition over an array leaf."""
     condition = jnp.asarray(condition, dtype=jnp.bool_)
     leaf_ndim = jnp.ndim(leaf)
     if condition.ndim < leaf_ndim:
@@ -128,8 +91,6 @@ def _broadcast_leading_condition(condition, leaf):
 
 
 def _where_tree(condition, on_true, on_false):
-    """Select matching pytrees, treating ``condition`` axes as leading axes."""
-
     def select(true_leaf, false_leaf):
         if true_leaf is None:
             return None
@@ -143,8 +104,6 @@ def _where_tree(condition, on_true, on_false):
 
 
 def _mask_tangent_tree(condition, tangent):
-    """Keep tangent leaves where condition holds and zero them elsewhere."""
-
     def mask(leaf):
         if leaf is None:
             return None
@@ -161,11 +120,6 @@ def _mask_tangent_tree(condition, tangent):
 
 
 def _typed_key(value):
-    # Tag each hashable value/container with its type so the static key keeps 1,
-    # 1.0, and True distinct -- raw ==/hash collapse them (hash(1) == hash(True)),
-    # which would silently reuse a mismatched compile. This mirrors jax's own
-    # strict-type equality for static jit arguments. Unhashable values raise, and
-    # _hashable_hook degrades those specs to identity hashing.
     if isinstance(value, tuple):
         return (tuple, tuple(_typed_key(v) for v in value))
     if isinstance(value, frozenset):
@@ -174,8 +128,6 @@ def _typed_key(value):
 
 
 class _IdentityKey:
-    """Static-key stand-in comparing by object identity (for unhashable values)."""
-
     __slots__ = ("obj",)
 
     def __init__(self, obj):
@@ -189,9 +141,6 @@ class _IdentityKey:
 
 
 def _static_key_component(value):
-    # Hashable settings (scalars, strings, functions, frozen configs) key by
-    # value; anything unhashable keys by identity so hashing never raises and
-    # equality stays consistent with the hash.
     try:
         hash(value)
     except TypeError:
@@ -200,11 +149,6 @@ def _static_key_component(value):
 
 
 class _IdentityCallable:
-    """Hashable-by-identity pass-through for unhashable callables used as jit
-    statics (e.g. an eq=True dataclass instance implementing ``__call__``).
-    ``__weakref__`` is required: jax.eval_shape weak-references the callable.
-    """
-
     __slots__ = ("fn", "__weakref__")
 
     def __init__(self, fn):
@@ -231,11 +175,6 @@ def _hashable_hook(fn):
 
 
 def canonicalize_residual(residual_fn):
-    """Wrap a residual taking ``(x)``, ``(x, args)``, or ``(x, args, p)`` --
-    always in that order -- into the canonical 3-arg form, so the compiled
-    code is identical for all three. Uninspectable signatures (or ``*args``)
-    are assumed 3-arg. Returns ``(canonical_fn, arity)``.
-    """
     try:
         signature = inspect.signature(residual_fn)
     except (TypeError, ValueError):
@@ -258,12 +197,12 @@ def canonicalize_residual(residual_fn):
             )
     if residual_arity == 1:
 
-        def canonical_residual(x, args, p):
+        def canonical_residual(x, _args, _p):
             return residual_fn(x)
 
     elif residual_arity == 2:
 
-        def canonical_residual(x, args, p):
+        def canonical_residual(x, args, _p):
             return residual_fn(x, args)
 
     else:
