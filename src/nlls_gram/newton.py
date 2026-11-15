@@ -550,6 +550,7 @@ class Newton(SolverBase):
                     ctx=ctx,
                     resid_loss_old=resid_loss_old if self.penalized else None,
                     penalty_old=penalty_value_old if self.penalized else None,
+                    penalty_grad=penalty_grad if self.penalized else None,
                 )
                 if self.geodesic_acceleration:
                     step_d_norm = jnp.linalg.norm(

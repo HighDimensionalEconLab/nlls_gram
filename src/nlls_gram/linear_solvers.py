@@ -434,6 +434,7 @@ class Cholesky(LinearSolver):
             )
 
         # Generalized ridge Gram with two-stage SPD bordered free-tail elimination
+        tiny = jnp.finfo(dtype).tiny
         n_f = rm.n_free_for(n)
         n_p = n - n_f
         part = rm.partition_indices(n)
@@ -441,24 +442,70 @@ class Cholesky(LinearSolver):
             n, rho, mu, dtype, sub.ctx, prefer_qr=False, active=sub.active
         )
         Jp_t, Jf_t = _split_parameter_blocks(sub.Jt, n_p, part)
+        theta_p, _ = _split_parameter_blocks(sub.theta, n_p, part)
         q_theta_p, _ = _split_parameter_blocks(sub.penalty_grad, n_p, part)
+        grad_p, grad_f = _split_parameter_blocks(grad, n_p, part)
+
+        def _penalized_d0():
+            sol = block.solve_Dp(jnp.column_stack([theta_p, rho * q_theta_p, grad_p]))
+            mu_dp_th = mu * sol[:, 0]
+            d0_shift = -theta_p + mu_dp_th
+            d0_rq = -sol[:, 1]
+            d0_grad = -sol[:, 2]
+            d0_split = jnp.where(
+                jnp.linalg.norm(mu_dp_th) <= 0.5 * jnp.linalg.norm(theta_p),
+                d0_shift,
+                d0_rq,
+            )
+            use_grad = jnp.linalg.norm(d0_grad) < jnp.linalg.norm(d0_split)
+            return jnp.where(use_grad, d0_grad, d0_split), use_grad
 
         if n_f == 0:
             Dp_inv_Jt = block.solve_Dp(Jp_t)
             S = jnp.eye(m, dtype=dtype) + mm(Jp_t.T, Dp_inv_Jt)
-            solve_S, s_ok, _ = _cholesky_spd_solve(
-                S,
-                m_scale,
-                jnp.zeros((), dtype=dtype),
-                precond,
-                sub.active,
-                spd_guaranteed=True,
-            )
+            if isinstance(precond, DiagonalPreconditioner):
+                solve_S, s_ok, _ = _cholesky_spd_solve(
+                    S,
+                    m_scale,
+                    jnp.zeros((), dtype=dtype),
+                    precond,
+                    sub.active,
+                    spd_guaranteed=True,
+                )
+            else:
+                S_work = _active_matrix(S, sub.active)
+                L_S_raw = jnp.linalg.cholesky(S_work)
+
+                def _qr_lower_s0(_):
+                    Bp = block.solve_Gp_T(Jp_t)
+                    stack = _active_rect(
+                        jnp.concatenate([Bp, jnp.eye(m, dtype=dtype)], axis=0),
+                        sub.active,
+                    )
+                    _, R_S = jnp.linalg.qr(stack, mode="reduced")
+                    return R_S.T
+
+                L_S = jax.lax.cond(
+                    jnp.all(jnp.isfinite(L_S_raw)),
+                    lambda _: L_S_raw,
+                    _qr_lower_s0,
+                    operand=None,
+                )
+                s_ok = jnp.all(jnp.isfinite(L_S)) & jnp.all(
+                    jnp.abs(jnp.diag(L_S)) > tiny
+                )
+
+                def solve_S(rhs):
+                    return jsp_linalg.cho_solve(
+                        (L_S, True), jnp.asarray(rhs, dtype=dtype)
+                    )
+
             ok = block.ok & s_ok & jnp.all(jnp.isfinite(grad))
 
             def velocity():
-                d0 = -block.solve_Dp(rho * q_theta_p)
-                c = sub.resid + mm(Jp_t.T, d0)
+                d0, use_grad = _penalized_d0()
+                jp_d0 = mm(Jp_t.T, d0)
+                c = jnp.where(use_grad, jp_d0, sub.resid + jp_d0)
                 return d0 - mm(Dp_inv_Jt, solve_S(c))
 
             def solve_residual_rhs(rhs_r):
@@ -480,28 +527,50 @@ class Cholesky(LinearSolver):
             else jnp.eye(m, dtype=dtype)
         )
         S_p_work = _active_matrix(S_p, sub.active)
-        L_S = jnp.linalg.cholesky(S_p_work)
-        s_ok = jnp.all(jnp.isfinite(L_S))
+        L_S_raw = jnp.linalg.cholesky(S_p_work)
+        if n_p > 0:
+
+            def _qr_lower_sp(_):
+                Bp = block.solve_Gp_T(Jp_t)
+                stack = _active_rect(
+                    jnp.concatenate([Bp, jnp.eye(m, dtype=dtype)], axis=0),
+                    sub.active,
+                )
+                _, R_S = jnp.linalg.qr(stack, mode="reduced")
+                return R_S.T
+
+            L_S = jax.lax.cond(
+                jnp.all(jnp.isfinite(L_S_raw)),
+                lambda _: L_S_raw,
+                _qr_lower_sp,
+                operand=None,
+            )
+        else:
+            L_S = L_S_raw
+        s_ok = jnp.all(jnp.isfinite(L_S)) & jnp.all(jnp.abs(jnp.diag(L_S)) > tiny)
         W = jsp_linalg.solve_triangular(L_S, Jf_t.T, lower=True)
         M_f = mm(W.T, W).at[jnp.arange(n_f), jnp.arange(n_f)].add(mu)
         solve_Mf, mf_ok, _ = _cholesky_spd_solve(M_f, m_scale, mu, None, sub.active)
         ok = block.ok & s_ok & mf_ok & jnp.all(jnp.isfinite(grad))
 
-        def _bordered_from_c(c, d0_p):
+        def _bordered_from_c(c, d0_p, extra_rhs_f=None):
             w_c = jsp_linalg.solve_triangular(L_S, c, lower=True)
-            d_f = -solve_Mf(mm(W.T, w_c))
+            rhs_f = mm(W.T, w_c)
+            if extra_rhs_f is not None:
+                rhs_f = rhs_f + extra_rhs_f
+            d_f = -solve_Mf(rhs_f)
             u = jsp_linalg.solve_triangular(L_S.T, w_c + mm(W, d_f), lower=False)
             d_p = d0_p - mm(Dp_inv_Jpt, u) if n_p > 0 else d0_p
             return _merge_parameter_blocks(d_p, d_f, n, part)
 
         def velocity():
-            d0_p = (
-                -block.solve_Dp(rho * q_theta_p)
-                if n_p > 0
-                else jnp.zeros((0,), dtype=dtype)
-            )
-            c = sub.resid + (mm(Jp_t.T, d0_p) if n_p > 0 else 0.0)
-            return _bordered_from_c(c, d0_p)
+            if n_p == 0:
+                return _bordered_from_c(sub.resid, jnp.zeros((0,), dtype=dtype))
+            d0_p, use_grad = _penalized_d0()
+            jp_d0 = mm(Jp_t.T, d0_p)
+            c = jnp.where(use_grad, jp_d0, sub.resid + jp_d0)
+            extra_f = jnp.where(use_grad, grad_f, jnp.zeros_like(grad_f))
+            return _bordered_from_c(c, d0_p, extra_f)
 
         def solve_residual_rhs(rhs_r):
             z_p = jnp.zeros((n_p,), dtype=dtype)
@@ -926,6 +995,7 @@ class QR(LinearSolver):
         )
         Jp_t, Jf_t = _split_parameter_blocks(sub.Jt, n_p, part)
         theta_p, _ = _split_parameter_blocks(sub.theta, n_p, part)
+        grad_p, grad_f = _split_parameter_blocks(grad, n_p, part)
 
         Bt_p = block.solve_Gp_T(Jp_t) if n_p > 0 else jnp.zeros((0, m), dtype=dtype)
         stack_S = jnp.concatenate([Bt_p, jnp.eye(m, dtype=dtype)], axis=0)
@@ -938,8 +1008,12 @@ class QR(LinearSolver):
             ok = block.ok & s_ok & jnp.all(jnp.isfinite(grad))
 
             def velocity():
-                d0 = block.solve_d0_qr(theta_p)
-                c = sub.resid + mm(Jp_t.T, d0)
+                d0_split = block.solve_d0_qr(theta_p)
+                d0_grad = -block.solve_Dp(grad_p)
+                use_grad = jnp.linalg.norm(d0_grad) < jnp.linalg.norm(d0_split)
+                d0 = jnp.where(use_grad, d0_grad, d0_split)
+                jp_d0 = mm(Jp_t.T, d0)
+                c = jnp.where(use_grad, jp_d0, sub.resid + jp_d0)
                 w = jsp_linalg.solve_triangular(R_S_work.T, c, lower=True)
                 return d0 - block.solve_Gp(mm(Q_S_top, w))
 
@@ -1003,11 +1077,14 @@ class QR(LinearSolver):
         R_M_work = _active_matrix(R_M, sub.active)
         ok = block.ok & s_ok & mf_ok & jnp.all(jnp.isfinite(grad))
 
-        def _qr_bordered_from_c(c, d0_p):
+        def _qr_bordered_from_c(c, d0_p, extra_rhs_f=None):
             w_c = jsp_linalg.solve_triangular(R_S_work.T, c, lower=True)
-            d_f = -jsp_linalg.solve_triangular(
-                R_M_work, mm(Q_M_top.T, w_c), lower=False
-            )
+            rhs_r = mm(Q_M_top.T, w_c)
+            if extra_rhs_f is not None:
+                rhs_r = rhs_r + jsp_linalg.solve_triangular(
+                    R_M_work.T, extra_rhs_f, lower=True
+                )
+            d_f = -jsp_linalg.solve_triangular(R_M_work, rhs_r, lower=False)
             d_p = (
                 d0_p - block.solve_Gp(mm(Q_S_top, w_c + mm(W, d_f)))
                 if n_p > 0
@@ -1016,11 +1093,16 @@ class QR(LinearSolver):
             return _merge_parameter_blocks(d_p, d_f, n, part)
 
         def velocity():
-            d0_p = (
-                block.solve_d0_qr(theta_p) if n_p > 0 else jnp.zeros((0,), dtype=dtype)
-            )
-            c = sub.resid + (mm(Jp_t.T, d0_p) if n_p > 0 else 0.0)
-            return _qr_bordered_from_c(c, d0_p)
+            if n_p == 0:
+                return _qr_bordered_from_c(sub.resid, jnp.zeros((0,), dtype=dtype))
+            d0_split = block.solve_d0_qr(theta_p)
+            d0_grad = -block.solve_Dp(grad_p)
+            use_grad = jnp.linalg.norm(d0_grad) < jnp.linalg.norm(d0_split)
+            d0_p = jnp.where(use_grad, d0_grad, d0_split)
+            jp_d0 = mm(Jp_t.T, d0_p)
+            c = jnp.where(use_grad, jp_d0, sub.resid + jp_d0)
+            extra_f = jnp.where(use_grad, grad_f, jnp.zeros_like(grad_f))
+            return _qr_bordered_from_c(c, d0_p, extra_f)
 
         def solve_residual_rhs(rhs_r):
             return _qr_bordered_from_c(

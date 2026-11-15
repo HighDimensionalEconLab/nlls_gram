@@ -81,6 +81,7 @@ def _armijo_backtracking(
     ctx=None,
     resid_loss_old=None,
     penalty_old=None,
+    penalty_grad=None,
 ):
     dtype = loss_old.dtype
     zero = jnp.zeros((), dtype=dtype)
@@ -99,6 +100,27 @@ def _armijo_backtracking(
     if not penalized:
         resid_loss_old = loss_old
         penalty_old = zero
+        p_c1 = p_c2 = p_c3 = p_c4 = zero
+    else:
+        d_safe = jnp.where(active, d, zero)
+        pg_safe = jnp.where(active, penalty_grad, zero)
+        p_c1 = 2.0 * jnp.sum(d_safe * pg_safe)
+        if a is None:
+            p_c2 = jnp.asarray(ridge_metric.quad_form(d_safe, ctx), dtype=dtype)
+            p_c3 = p_c4 = zero
+        elif ridge_metric.has_factor:
+            a_safe = jnp.where(active, a, zero)
+            u_d = jnp.asarray(ridge_metric.factor_apply(d_safe, ctx), dtype=dtype)
+            u_a = jnp.asarray(ridge_metric.factor_apply(a_safe, ctx), dtype=dtype)
+            p_c2 = jnp.sum(a_safe * pg_safe) + jnp.sum(u_d**2)
+            p_c3 = jnp.sum(u_d * u_a)
+            p_c4 = 0.25 * jnp.sum(u_a**2)
+        else:
+            a_safe = jnp.where(active, a, zero)
+            qd = jnp.asarray(ridge_metric.matvec(d_safe, ctx), dtype=dtype)
+            p_c2 = jnp.sum(a_safe * pg_safe) + jnp.sum(d_safe * qd)
+            p_c3 = jnp.sum(a_safe * qd)
+            p_c4 = 0.25 * jnp.asarray(ridge_metric.quad_form(a_safe, ctx), dtype=dtype)
 
     def cond(carry):
         trial, _, accepted, stagnated, _, _, _, _, _, _ = carry
@@ -123,22 +145,30 @@ def _armijo_backtracking(
         same_theta = cand_finite & jnp.all(cand_theta == theta)
         cand_resid = residual_value(cand_theta)
         cand_resid_loss = jnp.sum(cand_resid**2)
+        rhs_shifted = resid_loss_old + 2.0 * c1 * alpha * slope + 2.0 * linesearch_tol
         if penalized:
-            cand_penalty = jnp.asarray(
-                ridge_metric.quad_form(cand_theta, ctx), dtype=dtype
+            alpha2 = alpha**2
+            delta_penalty = (
+                alpha * p_c1
+                + alpha2 * p_c2
+                + (alpha * alpha2) * p_c3
+                + (alpha2**2) * p_c4
             )
+            cand_penalty = jnp.maximum(zero, penalty_old + delta_penalty)
             cand_loss = cand_resid_loss + ridge * cand_penalty
+            lhs_shifted = cand_resid_loss + ridge * delta_penalty
         else:
             cand_penalty = zero
             cand_loss = cand_resid_loss
+            lhs_shifted = cand_resid_loss
         trial_finite = (
             cand_finite
             & jnp.all(jnp.isfinite(cand_resid))
             & jnp.isfinite(cand_resid_loss)
             & jnp.isfinite(cand_loss)
+            & jnp.isfinite(lhs_shifted)
         )
-        rhs = loss_old + 2.0 * c1 * alpha * slope + 2.0 * linesearch_tol
-        ok = (~same_theta) & trial_finite & (cand_loss <= rhs)
+        ok = (~same_theta) & trial_finite & (lhs_shifted <= rhs_shifted)
         new_trial = trial + jnp.asarray(1, dtype=jnp.int32)
         new_theta = jnp.where(ok, cand_theta, theta_kept)
         new_loss = jnp.where(ok, cand_loss, loss_kept)

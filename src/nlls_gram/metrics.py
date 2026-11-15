@@ -593,18 +593,15 @@ class FactorRidge(RidgeMetric):
         k = L.shape[1]
         if not isinstance(L, jax.core.Tracer):
             l_np = np.asarray(L)
-            if not np.all(np.isfinite(l_np)):
-                raise ValueError("FactorRidge L must contain finite entries")
             if k == 0:
-                is_spd = True
-            elif L.shape[0] < k:
+                is_spd = bool(np.all(np.isfinite(l_np)))
+            elif not np.all(np.isfinite(l_np)) or L.shape[0] < k:
                 is_spd = False
             else:
                 s = np.linalg.svd(l_np, compute_uv=False)
                 cutoff = max(L.shape) * float(jnp.finfo(dtype).eps) * float(s[0])
                 is_spd = bool(s[-1] > cutoff)
         else:
-            L = jnp.where(jnp.all(jnp.isfinite(L)), L, jnp.full_like(L, jnp.nan))
             is_spd = L.shape[0] >= k
         object.__setattr__(self, "L", L)
         object.__setattr__(self, "size", k)
@@ -673,6 +670,7 @@ class RepeatedFactorRidge(RidgeMetric):
 
     L: jax.Array
     repeats: int = field(default=1, kw_only=True)
+    K: jax.Array = field(init=False)
     size: int = field(init=False)
     penalized_is_spd: bool = field(init=False)
 
@@ -694,18 +692,16 @@ class RepeatedFactorRidge(RidgeMetric):
         k = L.shape[1]
         if not isinstance(L, jax.core.Tracer):
             l_np = np.asarray(L)
-            if not np.all(np.isfinite(l_np)):
-                raise ValueError("RepeatedFactorRidge L must contain finite entries")
-            if L.shape[0] < k:
+            if not np.all(np.isfinite(l_np)) or L.shape[0] < k:
                 is_spd = False
             else:
                 s = np.linalg.svd(l_np, compute_uv=False)
                 cutoff = max(L.shape) * float(jnp.finfo(dtype).eps) * float(s[0])
                 is_spd = bool(s[-1] > cutoff)
         else:
-            L = jnp.where(jnp.all(jnp.isfinite(L)), L, jnp.full_like(L, jnp.nan))
             is_spd = L.shape[0] >= k
         object.__setattr__(self, "L", L)
+        object.__setattr__(self, "K", mm(L.T, L))
         object.__setattr__(self, "size", self.repeats * k)
         object.__setattr__(self, "penalized_is_spd", is_spd)
 
@@ -740,9 +736,8 @@ class RepeatedFactorRidge(RidgeMetric):
 
     def matvec(self, v, ctx):
         _check_covered_size(self.size, v.shape[0], "RepeatedFactorRidge")
-        L = jnp.asarray(self.L, dtype=v.dtype)
-        K_block = mm(L.T, L)
-        qp = self._map_blocks(lambda m: mm(K_block, m), v[: self.size], L.shape[1])
+        K_block = jnp.asarray(self.K, dtype=v.dtype)
+        qp = self._map_blocks(lambda m: mm(K_block, m), v[: self.size], self.L.shape[1])
         return _pad_tail(qp, v.shape[0] - self.size, v.dtype)
 
     def quad_form(self, v, ctx):
@@ -753,9 +748,8 @@ class RepeatedFactorRidge(RidgeMetric):
         _check_covered_size(self.size, G.shape[0], "RepeatedFactorRidge")
         if self.L.shape[0] == 0:
             return G
-        L = jnp.asarray(self.L, dtype=G.dtype)
-        k = L.shape[1]
-        scaled_K = jnp.asarray(rho, dtype=G.dtype) * mm(L.T, L)
+        k = self.L.shape[1]
+        scaled_K = jnp.asarray(rho, dtype=G.dtype) * jnp.asarray(self.K, dtype=G.dtype)
         sub = G[: self.size, : self.size].reshape(self.repeats, k, self.repeats, k)
         idx = jnp.arange(self.repeats)
         sub = sub.at[idx, :, idx, :].add(scaled_K)
@@ -766,9 +760,17 @@ class RepeatedFactorRidge(RidgeMetric):
     ):
         _check_covered_size(self.size, n, "RepeatedFactorRidge")
         L = jnp.asarray(self.L, dtype=dtype)
+        K_block = jnp.asarray(self.K, dtype=dtype)
         k = L.shape[1]
         block = _dense_factor_shifted_block(
-            L, k, rho, mu, dtype, prefer_qr=prefer_qr, active=active
+            L,
+            k,
+            rho,
+            mu,
+            dtype,
+            prefer_qr=prefer_qr,
+            active=active,
+            Q_sym=K_block,
         )
 
         def solve_Dp(rhs):
@@ -796,6 +798,6 @@ class RepeatedFactorRidge(RidgeMetric):
 
 register_pytree_dataclass(
     RepeatedFactorRidge,
-    data_fields=("L",),
+    data_fields=("L", "K"),
     meta_fields=("repeats", "size", "penalized_is_spd"),
 )

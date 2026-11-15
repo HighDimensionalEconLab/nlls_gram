@@ -501,6 +501,7 @@ class LevenbergMarquardt(SolverBase):
             ctx=ctx,
             resid_loss_old=resid_loss_old if self.penalized else None,
             penalty_old=penalty_value_old if self.penalized else None,
+            penalty_grad=penalty_grad if self.penalized else None,
         )
 
         grad_norm = jnp.linalg.norm(grad)
