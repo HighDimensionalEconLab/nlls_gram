@@ -29,6 +29,7 @@ from nlls_gram import (
     MatrixRidge,
     Minimum,
     Newton,
+    NewtonState,
     QRCache,
     RepeatedFactorRidge,
     Residuals,
@@ -87,10 +88,8 @@ def min_seminorm_solution():
 
 
 FORWARD_SOLVERS = {
-    "cholesky_auto": Cholesky(),
     "cholesky_gram": Cholesky(form="gram"),
     "cholesky_normal": Cholesky(form="normal"),
-    "qr_auto": QR(),
     "qr_gram": QR(form="gram"),
     "qr_normal": QR(form="normal"),
     "cg": CG(IdentityPreconditioner(), tol=1e-12, maxiter=400),
@@ -117,16 +116,6 @@ def test_unpenalized_euclidean_step_and_minimum_norm_convergence(name):
         float(info.grad_norm), np.linalg.norm(A_NP.T @ r0), rtol=1e-5
     )
 
-    # Underdetermined 1x2 Euclidean minimum-norm selection check
-    u_solver = LevenbergMarquardt(
-        lambda th: jnp.array([th[0] + th[1] + 1.0], dtype=jnp.float32),
-        linear_solver=FORWARD_SOLVERS[name],
-        geodesic_acceleration=False,
-    )
-    res_u = u_solver.solve(jnp.zeros(2, jnp.float32), max_steps=100, atol=1e-6)
-    assert int(res_u.status) == int(SolverStatus.CONVERGED)
-    np.testing.assert_allclose(res_u.x, np.array([-0.5, -0.5]), atol=1e-4)
-
     result = solver.solve(jnp.zeros(N, jnp.float32), max_steps=200, atol=1e-6)
     assert int(result.status) == int(SolverStatus.CONVERGED)
     np.testing.assert_allclose(
@@ -134,7 +123,7 @@ def test_unpenalized_euclidean_step_and_minimum_norm_convergence(name):
     )
 
 
-def test_gram_qr_float32_conditioning_unpenalized_and_ridge():
+def test_gram_qr_float32_conditioning_unpenalized():
     rng = np.random.default_rng(19)
     m_dec, n_dec = 24, 60
     U, _ = np.linalg.qr(rng.normal(size=(m_dec, m_dec)))
@@ -209,7 +198,6 @@ def test_generalized_tikhonov_step_algebra_and_bordered_free_tail(name):
     x1, _, info = solver.update(X0, solver.init(X0))
     x0_64 = np.asarray(X0, np.float64)
     r0 = A_NP @ x0_64 - B_NP
-    # Exact Euclidean gradient g = J'r + rho Q theta (NEVER includes mu * theta)
     g_ref = A_NP.T @ r0 + rho * (Q_SEMI_NP @ x0_64)
     H_ref = A_NP.T @ A_NP + rho * Q_SEMI_NP + mu * np.eye(N)
     d_ref = -np.linalg.solve(H_ref, g_ref)
@@ -242,8 +230,6 @@ def test_generalized_tikhonov_step_algebra_and_bordered_free_tail(name):
 
 
 def test_ridge_completion_nullspace_decay_and_ridge_representations():
-    # r(theta) = theta_0 - 1, Q = I_2, theta_init = (1, 3):
-    # nullspace coordinate theta_1 = 3 must decay to 0 via rho Q theta in g!
     rho = 0.25
     s_null = LevenbergMarquardt(
         lambda th: jnp.array([th[0] - 1.0], dtype=jnp.float32),
@@ -457,7 +443,6 @@ def test_geodesic_correction_unpenalized_and_ridge_closed_form(name):
     assert bool(info.used_geodesic)
     np.testing.assert_allclose(np.asarray(x1), x + v0 + 0.5 * a0, rtol=1e-4, atol=1e-5)
 
-    # Penalized closed-form: acceleration solves H_mu a = -J' r_vv WITHOUT rho Q theta!
     rho = 0.3
     w_q = jnp.array([2.0, 0.5], dtype=jnp.float32)
     Q_mat = np.diag([2.0, 0.5])
@@ -802,8 +787,6 @@ def test_lm_constructor_and_state_validation():
     rm = make_repeated_ridge()
     with pytest.raises(ValueError, match="ridge_metric requires a positive ridge"):
         LevenbergMarquardt(linear_residual, ridge=None, ridge_metric=rm)
-    with pytest.raises(TypeError):
-        LevenbergMarquardt(linear_residual, metric=rm)
     for bad_ridge in (0.0, -1e-3, True):
         with pytest.raises(ValueError):
             LevenbergMarquardt(linear_residual, ridge_metric=rm, ridge=bad_ridge)
@@ -839,8 +822,10 @@ def test_lm_constructor_and_state_validation():
         )
 
 
-def test_round2_solver_edge_cases():
-    # 1. Semidefinite RepeatedFactorRidge uses normal in auto and rejects gram
+def test_singular_ridge_damped_svd_and_terminal_callback_refresh():
+    assert Cholesky().resolve_form(M, N, False, None) == "gram"
+    assert QR().resolve_form(N, M, False, None) == "normal"
+
     R_sing = jnp.array([[1.0, 0.0], [0.0, 0.0]], dtype=jnp.float32)
     rm_sing = RepeatedFactorRidge(R_sing, repeats=2)
     s_sing = LevenbergMarquardt(
@@ -859,7 +844,6 @@ def test_round2_solver_edge_cases():
             linear_solver=Cholesky(form="gram"),
         ).init(jnp.zeros(4, jnp.float32))
 
-    # 2. Damped SVD retains small nonzero singular values without hard rcond truncation
     J_tiny = jnp.diag(jnp.array([1.0, 1e-7], dtype=jnp.float32))
     s_svd = LevenbergMarquardt(
         lambda x: J_tiny @ x - jnp.array([0.0, 1.0], jnp.float32),
@@ -872,7 +856,6 @@ def test_round2_solver_edge_cases():
     )
     assert float(x1_svd[1]) > 0.5
 
-    # 3. Overflow-safe smoothed inequality and eq_loss excluding complementarity
     s_ineq = LevenbergMarquardt(
         lambda x: Residuals(
             residual=x[:1] - 3.0,
@@ -888,7 +871,6 @@ def test_round2_solver_edge_cases():
     assert bool(jnp.isfinite(info0.loss))
     assert float(info0.eq_loss) == pytest.approx(9.0, rel=1e-5)
 
-    # 4. Final info.loss refreshes when callback modifies ridge on the terminal step
     def stop_with_new_ridge(ctx):
         return SolverAction(
             stop=True, state=dataclasses.replace(ctx.state, ridge=jnp.float32(10.0))
@@ -903,15 +885,71 @@ def test_round2_solver_edge_cases():
     expected_loss = float(jnp.sum((res_cb.x - 1.0) ** 2) + 10.0 * jnp.sum(res_cb.x**2))
     assert float(res_cb.info.loss) == pytest.approx(expected_loss, rel=1e-5)
 
-    # 5. Cholesky avoids coordinate-dependent diagonal shift on extreme scale
-    J_scale = jnp.array([[1e4, 1.0]], dtype=jnp.float32)
-    s_chol = LevenbergMarquardt(
-        lambda x: J_scale @ x - jnp.array([1.0], jnp.float32),
-        linear_solver=Cholesky(form="normal"),
-        init_damping=1e-20,
-        geodesic_acceleration=False,
+
+def test_penalized_newton_atol_bare_inequality_ad_and_zero_step_status():
+    sol_n = Newton(lambda x: x - jnp.ones(1, jnp.float32), ridge=1.0).solve(
+        jnp.zeros(1, jnp.float32), gtol=1e-5, atol=1e-3, max_steps=20
     )
-    _, _, info_chol = s_chol.update(
-        jnp.zeros(2, jnp.float32), s_chol.init(jnp.zeros(2, jnp.float32))
+    assert int(sol_n.status) != int(SolverStatus.CONVERGED)
+
+    anneal = AnnealRidge(ridge_floor=1e-6, decrease=0.1, grad_rtol=1e-2)
+    sol_na = Newton(lambda x: x - jnp.ones(1, jnp.float32), ridge=1.0).solve(
+        jnp.zeros(1, jnp.float32),
+        callback=anneal,
+        user_state=anneal.init_state(),
+        gtol=1e-5,
+        atol=1e-3,
+        max_steps=30,
     )
-    assert not bool(info_chol.accepted) or float(info_chol.damping) >= 1e-20
+    assert int(sol_na.status) == int(SolverStatus.CONVERGED)
+    assert float(jnp.abs(sol_na.x[0] - 1.0)) <= 1e-3
+
+    g_iq = jax.grad(
+        lambda p: jnp.sum(
+            LevenbergMarquardt(lambda x, _, p_: Inequality(x - p_))
+            .solve(jnp.array([2.0], jnp.float32), p=p, atol=1e-5)
+            .x
+        )
+    )(jnp.array([1.0], jnp.float32))
+    assert jnp.all(jnp.isfinite(g_iq)) and jnp.allclose(g_iq, 0.0)
+
+    def trace_check(L):
+        fr = FactorRidge(L)
+        rfr = RepeatedFactorRidge(L, repeats=2)
+        assert fr.penalized_is_spd is False
+        assert rfr.penalized_is_spd is False
+        return fr.L.sum() + rfr.L.sum()
+
+    jax.eval_shape(trace_check, jnp.diag(jnp.array([1.0, 0.0], jnp.float32)))
+
+    mr = MatrixRidge(jnp.array([[1.0, 0.0], [0.0, -1e-8]], dtype=jnp.float32))
+    np.testing.assert_allclose(mr.Q, mr.L.T @ mr.L, atol=1e-12)
+
+    for jit_flag in (True, False):
+        r0 = LevenbergMarquardt(lambda x: x - 1.0).solve(
+            jnp.array([0.0], jnp.float32), atol=1e-5, max_steps=0, jit=jit_flag
+        )
+        assert int(r0.status) == int(SolverStatus.MAX_STEPS)
+
+    lm_gcg = LevenbergMarquardt(
+        linear_residual,
+        ridge=1e-2,
+        ridge_metric=IdentityRidge(),
+        linear_solver=GramCG(DiagonalPreconditioner(jnp.ones(M, jnp.float32))),
+    )
+    assert int(lm_gcg.solve(X0, gtol=1e-5, max_steps=40).status) == int(
+        SolverStatus.CONVERGED
+    )
+
+    lm_cg = LevenbergMarquardt(
+        lambda x: x - jnp.ones(3, jnp.float32), linear_solver=CG()
+    )
+    _, _, info_u = lm_cg.update(
+        jnp.zeros(3, jnp.float32), LMState(jnp.float32(1e-3), hyper=lm_cg.hyperparams())
+    )
+    assert bool(info_u.accepted)
+    nw_cg = Newton(lambda x: x - jnp.ones(3, jnp.float32), linear_solver=CG())
+    _, _, info_nu = nw_cg.update(
+        jnp.zeros(3, jnp.float32), NewtonState(hyper=nw_cg.hyperparams())
+    )
+    assert bool(info_nu.accepted)

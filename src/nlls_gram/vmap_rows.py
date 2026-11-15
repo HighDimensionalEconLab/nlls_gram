@@ -342,7 +342,7 @@ def vmap_rows(f=None, *, in_axes=None, chunk_size=None):
             )
 
             def contract(jac_row, tangents_row):
-                def one_output(jac_o, dtype):
+                def one_output(jac_o, row_aval):
                     terms = jax.tree.map(
                         lambda j, t: (
                             None
@@ -355,11 +355,11 @@ def vmap_rows(f=None, *, in_axes=None, chunk_size=None):
                     )
                     valid_terms = [x for x in jax.tree.leaves(terms) if x is not None]
                     if not valid_terms:
-                        return jnp.zeros((), dtype=dtype)
-                    return functools.reduce(jnp.add, valid_terms).astype(dtype)
+                        return jnp.zeros(row_aval.shape[1:], dtype=row_aval.dtype)
+                    return functools.reduce(jnp.add, valid_terms).astype(row_aval.dtype)
 
                 return tuple(
-                    one_output(jac_row[k], out_avals_flat[idx].dtype)
+                    one_output(jac_row[k], out_avals_flat[idx])
                     for k, idx in enumerate(float_out_indices)
                 )
 

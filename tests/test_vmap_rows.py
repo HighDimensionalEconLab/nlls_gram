@@ -92,10 +92,16 @@ def assemble(residual, theta, args, p):
     return resid, J, jvp(v), f_vv
 
 
-def test_matches_vmap_to_second_order():
+@pytest.mark.parametrize("chunk", [None, 1, 4])
+def test_matches_vmap_to_second_order(chunk):
     theta, args, p = problem()
     reference = jax.jit(lambda th: assemble(native, th, args, p))(theta)
-    candidate = jax.jit(lambda th: assemble(rows, th, args, p))(theta)
+    fn = (
+        rows
+        if chunk is None
+        else make_residual(vmap_rows(in_axes=IN_AXES, chunk_size=chunk)(euler_row))
+    )
+    candidate = jax.jit(lambda th: assemble(fn, th, args, p))(theta)
     assert reference[1].shape[0] < ravel_pytree(theta)[0].size
     tol = 1e3 * float(jnp.finfo(reference[0].dtype).eps)
     for a, b in zip(reference, candidate, strict=True):
@@ -173,17 +179,8 @@ def test_jacobian_chunk_matches_one_batch():
         )
 
 
-def test_chunk_size_and_default_in_axes():
+def test_default_in_axes():
     theta, args, p = problem()
-    reference = jax.jit(lambda th: assemble(native, th, args, p))(theta)
-    tol = 1e3 * float(jnp.finfo(reference[0].dtype).eps)
-    for chunk in (1, 4):
-        chunked = make_residual(vmap_rows(in_axes=IN_AXES, chunk_size=chunk)(euler_row))
-        candidate = jax.jit(lambda th, fn=chunked: assemble(fn, th, args, p))(theta)
-        for a, b in zip(reference, candidate, strict=True):
-            np.testing.assert_allclose(
-                b, a, rtol=tol, atol=tol * float(jnp.abs(a).max())
-            )
 
     @vmap_rows
     def row_default(x, next_shocks, params, p):
@@ -204,6 +201,7 @@ def test_chunk_size_and_default_in_axes():
 
     J_default = jax.jit(jax.jacrev(residual_default))(theta)
     J_vmap = jax.jit(jax.jacrev(residual_vmap))(theta)
+    tol = 1e3 * float(jnp.finfo(jax.tree.leaves(J_vmap)[0].dtype).eps)
     for a, b in zip(jax.tree.leaves(J_vmap), jax.tree.leaves(J_default), strict=True):
         np.testing.assert_allclose(b, a, rtol=tol, atol=tol * float(jnp.abs(a).max()))
 
@@ -230,13 +228,18 @@ def test_one_arg_signature_nonfloating_aux_transpose_and_multishape_jit():
     @vmap_rows(in_axes=(0, None))
     def row_with_meta(g, x):
         r = jnp.sin(g * x[0]) - x[1]
-        return r, {"idx": jnp.int32(3), "pos": r > 0}
+        return r, {
+            "idx": jnp.int32(3),
+            "pos": r > 0,
+            "const": jnp.ones(3, dtype=jnp.float32),
+        }
 
     x0 = jnp.array([0.4, 0.1], dtype=jnp.float32)
     (r_val, meta_val), lin_fn = jax.linearize(lambda x: row_with_meta(grid, x), x0)
     assert meta_val["idx"].dtype == jnp.int32 and meta_val["pos"].dtype == jnp.bool_
     dr, dmeta = lin_fn(jnp.ones_like(x0))
     assert dmeta["idx"].dtype == jax.dtypes.float0
+    assert dmeta["const"].shape == (5, 3) and jnp.all(dmeta["const"] == 0.0)
     (xt,) = jax.linear_transpose(lambda v: lin_fn(v)[0], x0)(jnp.ones_like(r_val))
     J_rev = jax.jacrev(lambda x: row_with_meta(grid, x)[0])(x0)
     np.testing.assert_allclose(xt, jnp.sum(J_rev, axis=0), rtol=1e-5, atol=1e-6)

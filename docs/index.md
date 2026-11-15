@@ -1,21 +1,17 @@
 # nlls_gram
 
-`nlls_gram` solves nonlinear equations, nonlinear least-squares problems, and generalized Tikhonov interpolation problems over JAX pytrees using Euclidean outer step geometry.
+`nlls_gram` solves nonlinear equations, nonlinear least-squares problems, and generalized Tikhonov problems over JAX pytrees. Steps use scalar damping \(\mu I_n\) in parameter coordinates, and both outer solvers minimize
 
-Two solvers share one `init`/`update`/`solve` protocol, one linear-solver menu, and one implicit differentiation rule:
+$$
+F_\rho(\theta) = \frac{1}{2}\|r(\theta)\|_2^2 + \frac{\rho}{2}\theta^\top Q \theta ,
+$$
 
-| Solver | `ridge=None` | `ridge=<positive scalar>` | Globalization |
-|---|---|---|---|
-| `LevenbergMarquardt` | \(\frac{1}{2}\|r(\theta)\|_2^2\) | \(\frac{1}{2}\|r(\theta)\|_2^2 + \frac{\rho}{2}\theta^\top Q \theta\) | Euclidean trust-region damping \(\mu I_n\) + Armijo backtracking |
-| `Newton` | \(\frac{1}{2}\|r(\theta)\|_2^2\) | \(\frac{1}{2}\|r(\theta)\|_2^2 + \frac{\rho}{2}\theta^\top Q \theta\) | Optional residual-coupled scalar damping + Armijo backtracking |
+reporting `info.loss` as \(2 F_\rho(\theta)\).
 
-`info.loss` consistently reports \(2 F_\rho(\theta) = \|r(\theta)\|_2^2 + \rho\,\theta^\top Q \theta\).
-
-## Install
-
-```bash
-uv add nlls-gram
-```
+| Solver | Step damping \(\mu_k\) | Globalization |
+|---|---|---|
+| `LevenbergMarquardt` | Stateful scalar damping adapted from accepted Armijo step length | Armijo backtracking (optional geodesic acceleration) |
+| `Newton` | Optional stateless residual-coupled damping \(\propto \|r(\theta_k)\|_2^p\) (or \(\mu_k = 0\)) | Armijo backtracking (optional geodesic acceleration) |
 
 ## Residual interface
 
@@ -25,8 +21,12 @@ uv add nlls-gram
 - `p` carries external parameters with respect to which `solve(...).x` is implicitly differentiable.
 
 ```python
+import jax
 import jax.numpy as jnp
 from nlls_gram import LevenbergMarquardt
+
+design = jnp.arange(24.0).reshape(4, 6)
+target = jnp.ones(4)
 
 
 def residual(x, args, p):
@@ -35,50 +35,17 @@ def residual(x, args, p):
 
 solver = LevenbergMarquardt(residual)
 result = solver.solve(
-    jnp.zeros(8), {"design": design}, p={"target": y}, max_steps=200, atol=1e-8
+    jnp.zeros(6), {"design": design}, p={"target": target}, max_steps=200, atol=1e-6
 )
+grad_p = jax.grad(
+    lambda p: jnp.sum(
+        solver.solve(jnp.zeros(6), {"design": design}, p=p, atol=1e-6).x ** 2
+    )
+)({"target": target})
 ```
 
-## Generalized Tikhonov interpolation
+## Next steps
 
-When `ridge` is positive, `ridge_metric` specifies a positive semidefinite quadratic operator \(Q = L^\top L\) in the objective while keeping trust-region damping strictly Euclidean (\(\mu \|d\|_2^2\)). Passing `ridge_metric=None` uses the Euclidean identity \(Q = I_n\). Supplying a non-`None` `ridge_metric` when `ridge=None` raises `ValueError`.
-
-```python
-import jax.numpy as jnp
-from nlls_gram import AnnealRidge, LevenbergMarquardt, RepeatedFactorRidge
-
-ridge_metric = RepeatedFactorRidge(jnp.linalg.cholesky(K, upper=True), repeats=2)
-solver = LevenbergMarquardt(
-    collocation_residual,
-    ridge=1e-4,
-    ridge_metric=ridge_metric,
-)
-anneal = AnnealRidge(ridge_floor=1e-10)
-result = solver.solve(x0, callback=anneal, user_state=anneal.init_state(), gtol=1e-8)
-```
-
-## Linear solvers
-
-Numerical preconditioners live on `linear_solver` and `ad_solver`, never on the outer solver constructor.
-
-| Config | Space | Form | Notes |
-|---|---|---|---|
-| `Cholesky(form="auto", preconditioner=None)` | dense | `gram` or `normal` | Default dense solver with optional `DiagonalPreconditioner` |
-| `QR(form="auto", preconditioner=None)` | dense | `gram` or `normal` | Avoids squaring \(\operatorname{cond}(J)\) in both forward and implicit AD |
-| `CG(preconditioner, ...)` | parameter (\(n\)) | matrix-free normal | Supports matvec-only `RidgeMetric` |
-| `GramCG(preconditioner, ...)` | residual (\(m\)) | matrix-free Gram | Unpenalized wide systems (\(m \ll n\)) |
-| `LU()` | parameter (\(n\)) | square \(J\) | Undamped square systems (\(m = n\), `ridge=None`) |
-| `SVD(rcond=None)` | parameter (\(n\)) | pseudoinverse | Rank-aware augmented or unpenalized least squares |
-
-## Documentation guide
-
-- [Tikhonov Regularization](ridge_lm.md)
-- [Newton](newton.md)
-- [Ridge Operators and Preconditioners](metrics.md)
-- [Constraints](complementarity.md)
-- [Callbacks](callbacks.md)
-- [Multi-Start](multi_start.md)
-- [Implicit Differentiation](implicit_ad.md)
-- [Row-wise Residuals](vmap_rows.md)
-- [Tuning](tuning_guide.md)
-- [API](api.md)
+- [Levenberg-Marquardt and Tikhonov](ridge_lm.md) for step equations, Armijo damping updates, geodesic acceleration, RKHS seminorms, and bordered Gram reductions.
+- [Tuning and Capabilities](tuning_guide.md) for choosing linear solvers, preconditioning, Jacobian assembly, and `float32` GPU settings.
+- [Implicit Differentiation](implicit_ad.md) for Gauss-Newton sensitivity equations and `ad_solver` routing.

@@ -6,7 +6,6 @@ import jax.numpy as jnp
 import jax.scipy.linalg as jsp_linalg
 import numpy as np
 
-from nlls_gram.types import SolverContext
 from nlls_gram.utilities import mm, register_pytree_dataclass
 
 __all__ = [
@@ -16,7 +15,6 @@ __all__ = [
     "MatrixRidge",
     "RepeatedFactorRidge",
     "RidgeMetric",
-    "SolverContext",
 ]
 
 
@@ -359,9 +357,9 @@ class MatrixRidge(RidgeMetric):
                     f"||Q||_F = {q_norm:.3e})"
                 )
             q_sym_np = 0.5 * (q_np + q_np.T)
-            q_sym = jnp.asarray(q_sym_np, dtype=dtype)
             active = np.flatnonzero(np.any(q_sym_np != 0.0, axis=1))
             if len(active) == 0:
+                q_sym = jnp.zeros((k, k), dtype=dtype)
                 L = jnp.zeros((0, k), dtype=dtype)
                 is_spd = k == 0
             else:
@@ -378,12 +376,15 @@ class MatrixRidge(RidgeMetric):
                 eig_cutoff = max(len(active), 1) * eps * max(max_eval, 0.0)
                 pos = evals_np > 0.0
                 if not np.any(pos):
+                    q_sym = jnp.zeros((k, k), dtype=dtype)
                     L = jnp.zeros((0, k), dtype=dtype)
                 else:
                     L_sub_np = np.sqrt(evals_np[pos])[:, None] * evecs_np[:, pos].T
                     L_np = np.zeros((L_sub_np.shape[0], k), dtype=q_sym_np.dtype)
                     L_np[:, active] = L_sub_np
                     L = jnp.asarray(L_np, dtype=dtype)
+                    q_proj_np = L_np.T @ L_np
+                    q_sym = jnp.asarray(0.5 * (q_proj_np + q_proj_np.T), dtype=dtype)
                 is_spd = len(active) == k and bool(np.all(evals_np > eig_cutoff))
         else:
             q_norm = jnp.linalg.norm(q_arr)
@@ -396,12 +397,25 @@ class MatrixRidge(RidgeMetric):
                 & (asym <= sym_tol * scale)
                 & (jnp.min(evals) >= -sym_tol * scale)
             )
-            q_sym = jnp.where(valid, q_sym_raw, jnp.full_like(q_sym_raw, jnp.nan))
             pos = evals > 0.0
             sqrt_evals = jnp.where(
                 pos, jnp.sqrt(jnp.where(pos, evals, jnp.ones_like(evals))), 0.0
             )
             L_raw = sqrt_evals[:, None] * evecs.T
+
+            def _project_psd(q):
+                ev, vc = jnp.linalg.eigh(q)
+                ev_pos = jnp.maximum(ev, 0.0)
+                q_p = mm(vc * ev_pos[None, :], vc.T)
+                return 0.5 * (q_p + q_p.T)
+
+            q_psd = jax.lax.cond(
+                jnp.min(evals) >= 0.0,
+                lambda q: q,
+                _project_psd,
+                operand=q_sym_raw,
+            )
+            q_sym = jnp.where(valid, q_psd, jnp.full_like(q_sym_raw, jnp.nan))
             L = jnp.where(valid, L_raw, jnp.full_like(L_raw, jnp.nan))
             is_spd = False
         object.__setattr__(self, "Q", q_sym)
@@ -571,6 +585,20 @@ def _dense_factor_shifted_block(
     )
 
 
+def _factor_is_spd(L, dtype, *, empty_col_spd):
+    k = L.shape[1]
+    if isinstance(L, jax.core.Tracer):
+        return k == 0 if empty_col_spd else False
+    l_np = np.asarray(L)
+    if k == 0:
+        return bool(np.all(np.isfinite(l_np))) if empty_col_spd else False
+    if not np.all(np.isfinite(l_np)) or L.shape[0] < k:
+        return False
+    s = np.linalg.svd(l_np, compute_uv=False)
+    cutoff = max(L.shape) * float(jnp.finfo(dtype).eps) * float(s[0])
+    return bool(s[-1] > cutoff)
+
+
 @dataclass(frozen=True, eq=False)
 class FactorRidge(RidgeMetric):
     """Explicit factor ``L`` defining ``Q = L'L`` on leading ``L.shape[1]`` entries."""
@@ -590,21 +618,9 @@ class FactorRidge(RidgeMetric):
             raise ValueError("FactorRidge L must be a 2-D array")
         dtype = jnp.result_type(L, 1.0)
         L = L.astype(dtype)
-        k = L.shape[1]
-        if not isinstance(L, jax.core.Tracer):
-            l_np = np.asarray(L)
-            if k == 0:
-                is_spd = bool(np.all(np.isfinite(l_np)))
-            elif not np.all(np.isfinite(l_np)) or L.shape[0] < k:
-                is_spd = False
-            else:
-                s = np.linalg.svd(l_np, compute_uv=False)
-                cutoff = max(L.shape) * float(jnp.finfo(dtype).eps) * float(s[0])
-                is_spd = bool(s[-1] > cutoff)
-        else:
-            is_spd = L.shape[0] >= k
+        is_spd = _factor_is_spd(L, dtype, empty_col_spd=True)
         object.__setattr__(self, "L", L)
-        object.__setattr__(self, "size", k)
+        object.__setattr__(self, "size", L.shape[1])
         object.__setattr__(self, "penalized_is_spd", is_spd)
 
     def n_free_for(self, n):
@@ -689,20 +705,10 @@ class RepeatedFactorRidge(RidgeMetric):
             raise ValueError("RepeatedFactorRidge repeats must be >= 1")
         dtype = jnp.result_type(L, 1.0)
         L = L.astype(dtype)
-        k = L.shape[1]
-        if not isinstance(L, jax.core.Tracer):
-            l_np = np.asarray(L)
-            if not np.all(np.isfinite(l_np)) or L.shape[0] < k:
-                is_spd = False
-            else:
-                s = np.linalg.svd(l_np, compute_uv=False)
-                cutoff = max(L.shape) * float(jnp.finfo(dtype).eps) * float(s[0])
-                is_spd = bool(s[-1] > cutoff)
-        else:
-            is_spd = L.shape[0] >= k
+        is_spd = _factor_is_spd(L, dtype, empty_col_spd=False)
         object.__setattr__(self, "L", L)
         object.__setattr__(self, "K", mm(L.T, L))
-        object.__setattr__(self, "size", self.repeats * k)
+        object.__setattr__(self, "size", self.repeats * L.shape[1])
         object.__setattr__(self, "penalized_is_spd", is_spd)
 
     def _map_blocks(self, block_op, v_p, out_rows):

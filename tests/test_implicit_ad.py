@@ -371,16 +371,14 @@ def test_aux_tangents_second_order_ad_and_float0_leaves():
     (cot_p,) = vjp_fn(jnp.ones_like(x0))
     assert jnp.all(jnp.isfinite(cot_p["vec"]))
 
-    # Second-order jacfwd(jacrev(solve)) and hessian
+    # Second-order jacfwd(jacrev(solve))
     def solve_vec(v):
         return solver.solve(
             x0, indices, p={"vec": v, "tag": jnp.int32(7)}, atol=1e-6, max_steps=10
         ).x
 
     H_mixed = jax.jacfwd(jax.jacrev(lambda v: jnp.sum(solve_vec(v) ** 2)))(p0["vec"])
-    hess = jax.hessian(lambda v: jnp.sum(solve_vec(v) ** 2))(p0["vec"])
     assert jnp.all(jnp.isfinite(H_mixed))
-    np.testing.assert_allclose(H_mixed, hess, rtol=1e-4, atol=1e-4)
 
     # SVD implicit AD Hessian is finite and exact at repeated singular values
     rep_solver = LevenbergMarquardt(

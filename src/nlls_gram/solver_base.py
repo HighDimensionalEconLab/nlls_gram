@@ -1340,10 +1340,20 @@ class SolverBase:
                     ),
                 )
             if self.penalized:
-                self._check_instance_structure(
-                    state.ridge_metric, previous.ridge_metric, "ridge_metric"
-                )
-                rm_changed = _tree_changed(state.ridge_metric, previous.ridge_metric)
+                new_rm, prev_rm = state.ridge_metric, previous.ridge_metric
+                if type(new_rm) is type(prev_rm) and any(
+                    isinstance(leaf, jax.core.Tracer)
+                    for leaf in jax.tree_util.tree_leaves(new_rm)
+                ):
+                    rm_fields = getattr(new_rm, "__dataclass_fields__", {})
+                    if "penalized_is_spd" in rm_fields:
+                        object.__setattr__(
+                            new_rm, "penalized_is_spd", prev_rm.penalized_is_spd
+                        )
+                    if "pos_indices" in rm_fields:
+                        object.__setattr__(new_rm, "pos_indices", prev_rm.pos_indices)
+                self._check_instance_structure(new_rm, prev_rm, "ridge_metric")
+                rm_changed = _tree_changed(new_rm, prev_rm)
             self._check_instance_structure(
                 state.preconditioner, previous.preconditioner, "preconditioner"
             )
@@ -1892,7 +1902,7 @@ class SolverBase:
         )
         return dataclasses.replace(zero_result, x=x_dot, p=p_dot, aux=aux_dot)
 
-    def _resolved_ad_solver(self, m, n, ridge_metric):
+    def _resolved_ad_solver(self, m, n, ridge_metric, *, has_inequality=False):
         if self.ad_solver is not None:
             self.ad_solver.validate_shape(
                 m,
@@ -1912,7 +1922,11 @@ class SolverBase:
                 return self.linear_solver
             if isinstance(self.linear_solver, SVD):
                 return self.linear_solver
-            return LU() if (m == n and self.inequality is None) else SVD()
+            return (
+                LU()
+                if (m == n and not has_inequality and self.inequality is None)
+                else SVD()
+            )
 
         if isinstance(self.linear_solver, SVD):
             return self.linear_solver
@@ -1942,7 +1956,16 @@ class SolverBase:
                 pass
             else:
                 return self.linear_solver
-        return Cholesky()
+        fallback = Cholesky()
+        fallback.validate_shape(
+            m,
+            n,
+            penalized=True,
+            ridge_metric=ridge_metric,
+            damped=False,
+            role="ad_solver",
+        )
+        return fallback
 
     def _ad_x_tangent(
         self, x, args, p, p_dot, result, ad_success, initial_ad_point, zero_aux
@@ -2009,7 +2032,12 @@ class SolverBase:
         else:
             ridge = zero
 
-        resolved = self._resolved_ad_solver(m, n, state.ridge_metric)
+        resolved = self._resolved_ad_solver(
+            m,
+            n,
+            state.ridge_metric,
+            has_inequality=result.info.ineq_max_violation is not None,
+        )
         space, form = self._solver_space_and_form(
             resolved, m, n, state.ridge_metric, damped=False
         )

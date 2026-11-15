@@ -383,7 +383,11 @@ class Newton(SolverBase):
         zero = jnp.zeros((), dtype=dtype)
         nan = jnp.asarray(jnp.nan, dtype=dtype)
 
-        hyper = state.hyper if state.hyper is not None else self.hyperparams(dtype)
+        hyper = (
+            _cast_newton_hyper(state.hyper, dtype)
+            if state.hyper is not None
+            else self.hyperparams(dtype)
+        )
         resid_loss_raw = jnp.sum(resid**2)
         has_traced_damping = state.hyper is not None or self._damped
         if not has_traced_damping:
@@ -817,7 +821,8 @@ class Newton(SolverBase):
             ready & step_ok & (xtol > 0) & info.accepted & (info.step_norm < xtol)
         )
         if self.penalized:
-            return gtol_met | xtol_met
+            residual_ok = (atol <= 0) | (jnp.sqrt(info.resid_loss) <= atol)
+            return (gtol_met | xtol_met) & residual_ok
         exact_root = (
             (~homotopy_active)
             & (~ineq_decay_active)

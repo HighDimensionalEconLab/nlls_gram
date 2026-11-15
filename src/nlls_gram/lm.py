@@ -383,7 +383,11 @@ class LevenbergMarquardt(SolverBase):
             role="linear_solver",
         )
 
-        hyper = state.hyper if state.hyper is not None else self.hyperparams(dtype)
+        hyper = (
+            _cast_lm_hyper(state.hyper, dtype)
+            if state.hyper is not None
+            else self.hyperparams(dtype)
+        )
         damping_decrease = jnp.asarray(hyper.damping_decrease, dtype=dtype)
         damping_increase = jnp.asarray(hyper.damping_increase, dtype=dtype)
         damping_floor = _damping_floor(dtype)
@@ -562,14 +566,20 @@ class LevenbergMarquardt(SolverBase):
             ineq_smoothing=new_ineq_smoothing,
         )
         ridge_state = ridge if self.penalized else None
-        cache_valid = (~improved) & (~schedule_changed) & step_solver.solve_ok
         if self.cache_jacobian and self.linear_solver.materializes_jacobian:
+            jacobian_valid = (
+                (~improved)
+                & (~schedule_changed)
+                & jnp.all(jnp.isfinite(resid))
+                & jnp.all(jnp.isfinite(Jt))
+            )
+            cache_valid = jacobian_valid & step_solver.solve_ok
             new_state = LMState(
                 new_damping,
                 ridge=ridge_state,
                 resid=resid,
                 Jt=Jt,
-                jacobian_valid=cache_valid,
+                jacobian_valid=jacobian_valid,
                 aux=aux,
                 hyper=state.hyper,
                 solver_cache=step_solver.make_cache(cache_valid),

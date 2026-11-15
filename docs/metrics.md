@@ -1,58 +1,54 @@
 # Ridge Operators and Preconditioners
 
-`nlls_gram` separates objective regularization from numerical preconditioning into two independent interfaces:
+`nlls_gram` separates objective regularization from linear-solver preconditioning:
 
-- **`RidgeMetric`** defines the PSD quadratic penalty \(Q \succeq 0\) in the objective \(F_\rho(\theta) = \frac{1}{2}\|r(\theta)\|_2^2 + \frac{\rho}{2}\theta^\top Q \theta\) when `ridge` is positive. It never alters step geometry when `ridge=None`.
-- **`Preconditioner`** accelerates linear solves inside `linear_solver` and `ad_solver` without changing the mathematical objective, gradient, or converged step.
+- `RidgeMetric` defines the positive semidefinite penalty \(Q \succeq 0\) in \(F_\rho(\theta) = \frac{1}{2}\|r(\theta)\|_2^2 + \frac{\rho}{2}\theta^\top Q \theta\) when `ridge > 0`.
+- `Preconditioner` rescales linear solves inside `linear_solver` and `ad_solver` without changing the objective, gradient, or exact step equation.
 
-Both are registered as JAX pytrees via `register_pytree_dataclass` so their array leaves trace cleanly through `jit`, `vmap`, and callbacks without recompilation.
+Both are registered as JAX pytrees via `register_pytree_dataclass` so updating array leaves across calls with fixed shapes and metadata does not trigger recompilation.
 
 ## `RidgeMetric` implementations
 
-Every `RidgeMetric` implements `matvec(v, ctx)` (\(Q v\)) and `quad_form(v, ctx)` (\(v^\top Q v\), defaulting to `v @ matvec(v, ctx)`). Factored representations additionally expose square-root factor operations (\(Q = L^\top L\)) for `QR(form="normal")` and `SVD()`, and structured representations expose shifted block solves \((\rho Q_{pp} + \mu I_{n_p})^{-1}\) for `Cholesky(form="gram")` and `QR(form="gram")`. Never pass a Gram matrix \(Q\) where a square-root factor \(L\) is expected, or vice versa.
+Every `RidgeMetric` implements `matvec(v, ctx)` (\(Q v\)) and `quad_form(v, ctx)` (\(v^\top Q v\), defaulting to `v @ matvec(v, ctx)`). Factored representations additionally provide square-root operations (\(Q = L^\top L\)) for `QR(form="normal")` and `SVD()`, and structured representations provide shifted solves \((\rho Q_{pp} + \mu I_{n_p})^{-1}\) for `Cholesky(form="gram")`, `QR(form="gram")`, and `GramCG`.
 
-| Class | Constructor input | Penalty \(Q\) | Supported forward / AD solvers |
+| Class | Constructor input | Penalty \(Q\) | Capabilities |
 |---|---|---|---|
-| `IdentityRidge(size=None)` | optional leading penalized size | \(\operatorname{blockdiag}(I_{\text{size}}, 0)\) | `Cholesky` (normal/gram), `QR` (normal/gram), `CG`, `SVD` |
-| `DiagonalRidge(weights)` | 1D array \(w \ge 0\) (trailing or interior zeros allowed) | \(\operatorname{diag}(w, 0)\) | `Cholesky` (normal/gram), `QR` (normal/gram), `CG`, `SVD` |
-| `MatrixRidge(Q)` | symmetric PSD matrix \(Q \in \mathbb{R}^{n_m \times n_m}\) | \(\operatorname{blockdiag}(Q, 0)\) | `Cholesky` (normal, and gram when \(Q \succ 0\)), `QR` (normal, and gram when \(Q \succ 0\)), `CG`, `SVD` |
-| `FactorRidge(L)` | rectangular or triangular factor \(L \in \mathbb{R}^{p \times n_m}\) | \(\operatorname{blockdiag}(L^\top L, 0)\) | `Cholesky` (normal, and gram when \(\operatorname{rank}(L)=n_m\)), `QR` (normal, and gram when \(\operatorname{rank}(L)=n_m\)), `CG`, `SVD` |
-| `RepeatedFactorRidge(L, repeats=b)` | block factor \(L \in \mathbb{R}^{p_k \times b_k}\) | \(\operatorname{blockdiag}(L^\top L, \dots, L^\top L, 0)\) | `Cholesky` (normal, and gram when \(\operatorname{rank}(L)=b_k\)), `QR` (normal, and gram when \(\operatorname{rank}(L)=b_k\)), `CG`, `SVD` |
-| Custom `RidgeMetric` (`matvec` only) | user pytree dataclass | \(v \mapsto Q v\) | `CG` |
+| `IdentityRidge(size=None)` | optional leading penalized size | \(\operatorname{blockdiag}(I_{\text{size}}, 0)\) | Normal, factor, fast shifted solve |
+| `DiagonalRidge(weights)` | 1D array \(w \ge 0\) | \(\operatorname{diag}(w, 0)\) | Normal, factor, fast shifted solve |
+| `MatrixRidge(Q)` | symmetric PSD matrix \(Q \in \mathbb{R}^{k \times k}\) | \(\operatorname{blockdiag}(Q, 0)\) | Normal, factor, dense shifted solve |
+| `FactorRidge(L)` | factor \(L \in \mathbb{R}^{r \times k}\) | \(\operatorname{blockdiag}(L^\top L, 0)\) | Normal, factor, dense shifted solve |
+| `RepeatedFactorRidge(L, repeats=b)` | block factor \(L \in \mathbb{R}^{r_k \times b_k}\) | \(\operatorname{blockdiag}(L^\top L, \dots, L^\top L, 0)\) | Normal, factor, batched fast shifted solve |
+| Custom `RidgeMetric` (`matvec` only) | user pytree dataclass | \(v \mapsto Q v\) | Matrix-free `CG` only |
 
-`MatrixRidge(Q)` validates symmetry and positive semidefiniteness up to roundoff tolerance via `jnp.linalg.eigh`, clamping tiny negative roundoff eigenvalues to zero when forming its internal PSD square root and recording whether \(Q\) is strictly positive definite (`penalized_is_spd`) without adding artificial diagonal jitter to \(Q\).
-
-`RepeatedFactorRidge(L, repeats=b)` packs all `b` blocks and multiple right-hand sides into single batched matrix multiplications or Cholesky solves, avoiding materializing the \(b \cdot b_k \times b \cdot b_k\) block-diagonal matrix.
+`MatrixRidge(Q)` checks symmetry and positive semidefiniteness up to roundoff tolerance, clamps tiny negative roundoff eigenvalues to zero when forming its square-root factor \(L\), and stores the matching projected operator \(Q = L^\top L\). `RepeatedFactorRidge` evaluates block matrix-vector products and shifted solves in batched form without materializing the full block-diagonal matrix unless a consumer (`QR(form="normal")` or `SVD()`) explicitly requests `factor_matrix`. See [Tuning and Capabilities](tuning_guide.md) for the full solver compatibility matrix.
 
 ## `Preconditioner` implementations
 
-Preconditioners are attached to `Cholesky`, `QR`, `CG`, or `GramCG`.
+Preconditioners attach to `Cholesky`, `QR`, `CG`, or `GramCG` and receive a `SolverContext` carrying `x`, `state`, `args`, `p`, `ridge`, `damping`, `space` (`"parameter"` or `"residual"`), `role` (`"forward"` or `"ad"`), and `form` (`"normal"`, `"gram"`, `"lu"`, or `"svd"`).
 
-```python
-class Preconditioner:
-    requires_positive_damping: bool = False
-
-    def apply(self, v, damping, ctx): ...
-```
-
-`ctx` is a `SolverContext` carrying `x`, `state`, `args`, `p`, `space` (`"parameter"` or `"residual"`), `role` (`"forward"` or `"ad"`), and `form` (`"normal"`, `"gram"`, `"lu"`, or `"svd"`).
-
-| Class | Behavior | Supported linear solvers |
+| Class | Input | Supported linear solvers |
 |---|---|---|
-| `IdentityPreconditioner()` | Identity map \(v \mapsto v\) | `Cholesky`, `QR`, `CG`, `GramCG` |
-| `DiagonalPreconditioner(diagonal=None)` | Explicit nonnegative diagonal (`1 / (diagonal + damping)`) or automatic Jacobi equilibration (`diagonal=None`) for dense solvers | `Cholesky` (normal/gram), `QR(form="normal")`, unpenalized `QR(form="gram")`, and `CG`/`GramCG` (when `diagonal` is an explicit array) |
+| `IdentityPreconditioner()` | None | `Cholesky`, `QR`, `CG`, `GramCG` |
+| `DiagonalPreconditioner(diagonal=None)` | `None` (automatic dense equilibration) or strictly positive 1D array `d > 0` | `Cholesky` (except penalized Gram with \(n_f > 0\)), `QR(form="normal")`, unpenalized `QR(form="gram")`, and `CG`/`GramCG` (explicit `d > 0` only) |
 
-### Dense diagonal scaling
+### Diagonal scaling formulas
 
-When `DiagonalPreconditioner` is passed to a dense solver, it improves numerical conditioning while returning the exact unpreconditioned Euclidean solution:
+Let \(\varepsilon_{\text{tiny}} = \texttt{jnp.finfo(dtype).tiny}\). Dense diagonal scaling preserves the exact unpreconditioned step:
 
-- **`Cholesky(form="normal" | "gram", preconditioner=DiagonalPreconditioner(...))`**: applies symmetric diagonal congruence \(D^{-1/2} H_\mu D^{-1/2}\) (or \(D^{-1/2} S_\mu D^{-1/2}\) in Gram space) before Cholesky factorization.
-- **`QR(form="normal", preconditioner=DiagonalPreconditioner(...))`**: scales columns of the augmented stack via \(T = \operatorname{diag}(t)\) while transforming the damping block consistently to \(\sqrt{\mu}\,T\), preserving \((J^\top J + \rho Q + \mu I_n) d = -g\). At \(\mu = 0\), column scaling preserves the least-squares solution when the augmented stack has full column rank and reports `LINEAR_SOLVE_FAILED` if rank-deficient.
-- **`QR(form="gram", preconditioner=DiagonalPreconditioner(...))`**: supported on unpenalized wide systems (`ridge=None`), scaling rows of \(J\) at \(\mu > 0\) or full row rank at \(\mu = 0\). With `ridge > 0`, `QR(form="gram")` rejects `DiagonalPreconditioner` with `ValueError`.
+| Solver path | Auto scale (`diagonal=None`) | Explicit scale (`diagonal = d > 0`) | Linear transformation |
+|---|---|---|---|
+| `Cholesky` normal or unpenalized Gram (`H`) | \(c_i = \sqrt{\max(H_{ii}, 0)}\) (unit if \(\le \sqrt{\varepsilon_{\text{tiny}}}\)) | \(c_i = \max(\sqrt{d_i + \mu}, \sqrt{\varepsilon_{\text{tiny}}})\) | Congruence \(C^{-1} H C^{-1}\), \(C = \operatorname{diag}(c)\) |
+| `Cholesky` penalized Gram (\(n_f = 0\), \(S_p\)) | \(c_i = \sqrt{\max((S_p)_{ii}, 0)}\) | \(c_i = \max(\sqrt{d_i}, \sqrt{\varepsilon_{\text{tiny}}})\) | Congruence \(C^{-1} S_p C^{-1}\) |
+| `QR(form="normal")`, \(A_0 = [J; \sqrt{\rho}L]\) | \(t_j = (\|(A_0)_{:,j}\|_2^2 + \mu)^{-1/2}\) | \(t_j = (d_j + \mu)^{-1/2}\) | Stack \([A_0 T; \sqrt{\mu} T]\), \(d = T z\) |
+| `QR(form="gram")`, `ridge=None` | \(s_i = (\|J_{i,:}\|_2^2 + \mu)^{-1/2}\) | \(s_i = (d_i + \mu)^{-1/2}\) | Stack \([J^\top S; \sqrt{\mu} S]\) |
+| `CG` / unpenalized `GramCG` | Rejected | \(M^{-1} v_i = v_i / \max(d_i + \text{shift}, \varepsilon_{\text{tiny}})\) | Shift is \(\mu\) (plus `CG.penalty` in AD) |
+| Penalized `GramCG` (\(S = I_m + J D_p^{-1} J^\top\)) | Rejected | \(M^{-1} v_i = v_i / \max(d_i, \varepsilon_{\text{tiny}})\) | Preconditions \(S\) directly (zero additive shift) |
+
+`Cholesky(form="gram")` rejects `DiagonalPreconditioner` when `ridge > 0` and \(n_f > 0\). `QR(form="gram")` rejects `DiagonalPreconditioner` whenever `ridge > 0`. `SVD(rcond=None)` uses the default singular-value cutoff \(\sigma_i > \max(m_{\text{aug}}, n)\,\varepsilon_{\text{mach}}\,\sigma_{\max}\).
 
 ### Custom preconditioners
 
-Register custom preconditioners for `CG` or `GramCG` with `register_pytree_dataclass`. Because outer steps use unwhitened Euclidean coordinates, a parameter-space preconditioner for `CG` approximates \((J^\top J + \rho Q + \mu I_n)^{-1} v\) directly in original coordinates:
+Register custom preconditioners for `CG` or `GramCG` with `register_pytree_dataclass`. A parameter-space preconditioner for `CG` approximates \((J^\top J + \rho Q + \mu I_n)^{-1} v\) in parameter coordinates:
 
 ```python
 from dataclasses import dataclass
@@ -66,9 +62,14 @@ class CustomJacobi(Preconditioner):
     q_diag: jax.Array
 
     def apply(self, v, damping, ctx):
-        rho = ctx.state.ridge if ctx.state.ridge is not None else 0.0
+        rho = ctx.ridge if ctx.ridge is not None else 0.0
         return v / (self.jtj_diag + rho * self.q_diag + damping)
 
 
 register_pytree_dataclass(CustomJacobi, data_fields=("jtj_diag", "q_diag"))
 ```
+
+## References
+
+- van der Sluis (1969), Björck (1996), and Higham (2002) for diagonal equilibration and normal-versus-QR conditioning.
+- Hestenes and Stiefel (1952), Craig (1955), Paige and Saunders (1982), and Saunders (1995) for preconditioned CG and dual Gram Krylov methods. Full citations appear in [References](references.md).

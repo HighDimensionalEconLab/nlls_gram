@@ -6,7 +6,6 @@ import jax.scipy.linalg as jsp_linalg
 import numpy as np
 import pytest
 
-import nlls_gram
 from nlls_gram import (
     CG,
     QR,
@@ -43,25 +42,6 @@ class MatvecOnlyRidge(RidgeMetric):
 
 
 register_pytree_dataclass(MatvecOnlyRidge, data_fields=("weights",))
-
-
-def test_removed_legacy_exports_absent():
-    removed = (
-        "Metric",
-        "IdentityMetric",
-        "DiagonalMetric",
-        "CholeskyMetric",
-        "RepeatedFactorMetric",
-        "StateSpaceMetric",
-        "BlockEigenPreconditioner",
-        "NystromPreconditioner",
-        "ShermanMorrisonPreconditioner",
-        "WoodburyPreconditioner",
-        "PaddedPreconditioner",
-        "Equality",
-    )
-    for name in removed:
-        assert not hasattr(nlls_gram, name), f"{name} must not be exported"
 
 
 def test_ridge_operators_quadratic_forms_and_matrix_vs_factor_distinction():

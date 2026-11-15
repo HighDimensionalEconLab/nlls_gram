@@ -88,14 +88,19 @@ def _solve_loop_impl(
     step = jnp.asarray(0, dtype=jnp.int32)
     initial_nonfinite = ~jnp.isfinite(info.loss)
     initial_converged = solver._converged(info, atol, gtol, xtol)
-    stop = initial_nonfinite | initial_converged
+    initial_exhausted = step >= max_steps
+    stop = initial_nonfinite | initial_converged | initial_exhausted
     status = jnp.where(
         initial_nonfinite,
         jnp.asarray(status_cls.NONFINITE, dtype=jnp.int32),
         jnp.where(
             initial_converged,
             jnp.asarray(status_cls.CONVERGED, dtype=jnp.int32),
-            jnp.asarray(status_cls.RUNNING, dtype=jnp.int32),
+            jnp.where(
+                initial_exhausted,
+                jnp.asarray(status_cls.MAX_STEPS, dtype=jnp.int32),
+                jnp.asarray(status_cls.RUNNING, dtype=jnp.int32),
+            ),
         ),
     )
 

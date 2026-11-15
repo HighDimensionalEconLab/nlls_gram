@@ -1,21 +1,21 @@
-# Callbacks and Cookbook
+# Callbacks and Stopping
 
 `solve` runs repeated `update` steps inside `jax.lax.while_loop` (when `jit=True`, the default) and returns a `SolveResult`.
 
 ## Stopping tolerances and statuses
 
-Three optional scalar tolerances stop the loop with `SolverStatus.CONVERGED` (each defaults to `0.0`, which disables that check):
+Three optional scalar tolerances control convergence to `SolverStatus.CONVERGED` (each defaults to `0.0`, which disables that check) once all active constraint schedules and partitions have stabilized:
 
-- `atol`: residual norm \(\|r_{\text{eq}}\|_2 < \texttt{atol}\) (or total residual norm when no separate inequality penalty is active).
-- `gtol`: Euclidean half-gradient norm \(\|J^\top r + \rho Q \theta\|_2 < \texttt{gtol}\).
-- `xtol`: Euclidean step norm \(\|d\|_2 < \texttt{xtol}\) on accepted steps.
+- `atol` tests the full stacked optimization residual norm \(\|r(\theta)\|_2 = \sqrt{\texttt{info.resid\_loss}}\) (including transformed inequality and complementarity rows, excluding the ridge penalty). With `ridge=None`, `atol > 0` stops when \(\|r(\theta)\|_2 < \texttt{atol}\). With `ridge > 0` (on both `LevenbergMarquardt` and `Newton`), default `atol=0` checks `gtol` and `xtol` alone, while `atol > 0` acts as a conjunctive residual ceiling \(\|r(\theta)\|_2 \le \texttt{atol}\) paired with `gtol` or `xtol` (passing `atol > 0` with `gtol=0` and `xtol=0` raises `ValueError`).
+- `gtol` tests the pre-step gradient norm \(\|g(\theta_k)\|_2 = \|J(\theta_k)^\top r(\theta_k) + \rho Q \theta_k\|_2 < \texttt{gtol}\) and returns the updated iterate \(\theta_{k+1}\).
+- `xtol` tests the accepted displacement norm \(\|\theta_{k+1} - \theta_k\|_2 = \|\alpha_k d_k + \frac{1}{2}\alpha_k^2 a_k\|_2 < \texttt{xtol}\).
 
 `max_steps_is_success=True` (the default) treats `SolverStatus.MAX_STEPS` as usable for implicit AD and default multi-start acceptance. Set `max_steps_is_success=False` when budget exhaustion must follow the failed-solve path.
 
 | Status | Meaning |
 |---|---|
-| `SolverStatus.CONVERGED` | An active tolerance (`atol`, `gtol`, or `xtol`) was satisfied. |
-| `SolverStatus.MAX_STEPS` | `max_steps` was reached. |
+| `SolverStatus.CONVERGED` | Active stopping criteria were satisfied. |
+| `SolverStatus.MAX_STEPS` | `max_steps` was reached without meeting stopping criteria (including `max_steps=0`). |
 | `SolverStatus.NONFINITE` | Loss or state became nonfinite, or a callback set this status. |
 | `SolverStatus.CALLBACK_STOP` | A callback returned `stop=True` without overriding `status`. |
 | `SolverStatus.LINE_SEARCH_FAILED` | (`Newton` only) Armijo backtracking exhausted `maxls` trials. |
@@ -27,9 +27,9 @@ Three optional scalar tolerances stop the loop with `SolverStatus.CONVERGED` (ea
 
 Callbacks receive a `CallbackContext` after each step (`step`, `x`, `state`, `info`, `x_old`, `state_old`, `initial_state`, `args`, `p`, `user_state`) and return `None` or `SolverAction(stop=..., status=..., x=..., state=..., args=..., user_state=...)`.
 
-- Changing `x` or `args` invalidates cached Jacobians and factorizations and skips convergence checks on that step.
+- Changing `x` or `args` invalidates cached Jacobians and factorizations and suppresses convergence on that step.
 - Changing `state.ridge`, `state.ridge_metric`, `state.ineq_weight`, or `state.ineq_smoothing` invalidates penalty-dependent caches and suppresses convergence on that step.
-- Replacing `state.preconditioner` (with an instance of the same pytree structure) updates linear-solver conditioning without suppressing convergence or triggering recompilation.
+- Replacing `state.preconditioner` with an instance of the same pytree structure updates linear-solver conditioning without suppressing convergence or triggering recompilation.
 - Traced numeric step parameters live in `state.hyper` (`LMHyperparams` or `NewtonHyperparams`) and can be updated inside callbacks via `dataclasses.replace`.
 
 ## Cookbook examples
@@ -39,7 +39,6 @@ Callbacks receive a `CallbackContext` after each step (`step`, `x`, `state`, `in
 ```python
 import time
 import jax
-import jax.numpy as jnp
 
 step_fn = jax.jit(solver.update)
 state = solver.init(x0, args)

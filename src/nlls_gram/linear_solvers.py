@@ -275,6 +275,22 @@ class LinearSolver:
         raise NotImplementedError
 
 
+def _resolve_normal_or_gram_form(form, m, n, penalized, ridge_metric):
+    if form != "auto":
+        return form
+    if not penalized:
+        return "gram" if n > m else "normal"
+    if (
+        n > m
+        and ridge_metric.has_shifted_solve
+        and ridge_metric.fast_shifted_solve
+        and ridge_metric.penalized_is_spd
+        and ridge_metric.n_free_for(n) <= m
+    ):
+        return "gram"
+    return "normal"
+
+
 @dataclass(frozen=True)
 class Cholesky(LinearSolver):
     """Dense Cholesky solver on normal or Gram equations."""
@@ -290,19 +306,7 @@ class Cholesky(LinearSolver):
         _validate_dense_preconditioner(self.preconditioner, "Cholesky")
 
     def resolve_form(self, m, n, penalized, ridge_metric, damped=True):
-        if self.form != "auto":
-            return self.form
-        if not penalized:
-            return "gram" if n > m else "normal"
-        if (
-            n > m
-            and ridge_metric.has_shifted_solve
-            and ridge_metric.fast_shifted_solve
-            and ridge_metric.penalized_is_spd
-            and ridge_metric.n_free_for(n) <= m
-        ):
-            return "gram"
-        return "normal"
+        return _resolve_normal_or_gram_form(self.form, m, n, penalized, ridge_metric)
 
     def validate_shape(
         self, m, n, *, penalized, ridge_metric, damped, role="linear_solver"
@@ -446,6 +450,9 @@ class Cholesky(LinearSolver):
         q_theta_p, _ = _split_parameter_blocks(sub.penalty_grad, n_p, part)
         grad_p, grad_f = _split_parameter_blocks(grad, n_p, part)
 
+        # Select the smallest-norm base shift among -D_p^{-1} (rho Q theta_p),
+        # its identity -theta_p + mu D_p^{-1} theta_p, and -D_p^{-1} g_p so
+        # r + J_p d_0 (or J_p d_0 when using g_p) avoids float32 cancellation.
         def _penalized_d0():
             sol = block.solve_Dp(jnp.column_stack([theta_p, rho * q_theta_p, grad_p]))
             mu_dp_th = mu * sol[:, 0]
@@ -459,6 +466,15 @@ class Cholesky(LinearSolver):
             )
             use_grad = jnp.linalg.norm(d0_grad) < jnp.linalg.norm(d0_split)
             return jnp.where(use_grad, d0_grad, d0_split), use_grad
+
+        def _qr_lower_schur(_):
+            Bp = block.solve_Gp_T(Jp_t)
+            stack = _active_rect(
+                jnp.concatenate([Bp, jnp.eye(m, dtype=dtype)], axis=0),
+                sub.active,
+            )
+            _, R_S = jnp.linalg.qr(stack, mode="reduced")
+            return R_S.T
 
         if n_f == 0:
             Dp_inv_Jt = block.solve_Dp(Jp_t)
@@ -475,20 +491,10 @@ class Cholesky(LinearSolver):
             else:
                 S_work = _active_matrix(S, sub.active)
                 L_S_raw = jnp.linalg.cholesky(S_work)
-
-                def _qr_lower_s0(_):
-                    Bp = block.solve_Gp_T(Jp_t)
-                    stack = _active_rect(
-                        jnp.concatenate([Bp, jnp.eye(m, dtype=dtype)], axis=0),
-                        sub.active,
-                    )
-                    _, R_S = jnp.linalg.qr(stack, mode="reduced")
-                    return R_S.T
-
                 L_S = jax.lax.cond(
                     jnp.all(jnp.isfinite(L_S_raw)),
                     lambda _: L_S_raw,
-                    _qr_lower_s0,
+                    _qr_lower_schur,
                     operand=None,
                 )
                 s_ok = jnp.all(jnp.isfinite(L_S)) & jnp.all(
@@ -529,20 +535,10 @@ class Cholesky(LinearSolver):
         S_p_work = _active_matrix(S_p, sub.active)
         L_S_raw = jnp.linalg.cholesky(S_p_work)
         if n_p > 0:
-
-            def _qr_lower_sp(_):
-                Bp = block.solve_Gp_T(Jp_t)
-                stack = _active_rect(
-                    jnp.concatenate([Bp, jnp.eye(m, dtype=dtype)], axis=0),
-                    sub.active,
-                )
-                _, R_S = jnp.linalg.qr(stack, mode="reduced")
-                return R_S.T
-
             L_S = jax.lax.cond(
                 jnp.all(jnp.isfinite(L_S_raw)),
                 lambda _: L_S_raw,
-                _qr_lower_sp,
+                _qr_lower_schur,
                 operand=None,
             )
         else:
@@ -600,19 +596,7 @@ class QR(LinearSolver):
         _validate_dense_preconditioner(self.preconditioner, "QR")
 
     def resolve_form(self, m, n, penalized, ridge_metric, damped=True):
-        if self.form != "auto":
-            return self.form
-        if not penalized:
-            return "gram" if n > m else "normal"
-        if (
-            n > m
-            and ridge_metric.has_shifted_solve
-            and ridge_metric.fast_shifted_solve
-            and ridge_metric.penalized_is_spd
-            and ridge_metric.n_free_for(n) <= m
-        ):
-            return "gram"
-        return "normal"
+        return _resolve_normal_or_gram_form(self.form, m, n, penalized, ridge_metric)
 
     def validate_shape(
         self, m, n, *, penalized, ridge_metric, damped, role="linear_solver"
@@ -1350,9 +1334,10 @@ class GramCG(_KrylovConfig):
         if precond is None or isinstance(precond, IdentityPreconditioner):
             apply_M = None
         else:
+            shift = mu if not sub.penalized else jnp.zeros((), dtype=dtype)
 
             def apply_M(v):
-                mv = precond.apply(v, mu, sub.ctx)
+                mv = precond.apply(v, shift, sub.ctx)
                 if sub.active is not True:
                     mv = jnp.where(sub.active, mv, v)
                 return mv

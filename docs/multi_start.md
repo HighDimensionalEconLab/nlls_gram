@@ -1,6 +1,6 @@
 # Multi-Start
 
-`solve(multi_start=MultiStart(...))` retries failed solves from fresh initial conditions sequentially, or evaluates multiple initial conditions in parallel under `jax.vmap` and returns the best candidate as a single unbatched `SolveResult` with `result.multi_start` (`MultiStartInfo`).
+`solve(multi_start=MultiStart(...))` evaluates up to `num_starts` total attempts (including attempt `0` at the caller's initial `(x0, args)`), either sequentially until an accepted attempt is found or in parallel under `jax.vmap`, and returns the winning candidate as an unbatched `SolveResult` with `result.multi_start` (`MultiStartInfo`).
 
 ```python
 import jax
@@ -29,11 +29,11 @@ result = solver.solve(
 
 ## Hooks (`draw`, `reset_args`, `accept`)
 
-- `draw(key, x_old, args_old) -> x_new` generates a fresh initial parameter pytree with the same structure, shapes, and dtypes as `x0`. `DrawNNXModule(module_cls, *args, **kwargs)` provides a value-hashable `draw` hook for Flax NNX modules.
-- `reset_args(key, args_old) -> args_new` resets attempt-local solver `args` (such as epoch counters or simulation RNG streams) with the same pytree structure as `args`.
+- `draw(key, x_old, args_old) -> x_new` generates a fresh initial parameter pytree with the same structure, shapes, and dtypes as `x0`. `DrawNNXModule(module_cls, *args, wrt=nnx.Param, **kwargs)` provides a value-hashable `draw` hook for Flax NNX modules.
+- `reset_args(key, args_old) -> args_new` resets attempt-local solver `args` with the same pytree structure as `args`.
 - `accept(key, result) -> bool` overrides the default acceptance check (`CONVERGED`, plus `MAX_STEPS` when `max_steps_is_success=True`). Effective acceptance is always `accept(key, result) & jnp.isfinite(loss)`.
 
-At least one of `draw` or `reset_args` is required when `num_starts > 1`. Attempt `0` always evaluates the caller's original `(x0, args)` without calling `draw` or `reset_args`. For attempt `k`, keys follow the deterministic split:
+At least one of `draw` or `reset_args` is required when `num_starts > 1`. Attempt `0` evaluates `(x0, args)` directly without calling `draw` or `reset_args`. Subsequent attempts \(k \ge 1\) split keys deterministically:
 
 ```python
 draw_key, accept_key, reset_key = jax.random.split(jax.random.fold_in(key, k), 3)

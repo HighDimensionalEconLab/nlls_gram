@@ -28,7 +28,7 @@ plugins:
         python:
           options:
             show_root_heading: true
-            show_source: true
+            show_source: false
             inherited_members: true
 
 markdown_extensions:
@@ -44,13 +44,14 @@ extra_javascript:
 
 nav:
   - Home: index.md
-  - Tikhonov Regularization: ridge_lm.md
-  - Newton: newton.md
+  - Levenberg-Marquardt and Tikhonov: ridge_lm.md
+  - Gauss-Newton: newton.md
   - Ridge Operators and Preconditioners: metrics.md
   - Constraints: complementarity.md
-  - Callbacks: callbacks.md
+  - Callbacks and Stopping: callbacks.md
   - Multi-Start: multi_start.md
   - Implicit Differentiation: implicit_ad.md
   - Row-wise Residuals: vmap_rows.md
-  - Tuning: tuning_guide.md
+  - Tuning and Capabilities: tuning_guide.md
+  - References: references.md
   - API: api.md

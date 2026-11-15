@@ -6,7 +6,7 @@
 ::: nlls_gram.Newton
 ::: nlls_gram.AnnealRidge
 
-## Linear solvers and caches
+## Linear solvers
 
 ::: nlls_gram.Cholesky
 ::: nlls_gram.QR
@@ -14,8 +14,6 @@
 ::: nlls_gram.GramCG
 ::: nlls_gram.LU
 ::: nlls_gram.SVD
-::: nlls_gram.CholeskyCache
-::: nlls_gram.QRCache
 
 ## Ridge operators
 
@@ -31,21 +29,6 @@
 ::: nlls_gram.Preconditioner
 ::: nlls_gram.IdentityPreconditioner
 ::: nlls_gram.DiagonalPreconditioner
-
-## State and results
-
-::: nlls_gram.SolverStatus
-::: nlls_gram.SolverAction
-::: nlls_gram.CallbackContext
-::: nlls_gram.SolveResult
-::: nlls_gram.SolverContext
-::: nlls_gram.LMState
-::: nlls_gram.LMInfo
-::: nlls_gram.LMHyperparams
-::: nlls_gram.NewtonState
-::: nlls_gram.NewtonInfo
-::: nlls_gram.NewtonHyperparams
-::: nlls_gram.register_pytree_dataclass
 
 ## Residuals and constraints
 
@@ -63,3 +46,20 @@
 ::: nlls_gram.MultiStart
 ::: nlls_gram.MultiStartInfo
 ::: nlls_gram.DrawNNXModule
+
+## State, caches, and results
+
+::: nlls_gram.SolverStatus
+::: nlls_gram.SolverAction
+::: nlls_gram.CallbackContext
+::: nlls_gram.SolveResult
+::: nlls_gram.SolverContext
+::: nlls_gram.LMState
+::: nlls_gram.LMInfo
+::: nlls_gram.LMHyperparams
+::: nlls_gram.NewtonState
+::: nlls_gram.NewtonInfo
+::: nlls_gram.NewtonHyperparams
+::: nlls_gram.CholeskyCache
+::: nlls_gram.QRCache
+::: nlls_gram.register_pytree_dataclass

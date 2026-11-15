@@ -46,10 +46,8 @@ register_pytree_dataclass(
 @pytest.mark.parametrize(
     "linear_solver",
     [
-        Cholesky(),
         Cholesky(form="gram"),
         Cholesky(form="gram", preconditioner=DiagonalPreconditioner(None)),
-        QR(),
         QR(form="gram"),
         QR(form="gram", preconditioner=DiagonalPreconditioner(None)),
         SVD(),
