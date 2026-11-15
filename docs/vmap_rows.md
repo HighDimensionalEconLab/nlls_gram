@@ -12,8 +12,8 @@ where \(z_s(\theta)\) denotes row-mapped inputs (`in_axes != None`) and \(w(\the
 
 `vmap_rows(f=None, *, in_axes=None, chunk_size=None)` wraps `jax.experimental.hijax.HiPrim` with custom `jvp`, `lin`, `transpose`, and nested `vmap` rules:
 
-- During primal evaluation and plain directional `jax.jvp` calls (such as geodesic second directional derivatives \(D^2 r(\theta)[d, d]\) and parameter sensitivities \(D_p r(\theta, a, p)[\dot{p}]\)), `vmap_rows` executes `jax.vmap(g)` directly without materializing row Jacobians.
-- Under `jax.linearize` (used during dense Jacobian assembly), `vmap_rows` evaluates each row's derivatives \(G_{z,s} = D_z g(z_s, w)\) and \(G_{w,s} = D_w g(z_s, w)\) once via per-row `jax.jacrev` and stores those row Jacobians as linearization state instead of the full batched forward tape of `g`. Note that \(G_{z,s}\) is compact whenever each mapped state \(z_s\) is low-dimensional, whereas \(G_{w,s}\) has column dimension matching any differentiated shared leaf \(w\).
+- During primal evaluation, direct `jax.jvp` or `jax.jacfwd` calls, and geodesic second directional derivatives \(D^2 r(\theta)[d, d]\), `vmap_rows` executes `jax.vmap(g)` directly without materializing row Jacobians.
+- Under `jax.linearize` (used during dense Jacobian assembly and implicit differentiation), `vmap_rows` evaluates each row's derivatives \(G_{z,s} = D_z g(z_s, w)\) and \(G_{w,s} = D_w g(z_s, w)\) once via per-row `jax.jacrev` and stores those row Jacobians as linearization state instead of the full batched forward tape of `g`. Note that \(G_{z,s}\) is compact whenever each mapped state \(z_s\) is low-dimensional, whereas \(G_{w,s}\) has column dimension matching any differentiated shared leaf \(w\).
 
 Combined with JAX's linearization of the upstream path \(z_s(\theta)\), tangent pushforwards and cotangent pullbacks satisfy
 
@@ -26,6 +26,9 @@ D r(\theta)^\top u = \sum_{s=1}^{m} D z_s(\theta)^\top \big(G_{z,s}^\top u_s\big
 $$
 
 For scalar row outputs, dense Jacobian assembly evaluates `jacrev(g)` once per row (\(m\) row pullbacks total) rather than re-running `g` across \(m\) cotangents or \(n\) tangents. When per-row reverse-mode intermediates are large, pass `chunk_size=k` so the per-row `jacrev` pass runs via `jax.lax.map(..., batch_size=k)`. Pair this with `jacobian_chunk=c` on `LevenbergMarquardt` or `Newton` to bound peak memory along the upstream `scan`.
+
+!!! note "Mixed-mode accumulation in overdetermined systems"
+    Under `jacobian_mode="fwd"` (\(n \le m d_r\), where \(d_r\) is the output size of a single row), dense Jacobian assembly still traces through `jax.linearize`, producing mixed-mode differentiation. Upstream state paths push \(n\) tangents forward, while each row \(g(z_s, w) \in \mathbb{R}^{d_r}\) preaccumulates its local Jacobian in reverse mode via `jacrev` and contracts it with incoming tangents. Because both plain forward mode and `vmap_rows` visit all \(m\) rows, per-row derivative work scales with \(d_r\) rather than \(n\), so `vmap_rows` remains faster whenever \(d_r < n\) even when total residuals \(m d_r \gg n\).
 
 ## Example
 
