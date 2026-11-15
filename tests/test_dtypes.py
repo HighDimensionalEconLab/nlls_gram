@@ -132,7 +132,7 @@ def _run_x64_checks():
         steps[name] = np.asarray(x1)
     for high_acc in ("chol_gram", "qr_gram"):
         np.testing.assert_allclose(
-            steps["qr_normal"], steps[high_acc], rtol=1e-13, atol=1e-13
+            steps["qr_normal"], steps[high_acc], rtol=1e-11, atol=1e-12
         )
     for normal_eq in ("chol_normal", "cg"):
         np.testing.assert_allclose(

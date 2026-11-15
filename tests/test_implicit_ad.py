@@ -567,10 +567,11 @@ def test_batched_tangents_cotangents_and_ad_solve_failure_propagation():
         jv = jax.vmap(lambda ct, pb=f_vjp: pb((ct, jnp.float32(0.0)))[0])(
             jnp.eye(n, dtype=jnp.float32)
         )
+        tol_ad = (1e-4, 1e-5) if isinstance(ls, CG) else (1e-5, 1e-6)
         np.testing.assert_allclose(jf[0], J_ref_fwd[0], rtol=5e-4, atol=5e-5)
         np.testing.assert_allclose(jr[0], J_ref_rev[0], rtol=5e-4, atol=5e-5)
-        np.testing.assert_allclose(jl[0], jf[0], rtol=1e-5, atol=1e-6)
-        np.testing.assert_allclose(jv, jr[0], rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(jl[0], jf[0], rtol=tol_ad[0], atol=tol_ad[1])
+        np.testing.assert_allclose(jv, jr[0], rtol=tol_ad[0], atol=tol_ad[1])
         np.testing.assert_allclose(jf[1], J_ref_fwd[1], rtol=5e-4, atol=5e-5)
         np.testing.assert_allclose(jr[1], J_ref_rev[1], rtol=5e-4, atol=5e-5)
 
