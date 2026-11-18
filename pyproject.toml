@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nlls-gram"
-version = "3.2.0"
+version = "3.2.1"
 description = "Levenberg-Marquardt and Gauss-Newton nonlinear least-squares for JAX"
 readme = "README.md"
 license = "MIT"
@@ -26,8 +26,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 dependencies = [
-    "jax>=0.12.0.1",
-    "jaxlib>=0.12.0.1",
+    "jax>=0.12.1",
+    "jaxlib>=0.12.1",
 ]
 
 [project.urls]
@@ -63,5 +63,5 @@ docs = [
     "mkdocstrings[python]>=1.0.7",
 ]
 gpu = [
-    "jax[cuda13]>=0.12.0.1 ; sys_platform == 'linux'",
+    "jax[cuda13]>=0.12.1 ; sys_platform == 'linux'",
 ]

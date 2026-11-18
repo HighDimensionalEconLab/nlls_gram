@@ -234,11 +234,16 @@ def vmap_rows(f=None, *, in_axes=None, chunk_size=None):
             if jnp.issubdtype(av.dtype, jnp.floating)
         ]
 
+        in_avals_flat, in_tree = jax.tree.flatten(in_avals)
+
         def active_mask_for(nzs_in):
-            return jax.tree.map(
-                lambda nz, av: bool(nz) and jnp.issubdtype(av.dtype, jnp.floating),
-                nzs_in,
-                in_avals,
+            nzs_flat = jax.tree.leaves(nzs_in)
+            return jax.tree.unflatten(
+                in_tree,
+                [
+                    bool(nz) and jnp.issubdtype(av.dtype, jnp.floating)
+                    for nz, av in zip(nzs_flat, in_avals_flat, strict=True)
+                ],
             )
 
         def leaf_axes_for(primals):

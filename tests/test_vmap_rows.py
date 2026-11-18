@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import nnx
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram import (
@@ -251,3 +252,59 @@ def test_one_arg_signature_nonfloating_aux_transpose_and_multishape_jit():
     j5 = multi_shape_jac(grid, x0)
     j9 = multi_shape_jac(jnp.linspace(0.5, 2.0, 9, dtype=jnp.float32), x0)
     assert j5.shape == (5, 2) and j9.shape == (9, 2)
+
+
+class RowMLP(nnx.Module):
+    def __init__(self, rngs: nnx.Rngs):
+        self.scale = nnx.Variable(jnp.asarray(2.0, dtype=jnp.float32))
+        self.hidden = nnx.Linear(1, 4, rngs=rngs)
+        self.head = nnx.Linear(4, 1, rngs=rngs)
+
+    def __call__(self, x):
+        return self.scale[...] * self.head(nnx.tanh(self.hidden(x[None])))[0]
+
+
+def test_custom_pytree_module_argument():
+    xs = jnp.linspace(-1.0, 1.0, 7, dtype=jnp.float32)
+    ys = jnp.sin(xs)
+    graphdef, theta0, nondiff = nnx.split(RowMLP(nnx.Rngs(0)), nnx.Param, ...)
+
+    def row_fn(xy, mod):
+        x, y = xy
+        return mod(x) - y
+
+    xy = jnp.stack([xs, ys], axis=1)
+    rows_fn = vmap_rows(row_fn, in_axes=(0, None), chunk_size=3)
+    vmap_fn = jax.vmap(row_fn, in_axes=(0, None))
+
+    def res_rows(th, data, _p):
+        return rows_fn(data, nnx.merge(graphdef, th, nondiff))
+
+    def res_vmap(th, data, _p):
+        return vmap_fn(data, nnx.merge(graphdef, th, nondiff))
+
+    ref = jax.jit(lambda th: assemble(res_vmap, th, xy, None))(theta0)
+    cand = jax.jit(lambda th: assemble(res_rows, th, xy, None))(theta0)
+    tol = 1e3 * float(jnp.finfo(jnp.float32).eps)
+    for a, b in zip(ref, cand, strict=True):
+        np.testing.assert_allclose(b, a, rtol=tol, atol=tol)
+
+    batched_xy = jnp.stack([xy, 0.5 * xy])
+    j_ref = jax.jit(jax.vmap(lambda d: assemble(res_vmap, theta0, d, None)[1]))(
+        batched_xy
+    )
+    j_cand = jax.jit(jax.vmap(lambda d: assemble(res_rows, theta0, d, None)[1]))(
+        batched_xy
+    )
+    np.testing.assert_allclose(j_cand, j_ref, rtol=tol, atol=tol)
+
+    sol_ref = LevenbergMarquardt(res_vmap, geodesic_acceleration=True).solve(
+        theta0, xy, max_steps=30, atol=1e-4
+    )
+    sol_cand = LevenbergMarquardt(res_rows, geodesic_acceleration=True).solve(
+        theta0, xy, max_steps=30, atol=1e-4
+    )
+    assert int(sol_cand.steps) == int(sol_ref.steps)
+    np.testing.assert_allclose(
+        ravel_pytree(sol_cand.x)[0], ravel_pytree(sol_ref.x)[0], rtol=1e-4, atol=1e-5
+    )
