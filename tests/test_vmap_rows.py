@@ -257,16 +257,16 @@ def test_one_arg_signature_nonfloating_aux_transpose_and_multishape_jit():
 class RowMLP(nnx.Module):
     def __init__(self, rngs: nnx.Rngs):
         self.scale = nnx.Variable(jnp.asarray(2.0, dtype=jnp.float32))
-        self.hidden = nnx.Linear(1, 4, rngs=rngs)
-        self.head = nnx.Linear(4, 1, rngs=rngs)
+        self.linear = nnx.Linear(2, 1, rngs=rngs)
 
     def __call__(self, x):
-        return self.scale[...] * self.head(nnx.tanh(self.hidden(x[None])))[0]
+        return self.scale[...] * jnp.tanh(self.linear(jnp.stack([x, x**2])))[0]
 
 
 def test_custom_pytree_module_argument():
-    xs = jnp.linspace(-1.0, 1.0, 7, dtype=jnp.float32)
-    ys = jnp.sin(xs)
+    xs = jnp.linspace(-1.0, 1.0, 9, dtype=jnp.float32)
+    target_mod = RowMLP(nnx.Rngs(1))
+    ys = jax.vmap(target_mod)(xs)
     graphdef, theta0, nondiff = nnx.split(RowMLP(nnx.Rngs(0)), nnx.Param, ...)
 
     def row_fn(xy, mod):
@@ -274,7 +274,7 @@ def test_custom_pytree_module_argument():
         return mod(x) - y
 
     xy = jnp.stack([xs, ys], axis=1)
-    rows_fn = vmap_rows(row_fn, in_axes=(0, None), chunk_size=3)
+    rows_fn = vmap_rows(row_fn, in_axes=(0, None), chunk_size=4)
     vmap_fn = jax.vmap(row_fn, in_axes=(0, None))
 
     def res_rows(th, data, _p):
@@ -299,11 +299,12 @@ def test_custom_pytree_module_argument():
     np.testing.assert_allclose(j_cand, j_ref, rtol=tol, atol=tol)
 
     sol_ref = LevenbergMarquardt(res_vmap, geodesic_acceleration=True).solve(
-        theta0, xy, max_steps=30, atol=1e-4
+        theta0, xy, max_steps=30, atol=1e-6
     )
     sol_cand = LevenbergMarquardt(res_rows, geodesic_acceleration=True).solve(
-        theta0, xy, max_steps=30, atol=1e-4
+        theta0, xy, max_steps=30, atol=1e-6
     )
+    assert sol_cand.status == SolverStatus.CONVERGED
     assert int(sol_cand.steps) == int(sol_ref.steps)
     np.testing.assert_allclose(
         ravel_pytree(sol_cand.x)[0], ravel_pytree(sol_ref.x)[0], rtol=1e-4, atol=1e-5
