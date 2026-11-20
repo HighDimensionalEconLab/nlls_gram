@@ -10,7 +10,7 @@ Three optional scalar tolerances control convergence to `SolverStatus.CONVERGED`
 - `gtol` tests the pre-step gradient norm \(\|g(\theta_k)\|_2 = \|J(\theta_k)^\top r(\theta_k) + \rho Q \theta_k\|_2 < \texttt{gtol}\) and returns the updated iterate \(\theta_{k+1}\).
 - `xtol` tests the accepted displacement norm \(\|\theta_{k+1} - \theta_k\|_2 = \|\alpha_k d_k + \frac{1}{2}\alpha_k^2 a_k\|_2 < \texttt{xtol}\).
 
-`max_steps_is_success=True` (the default) treats `SolverStatus.MAX_STEPS` as usable for implicit AD and default multi-start acceptance. Set `max_steps_is_success=False` when budget exhaustion must follow the failed-solve path.
+`max_steps_is_success=False` (the default) treats `SolverStatus.MAX_STEPS` as budget exhaustion so multi-start retries and implicit AD zeros tangents unless `max_steps_is_success=True` is passed.
 
 | Status | Meaning |
 |---|---|

@@ -53,7 +53,7 @@ At \(\tau = 0\), feasible components \(g_i \ge 0\) have zero residual and zero d
 
 ## Complementarity reformulations
 
-Configure complementarity via `complementarity=...` on `LevenbergMarquardt` or `Newton` (defaulting to `PDAS()` when `Complementarity` is returned). Let \(\tilde{a} = \text{lhs} / c_{\text{scale}}\) and \(\tilde{b} = \text{rhs}\). Because `w_comp` scales the residual rows, its weight in \(F_\rho(\theta)\) is \(w_{\text{comp}}^2\).
+Configure complementarity via `complementarity=...` on `LevenbergMarquardt` or `Newton` (defaulting to `Minimum()` when `Complementarity` is returned). Let \(\tilde{a} = \text{lhs} / c_{\text{scale}}\) and \(\tilde{b} = \text{rhs}\). Because `w_comp` scales the residual rows, its weight in \(F_\rho(\theta)\) is \(w_{\text{comp}}^2\).
 
 | Config | Residual \(r_c(\tilde{a}, \tilde{b})\) | Homotopy |
 |---|---|---|

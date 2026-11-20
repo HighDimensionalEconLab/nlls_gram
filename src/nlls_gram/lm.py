@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 
 from nlls_gram.linear_solvers import (
-    Cholesky,
+    QR,
     CholeskyCache,
     QRCache,
     Subproblem,
@@ -109,13 +109,13 @@ class LevenbergMarquardt(SolverBase):
         *,
         ridge=None,
         ridge_metric=None,
-        linear_solver=Cholesky(),  # noqa: B008
+        linear_solver=QR(),  # noqa: B008
         ad_solver=None,
         jacobian_mode="auto",
         jacobian_chunk=None,
-        init_damping=1e-3,
-        damping_decrease=0.5,
-        damping_increase=4.0,
+        init_damping=1e-4,
+        damping_decrease=0.2,
+        damping_increase=2.0,
         c1=1e-4,
         decrease_factor=0.5,
         maxls=20,

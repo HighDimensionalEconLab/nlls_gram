@@ -182,7 +182,13 @@ def _run_x64_checks():
         )
         got = jax.jvp(
             lambda pv: (
-                s.solve(jnp.zeros(n_sq, jnp.float64), p=pv, max_steps=100, atol=1e-13).x
+                s.solve(
+                    jnp.zeros(n_sq, jnp.float64),
+                    p=pv,
+                    max_steps=100,
+                    atol=1e-13,
+                    max_steps_is_success=True,
+                ).x
             ),
             (p_ill,),
             (d_ill,),
@@ -201,7 +207,9 @@ def _run_x64_checks():
         lambda x, _, p: wiggles * (jnp.dot(w, x) - p), ad_solver=SVD()
     )
     grad_dup = jax.grad(
-        lambda t: jnp.sum(s_dup.solve(jnp.zeros(3, jnp.float64), p=t, max_steps=50).x)
+        lambda t: jnp.sum(
+            s_dup.solve(jnp.zeros(3, jnp.float64), p=t, max_steps=50, gtol=1e-12).x
+        )
     )(jnp.float64(1.0))
     np.testing.assert_allclose(grad_dup, jnp.sum(w) / jnp.dot(w, w), rtol=1e-8)
 

@@ -66,7 +66,7 @@ f_k =
 \end{cases}
 $$
 
-where \(\varepsilon_{\text{tiny}} = \texttt{jnp.finfo(dtype).tiny}\). Defaults are `init_damping=1e-3`, `damping_decrease=0.5`, `damping_increase=4.0`, `c1=1e-4`, `decrease_factor=0.5`, `maxls=20`, and `linesearch_tol=0.0`. On rejected steps with unchanged constraint schedules, `cache_jacobian=True` (the default for dense solvers) reuses `(resid, Jt)` and any valid pre-damping factorization without re-evaluating `J`.
+where \(\varepsilon_{\text{tiny}} = \texttt{jnp.finfo(dtype).tiny}\). Defaults are `init_damping=1e-4`, `damping_decrease=0.2`, `damping_increase=2.0`, `c1=1e-4`, `decrease_factor=0.5`, `maxls=20`, and `linesearch_tol=0.0`. On rejected steps with unchanged constraint schedules, `cache_jacobian=True` (the default for dense solvers) reuses `(resid, Jt)` and any valid pre-damping factorization without re-evaluating `J`.
 
 ## Geodesic acceleration
 

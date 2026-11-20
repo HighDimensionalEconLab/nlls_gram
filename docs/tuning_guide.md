@@ -8,7 +8,7 @@
 
 ## Linear solver capability matrix
 
-Let \(m\) denote total residual rows, \(n\) denote parameter count, \(n_p\) denote penalized coordinates, \(n_f = n - n_p\) denote unpenalized coordinates, and \(p\) denote rows of `ridge_metric`'s factor \(L\).
+Both `LevenbergMarquardt` and `Newton` default to `linear_solver=QR()`. Let \(m\) denote total residual rows, \(n\) denote parameter count, \(n_p\) denote penalized coordinates, \(n_f = n - n_p\) denote unpenalized coordinates, and \(p\) denote rows of `ridge_metric`'s factor \(L\).
 
 | Linear solver | `ridge=None`, \(\mu > 0\) | `ridge=None`, \(\mu = 0\) | `ridge > 0`, \(\mu > 0\) | `ridge > 0`, \(\mu = 0\) | Rank-deficient at \(\mu = 0\) |
 |---|---|---|---|---|---|

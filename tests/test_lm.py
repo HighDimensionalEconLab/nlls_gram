@@ -638,10 +638,14 @@ def test_nonlinear_inequalities_kink_smoothing_diagnostics_and_callbacks():
         )
 
     # 4. Smooth solutions converge to exact solution as tau -> 0 and via smoothing_decay
+    assert isinstance(LevenbergMarquardt(mixed_fn).linear_solver, QR)
+    assert isinstance(Newton(mixed_fn).linear_solver, QR)
     errs = []
     for tau in (0.5, 0.05, 1e-3):
         sol_tau = LevenbergMarquardt(
-            mixed_fn, inequality=InequalityPenalty(weight=w_pen, smoothing=tau)
+            mixed_fn,
+            linesearch_tol=1e-7,
+            inequality=InequalityPenalty(weight=w_pen, smoothing=tau),
         ).solve(x_init, gtol=1e-5, max_steps=60)
         assert int(sol_tau.status) == int(SolverStatus.CONVERGED)
         errs.append(float(np.linalg.norm(np.asarray(sol_tau.x) - x_star_exact)))

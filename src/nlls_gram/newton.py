@@ -7,6 +7,7 @@ from jax.flatten_util import ravel_pytree
 from nlls_gram.linear_solvers import (
     CG,
     LU,
+    QR,
     Cholesky,
     Subproblem,
 )
@@ -38,7 +39,7 @@ class Newton(SolverBase):
         *,
         ridge=None,
         ridge_metric=None,
-        linear_solver=Cholesky(),  # noqa: B008
+        linear_solver=QR(),  # noqa: B008
         ad_solver=None,
         jacobian_mode="auto",
         jacobian_chunk=None,

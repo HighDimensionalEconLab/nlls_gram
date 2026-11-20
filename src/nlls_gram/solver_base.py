@@ -360,7 +360,7 @@ class SolverBase:
         self.complementarity = complementarity
         self.inequality = inequality
 
-        comp_cfg = PDAS() if complementarity is None else complementarity
+        comp_cfg = Minimum() if complementarity is None else complementarity
         self._resolved_complementarity = comp_cfg
         self._uses_homotopy_decay = (
             isinstance(comp_cfg, PDAS)
@@ -1460,7 +1460,7 @@ class SolverBase:
         p=None,
         state=None,
         max_steps=256,
-        max_steps_is_success=True,
+        max_steps_is_success=False,
         atol=0.0,
         gtol=0.0,
         xtol=0.0,
