@@ -4,6 +4,7 @@
 
 ::: nlls_gram.LevenbergMarquardt
 ::: nlls_gram.Newton
+::: nlls_gram.BoxSecant
 ::: nlls_gram.AnnealRidge
 
 ## Linear solvers
@@ -53,6 +54,7 @@
 ::: nlls_gram.SolverAction
 ::: nlls_gram.CallbackContext
 ::: nlls_gram.SolveResult
+::: nlls_gram.BoxSolveResult
 ::: nlls_gram.SolverContext
 ::: nlls_gram.LMState
 ::: nlls_gram.LMInfo

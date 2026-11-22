@@ -1,3 +1,4 @@
+from nlls_gram.box_secant import BoxSecant
 from nlls_gram.linear_solvers import (
     CG,
     LU,
@@ -26,6 +27,7 @@ from nlls_gram.preconditioners import (
 )
 from nlls_gram.types import (
     PDAS,
+    BoxSolveResult,
     CallbackContext,
     Complementarity,
     FischerBurmeister,
@@ -54,6 +56,8 @@ __all__ = [
     "QR",
     "SVD",
     "AnnealRidge",
+    "BoxSecant",
+    "BoxSolveResult",
     "CallbackContext",
     "Cholesky",
     "CholeskyCache",

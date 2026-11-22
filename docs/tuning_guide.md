@@ -5,6 +5,7 @@
 - Use `LevenbergMarquardt` or `Newton` with positive `ridge` and a `ridge_metric` when minimizing a Tikhonov-regularized objective or continuing toward a minimum-seminorm interpolant with `AnnealRidge`.
 - Use `LevenbergMarquardt(residual_fn)` (`ridge=None`) when curved or ill-conditioned nonlinear least-squares problems benefit from adaptive step damping and rejected-step Jacobian reuse.
 - Use `Newton(residual_fn)` (`ridge=None`) when stateless residual-coupled damping (`damping=1e-3` by default, or `damping=0.0` for undamped Gauss-Newton) avoids repeated trial factorizations.
+- Use [`BoxSecant(fn)`](box_secant.md) when minimizing or maximizing a scalar objective over a 1D interval `[lower, upper]` (especially across large `vmap` batches or as an inner subproblem differentiated via `p`).
 
 ## Linear solver capability matrix
 

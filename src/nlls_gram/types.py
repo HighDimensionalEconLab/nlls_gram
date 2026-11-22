@@ -7,6 +7,7 @@ import jax.numpy as jnp
 
 __all__ = [
     "PDAS",
+    "BoxSolveResult",
     "CallbackContext",
     "Complementarity",
     "FischerBurmeister",
@@ -181,6 +182,24 @@ class SolveResult:
     aux_history: Any = None
     args_history: Any = None
     multi_start: Any = None
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class BoxSolveResult:
+    """Result returned by ``BoxSecant.solve``."""
+
+    x: jax.Array
+    fun: jax.Array
+    grad: jax.Array
+    bracket_width: jax.Array
+    steps: jax.Array
+    status: jax.Array
+    lower: jax.Array
+    upper: jax.Array
+    args: Any = None
+    p: Any = None
+    aux: Any = None
 
 
 @jax.tree_util.register_dataclass

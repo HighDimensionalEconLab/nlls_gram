@@ -46,6 +46,7 @@ nav:
   - Home: index.md
   - Levenberg-Marquardt and Tikhonov: ridge_lm.md
   - Gauss-Newton: newton.md
+  - Univariate Box Optimization: box_secant.md
   - Ridge Operators and Preconditioners: metrics.md
   - Constraints: complementarity.md
   - Callbacks and Stopping: callbacks.md

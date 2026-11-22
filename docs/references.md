@@ -3,6 +3,7 @@
 ## Levenberg-Marquardt, Gauss-Newton, and globalization
 
 - Armijo, Larry (1966). "Minimization of Functions Having Lipschitz Continuous First Partial Derivatives." *Pacific Journal of Mathematics* 16(1), 1–3.
+- Brent, Richard P. (1973). *Algorithms for Minimization without Derivatives*. Prentice-Hall.
 - Fan, Jinyan, and Ya-xiang Yuan (2005). "On the Quadratic Convergence of the Levenberg-Marquardt Method without Nonsingularity Assumption." *Computing* 74(1), 23–39.
 - Levenberg, Kenneth (1944). "A Method for the Solution of Certain Non-Linear Problems in Least Squares." *Quarterly of Applied Mathematics* 2(2), 164–168.
 - Madsen, Kaj, Hans Bruun Nielsen, and Ole Tingleff (2004). *Methods for Non-Linear Least Squares Problems*, 2nd ed. Informatics and Mathematical Modelling, Technical University of Denmark.

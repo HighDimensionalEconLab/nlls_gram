@@ -13,6 +13,8 @@ reporting `info.loss` as \(2 F_\rho(\theta)\).
 | `LevenbergMarquardt` | Stateful scalar damping adapted from accepted Armijo step length | Armijo backtracking (optional geodesic acceleration) |
 | `Newton` | Optional stateless residual-coupled damping \(\propto \|r(\theta_k)\|_2^p\) (or \(\mu_k = 0\)) | Armijo backtracking (optional geodesic acceleration) |
 
+For univariate box-constrained optimization over `[lower, upper]`, [`BoxSecant`](box_secant.md) combines forward-mode directional derivatives with projected secant steps safeguarded by bisection, fused `vmap` batching, deterministic `num_starts` sub-box partitioning, and box-aware implicit differentiation.
+
 ## Residual interface
 
 `residual_fn` accepts `(x)`, `(x, args)`, or `(x, args, p)` and returns a residual pytree, a `Residuals` / `Inequality` / `Complementarity` container, or `(residual, aux)` when `has_aux=True`.

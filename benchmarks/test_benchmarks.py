@@ -8,6 +8,7 @@ from nlls_gram import (
     PDAS,
     QR,
     AnnealRidge,
+    BoxSecant,
     Cholesky,
     Complementarity,
     DiagonalPreconditioner,
@@ -503,4 +504,70 @@ def test_euler_complementarity_gram_solve(benchmark, device, dtype, comp_name):
             return out
 
         benchmark.group = f"euler-comp-gram-solve-{dtype.__name__}"
+        benchmark(run)
+
+
+@pytest.mark.parametrize("mode", ["solve", "value_and_grad"])
+@pytest.mark.parametrize("loop", ["while", "fori"])
+def test_box_secant_batched_bellman_solve_and_grad(
+    benchmark, device, dtype, loop, mode
+):
+    n_states, width, n_quad = (8192 if device.platform == "gpu" else 1024), 32, 5
+    with jax.default_device(device):
+        keys = jax.random.split(jax.random.key(17), 7)
+        states = jax.random.uniform(
+            keys[0], (n_states,), dtype=dtype, minval=0.2, maxval=2.0
+        )
+        quad_z = jnp.linspace(-1.5, 1.5, n_quad, dtype=dtype)
+        quad_w = jnp.array([0.1, 0.25, 0.3, 0.25, 0.1], dtype=dtype)
+        s = jnp.asarray(0.25, dtype=dtype)
+        p0 = {
+            "w1": s * jax.random.normal(keys[1], (1, width), dtype=dtype),
+            "b1": jnp.zeros((width,), dtype=dtype),
+            "w2": s * jax.random.normal(keys[2], (width, width), dtype=dtype),
+            "b2": jnp.zeros((width,), dtype=dtype),
+            "w3": s * jax.random.normal(keys[3], (width,), dtype=dtype),
+            "b3": jnp.zeros((), dtype=dtype),
+        }
+
+        def v_net(k, p):
+            h = jax.nn.silu(k[..., None] * p["w1"] + p["b1"])
+            h = jax.nn.silu(h @ p["w2"] + p["b2"])
+            return h @ p["w3"] + p["b3"]
+
+        def rhs(a, k, p):
+            flow = k**0.6 - a - 1.5 * (a**2) / k
+            k_next = 0.9 * k + a + 0.08 * quad_z
+            ev = jnp.sum(quad_w * v_net(k_next, p))
+            return flow + 0.95 * ev
+
+        solver = BoxSecant(rhs, sense="max", loop=loop)
+        lo = jnp.asarray(0.0, dtype=dtype)
+        hi = jnp.asarray(0.5, dtype=dtype)
+        max_steps = 8 if loop == "fori" else 24
+
+        def solve_batch(p):
+            return jax.vmap(
+                lambda k: solver.solve(lo, hi, k, p=p, max_steps=max_steps)
+            )(states)
+
+        warm = jax.jit(solve_batch)(p0)
+        jax.block_until_ready(warm)
+        assert bool(jnp.all(warm.status == int(SolverStatus.CONVERGED)))
+        benchmark.extra_info["max_steps_used"] = int(jnp.max(warm.steps))
+
+        if mode == "solve":
+            fn = jax.jit(solve_batch)
+        else:
+            fn = jax.jit(jax.value_and_grad(lambda p: jnp.mean(solve_batch(p).fun)))
+
+        benchmark.extra_info["temp_mb"] = _temp_mb(fn.lower(p0))
+        jax.block_until_ready(fn(p0))
+
+        def run():
+            out = fn(p0)
+            jax.block_until_ready(out)
+            return out
+
+        benchmark.group = f"box-secant-{mode}-{dtype.__name__}"
         benchmark(run)

@@ -41,7 +41,7 @@ Any linear solver valid at \(\mu = 0\) can serve as `ad_solver`. When `ad_solver
 
 Carried `ridge`, `ridge_metric`, `preconditioner`, `homotopy`, `ineq_weight`, and `ineq_smoothing` values are detached via `jax.lax.stop_gradient`. Under `PDAS`, hard active sets (\(\tau = 0\), the default `tau_min=0` target) detach the indicator gate and differentiate the active branch, whereas positive terminal smoothing (\(\tau > 0\)) differentiates the full smoothed residual \(w_{\text{comp}}(m \tilde{a} + (1 - m)\tilde{b})\) including \(Dm\). Inactive exact inequalities contribute zero Jacobian rows, so automatic `ad_solver` routing uses rank-safe `SVD()` whenever an inequality block is present.
 
-Implicit AD differentiates results with `SolverStatus.CONVERGED` (plus `SolverStatus.MAX_STEPS` when `max_steps_is_success=True`). Failed solves return exact zero tangents for `result.x` and `result.aux`. Under `jax.vmap`, failed batch lanes evaluate the masked linear tangent program at detached copies of the initial `(x0, args, p)` so reverse-mode transposition remains finite across all lanes.
+Implicit AD differentiates results with `SolverStatus.CONVERGED` (plus `SolverStatus.MAX_STEPS` when `max_steps_is_success=True`). Failed solves return exact zero tangents for `result.x` and `result.aux`. Under `jax.vmap`, failed batch lanes evaluate the masked linear tangent program at detached copies of the initial `(x0, args, p)` so reverse-mode transposition remains finite across all lanes. For 1D box-constrained KKT sensitivities wrt `(lower, upper, p)`, see [Univariate Box Optimization](box_secant.md).
 
 ## References
 
