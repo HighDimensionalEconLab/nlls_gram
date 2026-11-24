@@ -25,7 +25,27 @@ from nlls_gram.types import (
     _cast_newton_hyper,
 )
 
-__all__ = ["Newton"]
+__all__ = ["Newton", "NewtonSettings"]
+
+
+@dataclasses.dataclass(frozen=True)
+class NewtonSettings:
+    """Scalar ``Newton`` arguments at their defaults, for command lines."""
+
+    ridge: float | None = None
+    jacobian_mode: str = "auto"
+    jacobian_chunk: int | None = None
+    c1: float = 1e-4
+    decrease_factor: float = 0.5
+    maxls: int = 30
+    max_stepsize: float = 1.0
+    linesearch_tol: float = 0.0
+    damping: float | None = None
+    damping_power: float = 1.5
+    min_damping: float = 1e-10
+    cache_jacobian: bool = False
+    geodesic_acceleration: bool = True
+    geodesic_acceptance_ratio: float = 0.75
 
 
 class Newton(SolverBase):

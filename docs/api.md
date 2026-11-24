@@ -3,7 +3,9 @@
 ## Solvers
 
 ::: nlls_gram.LevenbergMarquardt
+::: nlls_gram.LMSettings
 ::: nlls_gram.Newton
+::: nlls_gram.NewtonSettings
 ::: nlls_gram.BoxSecant
 ::: nlls_gram.AnnealRidge
 

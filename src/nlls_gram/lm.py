@@ -30,6 +30,7 @@ from nlls_gram.types import (
 __all__ = [
     "AnnealRidge",
     "CholeskyCache",
+    "LMSettings",
     "LevenbergMarquardt",
     "QRCache",
 ]
@@ -98,6 +99,26 @@ class AnnealRidge:
             ),
         }
         return SolverAction(state=new_state, user_state=new_user_state)
+
+
+@dataclass(frozen=True)
+class LMSettings:
+    """Scalar ``LevenbergMarquardt`` arguments at their defaults, for command lines."""
+
+    ridge: float | None = None
+    jacobian_mode: str = "auto"
+    jacobian_chunk: int | None = None
+    init_damping: float = 1e-4
+    damping_decrease: float = 0.2
+    damping_increase: float = 2.0
+    c1: float = 1e-4
+    decrease_factor: float = 0.5
+    maxls: int = 20
+    max_stepsize: float = 1.0
+    linesearch_tol: float = 0.0
+    cache_jacobian: bool = True
+    geodesic_acceleration: bool = True
+    geodesic_acceptance_ratio: float = 0.75
 
 
 class LevenbergMarquardt(SolverBase):

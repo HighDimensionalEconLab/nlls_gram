@@ -9,7 +9,7 @@ from nlls_gram.linear_solvers import (
     GramCG,
     QRCache,
 )
-from nlls_gram.lm import AnnealRidge, LevenbergMarquardt
+from nlls_gram.lm import AnnealRidge, LevenbergMarquardt, LMSettings
 from nlls_gram.metrics import (
     DiagonalRidge,
     FactorRidge,
@@ -19,7 +19,7 @@ from nlls_gram.metrics import (
     RidgeMetric,
 )
 from nlls_gram.multi_start import DrawNNXModule, MultiStart, MultiStartInfo
-from nlls_gram.newton import Newton
+from nlls_gram.newton import Newton, NewtonSettings
 from nlls_gram.preconditioners import (
     DiagonalPreconditioner,
     IdentityPreconditioner,
@@ -74,6 +74,7 @@ __all__ = [
     "InequalityPenalty",
     "LMHyperparams",
     "LMInfo",
+    "LMSettings",
     "LMState",
     "LevenbergMarquardt",
     "MatrixRidge",
@@ -83,6 +84,7 @@ __all__ = [
     "Newton",
     "NewtonHyperparams",
     "NewtonInfo",
+    "NewtonSettings",
     "NewtonState",
     "Preconditioner",
     "QRCache",
