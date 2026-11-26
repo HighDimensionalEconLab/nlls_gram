@@ -5,7 +5,8 @@
 - Use `LevenbergMarquardt` or `Newton` with positive `ridge` and a `ridge_metric` when minimizing a Tikhonov-regularized objective or continuing toward a minimum-seminorm interpolant with `AnnealRidge`.
 - Use `LevenbergMarquardt(residual_fn)` (`ridge=None`) when curved or ill-conditioned nonlinear least-squares problems benefit from adaptive step damping and rejected-step Jacobian reuse.
 - Use `Newton(residual_fn)` (`ridge=None`) when stateless residual-coupled damping (`damping=1e-3` by default, or `damping=0.0` for undamped Gauss-Newton) avoids repeated trial factorizations.
-- Use [`BoxSecant(fn)`](box_secant.md) when minimizing or maximizing a scalar objective over a 1D interval `[lower, upper]` (especially across large `vmap` batches or as an inner subproblem differentiated via `p`).
+- Use [`BoxSecant(fn)`](box_secant.md) when minimizing or maximizing a scalar objective over a known 1D interval `[lower, upper]` or when active corner shadow prices (`result.lm`) are needed.
+- Use [`ScalarNewton(fn)`](scalar_newton.md) when minimizing or maximizing an unconstrained 1D scalar objective from a warm start `x0` (especially with expensive neural-network objectives in `p` or open domains where guessing global bounds is unsafe).
 
 ## Linear solver capability matrix
 
@@ -43,6 +44,7 @@ Preconditioners never alter \(H_\mu d = -g\). Pass `DiagonalPreconditioner()` to
 
 - Traced across calls without recompilation: `atol`, `gtol`, `xtol`, `max_steps` (when `save_steps=False`), `p`, `args`, `ridge`, `damping`, `LMHyperparams`, `NewtonHyperparams`, and array leaves inside `RidgeMetric` and `Preconditioner` when static metadata such as `size` and `penalized_is_spd` remain unchanged. Construct `RidgeMetric` instances from concrete arrays on the host when `penalized_is_spd=True` is required for Gram routing.
 - Static (recompiles when changed): `residual_fn`, `linear_solver` class/form, `ad_solver` class/form, `jacobian_mode`, `jacobian_chunk`, `has_aux`, `cache_jacobian`, `geodesic_acceleration`, `callback`, array shapes, and `meta_fields` on `RidgeMetric` or `Preconditioner`.
+- Ahead-of-time compilation and memory inspection: call `compile_time, peak_bytes = solver.compile(x0, args, p=p, ...)` on `LevenbergMarquardt` or `Newton` to pre-compile the single-start solve loop into the in-memory JIT cache and query its XLA buffer allocation (`CompileInfo`) before timing `solver.solve(...)`.
 
 ## GPU `float32` matmul precision
 

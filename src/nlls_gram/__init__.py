@@ -25,14 +25,17 @@ from nlls_gram.preconditioners import (
     IdentityPreconditioner,
     Preconditioner,
 )
+from nlls_gram.scalar_newton import ScalarGlobalization, ScalarNewton, TrustRegion
 from nlls_gram.types import (
     PDAS,
     BoxSolveResult,
     CallbackContext,
+    CompileInfo,
     Complementarity,
     FischerBurmeister,
     Inequality,
     InequalityPenalty,
+    LagrangeMultipliers,
     LMHyperparams,
     LMInfo,
     LMState,
@@ -41,10 +44,12 @@ from nlls_gram.types import (
     NewtonInfo,
     NewtonState,
     Residuals,
+    ScalarSolveResult,
     SolverAction,
     SolverContext,
     SolveResult,
     SolverStatus,
+    TrustRegionInfo,
 )
 from nlls_gram.utilities import register_pytree_dataclass
 from nlls_gram.vmap_rows import vmap_rows
@@ -61,6 +66,7 @@ __all__ = [
     "CallbackContext",
     "Cholesky",
     "CholeskyCache",
+    "CompileInfo",
     "Complementarity",
     "DiagonalPreconditioner",
     "DiagonalRidge",
@@ -72,6 +78,7 @@ __all__ = [
     "IdentityRidge",
     "Inequality",
     "InequalityPenalty",
+    "LagrangeMultipliers",
     "LMHyperparams",
     "LMInfo",
     "LMSettings",
@@ -91,10 +98,15 @@ __all__ = [
     "RepeatedFactorRidge",
     "Residuals",
     "RidgeMetric",
+    "ScalarGlobalization",
+    "ScalarNewton",
+    "ScalarSolveResult",
     "SolveResult",
     "SolverAction",
     "SolverContext",
     "SolverStatus",
+    "TrustRegion",
+    "TrustRegionInfo",
     "register_pytree_dataclass",
     "vmap_rows",
 ]

@@ -2,7 +2,10 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from benchmarks.conftest import benchmark_batch_size, benchmark_direction_count
+from benchmarks.conftest import (
+    benchmark_batch_size,
+    benchmark_direction_count,
+)
 from nlls_gram import (
     CG,
     PDAS,
@@ -19,9 +22,12 @@ from nlls_gram import (
     Minimum,
     Newton,
     RepeatedFactorRidge,
+    ScalarNewton,
     SolverStatus,
     vmap_rows,
 )
+
+jax.config.update("jax_default_matmul_precision", "highest")
 
 
 def _temp_mb(lowered):
@@ -570,4 +576,88 @@ def test_box_secant_batched_bellman_solve_and_grad(
             return out
 
         benchmark.group = f"box-secant-{mode}-{dtype.__name__}"
+        benchmark(run)
+
+
+@pytest.mark.parametrize("start", ["cold", "warm"])
+@pytest.mark.parametrize("mode", ["solve", "value_and_grad"])
+@pytest.mark.parametrize("solver_name", ["scalar_newton", "box_secant"])
+def test_scalar_bellman_warm_vs_cold_solve_and_grad(
+    benchmark, device, dtype, solver_name, mode, start
+):
+    n_states, width, n_quad = (8192 if device.platform == "gpu" else 1024), 32, 5
+    with jax.default_device(device):
+        keys = jax.random.split(jax.random.key(17), 7)
+        states = jax.random.uniform(
+            keys[0], (n_states,), dtype=dtype, minval=0.35, maxval=2.0
+        )
+        quad_z = jnp.linspace(-1.5, 1.5, n_quad, dtype=dtype)
+        quad_w = jnp.array([0.1, 0.25, 0.3, 0.25, 0.1], dtype=dtype)
+        s = jnp.asarray(0.25, dtype=dtype)
+        p0 = {
+            "w1": s * jax.random.normal(keys[1], (1, width), dtype=dtype),
+            "b1": jnp.zeros((width,), dtype=dtype),
+            "w2": s * jax.random.normal(keys[2], (width, width), dtype=dtype),
+            "b2": jnp.zeros((width,), dtype=dtype),
+            "w3": s * jax.random.normal(keys[3], (width,), dtype=dtype),
+            "b3": jnp.zeros((), dtype=dtype),
+        }
+
+        def v_net(k, p):
+            h = jax.nn.silu(k[..., None] * p["w1"] + p["b1"])
+            h = jax.nn.silu(h @ p["w2"] + p["b2"])
+            return h @ p["w3"] + p["b3"]
+
+        def rhs(a, k, p):
+            flow = k**0.6 - a - 1.5 * (a**2) / k
+            k_next = 0.9 * k + a + 0.08 * quad_z
+            ev = jnp.sum(quad_w * v_net(k_next, p))
+            return flow + 0.95 * ev
+
+        ref = ScalarNewton(rhs, sense="max")
+        a_ref = jax.jit(
+            jax.vmap(lambda k: ref.solve(jnp.asarray(0.1, dtype=dtype), k, p=p0).x)
+        )(states)
+        x0_batch = (
+            jnp.full((n_states,), 0.25, dtype=dtype)
+            if start == "cold"
+            else a_ref + jnp.asarray(1e-3, dtype=dtype)
+        )
+
+        lo = jnp.asarray(-1.0, dtype=dtype)
+        hi = jnp.asarray(0.8, dtype=dtype)
+        if solver_name == "scalar_newton":
+            solver = ScalarNewton(rhs, sense="max")
+            solve_batch = lambda p: jax.vmap(  # noqa: E731
+                lambda x_i, k: solver.solve(x_i, k, p=p)
+            )(x0_batch, states)
+        else:
+            solver = BoxSecant(rhs, sense="max")
+            solve_batch = lambda p: jax.vmap(  # noqa: E731
+                lambda x_i, k: (
+                    solver.solve(lo, hi, k, p=p)
+                    if start == "cold"
+                    else solver.solve(lo, hi, k, x0=x_i, p=p)
+                )
+            )(x0_batch, states)
+
+        warm = jax.jit(solve_batch)(p0)
+        jax.block_until_ready(warm)
+        assert bool(jnp.all(warm.status == int(SolverStatus.CONVERGED)))
+        benchmark.extra_info["max_steps_used"] = int(jnp.max(warm.steps))
+
+        if mode == "solve":
+            fn = jax.jit(lambda p: solve_batch(p).x)
+        else:
+            fn = jax.jit(jax.value_and_grad(lambda p: jnp.mean(solve_batch(p).fun)))
+
+        benchmark.extra_info["temp_mb"] = _temp_mb(fn.lower(p0))
+        jax.block_until_ready(fn(p0))
+
+        def run():
+            out = fn(p0)
+            jax.block_until_ready(out)
+            return out
+
+        benchmark.group = f"scalar-bellman-{start}-{mode}-{dtype.__name__}"
         benchmark(run)

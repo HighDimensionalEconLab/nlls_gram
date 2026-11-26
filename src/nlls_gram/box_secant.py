@@ -4,9 +4,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from nlls_gram.types import BoxSolveResult, SolverStatus
+from nlls_gram.types import BoxSolveResult, LagrangeMultipliers, SolverStatus
 from nlls_gram.utilities import (
-    _mask_tangent_tree,
+    _broadcast_leading_condition,
     _static_key_component,
     _zero_tangent_leaf,
     canonicalize_residual,
@@ -40,13 +40,59 @@ def _explicit_float_dtypes(tree):
 
 
 def _infer_box_dtype(lower, upper, x0, args, p):
-    coord_dtypes = _explicit_float_dtypes((lower, upper, x0))
-    if coord_dtypes:
-        return jnp.result_type(*coord_dtypes)
-    param_dtypes = _explicit_float_dtypes((args, p))
-    if param_dtypes:
-        return jnp.result_type(*param_dtypes)
+    dtypes = _explicit_float_dtypes((lower, upper, x0, args, p))
+    if dtypes:
+        return jnp.result_type(*dtypes)
     return jnp.result_type(float)
+
+
+def _align_batched_leaf(is_b, leaf, coord_v):
+    if is_b and jnp.ndim(leaf) < coord_v.ndim:
+        leaf = jnp.reshape(
+            leaf,
+            (coord_v.shape[0],)
+            + (1,) * (coord_v.ndim - jnp.ndim(leaf))
+            + leaf.shape[1:],
+        )
+    return jnp.broadcast_to(leaf, coord_v.shape)
+
+
+def _safe_primal_tree(ad_success, tree):
+    def select(leaf):
+        if leaf is None:
+            return None
+        arr = jnp.asarray(leaf)
+        if not jnp.issubdtype(arr.dtype, jnp.inexact):
+            return leaf
+        if ad_success.ndim == 0 or (
+            arr.ndim >= ad_success.ndim
+            and arr.shape[: ad_success.ndim] == ad_success.shape
+        ):
+            cond = _broadcast_leading_condition(ad_success, arr)
+        else:
+            cond = jnp.any(ad_success)
+        return jnp.where(cond, arr, jax.lax.stop_gradient(arr))
+
+    return jax.tree.map(select, tree)
+
+
+def _safe_tangent_tree(ad_success, tangent):
+    def mask(leaf):
+        if leaf is None:
+            return None
+        arr = jnp.asarray(leaf)
+        if arr.dtype == jax.dtypes.float0:
+            return leaf
+        if ad_success.ndim == 0 or (
+            arr.ndim >= ad_success.ndim
+            and arr.shape[: ad_success.ndim] == ad_success.shape
+        ):
+            cond = _broadcast_leading_condition(ad_success, arr)
+        else:
+            cond = jnp.any(ad_success)
+        return jnp.where(cond, arr, jnp.zeros_like(arr))
+
+    return jax.tree.map(mask, tangent)
 
 
 def _secant_curv(x, g, xp, gp):
@@ -71,7 +117,7 @@ def _kkt_converged(x, a0, b0, lo, hi, g, curv, dx_abs, xtol, rtol, gtol):
     return at_lo_ok | at_hi_ok | grad_ok | bracket_ok | step_ok
 
 
-def _safeguarded_step(x, a0, b0, lo, hi, g, curv, prev_span, is_first_step):
+def _safeguarded_step(x, a0, b0, lo, hi, g, curv, prev_span, tried_lo, tried_hi):
     lo_n = jnp.where(g < 0, jnp.maximum(lo, x), lo)
     hi_n = jnp.where(g > 0, jnp.minimum(hi, x), hi)
     mid = 0.5 * (lo_n + hi_n)
@@ -84,13 +130,13 @@ def _safeguarded_step(x, a0, b0, lo, hi, g, curv, prev_span, is_first_step):
     x_proj = jnp.clip(x + raw_step, lo_n, hi_n)
 
     strictly_in = (x_proj > lo_n) & (x_proj < hi_n)
-    first_lo_hit = (x_proj == a0) & (x > a0) & (lo_n == a0)
-    first_hi_hit = (x_proj == b0) & (x < b0) & (hi_n == b0)
+    first_lo_hit = (x_proj == a0) & (x > a0) & (lo_n == a0) & (~tried_lo)
+    first_hi_hit = (x_proj == b0) & (x < b0) & (hi_n == b0) & (~tried_hi)
     fast_enough = jnp.abs(x_proj - x) <= 0.5 * prev_span
     use_secant = pos_curv & ((strictly_in & fast_enough) | first_lo_hit | first_hi_hit)
 
-    can_jump_lo = is_first_step & (~pos_curv) & (g >= 0) & (lo_n == a0) & (x > a0)
-    can_jump_hi = is_first_step & (~pos_curv) & (g <= 0) & (hi_n == b0) & (x < b0)
+    can_jump_lo = (~tried_lo) & (~pos_curv) & (g >= 0) & (lo_n == a0) & (x > a0)
+    can_jump_hi = (~tried_hi) & (~pos_curv) & (g <= 0) & (hi_n == b0) & (x < b0)
     fallback = jnp.where(can_jump_lo, a0, jnp.where(can_jump_hi, b0, bis))
 
     x_next = jnp.where(use_secant, x_proj, fallback)
@@ -104,23 +150,30 @@ def _run_secant_loop(
     xtol_a = jnp.asarray(xtol, dtype=dtype)
     rtol_a = jnp.asarray(rtol, dtype=dtype)
     gtol_a = jnp.asarray(gtol, dtype=dtype)
-    max_s = jnp.asarray(max_steps, dtype=jnp.int32)
+    max_s_lane = jnp.broadcast_to(jnp.asarray(max_steps, dtype=jnp.int32), a0.shape)
+    max_s = jnp.max(max_s_lane) if a0.size > 0 else jnp.asarray(0, dtype=jnp.int32)
     span0 = jnp.maximum(b0 - a0, jnp.zeros_like(a0))
+    b_clip = jnp.maximum(a0, b0)
 
     if has_x0:
         one = jnp.ones_like(a0)
-        x_init = jnp.clip(jnp.asarray(x0_in, dtype=dtype), a0, b0)
+        x_init = jnp.clip(jnp.asarray(x0_in, dtype=dtype), a0, b_clip)
         f_init, g_init = vg_fn(x_init)
         delta = jnp.asarray(0.03125, dtype=dtype) * span0
-        inward_dir = jnp.where(x_init - a0 <= b0 - x_init, one, -one)
+        inward_dir = jnp.where(x_init - a0 <= b_clip - x_init, one, -one)
         desc_dir = jnp.where(g_init > 0, -one, jnp.where(g_init < 0, one, inward_dir))
         cand_second = x_init + desc_dir * delta
-        out_of_box = (cand_second < a0) | (cand_second > b0)
+        out_of_box = (cand_second < a0) | (cand_second > b_clip)
         x_second = jnp.where(
-            out_of_box, jnp.clip(x_init - desc_dir * delta, a0, b0), cand_second
+            out_of_box, jnp.clip(x_init - desc_dir * delta, a0, b_clip), cand_second
         )
         f_second, g_second = vg_fn(x_second)
-        pick_second = f_second < f_init
+        second_end_kkt = ((x_second <= a0) & (g_second >= -gtol_a)) | (
+            (x_second >= b_clip) & (g_second <= gtol_a)
+        )
+        pick_second = (f_second < f_init) | (
+            (f_second == f_init) & second_end_kkt & (x_init > a0) & (x_init < b_clip)
+        )
         x_start = jnp.where(pick_second, x_second, x_init)
         f_start = jnp.where(pick_second, f_second, f_init)
         g_start = jnp.where(pick_second, g_second, g_init)
@@ -140,6 +193,8 @@ def _run_secant_loop(
 
     dx_inf = jnp.full_like(a0, jnp.inf)
     steps0 = jnp.zeros(a0.shape, dtype=jnp.int32)
+    tried_lo0 = (x_start <= a0) | (xp_start <= a0)
+    tried_hi0 = (x_start >= b0) | (xp_start >= b0)
 
     if use_fori:
 
@@ -157,32 +212,45 @@ def _run_secant_loop(
                 f_best,
                 x_best,
                 g_best,
+                tried_lo,
+                tried_hi,
                 steps,
             ) = carry
             curv = _secant_curv(x, g, xp, gp)
             conv = _kkt_converged(
                 x, a0, b0, lo, hi, g, curv, dx_abs, xtol_a, rtol_a, gtol_a
             )
-            active = (~conv) & jnp.isfinite(f_val) & jnp.isfinite(g) & (a0 < b0)
+            active = (
+                (~conv)
+                & (steps < max_s_lane)
+                & jnp.isfinite(f_val)
+                & jnp.isfinite(g)
+                & (a0 < b0)
+            )
             x_cand, lo_n, hi_n, span_n = _safeguarded_step(
-                x, a0, b0, lo, hi, g, curv, prev_span, steps == 0
+                x, a0, b0, lo, hi, g, curv, prev_span, tried_lo, tried_hi
             )
             x_eval = jnp.where(active, x_cand, x)
             f_n, g_n = vg_fn(x_eval)
-            better = active & (f_n <= f_best)
+            cand_fin = jnp.isfinite(f_n) & jnp.isfinite(g_n)
+            hit_end = (x_cand <= a0) | (x_cand >= b0)
+            accept_eval = active & (cand_fin | (~hit_end))
+            better = accept_eval & cand_fin & (f_n <= f_best)
             return (
-                x_eval,
-                jnp.where(active, f_n, f_val),
-                jnp.where(active, g_n, g),
-                jnp.where(active, x, xp),
-                jnp.where(active, g, gp),
+                jnp.where(accept_eval, x_cand, x),
+                jnp.where(accept_eval, f_n, f_val),
+                jnp.where(accept_eval, g_n, g),
+                jnp.where(accept_eval, x, xp),
+                jnp.where(accept_eval, g, gp),
                 jnp.where(active, lo_n, lo),
                 jnp.where(active, hi_n, hi),
                 jnp.where(active, span_n, prev_span),
-                jnp.where(active, jnp.abs(x_cand - x), dx_abs),
+                jnp.where(accept_eval, jnp.abs(x_cand - x), dx_abs),
                 jnp.where(better, f_n, f_best),
                 jnp.where(better, x_eval, x_best),
                 jnp.where(better, g_n, g_best),
+                jnp.where(active, tried_lo | (x_cand <= a0), tried_lo),
+                jnp.where(active, tried_hi | (x_cand >= b0), tried_hi),
                 jnp.where(active, steps + 1, steps),
             )
 
@@ -199,6 +267,8 @@ def _run_secant_loop(
             f_best,
             x_best,
             g_best,
+            _,
+            _,
             steps,
         ) = jax.lax.fori_loop(
             0,
@@ -217,6 +287,8 @@ def _run_secant_loop(
                 f_start,
                 x_start,
                 g_start,
+                tried_lo0,
+                tried_hi0,
                 steps0,
             ),
         )
@@ -237,13 +309,21 @@ def _run_secant_loop(
                 _,
                 _,
                 _,
+                _,
+                steps,
                 loop_s,
             ) = carry
             curv = _secant_curv(x, g, xp, gp)
             conv = _kkt_converged(
                 x, a0, b0, lo, hi, g, curv, dx_abs, xtol_a, rtol_a, gtol_a
             )
-            active = (~conv) & jnp.isfinite(f_val) & jnp.isfinite(g) & (a0 < b0)
+            active = (
+                (~conv)
+                & (steps < max_s_lane)
+                & jnp.isfinite(f_val)
+                & jnp.isfinite(g)
+                & (a0 < b0)
+            )
             return (loop_s < max_s) & jnp.any(active)
 
         def body_while(carry):
@@ -260,6 +340,8 @@ def _run_secant_loop(
                 f_best,
                 x_best,
                 g_best,
+                tried_lo,
+                tried_hi,
                 steps,
                 loop_s,
             ) = carry
@@ -267,26 +349,37 @@ def _run_secant_loop(
             conv = _kkt_converged(
                 x, a0, b0, lo, hi, g, curv, dx_abs, xtol_a, rtol_a, gtol_a
             )
-            active = (~conv) & jnp.isfinite(f_val) & jnp.isfinite(g) & (a0 < b0)
+            active = (
+                (~conv)
+                & (steps < max_s_lane)
+                & jnp.isfinite(f_val)
+                & jnp.isfinite(g)
+                & (a0 < b0)
+            )
             x_cand, lo_n, hi_n, span_n = _safeguarded_step(
-                x, a0, b0, lo, hi, g, curv, prev_span, steps == 0
+                x, a0, b0, lo, hi, g, curv, prev_span, tried_lo, tried_hi
             )
             x_eval = jnp.where(active, x_cand, x)
             f_n, g_n = vg_fn(x_eval)
-            better = active & (f_n <= f_best)
+            cand_fin = jnp.isfinite(f_n) & jnp.isfinite(g_n)
+            hit_end = (x_cand <= a0) | (x_cand >= b0)
+            accept_eval = active & (cand_fin | (~hit_end))
+            better = accept_eval & cand_fin & (f_n <= f_best)
             return (
-                x_eval,
-                jnp.where(active, f_n, f_val),
-                jnp.where(active, g_n, g),
-                jnp.where(active, x, xp),
-                jnp.where(active, g, gp),
+                jnp.where(accept_eval, x_cand, x),
+                jnp.where(accept_eval, f_n, f_val),
+                jnp.where(accept_eval, g_n, g),
+                jnp.where(accept_eval, x, xp),
+                jnp.where(accept_eval, g, gp),
                 jnp.where(active, lo_n, lo),
                 jnp.where(active, hi_n, hi),
                 jnp.where(active, span_n, prev_span),
-                jnp.where(active, jnp.abs(x_cand - x), dx_abs),
+                jnp.where(accept_eval, jnp.abs(x_cand - x), dx_abs),
                 jnp.where(better, f_n, f_best),
                 jnp.where(better, x_eval, x_best),
                 jnp.where(better, g_n, g_best),
+                jnp.where(active, tried_lo | (x_cand <= a0), tried_lo),
+                jnp.where(active, tried_hi | (x_cand >= b0), tried_hi),
                 jnp.where(active, steps + 1, steps),
                 loop_s + jnp.asarray(1, dtype=jnp.int32),
             )
@@ -304,6 +397,8 @@ def _run_secant_loop(
             f_best,
             x_best,
             g_best,
+            _,
+            _,
             steps,
             _,
         ) = jax.lax.while_loop(
@@ -322,6 +417,8 @@ def _run_secant_loop(
                 f_start,
                 x_start,
                 g_start,
+                tried_lo0,
+                tried_hi0,
                 steps0,
                 jnp.asarray(0, dtype=jnp.int32),
             ),
@@ -397,11 +494,10 @@ def _make_secant_primal(jet_fn, sign_float, use_fori, has_x0):
             x0_v = x0 if b_x0 else jnp.broadcast_to(x0, (axis_size, *jnp.shape(x0)))
         else:
             x0_v = None
-        expand_axes = tuple(range(1, lo_v.ndim))
-        xtol_v = jnp.expand_dims(xtol, expand_axes) if b_xtol else xtol
-        rtol_v = jnp.expand_dims(rtol, expand_axes) if b_rtol else rtol
-        gtol_v = jnp.expand_dims(gtol, expand_axes) if b_gtol else gtol
-        max_v = jnp.max(max_steps) if b_max else max_steps
+        xtol_v = _align_batched_leaf(b_xtol, xtol, lo_v)
+        rtol_v = _align_batched_leaf(b_rtol, rtol, lo_v)
+        gtol_v = _align_batched_leaf(b_gtol, gtol, lo_v)
+        max_v = _align_batched_leaf(b_max, max_steps, lo_v)
         args_axes = jax.tree.map(lambda is_b: 0 if is_b else None, b_args)
         p_axes = jax.tree.map(lambda is_b: 0 if is_b else None, b_p)
         next_jet = jax.vmap(jet_fn, in_axes=(0, args_axes, p_axes, None))
@@ -445,7 +541,8 @@ def _solve_box_secant(
     def f_only(z, ac_val, p_val):
         a_val, c_vals = ac_val
         out = fn_pure(z, a_val, c_vals, p_val)
-        return out[0] if has_aux else out
+        val = out[0] if has_aux else out
+        return jnp.asarray(val, dtype=z.dtype)
 
     def scalar_jet(x, ac_val, p_val, sign):
         return jax.jvp(
@@ -535,12 +632,24 @@ def _solve_box_secant(
                 ),
             )
 
+            at_internal_seam = ((sub_x <= edges[:-1]) & (edges[:-1] > lo_b)) | (
+                (sub_x >= edges[1:]) & (edges[1:] < hi_b)
+            )
+            seam_grad_ok = (gtol_b > 0) & (jnp.abs(sign * sub_g) <= gtol_b)
+            conv_code = jnp.asarray(SolverStatus.CONVERGED, dtype=jnp.int32)
+            max_code = jnp.asarray(SolverStatus.MAX_STEPS, dtype=jnp.int32)
+            sub_status_outer = jnp.where(
+                at_internal_seam & (~seam_grad_ok) & (sub_status == conv_code),
+                max_code,
+                sub_status,
+            )
+
             cand_x = jnp.concatenate([pts_extra, sub_x], axis=0)
             cand_h = jnp.concatenate([h_extra, sign * sub_f], axis=0)
             cand_f = jnp.concatenate([f_extra, sub_f], axis=0)
             cand_g = jnp.concatenate([g_extra, sub_g], axis=0)
             cand_bw = jnp.concatenate([bw_extra, sub_bw], axis=0)
-            cand_status = jnp.concatenate([status_extra, sub_status], axis=0)
+            cand_status = jnp.concatenate([status_extra, sub_status_outer], axis=0)
 
             cand_fin = cand_status != jnp.asarray(
                 SolverStatus.NONFINITE, dtype=jnp.int32
@@ -562,11 +671,32 @@ def _solve_box_secant(
                 jnp.zeros_like(sub_steps[0]),
                 jnp.max(sub_steps, axis=0),
             )
+        sign_arr = jnp.asarray(sign_float, dtype=x_star.dtype)
+        g_h_star = sign_arr * g_star
+        gtol_b_star = jnp.broadcast_to(gtol_in, x_star.shape)
+        zero_x = jnp.zeros_like(x_star)
+        fin_star = (
+            status != jnp.asarray(SolverStatus.NONFINITE, dtype=jnp.int32)
+        ) & jnp.isfinite(g_h_star)
+        deg_star = lo_in >= hi_in
+        at_lo_star = (~deg_star) & (x_star <= lo_in) & (g_h_star >= -gtol_b_star)
+        at_hi_star = (~deg_star) & (x_star >= hi_in) & (g_h_star <= gtol_b_star)
+        lm_lo_act = at_lo_star | (deg_star & (g_h_star >= zero_x))
+        lm_hi_act = at_hi_star | (deg_star & (g_h_star < zero_x))
+        lm_star = LagrangeMultipliers(
+            lower=jnp.where(
+                fin_star & lm_lo_act, jnp.maximum(g_h_star, zero_x), zero_x
+            ),
+            upper=jnp.where(
+                fin_star & lm_hi_act, jnp.maximum(-g_h_star, zero_x), zero_x
+            ),
+        )
         aux = fn_pure(x_star, args_in, consts_in, p_in)[1] if has_aux else None
         return BoxSolveResult(
             x=x_star,
             fun=f_star,
             grad=g_star,
+            lm=lm_star,
             bracket_width=bw_star,
             steps=steps,
             status=status,
@@ -590,10 +720,12 @@ def _solve_box_secant(
                 res.status == jnp.asarray(SolverStatus.MAX_STEPS, dtype=jnp.int32)
             )
 
-        mid_fallback = jnp.where(
-            jnp.isfinite(lo_in) & jnp.isfinite(hi_in),
-            0.5 * (lo_in + hi_in),
-            jnp.zeros_like(res.x),
+        mid_fallback = jax.lax.stop_gradient(
+            jnp.where(
+                jnp.isfinite(lo_in) & jnp.isfinite(hi_in),
+                0.5 * (lo_in + hi_in),
+                jnp.zeros_like(res.x),
+            )
         )
         x_safe = jnp.where(ad_success & jnp.isfinite(res.x), res.x, mid_fallback)
         lo_safe = jnp.where(
@@ -602,56 +734,84 @@ def _solve_box_secant(
         hi_safe = jnp.where(
             ad_success & jnp.isfinite(hi_in), hi_in, jnp.ones_like(hi_in)
         )
+        p_safe = _safe_primal_tree(ad_success, p_in)
 
         ad_lo_dot = jnp.where(ad_success, lo_dot, jnp.zeros_like(lo_dot))
         ad_hi_dot = jnp.where(ad_success, hi_dot, jnp.zeros_like(hi_dot))
-        ad_p_dot = _mask_tangent_tree(ad_success, p_dot)
+        ad_p_dot = _safe_tangent_tree(ad_success, p_dot)
+
+        one_x = jnp.ones_like(x_safe)
 
         def val_and_slope(x_val, p_val):
-            return jax.jvp(
-                lambda z: f_only(z, ac_in, p_val), (x_val,), (jnp.ones_like(x_val),)
-            )
+            return jax.jvp(lambda z: f_only(z, ac_in, p_val), (x_val,), (one_x,))
 
-        (_, g_f), lin_fg = jax.linearize(val_and_slope, x_safe, p_in)
-        zero_p = jax.tree.map(_zero_tangent_leaf, p_in)
-        _, f_xx = lin_fg(jnp.ones_like(x_safe), zero_p)
-        f_p_dot, f_xp_dot = lin_fg(jnp.zeros_like(x_safe), ad_p_dot)
+        (_, g_f), (_, f_xx) = jax.jvp(
+            lambda z: val_and_slope(z, p_safe), (x_safe,), (one_x,)
+        )
+        _, f_p_dot = jax.jvp(
+            lambda pv: f_only(x_safe, ac_in, pv), (p_safe,), (ad_p_dot,)
+        )
+        _, f_xp_dot = jax.jvp(
+            lambda pv: val_and_slope(x_safe, pv)[1], (p_safe,), (ad_p_dot,)
+        )
 
         sign = jnp.asarray(sign_float, dtype=x_safe.dtype)
         g_h = sign * g_f
         gtol_safe = jnp.where(jnp.isfinite(gtol_in), gtol_in, jnp.zeros_like(gtol_in))
+        zero_g = jnp.zeros_like(res.grad)
 
         deg = lo_safe >= hi_safe
+        deg_hi = deg & (g_h < zero_g)
+        deg_lo = deg & (~deg_hi)
         at_lower = (~deg) & (x_safe <= lo_safe) & (g_h >= -gtol_safe)
         at_upper = (~deg) & (x_safe >= hi_safe) & (g_h <= gtol_safe)
-        interior = (~(deg | at_lower | at_upper)) & ad_success
+        on_bound = deg | at_lower | at_upper
+        interior = (~on_bound) & ad_success
         nonzero_f_xx = interior & (f_xx != 0)
-        safe_f_xx = jnp.where(nonzero_f_xx, f_xx, jnp.ones_like(f_xx))
+        safe_f_xx = jnp.where(nonzero_f_xx, f_xx, one_x)
         interior_dot = jnp.where(
             nonzero_f_xx, -f_xp_dot / safe_f_xx, jnp.zeros_like(x_safe)
         )
 
+        bound_x_dot = jnp.where(
+            deg_lo | at_lower,
+            ad_lo_dot,
+            jnp.where(deg_hi | at_upper, ad_hi_dot, jnp.zeros_like(x_safe)),
+        )
         x_dot = jnp.where(
             ~ad_success,
             jnp.zeros_like(x_safe),
-            jnp.where(
-                deg | at_lower,
-                ad_lo_dot,
-                jnp.where(at_upper, ad_hi_dot, interior_dot),
-            ),
+            jnp.where(on_bound, bound_x_dot, interior_dot),
         )
-        fun_dot = jnp.where(ad_success, g_f * x_dot + f_p_dot, jnp.zeros_like(res.fun))
-        grad_dot = jnp.where(
-            ad_success, f_xx * x_dot + f_xp_dot, jnp.zeros_like(res.grad)
+        safe_f_xx_bnd = jnp.where(jnp.isfinite(f_xx), f_xx, zero_g)
+        if max_steps_is_success:
+            fun_dot = jnp.where(
+                ad_success, g_f * x_dot + f_p_dot, jnp.zeros_like(res.fun)
+            )
+            grad_dot = jnp.where(ad_success, safe_f_xx_bnd * x_dot + f_xp_dot, zero_g)
+        else:
+            fun_dot = jnp.where(
+                ad_success,
+                jnp.where(on_bound, g_f * bound_x_dot + f_p_dot, f_p_dot),
+                jnp.zeros_like(res.fun),
+            )
+            bound_grad_dot = safe_f_xx_bnd * bound_x_dot + f_xp_dot
+            grad_dot = jnp.where(ad_success & on_bound, bound_grad_dot, zero_g)
+        bound_lm_dot = safe_f_xx_bnd * bound_x_dot + f_xp_dot
+        lm_lo_active = (at_lower | deg_lo) & (g_h > zero_g)
+        lm_hi_active = (at_upper | deg_hi) & (g_h < zero_g)
+        lm_dot = LagrangeMultipliers(
+            lower=jnp.where(ad_success & lm_lo_active, sign * bound_lm_dot, zero_g),
+            upper=jnp.where(ad_success & lm_hi_active, -sign * bound_lm_dot, zero_g),
         )
 
         if has_aux:
             _, raw_aux_dot = jax.jvp(
                 lambda x_val, p_val: fn_pure(x_val, args_in, consts_in, p_val)[1],
-                (x_safe, p_in),
+                (x_safe, p_safe),
                 (x_dot, ad_p_dot),
             )
-            aux_dot = _mask_tangent_tree(ad_success, raw_aux_dot)
+            aux_dot = _safe_tangent_tree(ad_success, raw_aux_dot)
         else:
             aux_dot = None
 
@@ -659,6 +819,7 @@ def _solve_box_secant(
             x=x_dot,
             fun=fun_dot,
             grad=grad_dot,
+            lm=lm_dot,
             bracket_width=jnp.zeros_like(res.bracket_width),
             steps=_zero_tangent_leaf(res.steps),
             status=_zero_tangent_leaf(res.status),
@@ -766,7 +927,8 @@ class BoxSecant:
         ``4 * eps`` for the inferred floating dtype. ``num_starts > 1``
         partitions ``[lower, upper]`` into uniform sub-boxes (plus exact grid
         edges and optional ``x0``) in a single fused loop. Returned ``x``,
-        ``fun``, ``grad``, and ``aux`` support implicit AD wrt ``(lower, upper, p)``.
+        ``fun``, ``grad``, ``lm``, and ``aux`` support implicit AD wrt
+        ``(lower, upper, p)``.
         """
         self._check_fn_args(args, p)
         if isinstance(num_starts, bool) or int(num_starts) < 1:
@@ -776,10 +938,15 @@ class BoxSecant:
         if eff_loop not in ("while", "fori"):
             raise ValueError(f"loop must be 'while' or 'fori', got {eff_loop!r}")
         dtype = _infer_box_dtype(lower, upper, x0, args, p)
-        lo = jnp.asarray(lower, dtype=dtype)
-        hi = jnp.asarray(upper, dtype=dtype)
+        lo, hi = jnp.broadcast_arrays(
+            jnp.asarray(lower, dtype=dtype), jnp.asarray(upper, dtype=dtype)
+        )
         has_x0 = x0 is not None
-        x0_arr = None if not has_x0 else jnp.asarray(x0, dtype=dtype)
+        x0_arr = (
+            None
+            if not has_x0
+            else jnp.broadcast_to(jnp.asarray(x0, dtype=dtype), lo.shape)
+        )
         xtol_arr = jnp.asarray(
             _default_xtol(dtype) if xtol is None else xtol, dtype=dtype
         )

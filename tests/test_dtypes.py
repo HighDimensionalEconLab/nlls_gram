@@ -13,6 +13,7 @@ from nlls_gram import (
     QR,
     SVD,
     AnnealRidge,
+    BoxSecant,
     Cholesky,
     Complementarity,
     DiagonalPreconditioner,
@@ -29,6 +30,7 @@ from nlls_gram import (
     MultiStart,
     Newton,
     RepeatedFactorRidge,
+    ScalarNewton,
     SolverAction,
     SolverStatus,
 )
@@ -98,6 +100,7 @@ def test_float32_purity_and_highest_matmul_precision(solver_cls, ls):
 
 
 def _run_x64_checks():
+    jax.config.update("jax_default_matmul_precision", "highest")
     assert jax.config.jax_enable_x64
     # 1. Five-way step agreement (Cholesky, QR, CG) to 1e-9 in float64
     m, block, repeats, free = 5, 4, 2, 2
@@ -354,6 +357,35 @@ def _run_x64_checks():
         bad32 = promotions(str(jpr32))
         assert not bad32, f"Complementarity {cfg} promoted to f64: {bad32}"
 
+    # 8. BoxSecant (.lm) and ScalarNewton float64 precision and float32 non-promotion
+    bs64 = BoxSecant(lambda x, _, p: 0.5 * (x - p) ** 2)
+    r_bs64 = bs64.solve(jnp.float64(0.2), jnp.float64(1.0), p=jnp.float64(-0.3))
+    assert r_bs64.x.dtype == jnp.float64 and r_bs64.lm.lower.dtype == jnp.float64
+    np.testing.assert_allclose(r_bs64.lm.lower, 0.5, atol=1e-13)
+
+    sn64 = ScalarNewton(lambda x, _, p: 0.5 * (x - p) ** 2 + 0.1 * jnp.cosh(x - p))
+    r_sn64 = sn64.solve(jnp.float64(0.0), p=jnp.float64(0.7))
+    assert r_sn64.x.dtype == jnp.float64 and r_sn64.curv.dtype == jnp.float64
+    np.testing.assert_allclose(r_sn64.x, 0.7, atol=1e-13)
+    assert abs(float(r_sn64.grad)) <= 1e-12
+
+    p32 = jnp.float32(0.4)
+    bs_f32 = lambda p: (  # noqa: E731
+        bs64.solve(jnp.float32(0.5), jnp.float32(1.0), p=p).lm.lower
+    )
+    sn_f32 = lambda p: sn64.solve(jnp.float32(0.1), p=p).x  # noqa: E731
+    for label, fn32 in (("BoxSecant.lm", bs_f32), ("ScalarNewton", sn_f32)):
+        for mode, jpr in (
+            ("primal", jax.make_jaxpr(fn32)(p32)),
+            (
+                "jvp",
+                jax.make_jaxpr(lambda p, f=fn32: jax.jvp(f, (p,), (p32,))[1])(p32),
+            ),
+            ("vjp", jax.make_jaxpr(lambda p, f=fn32: jax.grad(f)(p))(p32)),
+        ):
+            bad_s = promotions(str(jpr))
+            assert not bad_s, f"{label} [{mode}] promoted to f64: {bad_s}"
+
 
 def test_float64_and_x64_nonpromotion_in_subprocess():
     subprocess.run(
@@ -362,6 +394,10 @@ def test_float64_and_x64_nonpromotion_in_subprocess():
             "-c",
             "from tests.test_dtypes import _run_x64_checks; _run_x64_checks()",
         ],
-        env={**os.environ, "JAX_ENABLE_X64": "1"},
+        env={
+            **os.environ,
+            "JAX_ENABLE_X64": "1",
+            "JAX_DEFAULT_MATMUL_PRECISION": "highest",
+        },
         check=True,
     )

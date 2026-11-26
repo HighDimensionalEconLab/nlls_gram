@@ -13,7 +13,7 @@ reporting `info.loss` as \(2 F_\rho(\theta)\).
 | `LevenbergMarquardt` | Stateful scalar damping adapted from accepted Armijo step length | Armijo backtracking (optional geodesic acceleration) |
 | `Newton` | Optional stateless residual-coupled damping \(\propto \|r(\theta_k)\|_2^p\) (or \(\mu_k = 0\)) | Armijo backtracking (optional geodesic acceleration) |
 
-For univariate box-constrained optimization over `[lower, upper]`, [`BoxSecant`](box_secant.md) combines forward-mode directional derivatives with projected secant steps safeguarded by bisection, fused `vmap` batching, deterministic `num_starts` sub-box partitioning, and box-aware implicit differentiation.
+For univariate scalar optimization, [`BoxSecant`](box_secant.md) solves box-constrained problems over `[lower, upper]` (returning primal optima and corner `LagrangeMultipliers`), and [`ScalarNewton`](scalar_newton.md) solves unconstrained 1D problems from an initial guess `x0` using second-order forward jets and pluggable `TrustRegion` globalization. Both support fused `vmap` batching and implicit differentiation.
 
 ## Residual interface
 

@@ -7,6 +7,9 @@
 ::: nlls_gram.Newton
 ::: nlls_gram.NewtonSettings
 ::: nlls_gram.BoxSecant
+::: nlls_gram.ScalarNewton
+::: nlls_gram.ScalarGlobalization
+::: nlls_gram.TrustRegion
 ::: nlls_gram.AnnealRidge
 
 ## Linear solvers
@@ -56,7 +59,11 @@
 ::: nlls_gram.SolverAction
 ::: nlls_gram.CallbackContext
 ::: nlls_gram.SolveResult
+::: nlls_gram.CompileInfo
 ::: nlls_gram.BoxSolveResult
+::: nlls_gram.LagrangeMultipliers
+::: nlls_gram.ScalarSolveResult
+::: nlls_gram.TrustRegionInfo
 ::: nlls_gram.SolverContext
 ::: nlls_gram.LMState
 ::: nlls_gram.LMInfo

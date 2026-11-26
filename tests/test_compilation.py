@@ -10,6 +10,7 @@ from nlls_gram import (
     QR,
     AnnealRidge,
     Cholesky,
+    CompileInfo,
     DiagonalPreconditioner,
     DiagonalRidge,
     FactorRidge,
@@ -260,3 +261,55 @@ def test_preconditioner_and_hyper_schedule_in_callback():
     np.testing.assert_allclose(
         scheduled.state.preconditioner.diagonal, dual_diag, rtol=1e-6
     )
+
+
+@pytest.mark.parametrize("solver_cls", [LevenbergMarquardt, Newton])
+def test_solver_compile_warms_jit_cache_and_reports_memory(solver_cls):
+    traces = 0
+
+    def counted_residual(x, args, p):
+        nonlocal traces
+        traces += 1
+        return A @ x - p["b"]
+
+    solver = solver_cls(counted_residual, linear_solver=Cholesky())
+    x0 = jnp.zeros(N, dtype=jnp.float32)
+    p0 = make_p(1.0)
+
+    info = solver.compile(x0, p=p0, max_steps=20, atol=1e-6)
+    assert isinstance(info, CompileInfo)
+    compile_time, peak_bytes = info
+    assert isinstance(compile_time, float) and compile_time > 0.0
+    assert isinstance(peak_bytes, int) and peak_bytes > 0
+
+    traces_after_compile = traces
+    res = solver.solve(x0, p=p0, max_steps=20, atol=1e-6)
+    assert int(res.status) == int(SolverStatus.CONVERGED)
+    assert traces == traces_after_compile
+    assert compilations() == 1
+
+    def count_cb(ctx):
+        return SolverAction(user_state=ctx.user_state + jnp.int32(1))
+
+    info_cb = solver.compile(
+        x0,
+        p=p0,
+        max_steps=12,
+        atol=1e-6,
+        callback=count_cb,
+        user_state=jnp.int32(0),
+        save_steps=True,
+    )
+    assert info_cb.peak_bytes > 0
+    traces_after_cb_compile = traces
+    res_cb = solver.solve(
+        x0,
+        p=p0,
+        max_steps=12,
+        atol=1e-6,
+        callback=count_cb,
+        user_state=jnp.int32(0),
+        save_steps=True,
+    )
+    assert int(res_cb.status) == int(SolverStatus.CONVERGED)
+    assert traces == traces_after_cb_compile

@@ -1,6 +1,6 @@
 import enum
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +9,7 @@ __all__ = [
     "PDAS",
     "BoxSolveResult",
     "CallbackContext",
+    "CompileInfo",
     "Complementarity",
     "FischerBurmeister",
     "Inequality",
@@ -16,15 +17,18 @@ __all__ = [
     "LMHyperparams",
     "LMInfo",
     "LMState",
+    "LagrangeMultipliers",
     "Minimum",
     "NewtonHyperparams",
     "NewtonInfo",
     "NewtonState",
     "Residuals",
+    "ScalarSolveResult",
     "SolveResult",
     "SolverAction",
     "SolverContext",
     "SolverStatus",
+    "TrustRegionInfo",
 ]
 
 
@@ -164,6 +168,13 @@ class CallbackContext:
     info: Any
 
 
+class CompileInfo(NamedTuple):
+    """Compilation wall time and XLA memory footprint returned by ``compile``."""
+
+    compile_time: float
+    peak_bytes: int
+
+
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class SolveResult:
@@ -186,17 +197,53 @@ class SolveResult:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
+class LagrangeMultipliers:
+    """Nonnegative KKT shadow prices for active lower and upper box bounds."""
+
+    lower: jax.Array
+    upper: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
 class BoxSolveResult:
     """Result returned by ``BoxSecant.solve``."""
 
     x: jax.Array
     fun: jax.Array
     grad: jax.Array
+    lm: LagrangeMultipliers
     bracket_width: jax.Array
     steps: jax.Array
     status: jax.Array
     lower: jax.Array
     upper: jax.Array
+    args: Any = None
+    p: Any = None
+    aux: Any = None
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class TrustRegionInfo:
+    """Diagnostics carried in ``ScalarSolveResult.info`` under ``TrustRegion``."""
+
+    radius: jax.Array
+    step_norm: jax.Array
+
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class ScalarSolveResult:
+    """Result returned by ``ScalarNewton.solve``."""
+
+    x: jax.Array
+    fun: jax.Array
+    grad: jax.Array
+    curv: jax.Array
+    info: Any
+    steps: jax.Array
+    status: jax.Array
     args: Any = None
     p: Any = None
     aux: Any = None

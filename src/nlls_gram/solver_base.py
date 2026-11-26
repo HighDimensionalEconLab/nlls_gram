@@ -1,5 +1,6 @@
 import dataclasses
 import functools
+import time
 from typing import NamedTuple
 
 import jax
@@ -34,6 +35,7 @@ from nlls_gram.preconditioners import (
 from nlls_gram.solve_loop import _solve_loop_jit, _solve_python_impl
 from nlls_gram.types import (
     PDAS,
+    CompileInfo,
     Complementarity,
     FischerBurmeister,
     Inequality,
@@ -1452,6 +1454,82 @@ class SolverBase:
             )
         return state
 
+    def _loop_args(
+        self,
+        x0,
+        args,
+        p,
+        state,
+        user_state,
+        max_steps,
+        atol,
+        gtol,
+        xtol,
+        callback,
+        save_steps,
+    ):
+        self._check_residual_args(args, p)
+        self._validate_tolerances(atol, gtol, xtol)
+        callback = _hashable_hook(callback)
+        state = self._solve_state(x0, args, p, state)
+        if state.hyper is None:
+            state = dataclasses.replace(state, hyper=self.hyperparams())
+        history_len = max_steps + 1 if save_steps else None
+        return (
+            self,
+            x0,
+            state,
+            args,
+            p,
+            user_state,
+            history_len,
+            max_steps,
+            atol,
+            gtol,
+            xtol,
+            callback,
+        )
+
+    def compile(
+        self,
+        x0,
+        args=None,
+        *,
+        p=None,
+        state=None,
+        max_steps=256,
+        atol=0.0,
+        gtol=0.0,
+        xtol=0.0,
+        callback=None,
+        user_state=None,
+        save_steps=False,
+    ) -> CompileInfo:
+        """Compile the jitted solve loop and return ``(compile_time, peak_bytes)``."""
+        start_time = time.perf_counter()
+        loop_args = self._loop_args(
+            x0,
+            args,
+            p,
+            state,
+            user_state,
+            max_steps,
+            atol,
+            gtol,
+            xtol,
+            callback,
+            save_steps,
+        )
+        m = _solve_loop_jit.lower(*loop_args).compile().memory_analysis()
+        compile_time = time.perf_counter() - start_time
+        peak_bytes = int(
+            m.temp_size_in_bytes
+            + m.argument_size_in_bytes
+            + m.output_size_in_bytes
+            - m.alias_size_in_bytes
+        )
+        return CompileInfo(compile_time=compile_time, peak_bytes=peak_bytes)
+
     def solve(
         self,
         x0,
@@ -1471,13 +1549,32 @@ class SolverBase:
         jit=True,
     ):
         """Run solver updates until a stopping rule fires and support AD in ``p``."""
-        self._check_residual_args(args, p)
-        self._validate_tolerances(atol, gtol, xtol)
-        callback = _hashable_hook(callback)
-        state = self._solve_state(x0, args, p, state)
-        if state.hyper is None:
-            state = dataclasses.replace(state, hyper=self.hyperparams())
-        history_len = max_steps + 1 if save_steps else None
+        (
+            _,
+            x0,
+            state,
+            args,
+            p,
+            user_state,
+            history_len,
+            max_steps,
+            atol,
+            gtol,
+            xtol,
+            callback,
+        ) = self._loop_args(
+            x0,
+            args,
+            p,
+            state,
+            user_state,
+            max_steps,
+            atol,
+            gtol,
+            xtol,
+            callback,
+            save_steps,
+        )
 
         if multi_start is not None:
             num_starts = multi_start.num_starts

@@ -7,6 +7,7 @@ from nlls_gram import (
     BoxSecant,
     BoxSolveResult,
     Cholesky,
+    LagrangeMultipliers,
     LevenbergMarquardt,
     SolverStatus,
     vmap_rows,
@@ -433,3 +434,178 @@ def test_multi_start_skiba_basins_vmap_and_implicit_ad():
     np.testing.assert_allclose(j_lo, [1.0, 0.0], atol=1e-4)
     assert abs(float(j_p[0])) == 0.0
     np.testing.assert_allclose(float(j_p[1]), 1.0, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("use_x64", [False, True])
+def test_lagrange_multipliers_values_ad_and_nonconvex_corner(use_x64):
+    with jax.enable_x64(use_x64):
+        dtype = jnp.float64 if use_x64 else jnp.float32
+        rtol = 1e-9 if use_x64 else 2e-4
+        atol = 1e-10 if use_x64 else 2e-4
+
+        # Minimization and maximization corner multipliers (>= 0 on both corners)
+        s_min = BoxSecant(
+            lambda x, _, q: 0.5 * (q[2] ** 2) * (x - q[3]) ** 2 + q[4] * jnp.sin(x),
+            sense="min",
+        )
+        s_max = BoxSecant(
+            lambda x, _, q: -(0.5 * (q[2] ** 2) * (x - q[3]) ** 2 + q[4] * jnp.sin(x)),
+            sense="max",
+        )
+
+        # Interior optimum: both multipliers and their derivatives are exact 0
+        q_int = jnp.array([0.0, 1.0, 2.0, 0.5, 0.1], dtype=dtype)
+        for slv in (s_min, s_max):
+            r_int = slv.solve(q_int[0], q_int[1], p=q_int)
+            assert isinstance(r_int.lm, LagrangeMultipliers)
+            assert float(r_int.lm.lower) == 0.0
+            assert float(r_int.lm.upper) == 0.0
+            j_int = jax.jacrev(
+                lambda q, sv=slv: jnp.stack(
+                    [
+                        sv.solve(q[0], q[1], p=q).lm.lower,
+                        sv.solve(q[0], q[1], p=q).lm.upper,
+                    ]
+                )
+            )(q_int)
+            np.testing.assert_array_equal(np.asarray(j_int), np.zeros((2, 5)))
+
+        # Active lower bound (x* = lo): lm.lower = c^2*(lo - t) + w*cos(lo) > 0
+        q_lo = jnp.array([0.2, 0.9, 2.5, -0.4, 0.3], dtype=dtype)
+        exact_lo = lambda q: (q[2] ** 2) * (q[0] - q[3]) + q[4] * jnp.cos(q[0])  # noqa: E731
+        for slv in (s_min, s_max):
+            r_lo = slv.solve(q_lo[0], q_lo[1], p=q_lo)
+            np.testing.assert_allclose(
+                float(r_lo.lm.lower), float(exact_lo(q_lo)), rtol=rtol, atol=atol
+            )
+            assert float(r_lo.lm.upper) == 0.0
+            lm_lo_fn = lambda q, sv=slv: sv.solve(q[0], q[1], p=q).lm.lower  # noqa: E731
+            np.testing.assert_allclose(
+                jax.jacfwd(lm_lo_fn)(q_lo),
+                jax.jacfwd(exact_lo)(q_lo),
+                rtol=rtol,
+                atol=atol,
+            )
+            np.testing.assert_allclose(
+                jax.jacrev(lm_lo_fn)(q_lo),
+                jax.jacrev(exact_lo)(q_lo),
+                rtol=rtol,
+                atol=atol,
+            )
+            np.testing.assert_allclose(
+                jax.hessian(lm_lo_fn)(q_lo),
+                jax.hessian(exact_lo)(q_lo),
+                rtol=rtol,
+                atol=atol,
+            )
+
+        # Active upper bound (x* = hi): lm.upper = -(c^2*(hi - t) + w*cos(hi)) > 0
+        q_hi = jnp.array([0.2, 0.9, 2.5, 1.8, -0.2], dtype=dtype)
+        exact_hi = lambda q: -((q[2] ** 2) * (q[1] - q[3]) + q[4] * jnp.cos(q[1]))  # noqa: E731
+        for slv in (s_min, s_max):
+            r_hi = slv.solve(q_hi[0], q_hi[1], p=q_hi)
+            assert float(r_hi.lm.lower) == 0.0
+            np.testing.assert_allclose(
+                float(r_hi.lm.upper), float(exact_hi(q_hi)), rtol=rtol, atol=atol
+            )
+            lm_hi_fn = lambda q, sv=slv: sv.solve(q[0], q[1], p=q).lm.upper  # noqa: E731
+            np.testing.assert_allclose(
+                jax.jacrev(lm_hi_fn)(q_hi),
+                jax.jacrev(exact_hi)(q_hi),
+                rtol=rtol,
+                atol=atol,
+            )
+            np.testing.assert_allclose(
+                jax.hessian(lm_hi_fn)(q_hi),
+                jax.hessian(exact_hi)(q_hi),
+                rtol=rtol,
+                atol=atol,
+            )
+
+        # Degenerate point interval lo == hi splits net multiplier cleanly by sign
+        r_deg_pos = s_min.solve(
+            jnp.asarray(0.5, dtype), jnp.asarray(0.5, dtype), p=q_lo
+        )
+        assert float(r_deg_pos.lm.lower) > 0.0 and float(r_deg_pos.lm.upper) == 0.0
+        r_deg_neg = s_min.solve(
+            jnp.asarray(0.5, dtype), jnp.asarray(0.5, dtype), p=q_hi
+        )
+        assert float(r_deg_neg.lm.lower) == 0.0 and float(r_deg_neg.lm.upper) > 0.0
+
+        # Nonconvex-near-corner polynomial hits exact x* = 0 with exact LM gradient
+        s_inf = BoxSecant(lambda x, _, p: p * x - x**2 + (5.0 / 3.0) * x**4)
+        p_inf = jnp.asarray(0.5, dtype=dtype)
+        lo0, hi1 = jnp.asarray(0.0, dtype=dtype), jnp.asarray(1.0, dtype=dtype)
+        r_inf = s_inf.solve(lo0, hi1, p=p_inf)
+        assert int(r_inf.status) == int(SolverStatus.CONVERGED)
+        assert int(r_inf.steps) <= 3
+        assert float(r_inf.x) == 0.0
+        np.testing.assert_allclose(float(r_inf.lm.lower), 0.5, rtol=rtol, atol=atol)
+        dx_dp = jax.grad(lambda p: s_inf.solve(lo0, hi1, p=p).x)(p_inf)
+        dlm_dp = jax.grad(lambda p: s_inf.solve(lo0, hi1, p=p).lm.lower)(p_inf)
+        assert float(dx_dp) == 0.0
+        np.testing.assert_allclose(float(dlm_dp), 1.0, rtol=rtol, atol=atol)
+        # Envelope Hessian on interior matches closed form with fun_dot = f_p_dot
+        quad_s = BoxSecant(lambda x, _, p: 0.5 * (x - p) ** 2 + 0.25 * p**4)
+        h_fun = jax.hessian(lambda p: quad_s.solve(lo0, hi1, p=p).fun)(
+            jnp.asarray(0.4, dtype=dtype)
+        )
+        np.testing.assert_allclose(float(h_fun), 3.0 * (0.4**2), rtol=rtol, atol=atol)
+
+
+def test_review_edge_cases_gtol_band_collapsed_box_and_elementwise_ad():
+    # 1. Clamped multiplier inside gtol band has zero derivative (not -1 / +1)
+    s_band = BoxSecant(lambda x, _, p: 0.5 * (x - p) ** 2)
+    r_band = s_band.solve(0.0, 1.0, x0=jnp.float32(0.0), p=jnp.float32(1e-6))
+    assert float(r_band.lm.lower) == 0.0
+    assert (
+        float(
+            jax.grad(lambda p: s_band.solve(0.0, 1.0, x0=0.0, p=p).lm.lower)(
+                jnp.float32(1e-6)
+            )
+        )
+        == 0.0
+    )
+
+    # 2. Collapsed box opening upward (lo == hi == 0, target = 1 -> g_h < 0)
+    s_open = BoxSecant(lambda x: 0.5 * (x - 1.0) ** 2)
+    _, tan_open = jax.jvp(
+        lambda u: s_open.solve(jnp.float32(0.0), u),
+        (jnp.float32(0.0),),
+        (jnp.float32(1.0),),
+    )
+    np.testing.assert_allclose(float(tan_open.x), 1.0, atol=1e-6)
+    np.testing.assert_allclose(float(tan_open.lm.upper), -1.0, atol=1e-6)
+
+    # 3. Infinite boundary f_xx with fixed bound (lo_dot == 0) avoids inf * 0 = NaN
+    s_frac = BoxSecant(lambda x, _, p: x**1.5 + p * x)
+    j_frac = jax.jacfwd(lambda p: s_frac.solve(0.0, 1.0, p=p).lm.lower)(
+        jnp.float32(1.0)
+    )
+    np.testing.assert_allclose(float(j_frac), 1.0, atol=1e-6)
+
+    # 4. Warm-start tie on large-offset linear objective picks KKT-valid corner
+    s_tie = BoxSecant(lambda x: jnp.float32(1e6) + x)
+    r_tie = s_tie.solve(0.0, 1.0, x0=jnp.float32(1.0 / 32.0))
+    assert float(r_tie.x) == 0.0
+    np.testing.assert_allclose(float(r_tie.lm.lower), 1.0, atol=1e-5)
+
+    # 5. Elementwise batch (lower/upper shape (3,)) with scalar p supports JVP & VJP
+    lo_vec = jnp.array([0.0, 0.0, 0.6], dtype=jnp.float32)
+    hi_vec = jnp.array([0.2, 1.0, 1.0], dtype=jnp.float32)
+    g_elem = jax.grad(lambda p: jnp.sum(s_band.solve(lo_vec, hi_vec, p=p).x))(
+        jnp.float32(0.4)
+    )
+    np.testing.assert_allclose(float(g_elem), 1.0, atol=1e-5)
+
+    # 6. Higher-order reverse AD (grad(grad)) stays finite with a failed NaN lane
+    s_nan = BoxSecant(lambda x, a, p: 0.5 * (x - jnp.sqrt(a + p)) ** 2)
+    a_lanes = jnp.array([-2.0, 1.0], dtype=jnp.float32)
+    gg = jax.grad(
+        jax.grad(
+            lambda p: jnp.sum(
+                jax.vmap(lambda a: s_nan.solve(0.0, 5.0, a, p=p).x)(a_lanes)
+            )
+        )
+    )(jnp.float32(1.0))
+    np.testing.assert_allclose(float(gg), -0.25 / (2.0**1.5), rtol=1e-4, atol=1e-5)

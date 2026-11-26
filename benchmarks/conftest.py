@@ -1,10 +1,19 @@
 import os
+import tempfile
 
 import jax
 import jax.numpy as jnp
 import pytest
 
 jax.config.update("jax_default_matmul_precision", "highest")
+jax.config.update(
+    "jax_compilation_cache_dir",
+    os.environ.get(
+        "JAX_COMPILATION_CACHE_DIR",
+        os.path.join(tempfile.gettempdir(), "nlls_gram_jax_cache"),
+    ),
+)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
 
 
 def _active_device():

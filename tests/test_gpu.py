@@ -11,6 +11,7 @@ from nlls_gram import (
     QR,
     SVD,
     AnnealRidge,
+    BoxSecant,
     Cholesky,
     Complementarity,
     DiagonalPreconditioner,
@@ -25,8 +26,11 @@ from nlls_gram import (
     Newton,
     RepeatedFactorRidge,
     Residuals,
+    ScalarNewton,
     SolverStatus,
 )
+
+jax.config.update("jax_default_matmul_precision", "highest")
 
 GPU_PLATFORMS = ("gpu",)
 
@@ -339,3 +343,72 @@ def test_multi_start_failed_lane_ad_inequality_and_complementarity_on_gpu(dtype)
             np.testing.assert_allclose(
                 np.asarray(sol_comp.x), np.asarray(a_exact), atol=3e-4
             )
+
+
+def test_box_secant_lm_and_scalar_newton_on_gpu(dtype):
+    gpu = _gpu_devices()[0]
+    atol = 2e-4 if dtype == jnp.float32 else 1e-10
+    rtol = 1e-3 if dtype == jnp.float32 else 1e-8
+
+    with jax.default_device(gpu):
+        targets = jnp.asarray([-0.4, 0.5, 1.6], dtype=dtype)
+        lo = jnp.asarray(0.0, dtype=dtype)
+        hi = jnp.asarray(1.0, dtype=dtype)
+        scale = jnp.asarray(2.5, dtype=dtype)
+
+        box_solver = BoxSecant(lambda x, t, p: 0.5 * p * (x - t) ** 2)
+        sn_solver = ScalarNewton(
+            lambda x, t, p: -0.5 * p * (x - t) ** 2 - 0.05 * (x - t) ** 4,
+            sense="max",
+        )
+
+        @jax.jit
+        def eval_both(lo_in, hi_in, p_in):
+            b_res = jax.vmap(lambda t: box_solver.solve(lo_in, hi_in, t, p=p_in))(
+                targets
+            )
+            j_lm = jax.jacrev(
+                lambda l_v, h_v, p_v: jax.vmap(
+                    lambda t: box_solver.solve(l_v, h_v, t, p=p_v).lm
+                )(targets),
+                argnums=(0, 1, 2),
+            )(lo_in, hi_in, p_in)
+
+            x0_batch = targets + jnp.asarray(1e-2, dtype=dtype)
+            s_res = jax.vmap(lambda x_i, t: sn_solver.solve(x_i, t, p=p_in))(
+                x0_batch, targets
+            )
+            g_sn = jax.grad(
+                lambda p_v: jnp.sum(
+                    jax.vmap(lambda x_i, t: sn_solver.solve(x_i, t, p=p_v).x)(
+                        x0_batch, targets
+                    )
+                )
+            )(p_in)
+            return b_res, j_lm, s_res, g_sn
+
+        jax.block_until_ready(eval_both(lo, hi, scale))
+        with jax.transfer_guard_device_to_host("disallow"):
+            b_res, j_lm, s_res, g_sn = eval_both(lo, hi, scale)
+            jax.block_until_ready((b_res, j_lm, s_res, g_sn))
+
+    for leaf in jax.tree.leaves((b_res, j_lm, s_res, g_sn)):
+        if isinstance(leaf, jax.Array):
+            assert next(iter(leaf.devices())).platform in GPU_PLATFORMS
+    assert b_res.lm.lower.dtype == dtype and s_res.x.dtype == dtype
+    np.testing.assert_allclose(
+        np.asarray(b_res.lm.lower), np.array([1.0, 0.0, 0.0]), rtol=rtol, atol=atol
+    )
+    np.testing.assert_allclose(
+        np.asarray(b_res.lm.upper), np.array([0.0, 0.0, 1.5]), rtol=rtol, atol=atol
+    )
+    np.testing.assert_allclose(
+        np.asarray(j_lm.lower[0]), np.array([2.5, 0.0, 0.0]), rtol=rtol, atol=atol
+    )
+    np.testing.assert_allclose(
+        np.asarray(j_lm.upper[1]), np.array([0.0, 0.0, -2.5]), rtol=rtol, atol=atol
+    )
+    np.testing.assert_allclose(
+        np.asarray(s_res.x), np.asarray(targets), rtol=rtol, atol=atol
+    )
+    np.testing.assert_allclose(float(g_sn), 0.0, atol=atol)
