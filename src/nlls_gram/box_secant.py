@@ -662,15 +662,24 @@ def _solve_box_secant(
                 jnp.where(cand_fin, cand_h, jnp.full_like(cand_h, jnp.inf)),
                 jnp.zeros_like(cand_h),
             )
-            # Objective values rank candidates only up to rounding. A converged
-            # candidate within a relative eps ** 0.8 of the lowest value is ranked
-            # ahead of every candidate that has not converged.
-            h_min = jnp.min(rank_h, axis=0, keepdims=True)
-            conv_tie = (cand_status == conv_code) & (
-                rank_h - h_min <= float(jnp.finfo(dtype).eps) ** 0.8 * jnp.abs(h_min)
+            # Objective values rank candidates only up to rounding. When the lowest
+            # value belongs to a candidate that has not converged, a converged
+            # sub-box result within a relative eps ** 0.8 of it that satisfies the
+            # KKT conditions of the full box is returned instead.
+            j_min = jnp.argmin(rank_h, axis=0)[None, ...]
+            h_min = jnp.take_along_axis(rank_h, j_min, axis=0)
+            min_conv = jnp.take_along_axis(cand_status, j_min, axis=0) == conv_code
+            sub_g_h = sign * sub_g
+            sub_kkt = (sub_status_outer == conv_code) & (
+                ((gtol_b > 0) & (jnp.abs(sub_g_h) <= jnp.sqrt(gtol_b)))
+                | ((sub_x <= lo_b) & (sub_g_h >= -gtol_b))
+                | ((sub_x >= hi_b) & (sub_g_h <= gtol_b))
             )
+            tie = jnp.concatenate(
+                [jnp.zeros_like(status_extra, dtype=bool), sub_kkt], axis=0
+            ) & (rank_h - h_min <= float(jnp.finfo(dtype).eps) ** 0.8 * jnp.abs(h_min))
             rank_h = jnp.where(
-                jnp.any(conv_tie, axis=0, keepdims=True) & ~conv_tie, jnp.inf, rank_h
+                ~min_conv & jnp.any(tie, axis=0, keepdims=True) & ~tie, jnp.inf, rank_h
             )
             j_best = jnp.argmin(rank_h, axis=0)[None, ...]
             x_star = jnp.take_along_axis(cand_x, j_best, axis=0)[0]
