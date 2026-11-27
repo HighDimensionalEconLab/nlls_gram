@@ -429,7 +429,9 @@ def _run_secant_loop(
         x, a0, b0, lo, hi, g, curv_end, dx_abs, xtol_a, rtol_a, gtol_a
     ) | (a0 >= b0)
     deg = a0 >= b0
-    take_curr = f_val <= f_best
+    # A converged finite last iterate is returned, so the status describes the
+    # returned point. The best visited point is the fallback.
+    take_curr = (conv & jnp.isfinite(f_val) & jnp.isfinite(g)) | (f_val <= f_best)
     x_out = jnp.where(deg, a0, jnp.where(take_curr, x, x_best))
     f_out = jnp.where(take_curr, f_val, f_best)
     g_out = jnp.where(take_curr, g, g_best)
