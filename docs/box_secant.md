@@ -32,7 +32,7 @@ Let \(\tau_x = \texttt{xtol} + \texttt{rtol}\,\max(|x_k|, \frac{1}{2}(|\ell_k| +
 
 - `loop="while"` (default) runs `jax.lax.while_loop` and exits as soon as every lane in the batch has converged, freezing converged lanes in place while stragglers finish.
 - `loop="fori"` runs `jax.lax.fori_loop` for all `max_steps` iterations without a cross-lane `jnp.any(active)` reduction, which can reduce GPU launch overhead when `max_steps` is small (e.g. `6` to `8`).
-- `num_starts > 1` deterministically partitions \([\ell, u]\) into `num_starts` uniform sub-boxes (and evaluates exact grid edges plus optional `x0`) inside one fused `vmap` without requiring a PRNG key, returning the global best feasible point.
+- `num_starts > 1` deterministically partitions \([\ell, u]\) into `num_starts` uniform sub-boxes (and evaluates exact grid edges plus optional `x0`) inside one fused `vmap` without requiring a PRNG key, returning the candidate with the best objective value. A converged candidate within a relative `eps ** 0.8` of the best value is returned ahead of every candidate that has not converged.
 
 ## Corner Lagrange multipliers and implicit differentiation
 

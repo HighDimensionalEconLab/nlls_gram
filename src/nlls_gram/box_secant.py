@@ -662,6 +662,16 @@ def _solve_box_secant(
                 jnp.where(cand_fin, cand_h, jnp.full_like(cand_h, jnp.inf)),
                 jnp.zeros_like(cand_h),
             )
+            # Objective values rank candidates only up to rounding. A converged
+            # candidate within a relative eps ** 0.8 of the lowest value is ranked
+            # ahead of every candidate that has not converged.
+            h_min = jnp.min(rank_h, axis=0, keepdims=True)
+            conv_tie = (cand_status == conv_code) & (
+                rank_h - h_min <= float(jnp.finfo(dtype).eps) ** 0.8 * jnp.abs(h_min)
+            )
+            rank_h = jnp.where(
+                jnp.any(conv_tie, axis=0, keepdims=True) & ~conv_tie, jnp.inf, rank_h
+            )
             j_best = jnp.argmin(rank_h, axis=0)[None, ...]
             x_star = jnp.take_along_axis(cand_x, j_best, axis=0)[0]
             f_star = jnp.take_along_axis(cand_f, j_best, axis=0)[0]
