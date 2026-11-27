@@ -114,7 +114,7 @@ def _kkt_converged(x, a0, b0, lo, hi, g, curv, dx_abs, xtol, rtol, gtol):
         & ((gtol <= 0) | (jnp.abs(g) <= jnp.sqrt(gtol)))
         & (curv >= 0)
     )
-    return at_lo_ok | at_hi_ok | grad_ok | bracket_ok | step_ok
+    return at_lo_ok | at_hi_ok | grad_ok | bracket_ok | step_ok, grad_ok | step_ok
 
 
 def _safeguarded_step(x, a0, b0, lo, hi, g, curv, prev_span, tried_lo, tried_hi):
@@ -217,7 +217,7 @@ def _run_secant_loop(
                 steps,
             ) = carry
             curv = _secant_curv(x, g, xp, gp)
-            conv = _kkt_converged(
+            conv, _ = _kkt_converged(
                 x, a0, b0, lo, hi, g, curv, dx_abs, xtol_a, rtol_a, gtol_a
             )
             active = (
@@ -314,7 +314,7 @@ def _run_secant_loop(
                 loop_s,
             ) = carry
             curv = _secant_curv(x, g, xp, gp)
-            conv = _kkt_converged(
+            conv, _ = _kkt_converged(
                 x, a0, b0, lo, hi, g, curv, dx_abs, xtol_a, rtol_a, gtol_a
             )
             active = (
@@ -346,7 +346,7 @@ def _run_secant_loop(
                 loop_s,
             ) = carry
             curv = _secant_curv(x, g, xp, gp)
-            conv = _kkt_converged(
+            conv, _ = _kkt_converged(
                 x, a0, b0, lo, hi, g, curv, dx_abs, xtol_a, rtol_a, gtol_a
             )
             active = (
@@ -425,10 +425,15 @@ def _run_secant_loop(
         )
 
     curv_end = _secant_curv(x, g, xp, gp)
-    conv = _kkt_converged(
+    conv, interior_min = _kkt_converged(
         x, a0, b0, lo, hi, g, curv_end, dx_abs, xtol_a, rtol_a, gtol_a
-    ) | (a0 >= b0)
+    )
     deg = a0 >= b0
+    conv = conv | deg
+    # The slope or step test passed with a secant between two distinct points.
+    interior_min = (
+        interior_min & (x != xp) & jnp.isfinite(f_val) & jnp.isfinite(g) & ~deg
+    )
     # A converged finite last iterate is returned, so the status describes the
     # returned point. The best visited point is the fallback.
     take_curr = (conv & jnp.isfinite(f_val) & jnp.isfinite(g)) | (f_val <= f_best)
@@ -450,7 +455,7 @@ def _run_secant_loop(
             jnp.asarray(SolverStatus.MAX_STEPS, dtype=jnp.int32),
         ),
     )
-    return x_out, sign * f_out, sign * g_out, bw_out, steps, status
+    return x_out, sign * f_out, sign * g_out, bw_out, steps, status, interior_min
 
 
 def _make_secant_primal(jet_fn, sign_float, use_fori, has_x0):
@@ -505,7 +510,7 @@ def _make_secant_primal(jet_fn, sign_float, use_fori, has_x0):
         next_jet = jax.vmap(jet_fn, in_axes=(0, args_axes, p_axes, None))
         next_solver = _make_secant_primal(next_jet, sign_float, use_fori, has_x0)
         out = next_solver(lo_v, hi_v, x0_v, args, p, xtol_v, rtol_v, gtol_v, max_v)
-        return out, (True, True, True, True, True, True)
+        return out, (True, True, True, True, True, True, True)
 
     return solve_level
 
@@ -571,7 +576,7 @@ def _solve_box_secant(
     ):
         ac_in = (args_in, consts_in)
         if num_starts == 1:
-            x_star, f_star, g_star, bw_star, steps, status = primal_fn(
+            x_star, f_star, g_star, bw_star, steps, status, _ = primal_fn(
                 lo_in, hi_in, x0_in, ac_in, p_in, xtol_in, rtol_in, gtol_in, max_s_in
             )
         else:
@@ -591,11 +596,13 @@ def _solve_box_secant(
                 .at[num_starts]
                 .set(hi_in)
             )
-            sub_x, sub_f, sub_g, sub_bw, sub_steps, sub_status = jax.vmap(
-                lambda l_k, h_k: primal_sub_fn(
-                    l_k, h_k, None, ac_in, p_in, xtol_in, rtol_in, gtol_in, max_s_in
-                )
-            )(edges[:-1], edges[1:])
+            sub_x, sub_f, sub_g, sub_bw, sub_steps, sub_status, sub_interior_min = (
+                jax.vmap(
+                    lambda l_k, h_k: primal_sub_fn(
+                        l_k, h_k, None, ac_in, p_in, xtol_in, rtol_in, gtol_in, max_s_in
+                    )
+                )(edges[:-1], edges[1:])
+            )
 
             if has_x0:
                 x0_clip = jnp.clip(x0_in, lo_in, hi_in)
@@ -662,26 +669,27 @@ def _solve_box_secant(
                 jnp.where(cand_fin, cand_h, jnp.full_like(cand_h, jnp.inf)),
                 jnp.zeros_like(cand_h),
             )
-            # Objective values rank candidates only up to rounding. When the lowest
-            # value belongs to a candidate that has not converged, a converged
-            # sub-box result within a relative eps ** 0.8 of it that satisfies the
-            # KKT conditions of the full box is returned instead.
-            j_min = jnp.argmin(rank_h, axis=0)[None, ...]
-            h_min = jnp.take_along_axis(rank_h, j_min, axis=0)
-            min_conv = jnp.take_along_axis(cand_status, j_min, axis=0) == conv_code
+            # Objective values rank candidates only up to rounding. A converged
+            # candidate at the lowest value is returned first. Otherwise a sub-box
+            # result within a relative eps ** 0.8 of the lowest value is returned
+            # when it is an interior minimum of the full box or sits on a strictly
+            # active bound.
+            h_min = jnp.min(rank_h, axis=0, keepdims=True)
+            cand_conv = cand_status == conv_code
+            conv_at_min = jnp.any(cand_conv & (rank_h <= h_min), axis=0, keepdims=True)
             sub_g_h = sign * sub_g
-            sub_kkt = (sub_status_outer == conv_code) & (
-                ((gtol_b > 0) & (jnp.abs(sub_g_h) <= jnp.sqrt(gtol_b)))
-                | ((sub_x <= lo_b) & (sub_g_h >= -gtol_b))
-                | ((sub_x >= hi_b) & (sub_g_h <= gtol_b))
+            sub_min = (sub_status_outer == conv_code) & (
+                (sub_interior_min & (sub_x > lo_b) & (sub_x < hi_b))
+                | ((sub_x <= lo_b) & (sub_g_h > gtol_b))
+                | ((sub_x >= hi_b) & (sub_g_h < -gtol_b))
             )
             tie = jnp.concatenate(
-                [jnp.zeros_like(status_extra, dtype=bool), sub_kkt], axis=0
+                [jnp.zeros_like(status_extra, dtype=bool), sub_min], axis=0
             ) & (rank_h - h_min <= float(jnp.finfo(dtype).eps) ** 0.8 * jnp.abs(h_min))
-            rank_h = jnp.where(
-                ~min_conv & jnp.any(tie, axis=0, keepdims=True) & ~tie, jnp.inf, rank_h
+            keep = jnp.where(
+                conv_at_min, cand_conv, tie | ~jnp.any(tie, axis=0, keepdims=True)
             )
-            j_best = jnp.argmin(rank_h, axis=0)[None, ...]
+            j_best = jnp.argmin(jnp.where(keep, rank_h, jnp.inf), axis=0)[None, ...]
             x_star = jnp.take_along_axis(cand_x, j_best, axis=0)[0]
             f_star = jnp.take_along_axis(cand_f, j_best, axis=0)[0]
             g_star = jnp.take_along_axis(cand_g, j_best, axis=0)[0]
