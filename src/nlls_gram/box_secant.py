@@ -430,9 +430,15 @@ def _run_secant_loop(
     )
     deg = a0 >= b0
     conv = conv | deg
-    # The slope or step test passed with a secant between two distinct points.
+    # The slope or step test passed with finite slopes that do not decrease
+    # between two distinct points.
     interior_min = (
-        interior_min & (x != xp) & jnp.isfinite(f_val) & jnp.isfinite(g) & ~deg
+        interior_min
+        & jnp.isfinite(f_val)
+        & jnp.isfinite(g)
+        & jnp.isfinite(gp)
+        & jnp.where(x > xp, g >= gp, (x < xp) & (g <= gp))
+        & ~deg
     )
     # A converged finite last iterate is returned, so the status describes the
     # returned point. The best visited point is the fallback.
@@ -673,15 +679,23 @@ def _solve_box_secant(
             # candidate at the lowest value is returned first. Otherwise a sub-box
             # result within a relative eps ** 0.8 of the lowest value is returned
             # when it is an interior minimum of the full box or sits on a strictly
-            # active bound.
-            h_min = jnp.min(rank_h, axis=0, keepdims=True)
+            # active bound, and the slope at the lowest value points toward it.
+            j_min = jnp.argmin(rank_h, axis=0)[None, ...]
+            h_min = jnp.take_along_axis(rank_h, j_min, axis=0)
+            x_min = jnp.take_along_axis(cand_x, j_min, axis=0)
+            g_h_min = sign * jnp.take_along_axis(cand_g, j_min, axis=0)
             cand_conv = cand_status == conv_code
             conv_at_min = jnp.any(cand_conv & (rank_h <= h_min), axis=0, keepdims=True)
             sub_g_h = sign * sub_g
-            sub_min = (sub_status_outer == conv_code) & (
-                (sub_interior_min & (sub_x > lo_b) & (sub_x < hi_b))
-                | ((sub_x <= lo_b) & (sub_g_h > gtol_b))
-                | ((sub_x >= hi_b) & (sub_g_h < -gtol_b))
+            gtol_pos = jnp.maximum(gtol_b, jnp.zeros_like(gtol_b))
+            sub_min = (
+                (sub_status_outer == conv_code)
+                & (
+                    (sub_interior_min & (gtol_b > 0) & (sub_x > lo_b) & (sub_x < hi_b))
+                    | ((sub_x <= lo_b) & (sub_g_h > gtol_pos))
+                    | ((sub_x >= hi_b) & (sub_g_h < -gtol_pos))
+                )
+                & jnp.where(x_min > sub_x, g_h_min > 0, (x_min < sub_x) & (g_h_min < 0))
             )
             tie = jnp.concatenate(
                 [jnp.zeros_like(status_extra, dtype=bool), sub_min], axis=0
