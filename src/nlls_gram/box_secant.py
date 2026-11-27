@@ -687,13 +687,12 @@ def _solve_box_secant(
             cand_conv = cand_status == conv_code
             conv_at_min = jnp.any(cand_conv & (rank_h <= h_min), axis=0, keepdims=True)
             sub_g_h = sign * sub_g
-            gtol_pos = jnp.maximum(gtol_b, jnp.zeros_like(gtol_b))
             sub_min = (
                 (sub_status_outer == conv_code)
                 & (
                     (sub_interior_min & (gtol_b > 0) & (sub_x > lo_b) & (sub_x < hi_b))
-                    | ((sub_x <= lo_b) & (sub_g_h > gtol_pos))
-                    | ((sub_x >= hi_b) & (sub_g_h < -gtol_pos))
+                    | ((sub_x <= lo_b) & (sub_g_h > gtol_b))
+                    | ((sub_x >= hi_b) & (sub_g_h < -gtol_b))
                 )
                 & jnp.where(x_min > sub_x, g_h_min > 0, (x_min < sub_x) & (g_h_min < 0))
             )
